@@ -1,0 +1,50 @@
+# OS / editor
+.DS_Store
+__MACOSX/
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python env / build
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Python caches
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Test / coverage reports
+.coverage
+htmlcov/
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+
+# Agent metadata
+.agent/
+
+# Local archives
+src.zip
+
+# Legacy
+old/
+
+# Generated outputs
+output/*
+!output/.gitkeep
+plots/
+*.pdf
+*.svg
