@@ -44,53 +44,39 @@ The simulator is motivated by the following accounting identities.
 
 ### 1. DU / RU transaction view
 
-$$
-\Delta D_{TDC}
-=
-\underbrace{(G_{dep} - T_{dep})}_{\substack{\text{Net fiscal} \\\text{injection to DUs}}}
-+
-\underbrace{(D_{sales} - D_{purch})}_{\substack{\text{Net Treasury-security sales} \\\text{from DUs to RUs}}}
-+
-\underbrace{D_{yield}}_{\substack{\text{Interest and principal} \\\text{payments to DUs}}}
-$$
+$$\Delta D_{TDC} = (G_{dep} - T_{dep}) + (D_{sales} - D_{purch}) + D_{yield}$$
 
-Where:
+| Term | Meaning |
+|---|---|
+| $G_{dep} - T_{dep}$ | Net fiscal injection to deposit users (DUs) |
+| $D_{sales} - D_{purch}$ | Net Treasury-security sales from DUs to reserve users (RUs) |
+| $D_{yield}$ | Interest and principal payments to DUs |
 
-- $(G_{dep} - T_{dep})$ is government spending net of taxation **in the form of deposits**.
-- $(D_{sales} - D_{purch})$ is the net sale of Treasury securities from **deposit users (DUs)** to **reserve users (RUs)**.
-- $D_{yield}$ is Treasury interest and principal paid to DUs.
-
-For this framework, **DUs** are domestic non-banks, and **RUs** include banks, the central bank, Treasury/federal accounts, and foreign reserve-linked holders.
+**DUs** are domestic non-banks. **RUs** include banks, the central bank, Treasury/federal accounts, and foreign reserve-linked holders.
 
 ### 2. Treasury / central-bank / TGA view
 
-$$
-\Delta D_{TDC}
-=
-\underbrace{(D_{sales} - D_{purch})}_{\substack{\text{Net TS sales} \\\text{from DUs to RUs}}}
-+
-\underbrace{(T_{AV} - T_{Rx} - R_{yield} + R_{Tx})}_{\substack{\text{Net Treasury flows} \\\text{with RUs}}}
-+
-\underbrace{\max\!\big(0,\;F_{PY} + M_{MT} - F_{OE}\big)}_{\substack{\text{Central-bank} \\\text{factors}}}
--
-\underbrace{\Delta TGA}_{\substack{\text{Change in Treasury} \\\text{cash balance}}}
-$$
+$$\Delta D_{TDC} = (D_{sales} - D_{purch}) + (T_{AV} - T_{Rx} - R_{yield} + R_{Tx}) + \max(0,\; F_{PY} + M_{MT} - F_{OE}) - \Delta TGA$$
 
-Where $T_{AV}$ is auction receipts, $T_{Rx}$ is Treasury outlays to RUs, $R_{Tx}$ is Treasury receipts from RUs, $F_{PY}$ is CB income, $F_{OE}$ is CB operating expenses, $M_{MT}$ includes seigniorage, and $\Delta TGA$ is the change in the Treasury General Account.
+| Term | Meaning |
+|---|---|
+| $D_{sales} - D_{purch}$ | Net TS sales from DUs to RUs |
+| $T_{AV} - T_{Rx} - R_{yield} + R_{Tx}$ | Net Treasury flows with RUs |
+| $\max(0,\; F_{PY} + M_{MT} - F_{OE})$ | Central-bank factors (remittances, seigniorage) |
+| $\Delta TGA$ | Change in the Treasury General Account |
+
+Where $T_{AV}$ is auction receipts, $T_{Rx}$ is Treasury outlays to RUs, $R_{Tx}$ is Treasury receipts from RUs, $F_{PY}$ is CB income, $F_{OE}$ is CB operating expenses, and $M_{MT}$ includes seigniorage.
 
 ### 3. Bank-balance-sheet decomposition view
 
-$$
-\Delta D_{TDC}
-=
-\underbrace{(\Delta M-\Delta C-\Delta X)}_{\substack{\text{DU liquid balances}\\\text{net of non-deposits}}}
--
-\underbrace{(\Delta L_{B,DU}+\Delta S_{B,DU}-\Delta CB_{B})}_{\substack{\text{Bank non-TS asset acquisition}\\\text{from DUs (net)}}}
--
-\underbrace{(\Delta CB_{NB})}_{\substack{\text{CB non-TS}\\\text{with non-banks}}}
--
-\underbrace{(\Delta FI_{NonTS})}_{\substack{\text{Foreign non-TS flow}\\\text{to DUs}}}
-$$
+$$\Delta D_{TDC} = (\Delta M - \Delta C - \Delta X) - (\Delta L_{B,DU} + \Delta S_{B,DU} - \Delta CB_B) - \Delta CB_{NB} - \Delta FI_{NonTS}$$
+
+| Term | Meaning |
+|---|---|
+| $\Delta M - \Delta C - \Delta X$ | DU liquid balances net of non-deposits |
+| $\Delta L_{B,DU} + \Delta S_{B,DU} - \Delta CB_B$ | Bank non-TS asset acquisition from DUs (net) |
+| $\Delta CB_{NB}$ | CB non-TS operations with non-banks |
+| $\Delta FI_{NonTS}$ | Foreign non-TS flows to DUs |
 
 These three views are different ways of isolating the **same Treasury deposit component**.
 
@@ -108,19 +94,7 @@ The simulator reports the mechanism directly through a 5-term decomposition:
 | Secondary trades | `TDC_SecondaryTrades` | Deposit effect of preference-driven secondary-market trading |
 | Other | `TDC_Other` | Reserve transfers, CB expenses, minting flows |
 
-$$
-TDC_{Change}
-=
-TDC_{FiscalFlow}
-+
-TDC_{DebtService}
-+
-TDC_{AuctionAbsorption}
-+
-TDC_{SecondaryTrades}
-+
-TDC_{Other}
-$$
+$$TDC_{Change} = TDC_{FiscalFlow} + TDC_{DebtService} + TDC_{AuctionAbsorption} + TDC_{SecondaryTrades} + TDC_{Other}$$
 
 This identity is enforced row-wise and verified by automated tests. It tells you **why** TDC moved, not just that it moved.
 
