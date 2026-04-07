@@ -12,9 +12,10 @@ initial_values:
   tga: 500.0
 
 initial_portfolio:
-  mode: generated   # generated is the default; creates a synthetic starting portfolio
+  mode: generated   # generated preserves legacy behavior; use config_derived for a scenario-consistent stock
   file: output/initial_bond_portfolio.csv
   generation:
+    generation_method: legacy
     output_filename: "output/initial_bond_portfolio.csv"
     target_public_marketable_wam: 6.0
     random_seed: 42
@@ -155,6 +156,18 @@ other_flows:
   reserve_transfer: 0.0
   cb_net_expense: 0.0
   money_minting_transfers: 0.0
+
+rate_sensitive_demand:
+  enabled: false
+  min_multiplier: 0.25
+  anchor_maturity_years: 5.0
+  slope_short_maturity_years: 2.0
+  slope_long_maturity_years: 10.0
+  auction: {}
+  secondary: {}
+
+financing_cost_options:
+  include_tips_inflation_accretion: false
 
 # --- Scenario Definitions ---
 

@@ -9,9 +9,10 @@ The simulator is designed for scenario analysis, not forecasting. It makes the T
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest -q          # run the test suite
 python run.py      # run all scenario groups
+python run.py tdc_config_optional.yaml  # run the optional-feature example config
 ```
 
 By default, the project uses the shipped `tdc_config.yaml` and generates a synthetic starting portfolio. Generated CSVs and plots are written to `output/`.
@@ -181,6 +182,9 @@ Key result columns:
 | `TotalDebt_Agg` | Total outstanding debt |
 | `DebtServiceOutlay_Cumulative` | Cumulative debt-service payments |
 | `FinancingCost_Cumulative` | Cumulative financing cost |
+| `TIPSInflationAccretion_Cumulative` | Optional cumulative TIPS principal accretion included in financing cost |
+| `AuctionDemandShift_AvgAbs` | Mean absolute auction-share shift from rate-sensitive demand overlays |
+| `SecondaryDemandShift_AvgAbs` | Mean absolute secondary-target shift from rate-sensitive demand overlays |
 | `WAM` | Weighted-average maturity of the active portfolio |
 
 ---
@@ -206,18 +210,31 @@ The main configuration file is `tdc_config.yaml`.
 |---|---|
 | `simulation_period` | Start date, end date, frequency, and whether preference trading is enabled |
 | `initial_values` | Starting TGA, reserves, and TDC level |
-| `initial_portfolio` | Mode (`generated` or `file`), generation parameters, target face values by holder |
+| `initial_portfolio` | Mode (`generated`, `config_derived`, or `file`), generation parameters, target face values by holder |
 | `fiscal_params` | Spending and tax assumptions |
 | `tga_params` | Treasury cash target and floor |
 | `yield_curve` | Exogenous term structure inputs (named curves for scenario overrides) |
 | `treasury_issuance_profile` | Issuance mix — bills/notes/bonds/TIPS/FRNs/nonmarketable, maturity distributions |
 | `sector_preferences` | Holder absorption preferences for auction allocation |
+| `rate_sensitive_demand` | Optional demand elasticities layered on top of auction and secondary preference blocks |
 | `tips_params` | Inflation rate, reference CPI, real coupon rate |
+| `financing_cost_options` | Optional financing-cost accounting toggles |
 | `frn_params` | Benchmark rate and spread |
 | `nonmarketable_params` | Trust fund interest crediting rate |
 | `scenario_groups` | Scenario batches — each group defines scenarios with parameter overrides and output settings |
 
 Scenarios are defined as overrides on the base config. Each scenario in a group specifies which parameters to change (yield curve, issuance profile, sector preferences, events, etc.), and the engine runs all scenarios in a group and produces comparative plots.
+
+`initial_portfolio` is different: it is loaded once before scenarios run, so changing the starting stock is a run-level choice, not a per-scenario override.
+
+### Optional additions
+
+- `initial_portfolio.mode: config_derived` builds the starting stock from the configured issuance profile, holder preferences, and yield curve instead of the legacy hard-coded maturity menus.
+- `rate_sensitive_demand` keeps yields exogenous but lets auction and secondary demand shares flex with yield level, spread-to-anchor, or curve slope. When `enabled: false`, behavior is unchanged.
+- `financing_cost_options.include_tips_inflation_accretion: true` adds TIPS principal accretion to `FinancingCost_Period` and exposes `TIPSInflationAccretion_Period` / `TIPSInflationAccretion_Cumulative`.
+- The engine now exposes lightweight diagnostics for the new demand system via `AuctionDemandShift_AvgAbs`, `AuctionDemandShift_MaxAbs`, `SecondaryDemandShift_AvgAbs`, and `SecondaryDemandShift_MaxAbs`.
+
+Mergeable examples live in [examples/optional_feature_scenarios.yaml](/Users/shanewray/malus/proj/tdcsim/examples/optional_feature_scenarios.yaml). A ready-to-run alternate config is available at [tdc_config_optional.yaml](/Users/shanewray/malus/proj/tdcsim/tdc_config_optional.yaml), and the chosen auction-demand coefficients are summarized in [examples/calibration_notes.md](/Users/shanewray/malus/proj/tdcsim/examples/calibration_notes.md).
 
 ---
 
@@ -237,8 +254,8 @@ Scenarios are defined as overrides on the base config. Each scenario in a group 
 
 The runtime flow:
 
-1. `run.py` calls `simulation_core.main()`.
-2. `simulation_core.py` loads and validates `tdc_config.yaml`, then loads or generates the initial portfolio.
+1. `run.py` calls `simulation_core.main()` and can optionally take a config path argument.
+2. `simulation_core.py` loads and validates the selected config file, then loads or generates the initial portfolio.
 3. `sim_groups.py` dispatches each scenario group (parallel for multiple groups, serial for one).
 4. For each scenario, `sim_engine.py` runs the simulation loop period by period — fiscal flows, debt service, issuance, allocation, optional secondary trading — and accumulates results.
 5. `sim_plotting.py` writes comparison charts across scenarios in each group.
@@ -300,11 +317,12 @@ pytest -q
 This is a mechanism-focused simulator, not a macro forecast model.
 
 - **Yield curves are exogenous.** The model does not endogenize rates from demand. Statements like "more bank demand lowers rates" require an explicit yield curve scenario, not just a preference shift.
-- **The generated starting portfolio is stylized.** It uses representative maturities and coupons, not a full reconstruction of the actual outstanding Treasury portfolio.
+- **The legacy generated starting portfolio is stylized.** `initial_portfolio.mode: generated` uses representative maturities and coupons, not a full reconstruction of the actual outstanding Treasury portfolio. `config_derived` reduces this gap but still does not recreate the real Treasury stock.
 - **Best used for comparing scenarios**, not estimating real-world outcomes directly.
 - **Preference trading is simplified.** It is a single-pass reallocation per period, not a full market microstructure model.
-- **TIPS inflation accretion is excluded from financing cost.** The financing cost identity holds on cash flows only.
+- **By default, TIPS inflation accretion is excluded from financing cost.** Enable `financing_cost_options.include_tips_inflation_accretion` to include it explicitly.
 - **Coupon logic assumes sub-semiannual step frequency.** Weekly (the default) is always safe. Monthly or coarser frequencies may miss coupon dates.
+- **Coarse frequencies are guarded but still approximate.** `simulation_period.coarse_frequency_action` can be set to `warn`, `allow`, or `error`. The shipped configs use `warn`; weekly remains the recommended mode.
 
 ## What this is not
 

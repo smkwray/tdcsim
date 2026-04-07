@@ -243,12 +243,15 @@ def _load_initial_portfolio(base_config, sim_start_date, script_dir):
     else:
         initial_bonds_path = portfolio_config.get('file')
 
-    if portfolio_mode == 'generated':
-        print('Portfolio mode: generated — running portfolio generator...')
+    if portfolio_mode in {'generated', 'config_derived'}:
+        print(f'Portfolio mode: {portfolio_mode} — running portfolio generator...')
         from csv_gen import generate_initial_portfolio, save_portfolio_csv
 
         gen_config = portfolio_config.get('generation', base_config.get('initial_portfolio_generation', {}))
-        initial_bonds_df_global = generate_initial_portfolio(gen_config, sim_start_date)
+        gen_config = copy.deepcopy(gen_config)
+        if portfolio_mode == 'config_derived':
+            gen_config.setdefault('generation_method', 'config_derived')
+        initial_bonds_df_global = generate_initial_portfolio(gen_config, sim_start_date, base_config=base_config)
         output_filename = gen_config.get('output_filename')
         if output_filename:
             save_path = os.path.join(script_dir, output_filename)
@@ -289,14 +292,17 @@ def _load_initial_portfolio(base_config, sim_start_date, script_dir):
     return initial_bonds_df_global
 
 
-def main():
+def main(config_file=None):
     overall_start_time = time.time()
     try:
         src_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(src_dir)
     except NameError:
         project_root = os.getcwd()
-    config_file = os.path.join(project_root, 'tdc_config.yaml')
+    if config_file is None:
+        config_file = os.path.join(project_root, 'tdc_config.yaml')
+    elif not os.path.isabs(config_file):
+        config_file = os.path.join(project_root, config_file)
 
     print('--- Treasury-Driven Deposit Component (TDC) Simulator ---')
     print(f'Using configuration file: {config_file}')

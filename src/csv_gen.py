@@ -12,7 +12,8 @@ import random
 import numpy as np
 import os
 import yaml
-from tdc_shared import BOND_PORTFOLIO_COLS, ISSUANCE_PROFILE_CUTOFFS
+from sim_pricing import calculate_coupon_rate, get_yield_for_maturity
+from tdc_shared import BOND_PORTFOLIO_COLS, HOLDER_TYPES, ISSUANCE_PROFILE_CUTOFFS, TGA_FLOOR_TOLERANCE
 
 # --- Constants ---
 SECTOR_PREFERENCES = {
@@ -70,6 +71,14 @@ NUM_TRANCHES_PER_TYPE = {
     'nonmarketable_federal': 50
 }
 
+CONFIG_DERIVED_CATEGORY_DEFAULTS = {
+    'bills': {'maturities': [0.25, 0.5, 1.0], 'weights': [0.40, 0.40, 0.20], 'security_type': 'Fixed'},
+    'notes': {'maturities': [2.0, 3.0, 5.0, 7.0, 10.0], 'weights': [0.25, 0.25, 0.30, 0.15, 0.05], 'security_type': 'Fixed'},
+    'bonds': {'maturities': [20.0, 30.0], 'weights': [0.70, 0.30], 'security_type': 'Fixed'},
+    'tips': {'maturities': [5.0, 10.0, 30.0], 'weights': [0.50, 0.30, 0.20], 'security_type': 'TIPS'},
+    'frn': {'maturities': [2.0], 'weights': [1.0], 'security_type': 'FRN'},
+}
+
 
 def _get_maturity_category(maturity_years):
     if maturity_years <= ISSUANCE_PROFILE_CUTOFFS['bills_cutoff_years']: return 'bills'
@@ -110,6 +119,230 @@ def _get_random_issue_date(sim_start_date):
     days_between = (end_issue_date - start_issue_date).days
     if days_between <= 0: return start_issue_date
     return start_issue_date + timedelta(days=random.randrange(days_between))
+
+
+def _normalize_positive_weights(weights, fallback_weights):
+    values = list(weights) if weights else list(fallback_weights)
+    cleaned = []
+    for value in values:
+        try:
+            cleaned.append(max(0.0, float(value)))
+        except Exception:
+            cleaned.append(0.0)
+    total = sum(cleaned)
+    if total <= TGA_FLOOR_TOLERANCE:
+        fallback = [float(v) for v in fallback_weights]
+        total = sum(fallback)
+        return [v / total for v in fallback] if total > TGA_FLOOR_TOLERANCE else []
+    return [v / total for v in cleaned]
+
+
+def _normalize_mapping(mapping):
+    total = sum((max(0.0, float(v)) for v in mapping.values()), 0.0)
+    if total <= TGA_FLOOR_TOLERANCE:
+        return {k: 0.0 for k in mapping}
+    return {k: max(0.0, float(v)) / total for k, v in mapping.items()}
+
+
+def _build_config_derived_generation_context(gen_config, base_config):
+    issuance_profile = base_config.get('treasury_issuance_profile', {})
+    prefs_source = base_config.get('auction_absorption_preferences', base_config.get('sector_preferences', {}))
+    yield_curve = base_config.get('yield_curve', {})
+    tips_params = base_config.get('tips_params', {})
+    frn_params = base_config.get('frn_params', {})
+    nonmarketable_params = base_config.get('nonmarketable_params', {})
+
+    special_alloc = {
+        'tips': float(issuance_profile.get('TIPS', {}).get('target_percentage', 0.0) or 0.0),
+        'frn': float(issuance_profile.get('FRN', {}).get('target_percentage', 0.0) or 0.0),
+    }
+    fixed_share = max(0.0, 1.0 - sum(special_alloc.values()) - float(issuance_profile.get('NonMarketable', {}).get('target_percentage', 0.0) or 0.0))
+    category_shares = {
+        'bills': fixed_share * float(issuance_profile.get('bills', {}).get('target_percentage_of_remainder', 0.0) or 0.0),
+        'notes': fixed_share * float(issuance_profile.get('notes', {}).get('target_percentage_of_remainder', 0.0) or 0.0),
+        'bonds': fixed_share * float(issuance_profile.get('bonds', {}).get('target_percentage_of_remainder', 0.0) or 0.0),
+        'tips': special_alloc['tips'],
+        'frn': special_alloc['frn'],
+    }
+
+    holder_mix_by_category = {}
+    for holder in HOLDER_TYPES:
+        raw_mix = {}
+        holder_cfg = prefs_source.get(holder, {}) if isinstance(prefs_source, dict) else {}
+        for category, total_share in category_shares.items():
+            pref_value = float(holder_cfg.get(f'{category}_pct', 0.0) or 0.0) if isinstance(holder_cfg, dict) else 0.0
+            raw_mix[category] = total_share * pref_value
+        normalized_mix = _normalize_mapping(raw_mix)
+        if sum(normalized_mix.values()) <= TGA_FLOOR_TOLERANCE:
+            fallback = SECTOR_PREFERENCES.get(holder, {})
+            normalized_mix = _normalize_mapping({
+                category: float(fallback.get(f'{category}_pct', 0.0) or 0.0)
+                for category in ['bills', 'notes', 'bonds', 'tips', 'frn']
+            })
+        holder_mix_by_category[holder] = normalized_mix
+
+    category_specs = {}
+    for category, defaults in CONFIG_DERIVED_CATEGORY_DEFAULTS.items():
+        source_key = category if category in ['bills', 'notes', 'bonds'] else category.upper()
+        cfg = issuance_profile.get(source_key, {})
+        maturities = list(cfg.get('maturities', defaults['maturities']))
+        weights = _normalize_positive_weights(cfg.get('maturity_distribution', []), defaults['weights'])
+        if len(maturities) != len(weights) or not maturities:
+            maturities = list(defaults['maturities'])
+            weights = _normalize_positive_weights(defaults['weights'], defaults['weights'])
+        category_specs[category] = {
+            'security_type': defaults['security_type'],
+            'maturities': maturities,
+            'weights': weights,
+        }
+
+    tips_reference_cpi = float(tips_params.get('cpi_start_level', 100.0) or 100.0)
+    nm_private_maturity = float(nonmarketable_params.get('private_nominal_maturity_years', 10.0) or 10.0)
+    nm_federal_maturity = float(nonmarketable_params.get('federal_nominal_maturity_years', 15.0) or 15.0)
+
+    return {
+        'holder_mix_by_category': holder_mix_by_category,
+        'category_specs': category_specs,
+        'yield_curve_years': list(yield_curve.get('years', [])),
+        'yield_curve_rates': list(yield_curve.get('rates', [])),
+        'tips_real_coupon_rate': float(tips_params.get('default_real_coupon_rate', 0.005) or 0.005),
+        'tips_reference_cpi': tips_reference_cpi,
+        'frn_fixed_spread': float(frn_params.get('default_fixed_spread', 0.0005) or 0.0005),
+        'nonmarketable_private_maturity': nm_private_maturity,
+        'nonmarketable_federal_maturity': nm_federal_maturity,
+    }
+
+
+def _get_config_derived_issue_terms(category, maturity_years, context):
+    yield_curve_years = context['yield_curve_years']
+    yield_curve_rates = context['yield_curve_rates']
+    security_type = CONFIG_DERIVED_CATEGORY_DEFAULTS[category]['security_type']
+    issue_yield = get_yield_for_maturity(maturity_years, yield_curve_years, yield_curve_rates)
+    issue_yield = 0.0 if pd.isna(issue_yield) else float(issue_yield)
+
+    if security_type == 'Fixed':
+        coupon_rate = calculate_coupon_rate('Fixed', maturity_years, issue_yield, 0.0)
+    elif security_type == 'TIPS':
+        coupon_rate = calculate_coupon_rate('TIPS', maturity_years, issue_yield, context['tips_real_coupon_rate'])
+    else:
+        coupon_rate = 0.0
+
+    price_ratio = _issue_price_ratio(security_type, maturity_years, coupon_rate, issue_yield)
+    return security_type, coupon_rate, issue_yield, price_ratio
+
+
+def _generate_one_portfolio_config_derived(target_face_values, sim_start_date, context):
+    bond_id_counter = 100
+    all_bonds_data = []
+
+    for holder_key_target, holder_total_target in target_face_values.items():
+        if holder_key_target.startswith('Private_'):
+            holder_type_csv = 'Private'
+        elif holder_key_target.startswith('TrustFunds_'):
+            holder_type_csv = 'TrustFunds'
+        else:
+            holder_type_csv = holder_key_target
+
+        if holder_key_target in ['TrustFunds_NonMarketable', 'Private_NonMarketable']:
+            nm_type_key = 'nonmarketable_federal' if holder_key_target == 'TrustFunds_NonMarketable' else 'nonmarketable_private'
+            num_tranches_nm = NUM_TRANCHES_PER_TYPE[nm_type_key]
+            if holder_total_target <= 0 or num_tranches_nm == 0:
+                continue
+            face_per_nm_tranche = holder_total_target / num_tranches_nm
+            maturity_years = context['nonmarketable_federal_maturity'] if nm_type_key == 'nonmarketable_federal' else context['nonmarketable_private_maturity']
+            for _ in range(num_tranches_nm):
+                bond_id_counter += 1
+                issue_dt = _get_random_issue_date(sim_start_date)
+                years_int = int(maturity_years)
+                months_int = int(round((maturity_years - years_int) * 12))
+                maturity_date_dt = issue_dt + relativedelta(years=years_int, months=months_int)
+                if maturity_date_dt <= sim_start_date:
+                    maturity_date_dt = sim_start_date + relativedelta(years=years_int, months=months_int)
+                face_value = round(face_per_nm_tranche, 4 if nm_type_key == 'nonmarketable_private' else 2)
+                bond = {col: None for col in BOND_PORTFOLIO_COLS}
+                bond['BondID'] = bond_id_counter
+                bond['SecurityType'] = 'NonMarketable'
+                bond['HolderType'] = holder_type_csv
+                bond['Status'] = 'Active'
+                bond['IssueDate'] = issue_dt
+                bond['OriginalMaturityYears'] = maturity_years
+                bond['MaturityDate'] = maturity_date_dt
+                bond['FaceValue'] = face_value
+                bond['CouponRate'] = 0.0
+                bond['OriginalPrincipal'] = face_value
+                bond['AdjustedPrincipal'] = face_value
+                bond['IndexRatio'] = 1.0
+                bond['IssueYieldAtIssue'] = 0.0
+                bond['IssuePriceRatio'] = 1.0
+                bond['IssueProceeds'] = face_value
+                all_bonds_data.append(bond)
+            continue
+
+        if holder_total_target <= 0:
+            continue
+
+        holder_mix = context['holder_mix_by_category'].get(holder_type_csv, {})
+        for category, category_weight in holder_mix.items():
+            target_fv_cat = holder_total_target * category_weight
+            if target_fv_cat < MIN_FACE_VALUE_BILLIONS_MARKETABLE:
+                continue
+            spec = context['category_specs'][category]
+            actual_sec_type = spec['security_type']
+            mat_opts = spec['maturities']
+            weights = spec['weights']
+            num_tranches = NUM_TRANCHES_PER_TYPE.get(category, 100)
+            if not mat_opts or num_tranches <= 0:
+                continue
+            face_per_tranche = target_fv_cat / num_tranches
+            if face_per_tranche < MIN_FACE_VALUE_BILLIONS_MARKETABLE and target_fv_cat >= MIN_FACE_VALUE_BILLIONS_MARKETABLE:
+                num_tranches = max(1, int(target_fv_cat / MIN_FACE_VALUE_BILLIONS_MARKETABLE))
+                face_per_tranche = target_fv_cat / num_tranches
+            if face_per_tranche < MIN_FACE_VALUE_BILLIONS_MARKETABLE:
+                continue
+            for _ in range(num_tranches):
+                bond_id_counter += 1
+                issue_dt = _get_random_issue_date(sim_start_date)
+                orig_mat_yrs = random.choices(mat_opts, weights=weights, k=1)[0]
+                years_int = int(orig_mat_yrs)
+                months_int = int(round((orig_mat_yrs - years_int) * 12))
+                maturity_date_dt = issue_dt + relativedelta(years=years_int, months=months_int)
+                while maturity_date_dt <= sim_start_date:
+                    issue_dt = _get_random_issue_date(sim_start_date)
+                    maturity_date_dt = issue_dt + relativedelta(years=years_int, months=months_int)
+                face_value = round(face_per_tranche, 3)
+                security_type, coupon_rate, issue_yield, issue_price_ratio = _get_config_derived_issue_terms(category, orig_mat_yrs, context)
+
+                bond = {col: None for col in BOND_PORTFOLIO_COLS}
+                bond['BondID'] = bond_id_counter
+                bond['SecurityType'] = actual_sec_type
+                bond['HolderType'] = holder_type_csv
+                bond['Status'] = 'Active'
+                bond['IssueDate'] = issue_dt
+                bond['OriginalMaturityYears'] = orig_mat_yrs
+                bond['MaturityDate'] = maturity_date_dt
+                bond['FaceValue'] = face_value
+                bond['CouponRate'] = coupon_rate
+                bond['OriginalPrincipal'] = face_value
+                bond['AdjustedPrincipal'] = face_value
+                bond['IssueYieldAtIssue'] = issue_yield
+                bond['IssuePriceRatio'] = issue_price_ratio
+                bond['IssueProceeds'] = face_value * issue_price_ratio
+                bond['IndexRatio'] = 1.0
+                if actual_sec_type == 'Fixed':
+                    bond['MaturityCategory'] = _get_maturity_category(orig_mat_yrs)
+                elif actual_sec_type == 'TIPS':
+                    bond['ReferenceCPI_Issue'] = context['tips_reference_cpi']
+                elif actual_sec_type == 'FRN':
+                    bond['FixedSpread'] = context['frn_fixed_spread']
+                    bond['AccruedInterest_FRN'] = 0.0
+                    bond['BenchmarkRate_FRN'] = max(0.0, issue_yield)
+                    bond['LastAccrualDate'] = issue_dt
+                all_bonds_data.append(bond)
+
+    df = pd.DataFrame(all_bonds_data, columns=BOND_PORTFOLIO_COLS)
+    df['FaceValue'] = pd.to_numeric(df['FaceValue'], errors='coerce').fillna(0.0)
+    df['MaturityDate'] = pd.to_datetime(df['MaturityDate'], errors='coerce')
+    return df
 
 
 def _generate_one_portfolio(target_face_values, sim_start_date):
@@ -215,13 +448,14 @@ def _generate_one_portfolio(target_face_values, sim_start_date):
     return df
 
 
-def generate_initial_portfolio(gen_config, sim_start_date):
+def generate_initial_portfolio(gen_config, sim_start_date, base_config=None):
     """
     Generate an initial bond portfolio using WAM targeting.
 
     Parameters:
         gen_config: dict from config's initial_portfolio.generation (or initial_portfolio_generation)
         sim_start_date: datetime — simulation start date
+        base_config: optional full configuration dict used by config-derived generation
 
     Returns:
         pd.DataFrame with columns matching BOND_PORTFOLIO_COLS
@@ -237,6 +471,10 @@ def generate_initial_portfolio(gen_config, sim_start_date):
     target_wam = gen_config.get('target_public_marketable_wam', 6.0)
     iterations = gen_config.get('wam_targeting_iterations', 300)
     target_face_values = gen_config.get('target_face_values_billions', DEFAULT_TARGET_FACE_VALUES)
+    generation_method = str(gen_config.get('generation_method', 'legacy')).strip().lower()
+    config_context = None
+    if generation_method == 'config_derived':
+        config_context = _build_config_derived_generation_context(gen_config, base_config or {})
 
     best_portfolio_df = None
     closest_wam_diff = float('inf')
@@ -248,7 +486,10 @@ def generate_initial_portfolio(gen_config, sim_start_date):
         if (i + 1) % 50 == 0 or i == 0:
             print(f"  Generating portfolio attempt {i+1}/{iterations}...")
 
-        df = _generate_one_portfolio(target_face_values, sim_start_date)
+        if generation_method == 'config_derived':
+            df = _generate_one_portfolio_config_derived(target_face_values, sim_start_date, config_context)
+        else:
+            df = _generate_one_portfolio(target_face_values, sim_start_date)
 
         # Calculate public marketable WAM
         public_holders = ['Banks', 'Private', 'Foreign']
@@ -358,7 +599,7 @@ if __name__ == "__main__":
     target_fv = gen_config.get('target_face_values_billions', DEFAULT_TARGET_FACE_VALUES)
     output_filename = gen_config.get('output_filename', 'initial_bond_portfolio.csv')
 
-    df = generate_initial_portfolio(gen_config, sim_start)
+    df = generate_initial_portfolio(gen_config, sim_start, base_config=config)
 
     if not df.empty:
         output_dir = os.path.dirname(output_filename)

@@ -14,6 +14,7 @@ VALID_OVERRIDE_KEYS = frozenset({
     'fiscal_params', 'tga_params', 'yield_curve', 'treasury_issuance_profile',
     'sector_preferences', 'auction_absorption_preferences', 'secondary_target_preferences',
     'events', 'tips_params', 'frn_params', 'nonmarketable_params', 'other_flows',
+    'rate_sensitive_demand', 'financing_cost_options',
     'simulation_period',
 })
 
@@ -32,6 +33,8 @@ SUPPORTED_EVENT_PATH_PREFIXES: Tuple[Tuple[str, ...], ...] = (
     ('tips_params',),
     ('frn_params',),
     ('nonmarketable_params',),
+    ('rate_sensitive_demand',),
+    ('financing_cost_options',),
 )
 
 # Valid leaf keys for each flat parameter block targeted by events.
@@ -62,8 +65,18 @@ HOLDER_PREF_BLOCKS: frozenset = frozenset({
 
 # Parameter blocks with complex nested structure validated elsewhere
 COMPLEX_REPLACEMENT_BLOCKS: frozenset = frozenset({
-    'yield_curve', 'treasury_issuance_profile',
+    'yield_curve', 'treasury_issuance_profile', 'rate_sensitive_demand', 'financing_cost_options',
 })
+
+_VALID_RATE_SENSITIVE_SECTIONS = frozenset({'auction', 'secondary'})
+_VALID_RATE_SENSITIVE_LEAF_KEYS = frozenset({'yield_beta', 'spread_beta', 'slope_beta', 'intercept'})
+_VALID_RATE_SENSITIVE_TOP_LEVEL_KEYS = frozenset({
+    'enabled', 'min_multiplier', 'anchor_maturity_years',
+    'slope_short_maturity_years', 'slope_long_maturity_years',
+    'auction', 'secondary',
+})
+_VALID_FINANCING_COST_OPTION_KEYS = frozenset({'include_tips_inflation_accretion'})
+VALID_COARSE_FREQUENCY_ACTIONS = frozenset({'allow', 'warn', 'error'})
 
 _VALID_PREF_CATEGORIES = frozenset({'bills', 'notes', 'bonds', 'tips', 'frn', 'nonmarketable'})
 _HOLDER_TYPES_SET = frozenset(HOLDER_TYPES)
@@ -341,6 +354,134 @@ def validate_nonmarketable_params(params: dict, label: str = 'nonmarketable_para
     return errors
 
 
+def is_coarse_frequency(freq) -> bool:
+    import pandas as _pd
+    if freq is None:
+        return False
+    try:
+        offset = _pd.tseries.frequencies.to_offset(freq)
+    except Exception:
+        return False
+    coarse_classes = {
+        'MonthBegin', 'MonthEnd', 'BusinessMonthBegin', 'BusinessMonthEnd',
+        'QuarterBegin', 'QuarterEnd', 'BQuarterBegin', 'BQuarterEnd',
+        'YearBegin', 'YearEnd', 'BYearBegin', 'BYearEnd',
+    }
+    if offset.__class__.__name__ in coarse_classes:
+        return True
+    try:
+        return offset.nanos >= _pd.Timedelta(days=28).value
+    except Exception:
+        return False
+
+
+def validate_simulation_period(params: dict, label: str = 'simulation_period') -> List[str]:
+    import pandas as _pd
+    errors: List[str] = []
+    if params is None:
+        return errors
+    if not isinstance(params, collections.abc.Mapping):
+        return [f"{label} must be a mapping."]
+
+    for date_key in ['start_date', 'end_date']:
+        if date_key in params:
+            try:
+                _pd.to_datetime(params.get(date_key))
+            except Exception:
+                errors.append(f"{label}.{date_key} must be a valid date. Found {params.get(date_key)!r}.")
+
+    freq = params.get('frequency')
+    if freq is not None:
+        try:
+            _pd.tseries.frequencies.to_offset(freq)
+        except Exception:
+            errors.append(f"{label}.frequency must be a valid pandas offset alias. Found {freq!r}.")
+
+    action = params.get('coarse_frequency_action', 'warn')
+    if action not in VALID_COARSE_FREQUENCY_ACTIONS:
+        errors.append(
+            f"{label}.coarse_frequency_action '{action}' is not supported. "
+            f"Valid values: {sorted(VALID_COARSE_FREQUENCY_ACTIONS)}"
+        )
+    elif freq is not None and is_coarse_frequency(freq) and action == 'error':
+        errors.append(
+            f"{label}.frequency '{freq}' is coarse relative to coupon timing. "
+            f"Set coarse_frequency_action to 'allow' or 'warn' to proceed."
+        )
+    return errors
+
+
+def validate_rate_sensitive_demand(params: dict, label: str = 'rate_sensitive_demand') -> List[str]:
+    errors: List[str] = []
+    if params is None:
+        return errors
+    if not isinstance(params, collections.abc.Mapping):
+        return [f"{label} must be a mapping."]
+
+    for key in params.keys():
+        if key not in _VALID_RATE_SENSITIVE_TOP_LEVEL_KEYS:
+            errors.append(
+                f"{label} contains unexpected key '{key}'. "
+                f"Valid keys: {sorted(_VALID_RATE_SENSITIVE_TOP_LEVEL_KEYS)}"
+            )
+
+    for numeric_key in ['min_multiplier', 'anchor_maturity_years', 'slope_short_maturity_years', 'slope_long_maturity_years']:
+        if numeric_key in params:
+            _assert_nonnegative(params.get(numeric_key), f"{label}.{numeric_key}", errors)
+
+    for section in _VALID_RATE_SENSITIVE_SECTIONS:
+        section_cfg = params.get(section, {})
+        if section_cfg in ({}, None):
+            continue
+        if not isinstance(section_cfg, collections.abc.Mapping):
+            errors.append(f"{label}.{section} must be a mapping.")
+            continue
+        for holder, holder_cfg in section_cfg.items():
+            if holder not in HOLDER_TYPES:
+                errors.append(f"{label}.{section} contains unknown holder '{holder}'.")
+                continue
+            if not isinstance(holder_cfg, collections.abc.Mapping):
+                errors.append(f"{label}.{section}.{holder} must be a mapping.")
+                continue
+            for category, category_cfg in holder_cfg.items():
+                if category not in _VALID_PREF_CATEGORIES:
+                    errors.append(f"{label}.{section}.{holder} contains unknown category '{category}'.")
+                    continue
+                if not isinstance(category_cfg, collections.abc.Mapping):
+                    errors.append(f"{label}.{section}.{holder}.{category} must be a mapping.")
+                    continue
+                for coeff_key, coeff_val in category_cfg.items():
+                    if coeff_key not in _VALID_RATE_SENSITIVE_LEAF_KEYS:
+                        errors.append(
+                            f"{label}.{section}.{holder}.{category} contains unexpected key '{coeff_key}'. "
+                            f"Valid keys: {sorted(_VALID_RATE_SENSITIVE_LEAF_KEYS)}"
+                        )
+                        continue
+                    try:
+                        float(coeff_val)
+                    except Exception:
+                        errors.append(
+                            f"{label}.{section}.{holder}.{category}.{coeff_key} must be numeric. "
+                            f"Found {coeff_val!r}."
+                        )
+    return errors
+
+
+def validate_financing_cost_options(params: dict, label: str = 'financing_cost_options') -> List[str]:
+    errors: List[str] = []
+    if params is None:
+        return errors
+    if not isinstance(params, collections.abc.Mapping):
+        return [f"{label} must be a mapping."]
+    for key in params.keys():
+        if key not in _VALID_FINANCING_COST_OPTION_KEYS:
+            errors.append(
+                f"{label} contains unexpected key '{key}'. "
+                f"Valid keys: {sorted(_VALID_FINANCING_COST_OPTION_KEYS)}"
+            )
+    return errors
+
+
 def validate_events(events: Iterable[dict], label: str = 'events') -> List[str]:
     import pandas as _pd
     errors: List[str] = []
@@ -391,6 +532,12 @@ def validate_config(base_config: dict) -> List[str]:
 
     if 'nonmarketable_params' in base_config:
         errors.extend(validate_nonmarketable_params(base_config.get('nonmarketable_params', {})))
+    if 'simulation_period' in base_config:
+        errors.extend(validate_simulation_period(base_config.get('simulation_period', {})))
+    if 'rate_sensitive_demand' in base_config:
+        errors.extend(validate_rate_sensitive_demand(base_config.get('rate_sensitive_demand', {})))
+    if 'financing_cost_options' in base_config:
+        errors.extend(validate_financing_cost_options(base_config.get('financing_cost_options', {})))
     if 'yield_curve' in base_config and base_config.get('yield_curve'):
         errors.extend(validate_yield_curve(base_config.get('yield_curve', {})))
     if 'treasury_issuance_profile' in base_config and base_config.get('treasury_issuance_profile'):
@@ -464,6 +611,20 @@ def validate_config(base_config: dict) -> List[str]:
                                 label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides.{pref_block}",
                             )
                         )
+                if 'rate_sensitive_demand' in overrides:
+                    errors.extend(
+                        validate_rate_sensitive_demand(
+                            overrides['rate_sensitive_demand'],
+                            label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides.rate_sensitive_demand",
+                        )
+                    )
+                if 'financing_cost_options' in overrides:
+                    errors.extend(
+                        validate_financing_cost_options(
+                            overrides['financing_cost_options'],
+                            label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides.financing_cost_options",
+                        )
+                    )
                 if 'events' in overrides:
                     errors.extend(validate_events(overrides['events'], label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides.events"))
     return errors
