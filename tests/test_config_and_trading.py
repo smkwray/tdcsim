@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 
 import pandas as pd
+import pandas.testing as pdt
 import pytest
 import yaml
 
@@ -287,3 +288,116 @@ def test_generated_portfolio_populates_issue_cash_fields():
     )
     assert bill_mask.any()
     assert (df.loc[bill_mask, 'IssueProceeds'] < df.loc[bill_mask, 'FaceValue']).all()
+
+
+def test_config_derived_generated_portfolio_uses_config_curve_and_maturities():
+    base_config = minimal_params()
+    base_config['treasury_issuance_profile'] = {
+        'bills': {
+            'category_cutoff_years': 1.0,
+            'target_percentage_of_remainder': 1.0,
+            'maturities': [1.0],
+            'maturity_distribution': [1.0],
+        },
+        'notes': {
+            'category_cutoff_years': 10.0,
+            'target_percentage_of_remainder': 0.0,
+            'maturities': [2.0],
+            'maturity_distribution': [1.0],
+        },
+        'bonds': {
+            'category_cutoff_years': 999.0,
+            'target_percentage_of_remainder': 0.0,
+            'maturities': [20.0],
+            'maturity_distribution': [1.0],
+        },
+        'remainder_maturity_years': 1.0,
+    }
+    base_config['yield_curve'] = {
+        'use_static': True,
+        'years': [0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+        'rates': [0.02, 0.03, 0.05, 0.055, 0.06, 0.065],
+    }
+    base_config['sector_preferences'] = {
+        'Banks': {'bills_pct': 1.0, 'notes_pct': 1.0, 'bonds_pct': 1.0},
+        'Private': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+        'CB': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+        'Foreign': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+        'FedInternal': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+        'TrustFunds': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+    }
+
+    df = generate_initial_portfolio(
+        {
+            'generation_method': 'config_derived',
+            'target_public_marketable_wam': 1.0,
+            'wam_targeting_iterations': 1,
+            'random_seed': 7,
+            'target_face_values_billions': {
+                'Banks': 0.05,
+                'Private_Marketable': 0.0,
+                'Private_NonMarketable': 0.0,
+                'CB': 0.0,
+                'Foreign': 0.0,
+                'FedInternal': 0.0,
+                'TrustFunds_NonMarketable': 0.0,
+            },
+        },
+        '2025-01-01',
+        base_config=base_config,
+    )
+
+    assert not df.empty
+    assert set(df['OriginalMaturityYears'].astype(float).unique()) == {1.0}
+    assert ((df['IssueYieldAtIssue'] - 0.05).abs() < 1e-6).all()
+
+
+def test_legacy_generator_ignores_optional_base_config_when_generation_method_legacy():
+    gen_config = {
+        'generation_method': 'legacy',
+        'target_public_marketable_wam': 3.0,
+        'wam_targeting_iterations': 1,
+        'random_seed': 123,
+        'target_face_values_billions': {
+            'Banks': 0.05,
+            'Private_Marketable': 0.10,
+            'Private_NonMarketable': 0.0,
+            'CB': 0.0,
+            'Foreign': 0.0,
+            'FedInternal': 0.0,
+            'TrustFunds_NonMarketable': 0.0,
+        },
+    }
+    base_config = minimal_params()
+    base_config['yield_curve']['rates'] = [0.10] * len(base_config['yield_curve']['rates'])
+
+    legacy_plain = generate_initial_portfolio(gen_config, '2025-01-01')
+    legacy_with_base = generate_initial_portfolio(gen_config, '2025-01-01', base_config=base_config)
+    pdt.assert_frame_equal(legacy_plain.reset_index(drop=True), legacy_with_base.reset_index(drop=True), check_dtype=False)
+
+
+def test_disabled_optional_blocks_preserve_simulation_results():
+    baseline = minimal_params()
+    disabled = copy.deepcopy(baseline)
+    disabled['rate_sensitive_demand'] = {
+        'enabled': False,
+        'min_multiplier': 0.25,
+        'auction': {},
+        'secondary': {},
+    }
+    disabled['financing_cost_options'] = {'include_tips_inflation_accretion': False}
+
+    baseline_results, baseline_portfolio = run_simulation(
+        baseline, '2025-01-01', '2025-03-01', freq='W', scenario_name='baseline_disabled_compare'
+    )
+    disabled_results, disabled_portfolio = run_simulation(
+        disabled, '2025-01-01', '2025-03-01', freq='W', scenario_name='disabled_optional_compare'
+    )
+
+    pdt.assert_frame_equal(baseline_results, disabled_results, check_dtype=False, check_like=False)
+    pdt.assert_frame_equal(
+        baseline_portfolio.reset_index(drop=True),
+        disabled_portfolio.reset_index(drop=True),
+        check_dtype=False,
+        check_like=False,
+    )

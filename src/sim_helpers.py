@@ -9,8 +9,11 @@ import pandas as pd
 from tdc_validation import (
     VALID_OVERRIDE_KEYS,
     validate_events,
+    validate_financing_cost_options,
     validate_issuance_profile,
+    validate_rate_sensitive_demand,
     validate_sector_preferences,
+    validate_simulation_period,
     validate_yield_curve,
 )
 
@@ -82,12 +85,15 @@ def validate_run_params(params, scenario_name='Scenario'):
     for required_block in ('fiscal_params', 'yield_curve', 'treasury_issuance_profile'):
         if required_block not in params or not params[required_block]:
             errors.append(f"Required parameter block '{required_block}' is missing or empty.")
+    errors.extend(validate_simulation_period(params.get('simulation_period', {}), label='simulation_period'))
     errors.extend(validate_yield_curve(params.get('yield_curve', {}), label='yield_curve'))
     errors.extend(validate_issuance_profile(params.get('treasury_issuance_profile', {}), label='treasury_issuance_profile'))
     auction_prefs = params.get('auction_absorption_preferences', params.get('sector_preferences', {}))
     secondary_prefs = params.get('secondary_target_preferences', params.get('sector_preferences', {}))
     errors.extend(validate_sector_preferences(auction_prefs, issuance_profile=params.get('treasury_issuance_profile', {}), label='auction_absorption_preferences'))
     errors.extend(validate_sector_preferences(secondary_prefs, issuance_profile=params.get('treasury_issuance_profile', {}), label='secondary_target_preferences'))
+    errors.extend(validate_rate_sensitive_demand(params.get('rate_sensitive_demand', {}), label='rate_sensitive_demand'))
+    errors.extend(validate_financing_cost_options(params.get('financing_cost_options', {}), label='financing_cost_options'))
     errors.extend(validate_events(params.get('events', []), label='events'))
     if errors:
         msg = '\n - '.join(errors[:20])

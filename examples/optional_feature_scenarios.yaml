@@ -1,0 +1,92 @@
+# Mergeable example snippets for tdc_config.yaml.
+#
+# These examples are not loaded automatically. They are intended to be copied
+# into the main config when you want to exercise the new optional features
+# without changing the shipped default runs.
+
+# ---------------------------------------------------------------------------
+# Example A: Config-derived starting portfolio
+# ---------------------------------------------------------------------------
+#
+# This is a run-level setting, not a scenario override. The initial portfolio
+# is generated once before scenario groups execute, so all scenarios in a run
+# share the same starting stock.
+#
+# initial_portfolio:
+#   mode: config_derived
+#   generation:
+#     generation_method: config_derived
+#     output_filename: "output/initial_bond_portfolio_config_derived.csv"
+#     target_public_marketable_wam: 6.0
+#     random_seed: 42
+#     wam_targeting_iterations: 300
+#     target_face_values_billions:
+#       Banks: 4400.0
+#       Private_Marketable: 10200.0
+#       Private_NonMarketable: 700.0
+#       CB: 4600.0
+#       Foreign: 8100.0
+#       FedInternal: 200.0
+#       TrustFunds_NonMarketable: 6800.0
+
+# ---------------------------------------------------------------------------
+# Example B: Scenario group using rate-sensitive demand and TIPS accretion
+# ---------------------------------------------------------------------------
+#
+# This block can be appended to the existing scenario_groups list in
+# tdc_config.yaml.
+#
+# - group_name: "Optional Feature Examples"
+#   group_output_settings:
+#     save_plot_filename: "output/optional_feature_examples"
+#     graphs_to_show: ["TDC_Level", "FinancingCost_Cumulative", "AuctionProceeds", "DebtHeld_Banks"]
+#     output_mode: "single_file"
+#
+#   scenarios:
+#     - name: "Baseline_LegacyBehavior"
+#       overrides:
+#         fiscal_params: *fiscal_baseline
+#         treasury_issuance_profile: *default_issuance_profile
+#         sector_preferences: *sector_preferences_default
+#         yield_curve: *yield_curve_default
+#
+#     - name: "RateSensitive_BillDemand"
+#       overrides:
+#         fiscal_params: *fiscal_baseline
+#         treasury_issuance_profile: *default_issuance_profile
+#         sector_preferences: *sector_preferences_default
+#         yield_curve: *yield_curve_default
+#         rate_sensitive_demand:
+#           enabled: true
+#           min_multiplier: 0.25
+#           anchor_maturity_years: 5.0
+#           slope_short_maturity_years: 2.0
+#           slope_long_maturity_years: 10.0
+#           auction:
+#             Banks:
+#               bills:
+#                 yield_beta: 30.0
+#                 spread_beta: 15.0
+#             Private:
+#               bills:
+#                 yield_beta: -12.0
+#           secondary: {}
+#
+#     - name: "InflationAccretion_AccountingOn"
+#       overrides:
+#         fiscal_params: *fiscal_baseline
+#         treasury_issuance_profile:
+#           <<: *default_issuance_profile
+#           TIPS:
+#             target_percentage: 0.15
+#             maturities: [5.0, 10.0, 30.0]
+#             maturity_distribution: [0.4, 0.4, 0.2]
+#         sector_preferences: *sector_preferences_default
+#         yield_curve: *yield_curve_default
+#         tips_params:
+#           cpi_start_level: 100.0
+#           cpi_annual_inflation: 0.03
+#           ref_cpi_lag_months: 3
+#           default_real_coupon_rate: 0.005
+#         financing_cost_options:
+#           include_tips_inflation_accretion: true

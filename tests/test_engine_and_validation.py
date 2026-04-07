@@ -22,6 +22,7 @@ from tdc_validation import (
     validate_config,
     validate_issuance_profile,
     validate_nonmarketable_params,
+    validate_simulation_period,
     validate_sector_preferences,
 )
 
@@ -595,6 +596,108 @@ class TestNonMarketableInterestCapitalization:
         )
 
 
+class TestOptionalEnhancements:
+    """Tests for optional additive functionality that preserves legacy defaults."""
+
+    def test_rate_sensitive_auction_demand_reweights_holder_absorption(self):
+        baseline = minimal_params()
+        baseline.pop('sector_preferences', None)
+        baseline['auction_absorption_preferences'] = {
+            'Banks': {'bills_pct': 0.5, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+            'Private': {'bills_pct': 0.5, 'notes_pct': 1.0, 'bonds_pct': 1.0},
+            'CB': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+            'Foreign': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+            'FedInternal': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+            'TrustFunds': {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0},
+        }
+        baseline['secondary_target_preferences'] = copy.deepcopy(baseline['auction_absorption_preferences'])
+
+        shocked = copy.deepcopy(baseline)
+        shocked['rate_sensitive_demand'] = {
+            'enabled': True,
+            'min_multiplier': 0.01,
+            'auction': {
+                'Banks': {'bills': {'yield_beta': 40.0}},
+                'Private': {'bills': {'yield_beta': -40.0}},
+            },
+        }
+
+        baseline_results, _ = run_simulation(
+            baseline, '2025-01-01', '2025-01-19', freq='W',
+            scenario_name='rate_sensitive_baseline',
+        )
+        shocked_results, _ = run_simulation(
+            shocked, '2025-01-01', '2025-01-19', freq='W',
+            scenario_name='rate_sensitive_shocked',
+        )
+
+        baseline_period = baseline_results.iloc[1]
+        shocked_period = shocked_results.iloc[1]
+        assert baseline_period['DebtHeld_Banks'] == pytest.approx(baseline_period['DebtHeld_DomesticNonBanks'], rel=1e-6)
+        assert shocked_period['DebtHeld_Banks'] > shocked_period['DebtHeld_DomesticNonBanks']
+        assert shocked_results.attrs['run_metadata']['rate_sensitive_demand_enabled'] is True
+
+    def test_optional_tips_accretion_enters_financing_cost(self):
+        tips_bond = make_bond_row(
+            BondID=901,
+            SecurityType='TIPS',
+            HolderType='Private',
+            FaceValue=100.0,
+            CouponRate=0.0,
+            IssueDate=pd.Timestamp('2024-01-01'),
+            MaturityDate=pd.Timestamp('2030-01-01'),
+            OriginalMaturityYears=6.0,
+            MaturityCategory='notes',
+            OriginalPrincipal=100.0,
+            AdjustedPrincipal=100.0,
+            ReferenceCPI_Issue=100.0,
+            IndexRatio=1.0,
+            IssueYieldAtIssue=0.01,
+        )
+        portfolio = pd.DataFrame([tips_bond], columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES, errors='ignore')
+
+        baseline = minimal_params()
+        baseline['initial_bonds_df'] = portfolio
+        baseline['tips_params'] = {
+            'cpi_start_level': 100.0,
+            'cpi_annual_inflation': 0.12,
+            'ref_cpi_lag_months': 0,
+            'default_real_coupon_rate': 0.0,
+        }
+        baseline['initial_values']['tga'] = 500.0
+        baseline['tga_params']['target_balance'] = 500.0
+
+        enhanced = copy.deepcopy(baseline)
+        enhanced['financing_cost_options'] = {'include_tips_inflation_accretion': True}
+
+        baseline_results, _ = run_simulation(
+            baseline, '2025-01-01', '2025-02-15', freq='W',
+            scenario_name='tips_accretion_off',
+        )
+        enhanced_results, _ = run_simulation(
+            enhanced, '2025-01-01', '2025-02-15', freq='W',
+            scenario_name='tips_accretion_on',
+        )
+
+        assert baseline_results['TIPSInflationAccretion_Period'].sum() == pytest.approx(0.0, abs=1e-12)
+        assert enhanced_results['TIPSInflationAccretion_Period'].sum() > 0.0
+        cumulative_delta = (
+            enhanced_results.iloc[-1]['FinancingCost_Cumulative']
+            - baseline_results.iloc[-1]['FinancingCost_Cumulative']
+        )
+        assert cumulative_delta == pytest.approx(
+            enhanced_results.iloc[-1]['TIPSInflationAccretion_Cumulative'], rel=1e-6
+        )
+        enhanced_data = enhanced_results.iloc[1:]
+        component_sum = (
+            enhanced_data['InterestOutlay_Period']
+            + enhanced_data['IssueDiscountCost_Period']
+            + enhanced_data['NonMarketableInterestCapitalized_Period']
+            + enhanced_data['TIPSInflationAccretion_Period']
+        )
+        assert (enhanced_data['FinancingCost_Period'] - component_sum).abs().max() < 1e-6
+
+
 # ===================================================================
 # 5. Tranche Split Proration Tests
 # ===================================================================
@@ -1103,6 +1206,38 @@ class TestStrictConfigValidation:
         """Valid values 'semi-annual' and 'annual' should pass."""
         assert validate_nonmarketable_params({'interest_crediting_frequency': 'semi-annual'}) == []
         assert validate_nonmarketable_params({'interest_crediting_frequency': 'annual'}) == []
+
+    def test_coarse_frequency_error_policy_rejected_by_validation(self):
+        errors = validate_simulation_period({
+            'start_date': '2025-01-01',
+            'end_date': '2025-12-31',
+            'frequency': 'ME',
+            'coarse_frequency_action': 'error',
+        })
+        assert errors
+        assert any('coarse relative to coupon timing' in e for e in errors)
+
+    def test_coarse_frequency_warn_policy_allowed(self):
+        errors = validate_simulation_period({
+            'start_date': '2025-01-01',
+            'end_date': '2025-12-31',
+            'frequency': 'ME',
+            'coarse_frequency_action': 'warn',
+        })
+        assert errors == []
+
+    def test_run_metadata_records_coarse_frequency_warning(self):
+        params = minimal_params()
+        params['simulation_period'] = {
+            'enable_preference_trading': False,
+            'frequency': 'ME',
+            'coarse_frequency_action': 'warn',
+        }
+        results, _ = run_simulation(
+            params, '2025-01-01', '2025-04-01', freq='ME',
+            scenario_name='monthly_warn',
+        )
+        assert results.attrs['run_metadata']['coarse_frequency_warning'] is not None
 
     def test_tips_target_without_maturities_rejected(self):
         """TIPS with target_percentage > 0 but no maturities should be rejected."""

@@ -1,0 +1,176 @@
+# Alternate config for exercising the optional additive features.
+
+simulation_period:
+  start_date: '2025-01-01'
+  end_date: '2030-01-01'
+  frequency: 'W'
+  enable_preference_trading: false
+  coarse_frequency_action: warn
+
+initial_values:
+  reserves: 2500.0
+  tdc_level: 0.0
+  tga: 500.0
+
+initial_portfolio:
+  mode: config_derived
+  generation:
+    generation_method: config_derived
+    output_filename: "output/initial_bond_portfolio_config_derived.csv"
+    target_public_marketable_wam: 6.0
+    random_seed: 42
+    wam_targeting_iterations: 200
+    target_face_values_billions:
+      Banks: 4400.0
+      Private_Marketable: 10200.0
+      Private_NonMarketable: 700.0
+      CB: 4600.0
+      Foreign: 8100.0
+      FedInternal: 200.0
+      TrustFunds_NonMarketable: 6800.0
+
+tga_params:
+  target_balance: 750.0
+  floor: 100.0
+
+fiscal_baseline: &fiscal_baseline
+  initial_weekly_spending: 120
+  initial_weekly_taxes: 100
+  spending_growth_qtr: 0.01
+  tax_growth_qtr: 0.01
+
+default_issuance_profile: &default_issuance_profile
+  bills:
+    category_cutoff_years: 1.0
+    target_percentage_of_remainder: 0.20
+    maturities: [0.25, 0.5, 1.0]
+    maturity_distribution: [0.333, 0.333, 0.334]
+  notes:
+    category_cutoff_years: 10.0
+    target_percentage_of_remainder: 0.60
+    maturities: [2.0, 5.0, 10.0]
+    maturity_distribution: [0.333, 0.333, 0.334]
+  bonds:
+    category_cutoff_years: 999.0
+    target_percentage_of_remainder: 0.20
+    maturities: [20.0, 30.0]
+    maturity_distribution: [0.5, 0.5]
+  TIPS:
+    target_percentage: 0.10
+    maturities: [5.0, 10.0, 30.0]
+    maturity_distribution: [0.4, 0.4, 0.2]
+  FRN:
+    target_percentage: 0.05
+    maturities: [2.0]
+    maturity_distribution: [1.0]
+  remainder_maturity_years: 0.5
+
+yield_curve_default: &yield_curve_default
+  use_static: True
+  years: [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+  rates: [0.0400, 0.0410, 0.0425, 0.0450, 0.0475, 0.0500, 0.0515, 0.0525]
+
+sector_preferences_default: &sector_preferences_default
+  Banks:       { bills_pct: 0.15, notes_pct: 0.20, bonds_pct: 0.10, tips_pct: 0.20, frn_pct: 0.25 }
+  Private:     { bills_pct: 0.45, notes_pct: 0.50, bonds_pct: 0.60, tips_pct: 0.45, frn_pct: 0.45 }
+  CB:          { bills_pct: 0.15, notes_pct: 0.05, bonds_pct: 0.05, tips_pct: 0.10, frn_pct: 0.05 }
+  Foreign:     { bills_pct: 0.25, notes_pct: 0.25, bonds_pct: 0.25, tips_pct: 0.20, frn_pct: 0.20 }
+  FedInternal: { bills_pct: 0.00, notes_pct: 0.00, bonds_pct: 0.00, tips_pct: 0.05, frn_pct: 0.05 }
+  TrustFunds:  { bills_pct: 0.00, notes_pct: 0.00, bonds_pct: 0.00, tips_pct: 0.00, frn_pct: 0.00 }
+
+fiscal_params: *fiscal_baseline
+treasury_issuance_profile: *default_issuance_profile
+yield_curve: *yield_curve_default
+sector_preferences: *sector_preferences_default
+
+tips_params:
+  cpi_start_level: 100.0
+  cpi_annual_inflation: 0.0
+  ref_cpi_lag_months: 3
+  default_real_coupon_rate: 0.005
+
+frn_params:
+  benchmark_maturity_years: 0.25
+  default_fixed_spread: 0.0005
+
+nonmarketable_params:
+  interest_rate_basis_maturities: [5.0, 10.0]
+  interest_crediting_frequency: 'semi-annual'
+  initial_holder: 'TrustFunds'
+  rate_setting_method: 'yield_curve_points'
+
+other_flows:
+  reserve_transfer: 0.0
+  cb_net_expense: 0.0
+  money_minting_transfers: 0.0
+
+rate_sensitive_demand:
+  enabled: false
+  min_multiplier: 0.25
+  anchor_maturity_years: 5.0
+  slope_short_maturity_years: 2.0
+  slope_long_maturity_years: 10.0
+  auction: {}
+  secondary: {}
+
+financing_cost_options:
+  include_tips_inflation_accretion: false
+
+scenario_groups:
+  - group_name: "Optional Feature Comparisons"
+    group_output_settings:
+      save_plot_filename: "output/optional_feature_comparisons"
+      graphs_to_show: ["TDC_Level", "FinancingCost_Cumulative", "AuctionDemandShift_AvgAbs", "DebtHeld_Banks"]
+      output_mode: "single_file"
+
+    scenarios:
+      - name: "ConfigDerived_LegacyLike"
+        overrides:
+          fiscal_params: *fiscal_baseline
+          treasury_issuance_profile: *default_issuance_profile
+          sector_preferences: *sector_preferences_default
+          yield_curve: *yield_curve_default
+          rate_sensitive_demand:
+            enabled: false
+            min_multiplier: 0.25
+            anchor_maturity_years: 5.0
+            slope_short_maturity_years: 2.0
+            slope_long_maturity_years: 10.0
+            auction: {}
+            secondary: {}
+
+      - name: "RateSensitive_Demand"
+        overrides:
+          fiscal_params: *fiscal_baseline
+          treasury_issuance_profile: *default_issuance_profile
+          sector_preferences: *sector_preferences_default
+          yield_curve: *yield_curve_default
+          rate_sensitive_demand:
+            enabled: true
+            min_multiplier: 0.25
+            anchor_maturity_years: 5.0
+            slope_short_maturity_years: 2.0
+            slope_long_maturity_years: 10.0
+            auction:
+              Banks:
+                bills:
+                  yield_beta: 30.0
+                  spread_beta: 15.0
+              Private:
+                bills:
+                  yield_beta: -12.0
+            secondary: {}
+
+      - name: "TIPSAccretion_AccountingOn"
+        overrides:
+          fiscal_params: *fiscal_baseline
+          treasury_issuance_profile: *default_issuance_profile
+          sector_preferences: *sector_preferences_default
+          yield_curve: *yield_curve_default
+          tips_params:
+            cpi_start_level: 100.0
+            cpi_annual_inflation: 0.03
+            ref_cpi_lag_months: 3
+            default_real_coupon_rate: 0.005
+          financing_cost_options:
+            include_tips_inflation_accretion: true
