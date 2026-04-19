@@ -1,5 +1,5 @@
 # tdc_shared.py
-# Shared definitions for TDC Simulator components to ensure consistency between generation and simulation.
+# Shared definitions for the TDC simulator to ensure consistency between generation and simulation.
 
 # --- Core Columns ---
 BOND_PORTFOLIO_COLS = [

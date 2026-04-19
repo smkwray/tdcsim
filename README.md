@@ -1,8 +1,8 @@
-# TDCsim — Treasury Deposit Component Simulator
+# TDCsim — Treasury Deposit Contribution Simulator
 
-TDCsim is a **stock-flow Treasury funding-chain simulator** built for thesis research. It answers a focused question: **how Treasury issuance, debt service, holder mix, and Treasury cash management change the Treasury-attributed deposit component (TDC), reserves, and the maturity structure of debt**.
+TDCsim is a **stock-flow Treasury funding-chain simulator** built for thesis research. It answers a focused question: **how Treasury issuance, debt service, holder mix, and Treasury cash management change the Treasury-attributed deposit contribution (TDC), reserves, and the maturity structure of debt**.
 
-The simulator is designed for scenario analysis, not forecasting. It makes the Treasury funding chain explicit so you can compare mechanisms across counterfactuals — different issuance mixes, yield curves, holder preferences, TGA paths, and debt-service dynamics.
+The simulator is designed for scenario analysis, not forecasting. It makes the Treasury funding chain explicit so you can compare mechanisms across counterfactuals — different issuance mixes, yield curves, holder preferences, Treasury operating-cash paths, and debt-service dynamics.
 
 ## Quick start
 
@@ -22,20 +22,20 @@ By default, the project uses the shipped `tdc_config.yaml` and generates a synth
 TDCsim models a Treasury liability portfolio at the tranche level and steps it forward through time. In each period the engine:
 
 1. **Applies fiscal flows** — spending, taxes, and the primary deficit path.
-2. **Updates TGA, reserves, and TDC** — tracks the Treasury General Account, banking-system reserves, and the deposit component.
+2. **Updates Treasury cash, reserves, and TDC** — tracks the Treasury General Account (the baseline proxy for Treasury operating cash), banking-system reserves, and the Treasury-attributed deposit contribution.
 3. **Pays interest and principal by holder type** — coupon payments, bill maturities, and TIPS/FRN-specific debt service, routed through the correct balance-sheet channels.
 4. **Issues new debt** across a configurable maturity and security-type mix — bills, notes, bonds, TIPS, FRNs, and non-marketable liabilities.
 5. **Allocates new issuance across holders** using configurable sector preferences, determining who absorbs each tranche and what the deposit/reserve impact is.
 6. **Optionally simulates secondary-market preference trading** — a simplified reallocation mechanism where holders trade toward their preferred portfolio mix.
 7. **Tracks debt composition, financing cost, CPI/reference CPI paths, and WAM** period by period.
 
-## Core idea: TDC is a component, not "all deposits"
+## Core idea: TDC is a contribution, not "all deposits"
 
-The simulator is built around the idea that Treasury operations can change deposits even when the headline fiscal story looks similar. The deposit effect depends on **who receives Treasury outlays**, **who buys new issuance**, **who receives debt service**, and **whether cash is accumulating in or leaving the TGA**.
+The simulator is built around the idea that Treasury operations can change deposits even when the headline fiscal story looks similar. The deposit effect depends on **who receives Treasury outlays**, **who buys new issuance**, **who receives debt service**, and **whether cash is accumulating in or leaving Treasury operating cash (TOC)**. In the current implementation, `TGA` is the primary tracked proxy for `TOC`.
 
 That is why a Treasury debt-management problem can be monetary even without changing the headline deficit path.
 
-> **Positive TDC = the Treasury deposit component is increasing. Negative TDC = the Treasury deposit component is decreasing.**
+> **Positive TDC increases domestic nonbank deposits. Negative TDC reduces domestic nonbank deposits.**
 
 ---
 
@@ -45,28 +45,27 @@ The simulator is motivated by the following accounting identities.
 
 ### 1. DU / RU transaction view
 
-$$\Delta D_{TDC} = (G_{dep} - T_{dep}) + (D_{sales} - D_{purch}) + D_{yield}$$
+$$\Delta D^{TDC}_{DU} = (G^{ND}_{DU} - R^T_{DU}) + DS^T_{DU} + (Q^T_{DU\to RU} - Q^T_{RU\to DU})$$
 
 | Term | Meaning |
 |---|---|
-| $G_{dep} - T_{dep}$ | Net fiscal injection to deposit users (DUs) |
-| $D_{sales} - D_{purch}$ | Net Treasury-security sales from DUs to reserve users (RUs) |
-| $D_{yield}$ | Interest and principal payments to DUs |
+| $(G^{ND}_{DU} - R^T_{DU})$ | Net non-debt-service Treasury payments to DUs |
+| $DS^T_{DU}$ | Treasury-security debt service to DUs |
+| $(Q^T_{DU\to RU} - Q^T_{RU\to DU})$ | Net Treasury-security sales from DUs to the reserve-side settlement sector (RUs) |
 
-**DUs** are domestic non-banks. **RUs** include banks, the central bank, Treasury/federal accounts, and foreign reserve-linked holders.
+**DUs** are domestic nonbank deposit-using sectors. **RUs** are the reserve-side settlement sector: counterparties outside the DU deposit ledger, including banks, the central bank, Treasury operating accounts, and foreign official or banking entities. The RU label is a settlement shorthand, not a claim that every RU literally holds reserve balances.
 
-### 2. Treasury / central-bank / TGA view
+### 2. Treasury / central-bank / TOC view
 
-$$\Delta D_{TDC} = (D_{sales} - D_{purch}) + (T_{AV} - T_{Rx} - R_{yield} + R_{Tx}) + \max(0,\; F_{PY} + M_{MT} - F_{OE}) - \Delta TGA$$
+$$\Delta D^{TDC}_{DU} = (Q^T_{DU\to RU} - Q^T_{RU\to DU}) + (I^T + R^T_{RU} + \Pi^F_T - G^{ND}_{RU} - DS^T_{RU}) - \Delta TOC$$
 
 | Term | Meaning |
 |---|---|
-| $D_{sales} - D_{purch}$ | Net TS sales from DUs to RUs |
-| $T_{AV} - T_{Rx} - R_{yield} + R_{Tx}$ | Net Treasury flows with RUs |
-| $\max(0,\; F_{PY} + M_{MT} - F_{OE})$ | Central-bank factors (remittances, seigniorage) |
-| $\Delta TGA$ | Change in the Treasury General Account |
+| $(Q^T_{DU\to RU} - Q^T_{RU\to DU})$ | Net Treasury-security sales from DUs to RUs |
+| $(I^T + R^T_{RU} + \Pi^F_T - G^{ND}_{RU} - DS^T_{RU})$ | Net Treasury and remittance flows with RUs |
+| $\Delta TOC$ | Change in Treasury operating cash |
 
-Where $T_{AV}$ is auction receipts, $T_{Rx}$ is Treasury outlays to RUs, $R_{Tx}$ is Treasury receipts from RUs, $F_{PY}$ is CB income, $F_{OE}$ is CB operating expenses, and $M_{MT}$ includes seigniorage.
+Operationally, the current simulator tracks `TGA` rather than full `TOC`, so baseline runs use the approximation `ΔTOC ≈ ΔTGA` unless TT&L or other Treasury operating balances are modeled separately.
 
 ### 3. Bank-balance-sheet decomposition view
 
@@ -79,7 +78,7 @@ $$\Delta D_{TDC} = (\Delta M - \Delta C - \Delta X) - (\Delta L_{B,DU} + \Delta 
 | $\Delta CB_{NB}$ | CB non-TS operations with non-banks |
 | $\Delta FI_{NonTS}$ | Foreign non-TS flows to DUs |
 
-These three views are different ways of isolating the **same Treasury deposit component**.
+These three views are different ways of isolating the **same Treasury Deposit Contribution**.
 
 ---
 
@@ -89,7 +88,7 @@ The simulator reports the mechanism directly through a 5-term decomposition:
 
 | Channel | Column | What it captures |
 |---|---|---|
-| Fiscal flows | `TDC_FiscalFlow` | Net fiscal impact (taxes minus spending) |
+| Fiscal flows | `TDC_FiscalFlow` | Net non-debt-service fiscal impact (spending minus taxes) |
 | Debt service | `TDC_DebtService` | Deposit effect of interest and principal payments by holder type |
 | Auction absorption | `TDC_AuctionAbsorption` | Deposit effect of new debt issuance by holder type |
 | Secondary trades | `TDC_SecondaryTrades` | Deposit effect of preference-driven secondary-market trading |
@@ -107,12 +106,12 @@ This identity is enforced row-wise and verified by automated tests. It tells you
 
 | Holder | Role | Deposit/reserve impact |
 |---|---|---|
-| `Private` | Domestic non-banks (deposit users) | DU — Treasury flows create/destroy deposits |
-| `Banks` | Commercial banks (reserve users) | RU — purchases create deposits; interest receipt is a reserve flow |
+| `Private` | Domestic nonbanks in the DU ledger | DU — Treasury-related flows can change DU deposits |
+| `Banks` | Commercial banks | RU — auction absorption drains reserves and avoids the direct DU deposit drain that occurs when DUs buy issuance |
 | `CB` | Central bank | RU — remittances and balance-sheet operations |
-| `Foreign` | Foreign official and private holders | RU — reserve-linked |
-| `FedInternal` | Treasury-internal accounts | Intragovernmental — P&I is a TGA wash, no reserve/deposit impact |
-| `TrustFunds` | Social Security, Medicare, etc. | Intragovernmental — large non-marketable holdings, P&I is a TGA wash |
+| `Foreign` | Foreign official and private holders | RU — outside the DU deposit ledger for TDC accounting |
+| `FedInternal` | Treasury-internal accounts | Intragovernmental — P&I is a TGA/TOC wash, no reserve/deposit impact |
+| `TrustFunds` | Social Security, Medicare, etc. | Intragovernmental — large non-marketable holdings, P&I is a TGA/TOC wash |
 
 ### Security types
 
@@ -132,14 +131,14 @@ Bills use **discounted proceeds** (not face value) for TGA/reserve/deposit effec
 The simulator is configuration-driven. Typical scenario levers include:
 
 - **Fiscal path** — spending and tax growth rates
-- **TGA target and floor** — Treasury cash management policy
+- **TGA target and floor** — Treasury cash-management policy in the baseline `TGA` proxy for `TOC`
 - **Yield curve** — exogenous term structure (static or scenario-specific)
 - **Issuance profile** — allocation across bills, notes, bonds, TIPS, FRNs, and non-marketable debt
 - **Sector holding preferences** — who absorbs new issuance at auction
 - **Secondary-market trading** — optional preference-driven reallocation
 - **TIPS parameters** — inflation rate, reference CPI, real coupon
 - **FRN parameters** — benchmark rate, spread
-- **Dated events** — parameter changes that take effect mid-simulation (e.g., a TGA rebuild starting in Q3, a yield curve shift in year 3)
+- **Dated events** — parameter changes that take effect mid-simulation (e.g., a Treasury cash rebuild starting in Q3, a yield curve shift in year 3)
 - **Initial portfolio** — generated from config or loaded from CSV
 
 This makes the project a **counterfactual lab** rather than a one-off chart generator.
@@ -161,7 +160,7 @@ See `scenario_overview.md` for full scenario descriptions and decomposition logi
 A typical run produces:
 
 - **TDC level and change** with the full 5-term decomposition
-- **TGA and reserve balances** period by period
+- **TGA and reserve balances** period by period, with `TGA` serving as the tracked proxy for Treasury operating cash
 - **Government spending, taxes, and primary deficit**
 - **Interest payments, principal payments, and debt-service outlays**
 - **New issuance by period**
@@ -175,10 +174,10 @@ Key result columns:
 
 | Column | Description |
 |---|---|
-| `TDC_Level` | Cumulative Treasury deposit component |
+| `TDC_Level` | Cumulative Treasury Deposit Contribution |
 | `TDC_Change` | Period change in TDC (= sum of decomposition) |
 | `Reserves` | Banking-system reserve balance |
-| `TGA` | Treasury General Account balance |
+| `TGA` | Treasury General Account balance, used here as the tracked baseline proxy for Treasury operating cash |
 | `TotalDebt_Agg` | Total outstanding debt |
 | `DebtServiceOutlay_Cumulative` | Cumulative debt-service payments |
 | `FinancingCost_Cumulative` | Cumulative financing cost |
@@ -194,7 +193,7 @@ Key result columns:
 TDCsim is especially useful for:
 
 - **Debt-management counterfactuals** — compare issuance profiles (more bills vs. more notes vs. more bonds) and see how TDC, reserves, and financing cost diverge.
-- **TGA rebuild and spend-down episodes** — study how TGA refills change TDC and reserves depending on who funds the refill.
+- **Treasury cash rebuild and spend-down episodes** — study how TOC/TGA refills change TDC and reserves depending on who funds the refill.
 - **Holder-mix experiments** — ask whether the same gross issuance has different monetary effects depending on whether banks, non-banks, foreigners, or the CB absorb it.
 - **Debt-service channel analysis** — measure how growing debt-service payments feed back into TGA, reserves, and TDC depending on who holds the debt.
 - **WAM and maturity-structure analysis** — compare whether shorter or longer maturity structures change TDC, funding needs, or reserve pressure.
@@ -240,13 +239,15 @@ Mergeable examples live in [examples/optional_feature_scenarios.yaml](/Users/sha
 
 ## Important assumptions and conventions
 
-1. **TDC is a component, not the whole deposit stock.** The model isolates the Treasury-attributable portion of deposit dynamics.
-2. **Private = domestic non-banks.** That is the sector most closely aligned with deposit users.
-3. **Intragovernmental holders are split into FedInternal and TrustFunds.** Both are intragovernmental (P&I is a TGA wash, no reserve or deposit impact).
-4. **Monetary units are billions USD.** Time units are years (for yields, TTM, WAM).
-5. **Transaction values, not mark-to-market.** For TDC accounting, the price that matters is the price at which the security changes hands.
-6. **Yield curves are exogenous.** The model does not endogenize rates from demand.
-7. **WAM is a scenario statistic, not a sufficient statistic.** It is useful, but does not replace the full holder-by-instrument funding-chain view.
+1. **TDC is a contribution, not the whole deposit stock.** The model isolates the Treasury-attributable contribution to DU deposit dynamics.
+2. **Private = the DU proxy.** In the implementation, `Private` is the domestic nonbank holder bucket most closely aligned with the DU ledger.
+3. **RU is a settlement label.** It includes entities outside the DU deposit ledger and does not mean every included entity literally holds reserves.
+4. **Intragovernmental holders are split into FedInternal and TrustFunds.** Both are intragovernmental (P&I is a TGA/TOC wash, no reserve or deposit impact).
+5. **Monetary units are billions USD.** Time units are years (for yields, TTM, WAM).
+6. **Transaction values, not mark-to-market.** For TDC accounting, the price that matters is the cash-settlement value at which the security changes hands.
+7. **Yield curves are exogenous.** The model does not endogenize rates from demand.
+8. **`TGA` is the current implementation cash variable.** The broader accounting concept is `TOC`; baseline runs use `ΔTOC ≈ ΔTGA`.
+9. **WAM is a scenario statistic, not a sufficient statistic.** It is useful, but does not replace the full holder-by-instrument funding-chain view.
 
 ---
 
