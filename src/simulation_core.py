@@ -304,7 +304,7 @@ def main(config_file=None):
     elif not os.path.isabs(config_file):
         config_file = os.path.join(project_root, config_file)
 
-    print('--- Treasury-Driven Deposit Component (TDC) Simulator ---')
+    print('--- Treasury Deposit Contribution (TDC) Simulator ---')
     print(f'Using configuration file: {config_file}')
 
     base_config = _load_base_config(config_file)

@@ -16,7 +16,7 @@ This document describes the scenarios configured in `tdc_config.yaml` and the mo
 ### 2. BanksBuyFromPriv_25bpsLowerRates
 - **Mechanism**: Banks absorb a larger share of new issuance (especially bills and notes), combined with a parallel yield curve shift down by ~25bps.
 - **Why Outlays Fall**: Lower rates reduce coupon costs on new issuance. The exogenous rate reduction is applied directly via `yield_curve_lower`.
-- **Why Deposits Rise**: When banks purchase Treasury debt (modeled as deposit-creating), deposits expand. When non-banks purchase, they transfer existing deposits. The holder shift from Private to Banks increases the deposit-creating share of absorption.
+- **Why Deposits Rise**: When banks absorb more Treasury issuance, they avoid the direct DU deposit drain that occurs when domestic nonbanks (`Private`) buy the same issuance. The holder shift from `Private` to `Banks` therefore raises TDC relative to the nonbank-funded case, even without treating primary bank purchases as literal deposit creation.
 
 ### 3. MaturityShift_MoreNotes
 - **Mechanism**: A combined change — the Treasury shifts issuance toward 2–10y notes (away from long bonds), and banks are assumed to have a stronger preference for notes.
