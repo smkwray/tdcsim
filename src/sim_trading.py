@@ -307,9 +307,9 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
             elif buyer == 'Banks' and seller == 'Foreign':
                 pass
             elif buyer == 'Foreign' and seller == 'Private':
-                net_deposit_change -= actual_dirty_value_traded
-            elif buyer == 'Private' and seller == 'Foreign':
                 net_deposit_change += actual_dirty_value_traded
+            elif buyer == 'Private' and seller == 'Foreign':
+                net_deposit_change -= actual_dirty_value_traded
             elif buyer == 'Foreign' and seller == 'CB':
                 net_reserve_change -= actual_dirty_value_traded
             elif buyer == 'CB' and seller == 'Foreign':

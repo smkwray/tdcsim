@@ -259,6 +259,60 @@ def test_frn_partial_trade_preserves_accrued_interest():
         assert row['AccruedInterest_FRN'] > 0.0
 
 
+@pytest.mark.parametrize('counterparty', ['Banks', 'CB', 'Foreign', 'FedInternal', 'TrustFunds'])
+@pytest.mark.parametrize('private_role, expected_sign', [('seller', 1), ('buyer', -1)])
+def test_private_ru_secondary_trade_deposit_sign_matches_du_ru_identity(counterparty, private_role, expected_sign):
+    """Private-as-seller to any RU raises DU deposits; Private-as-buyer from any RU lowers them."""
+    seller = 'Private' if private_role == 'seller' else counterparty
+    buyer = counterparty if private_role == 'seller' else 'Private'
+    portfolio = pd.DataFrame([
+        make_bond_row(
+            BondID=201,
+            HolderType=seller,
+            FaceValue=100.0,
+            CouponRate=0.04,
+            IssueDate=pd.Timestamp('2025-01-01'),
+            MaturityDate=pd.Timestamp('2027-01-01'),
+            OriginalMaturityYears=2.0,
+            MaturityCategory='notes',
+        ),
+        make_bond_row(
+            BondID=202,
+            HolderType=buyer,
+            FaceValue=100.0,
+            CouponRate=0.0,
+            IssueDate=pd.Timestamp('2025-01-01'),
+            MaturityDate=pd.Timestamp('2025-07-01'),
+            OriginalMaturityYears=0.5,
+            MaturityCategory='bills',
+            IssueYieldAtIssue=0.04,
+            IssuePriceRatio=0.98,
+            IssueProceeds=98.0,
+        ),
+    ], columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES, errors='ignore')
+    prefs = {
+        holder: {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0, 'tips_pct': 0.0, 'frn_pct': 0.0}
+        for holder in ['Banks', 'CB', 'Foreign', 'FedInternal', 'TrustFunds', 'Private']
+    }
+    prefs[buyer]['notes_pct'] = 1.0
+
+    _, impact = execute_preference_trades(
+        portfolio,
+        pd.Timestamp('2025-03-01'),
+        [0.25, 0.5, 1.0, 2.0, 5.0],
+        [0.04, 0.041, 0.042, 0.043, 0.045],
+        prefs,
+        {
+            'bills': {'category_cutoff_years': 1.0},
+            'notes': {'category_cutoff_years': 10.0},
+            'bonds': {'category_cutoff_years': 999.0},
+        },
+        f'private_{private_role}_{counterparty}',
+    )
+
+    assert impact['deposit_change'] * expected_sign > 0.0
+
+
 
 def test_generated_portfolio_populates_issue_cash_fields():
     df = generate_initial_portfolio(
