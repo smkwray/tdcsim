@@ -32,7 +32,11 @@ def _series(results: pd.DataFrame, column: str) -> pd.Series:
     return pd.Series([0.0] * len(results.index), index=results.index)
 
 
-def _primary_flow_status(config: dict | None) -> str:
+def _primary_flow_status(config: dict | None, results: pd.DataFrame | None = None) -> str:
+    if isinstance(results, pd.DataFrame):
+        metadata = results.attrs.get("run_metadata", {})
+        if isinstance(metadata, dict) and metadata.get("ratewall_primary_flow_status"):
+            return str(metadata["ratewall_primary_flow_status"])
     ratewall_inputs = config.get("ratewall_input_paths", {}) if isinstance(config, dict) else {}
     if isinstance(ratewall_inputs, dict) and ratewall_inputs.get("primary_flow_to_du_file"):
         return "aggregate_cash_proxy_from_cbo_total_deficit_less_net_interest"
@@ -337,9 +341,12 @@ def export_ratewall_bundle(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    primary_flow_status = _primary_flow_status(config)
     summary_frames = [
-        _quarterly_summary_for_scenario(results, scenario_id, primary_flow_status=primary_flow_status)
+        _quarterly_summary_for_scenario(
+            results,
+            scenario_id,
+            primary_flow_status=_primary_flow_status(config, results),
+        )
         for scenario_id, results in scenario_results.items()
         if isinstance(results, pd.DataFrame) and not results.empty
     ]

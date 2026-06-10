@@ -296,6 +296,15 @@ src/
   sim_plotting.py        scenario comparison chart generation
   sim_groups.py          scenario group dispatch and parallel execution
   sim_helpers.py         nested config updates, event application, run validation wrapper
+  ratewall_contract.py   quarterly RateWall contract bundle export
+  ratewall_input_builder.py  source-backed RateWall input bundle builder
+  ratewall_paths.py      runtime source-backed fiscal and holder path loaders
+  yield_curve_path.py    dynamic yield-curve surface loader
+  contract_validation.py RateWall contract identity validation
+  holder_mapping.py      holder perimeter mapping contract
+  quarterly_aggregation.py  period-to-quarter aggregation helpers
+  route_component_support_registry.py  component support registry checks
+  ratewall_assumption_mode_schema.py   assumption-mode schema rows
   tdc_validation.py      strict config and event validation
   csv_gen.py             synthetic initial-portfolio generator
   tdc_shared.py          shared constants, schema definitions, dtypes
@@ -303,6 +312,9 @@ tests/
   conftest.py            test import path setup
   test_config_and_trading.py     config validation, issuance mechanics, trading logic
   test_engine_and_validation.py  accounting identities, bucket splits, maturity categorization
+  test_ratewall_contract.py      RateWall input paths, contract export, source registry
+  test_ratewall_assumption_mode_schema.py  assumption-mode schema
+  test_route_component_support_registry.py component support registry
   test_coupon_schedule.py        coupon date scheduling and accrual
   test_yield_curve.py            yield interpolation and curve handling
 output/                  generated portfolios and plots (gitignored)
@@ -310,7 +322,7 @@ output/                  generated portfolios and plots (gitignored)
 
 ## Testing
 
-The repo includes 75 automated tests covering:
+The repo includes 123 automated tests covering:
 
 - Coupon scheduling and accrual calculations
 - Yield curve interpolation
@@ -320,6 +332,8 @@ The repo includes 75 automated tests covering:
 - TIPS, FRN, and non-marketable instrument behavior
 - Secondary trading mechanics
 - Event validation and application
+- RateWall quarterly contract export, component-sum validation, and source registry semantics
+- Source-backed RateWall input paths, dynamic yield surfaces, and fail-loud path loading
 
 ```bash
 # Run tests (install dev dependencies first)

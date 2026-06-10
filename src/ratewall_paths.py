@@ -38,9 +38,12 @@ def _scenario_candidates(scenario_name: str) -> list[str]:
 def load_primary_flow_path(config: dict, *, base_dir: str | os.PathLike[str] | None = None) -> dict[str, dict[str, float]]:
     """Load quarterly fiscal-flow path rows keyed by scenario then quarter."""
 
-    path = _resolve_path(config.get("primary_flow_to_du_file"), base_dir)
-    if path is None or not path.exists():
+    path_value = config.get("primary_flow_to_du_file")
+    path = _resolve_path(path_value, base_dir)
+    if path is None:
         return {}
+    if not path.exists():
+        raise FileNotFoundError(f"Primary flow path file is missing: {path}")
     frame = pd.read_csv(path)
     required = {"quarter", "primary_fiscal_flow_to_du_bil"}
     missing = required - set(frame.columns)
@@ -62,6 +65,7 @@ def primary_flow_for_period(
     scenario_name: str,
     current_date,
     period_counts_by_quarter: dict[str, int],
+    warning_cache: set[str] | None = None,
 ) -> float | None:
     """Return the current period's fiscal-flow amount in billions."""
 
@@ -70,6 +74,14 @@ def primary_flow_for_period(
     quarter = _quarter_label(current_date)
     for scenario_id in _scenario_candidates(scenario_name):
         if quarter in lookup.get(scenario_id, {}):
+            if scenario_id != scenario_name and warning_cache is not None:
+                key = f"primary_flow:{scenario_name}:{scenario_id}"
+                if key not in warning_cache:
+                    print(
+                        f"WARNING [{scenario_name}]: primary_flow path used fallback scenario "
+                        f"'{scenario_id}' instead of '{scenario_name}'."
+                    )
+                    warning_cache.add(key)
             count = max(1, int(period_counts_by_quarter.get(quarter, 1)))
             return float(lookup[scenario_id][quarter]) / count
     return None
@@ -78,9 +90,12 @@ def primary_flow_for_period(
 def load_holder_absorption_path(config: dict, *, base_dir: str | os.PathLike[str] | None = None) -> dict[str, dict[str, dict[str, dict[str, float]]]]:
     """Load holder preferences keyed by scenario, quarter, and holder."""
 
-    path = _resolve_path(config.get("holder_absorption_path_file"), base_dir)
-    if path is None or not path.exists():
+    path_value = config.get("holder_absorption_path_file")
+    path = _resolve_path(path_value, base_dir)
+    if path is None:
         return {}
+    if not path.exists():
+        raise FileNotFoundError(f"Holder absorption path file is missing: {path}")
     frame = pd.read_csv(path)
     required = {"scenario_id", "quarter", "holder_type"}
     missing = required - set(frame.columns)
@@ -113,6 +128,7 @@ def holder_preferences_for_period(
     scenario_name: str,
     current_date,
     fallback_preferences: dict,
+    warning_cache: set[str] | None = None,
 ) -> dict:
     """Return quarter-specific auction preferences when available."""
 
@@ -123,9 +139,16 @@ def holder_preferences_for_period(
         scenario_rows = lookup.get(scenario_id, {})
         if quarter not in scenario_rows:
             continue
+        if scenario_id != scenario_name and warning_cache is not None:
+            key = f"holder_absorption:{scenario_name}:{scenario_id}"
+            if key not in warning_cache:
+                print(
+                    f"WARNING [{scenario_name}]: holder_absorption path used fallback scenario "
+                    f"'{scenario_id}' instead of '{scenario_name}'."
+                )
+                warning_cache.add(key)
         prefs = {holder: dict(fallback_preferences.get(holder, {})) for holder in HOLDER_TYPES}
         for holder, holder_prefs in scenario_rows[quarter].items():
             prefs.setdefault(holder, {}).update(holder_prefs)
         return prefs
     return fallback_preferences
-

@@ -42,6 +42,7 @@ VALID_EVENT_LEAF_KEYS: Dict[str, frozenset] = {
     'fiscal_params': frozenset({
         'initial_weekly_spending', 'initial_weekly_taxes',
         'spending_growth_qtr', 'tax_growth_qtr',
+        'du_share_spending', 'du_share_taxes',
     }),
     'tga_params': frozenset({'target_balance', 'floor'}),
     'other_flows': frozenset({'reserve_transfer', 'cb_net_expense', 'money_minting_transfers'}),

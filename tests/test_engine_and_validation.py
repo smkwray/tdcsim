@@ -128,6 +128,46 @@ def make_bond_row(**overrides):
     return row
 
 
+def test_binding_tga_floor_after_secondary_trading_raises():
+    params = minimal_params()
+    params['initial_values']['tga'] = 100.0
+    params['tga_params']['target_balance'] = 100.0
+    params['tga_params']['floor'] = 100.0
+    params['simulation_period']['enable_preference_trading'] = True
+    params['initial_bonds_df'] = pd.DataFrame(
+        [
+            make_bond_row(BondID=301, HolderType='Private', MaturityCategory='notes'),
+            make_bond_row(
+                BondID=302,
+                HolderType='FedInternal',
+                CouponRate=0.0,
+                MaturityDate=pd.Timestamp('2025-07-01'),
+                OriginalMaturityYears=0.5,
+                MaturityCategory='bills',
+                IssuePriceRatio=0.98,
+                IssueProceeds=98.0,
+            ),
+        ],
+        columns=BOND_PORTFOLIO_COLS,
+    ).astype(PORTFOLIO_DTYPES, errors='ignore')
+    params['secondary_target_preferences'] = {
+        holder: {'bills_pct': 0.0, 'notes_pct': 0.0, 'bonds_pct': 0.0, 'tips_pct': 0.0, 'frn_pct': 0.0}
+        for holder in HOLDER_TYPES
+    }
+    params['secondary_target_preferences']['FedInternal']['bills_pct'] = 1.0
+    params['secondary_target_preferences']['FedInternal']['notes_pct'] = 1.0
+    params['secondary_target_preferences']['Banks']['bonds_pct'] = 1.0
+
+    with pytest.raises(RuntimeError, match='TGA floor would bind without explicit financing'):
+        run_simulation(
+            params,
+            '2025-01-01',
+            '2025-01-19',
+            freq='W',
+            scenario_name='binding_tga_floor_test',
+        )
+
+
 # ===================================================================
 # 1. Federal Bucket Split Tests
 # ===================================================================
@@ -910,6 +950,65 @@ class TestTIPSDebtAggregates:
             f"DebtHeldByType_TIPS at t=0 should reflect AdjustedPrincipal (~110), got {t0_tips_debt}"
         )
 
+    def test_tips_deflation_uses_unfloored_interim_principal_and_maturity_par_floor(self):
+        active_tips = make_bond_row(
+            BondID=902,
+            SecurityType='TIPS',
+            HolderType='Private',
+            FaceValue=100.0,
+            CouponRate=0.0,
+            IssueDate=pd.Timestamp('2024-01-01'),
+            MaturityDate=pd.Timestamp('2034-01-01'),
+            OriginalMaturityYears=10.0,
+            MaturityCategory='tips',
+            OriginalPrincipal=100.0,
+            AdjustedPrincipal=100.0,
+            ReferenceCPI_Issue=100.0,
+            IndexRatio=1.0,
+        )
+        maturing_tips = make_bond_row(
+            BondID=903,
+            SecurityType='TIPS',
+            HolderType='Private',
+            FaceValue=100.0,
+            CouponRate=0.0,
+            IssueDate=pd.Timestamp('2024-01-01'),
+            MaturityDate=pd.Timestamp('2025-01-10'),
+            OriginalMaturityYears=5.0,
+            MaturityCategory='tips',
+            OriginalPrincipal=100.0,
+            AdjustedPrincipal=100.0,
+            ReferenceCPI_Issue=100.0,
+            IndexRatio=1.0,
+        )
+        params = minimal_params()
+        params['initial_values']['tga'] = 500.0
+        params['tga_params']['target_balance'] = 500.0
+        params['tips_params'] = {
+            'cpi_start_level': 100.0,
+            'cpi_annual_inflation': -0.12,
+            'ref_cpi_lag_months': 0,
+            'default_real_coupon_rate': 0.0,
+        }
+        params['initial_bonds_df'] = pd.DataFrame(
+            [active_tips, maturing_tips],
+            columns=BOND_PORTFOLIO_COLS,
+        ).astype(PORTFOLIO_DTYPES, errors='ignore')
+
+        results, final_portfolio = run_simulation(
+            params,
+            '2025-01-01',
+            '2025-02-01',
+            freq='W',
+            scenario_name='tips_deflation_test',
+        )
+
+        active_final = final_portfolio[final_portfolio['BondID'] == 902].iloc[0]
+        assert active_final['AdjustedPrincipal'] < active_final['OriginalPrincipal']
+        assert results.iloc[-1]['DebtHeldByType_TIPS'] < 100.0
+        assert results['PrincipalPaid_Bonds'].sum() == pytest.approx(100.0, rel=1e-6)
+        assert results['TDC_TIPSInflationCompensationToDU'].sum() == pytest.approx(0.0, abs=1e-12)
+
 
 # ===================================================================
 # 9. Schema-Strict Event Validation Tests
@@ -1116,6 +1215,52 @@ class TestAccountingIdentities:
         )
         diff = (data['TDC_Change'] - decomp_sum).abs()
         assert diff.max() < 1e-6, f"TDC identity violated, max deviation: {diff.max()}"
+
+    def test_default_fiscal_incidence_shares_preserve_results(self):
+        baseline = minimal_params()
+        baseline['fiscal_params']['initial_weekly_spending'] = 120.0
+        baseline['fiscal_params']['initial_weekly_taxes'] = 100.0
+        baseline['initial_values']['tga'] = 500.0
+        baseline['tga_params']['target_balance'] = 500.0
+        explicit = copy.deepcopy(baseline)
+        explicit['fiscal_params']['du_share_spending'] = 1.0
+        explicit['fiscal_params']['du_share_taxes'] = 1.0
+
+        baseline_results, _ = run_simulation(
+            baseline, '2025-01-01', '2025-03-01', freq='W',
+            scenario_name='fiscal_incidence_default',
+        )
+        explicit_results, _ = run_simulation(
+            explicit, '2025-01-01', '2025-03-01', freq='W',
+            scenario_name='fiscal_incidence_explicit_default',
+        )
+
+        pd.testing.assert_frame_equal(baseline_results, explicit_results, check_dtype=False)
+
+    def test_fiscal_incidence_du_share_satisfies_tdc_identity(self):
+        params = minimal_params()
+        params['fiscal_params']['initial_weekly_spending'] = 120.0
+        params['fiscal_params']['initial_weekly_taxes'] = 100.0
+        params['fiscal_params']['du_share_spending'] = 0.8
+        params['fiscal_params']['du_share_taxes'] = 0.8
+        params['initial_values']['tga'] = 500.0
+        params['tga_params']['target_balance'] = 500.0
+
+        results, _ = run_simulation(
+            params, '2025-01-01', '2025-03-01', freq='W',
+            scenario_name='fiscal_incidence_du_share',
+        )
+        data = results.iloc[1:]
+
+        assert (data['TDC_FiscalFlow'] - data['PrimaryDeficit'] * 0.8).abs().max() < 1e-6
+        decomp_sum = (
+            data['TDC_FiscalFlow']
+            + data['TDC_DebtService']
+            + data['TDC_AuctionAbsorption']
+            + data['TDC_SecondaryTrades']
+            + data['TDC_Other']
+        )
+        assert (data['TDC_Change'] - decomp_sum).abs().max() < 1e-6
 
     def test_financing_cost_identity(self):
         """FinancingCost_Period must equal sum of its 3 components row-wise."""
