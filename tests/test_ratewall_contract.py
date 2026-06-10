@@ -1,0 +1,570 @@
+"""RateWall contract export tests."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+import ratewall_input_builder as rib
+from ratewall_contract import export_ratewall_bundle
+from ratewall_input_builder import (
+    SCENARIO_CURVE_MAP,
+    _cbo_budget_values,
+    build_holder_absorption_path,
+    build_yield_curve_surface,
+)
+from sim_groups import resolve_worker_count
+from simulation_core import run_simulation
+from yield_curve_path import curve_for_date, load_yield_curve_surface
+
+from test_engine_and_validation import make_bond_row, minimal_params
+
+
+def _run_contract_case():
+    params = minimal_params()
+    params["initial_values"]["tga"] = 200.0
+    params["tga_params"]["target_balance"] = 200.0
+    params["treasury_issuance_profile"]["bills"]["maturities"] = [0.25]
+    params["treasury_issuance_profile"]["bills"]["maturity_distribution"] = [1.0]
+    bill = make_bond_row(
+        BondID=401,
+        SecurityType="Fixed",
+        HolderType="Private",
+        FaceValue=100.0,
+        CouponRate=0.0,
+        MaturityDate=pd.Timestamp("2025-01-10"),
+        OriginalMaturityYears=0.25,
+        MaturityCategory="bills",
+        IssueProceeds=98.0,
+        IssueYieldAtIssue=0.08,
+    )
+    frn = make_bond_row(
+        BondID=402,
+        SecurityType="FRN",
+        HolderType="Private",
+        FaceValue=50.0,
+        CouponRate=0.0,
+        MaturityDate=pd.Timestamp("2027-01-01"),
+        OriginalMaturityYears=2.0,
+        MaturityCategory=None,
+        FixedSpread=0.001,
+        LastAccrualDate=pd.Timestamp("2025-01-01"),
+    )
+    params["initial_bonds_df"] = pd.DataFrame([bill, frn]).astype("object")
+    return run_simulation(params, "2025-01-01", "2025-04-15", freq="W", scenario_name="ratewall_contract_case")
+
+
+def test_ratewall_bundle_component_identity_and_overlap(tmp_path):
+    results, _ = _run_contract_case()
+    paths = export_ratewall_bundle({"contract_case": results}, tmp_path)
+
+    summary = pd.read_csv(paths["summary"])
+    components = pd.read_csv(paths["components"])
+    assert not summary.empty
+    assert not components.empty
+    for _, row in summary.iterrows():
+        expected = (
+            row["tdc_fiscal_flow_bil"]
+            + row["tdc_debt_service_principal_to_du_bil"]
+            + row["tdc_debt_service_interest_to_du_bil"]
+            + row["tdc_auction_absorption_du_bil"]
+            + row["tdc_secondary_trades_bil"]
+            + row["tdc_other_bil"]
+        )
+        assert abs(expected - row["tdc_change_bil"]) < 1e-7
+        assert abs(
+            row["tdc_change_bil"]
+            - row["overlap_cashflow_bil"]
+            - row["tdc_change_ex_overlap_bil"]
+        ) < 1e-7
+    assert not (
+        components["enters_direct_interest_support"]
+        & components["enters_tdc_deposit_support_default"]
+    ).any()
+
+
+def test_ratewall_contract_splits_bill_discount_from_principal(tmp_path):
+    results, _ = _run_contract_case()
+    paths = export_ratewall_bundle({"contract_case": results}, tmp_path)
+    summary = pd.read_csv(paths["summary"])
+
+    assert summary["bill_discount_interest_to_du_bil"].sum() > 0
+    assert summary["tdc_debt_service_principal_to_du_bil"].sum() > 0
+    first_redemption = summary[summary["bill_discount_interest_to_du_bil"] >= 2.0].iloc[0]
+    assert abs(
+        first_redemption["tdc_debt_service_principal_to_du_bil"]
+        + first_redemption["bill_discount_interest_to_du_bil"]
+        - 100.0
+    ) < 1e-7
+
+
+def test_ratewall_contract_exports_remittance_as_non_tdc_component(tmp_path):
+    params = minimal_params()
+    params["other_flows"]["cb_net_expense"] = 0.0
+    params["initial_bonds_df"] = pd.DataFrame(
+        [
+            make_bond_row(
+                BondID=501,
+                SecurityType="Fixed",
+                HolderType="CB",
+                FaceValue=100.0,
+                CouponRate=0.08,
+                MaturityDate=pd.Timestamp("2030-01-01"),
+                OriginalMaturityYears=5.0,
+                MaturityCategory="notes",
+            )
+        ]
+    ).astype("object")
+    results, _ = run_simulation(
+        params,
+        "2025-01-01",
+        "2025-07-15",
+        freq="W",
+        scenario_name="ratewall_remittance_contract_case",
+    )
+
+    paths = export_ratewall_bundle({"remittance_case": results}, tmp_path)
+    summary = pd.read_csv(paths["summary"])
+    components = pd.read_csv(paths["components"])
+
+    assert summary["cb_remittance_to_tga_bil"].sum() > 0
+    remittance = components[
+        components["component_key"] == "central_bank_remittance_to_tga"
+    ]
+    assert not remittance.empty
+    assert set(remittance["cash_component_key"]) == {"central_bank_remittance_to_tga"}
+    assert not remittance["enters_direct_interest_support"].any()
+    assert not remittance["enters_tdc_deposit_support_default"].any()
+
+
+def test_dynamic_yield_curve_surface_applies_by_period(tmp_path):
+    curve_path = tmp_path / "curve.csv"
+    pd.DataFrame(
+        [
+            {"scenario_id": "baseline", "curve_date": "2025-01-01", "tenor_years": 1, "nominal_rate": 0.03},
+            {"scenario_id": "baseline", "curve_date": "2025-01-01", "tenor_years": 10, "nominal_rate": 0.04},
+            {"scenario_id": "baseline", "curve_date": "2025-04-01", "tenor_years": 1, "nominal_rate": 0.05},
+            {"scenario_id": "baseline", "curve_date": "2025-04-01", "tenor_years": 10, "nominal_rate": 0.06},
+        ]
+    ).to_csv(curve_path, index=False)
+
+    surface = load_yield_curve_surface(curve_path)
+    years, rates, status = curve_for_date(surface, "2025-05-01", scenario_id="baseline")
+    assert years == [1.0, 10.0]
+    assert rates == [0.05, 0.06]
+    assert status == "dynamic_curve_surface:2025-04-01"
+
+
+def test_ratewall_source_registry_blocks_weak_wamest_rows(tmp_path):
+    results, _ = run_simulation(
+        minimal_params(),
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="source_registry_case",
+    )
+    paths = export_ratewall_bundle({"source_registry_case": results}, tmp_path)
+    registry = pd.read_csv(paths["source_registry"])
+
+    weak_wamest = registry[registry["source_key"] == "weak_revaluation_wam_rows"].iloc[0]
+    assert not weak_wamest["central_default_eligible"]
+    assert weak_wamest["sensitivity_only"]
+
+
+def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_path):
+    results, _ = run_simulation(
+        minimal_params(),
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="source_registry_case",
+    )
+    paths = export_ratewall_bundle({"source_registry_case": results}, tmp_path)
+    registry = pd.read_csv(paths["source_registry"])
+
+    route_rows = registry[registry["source_family"] == "holder_route_contract"]
+    assert set(route_rows["source_key"]) >= {
+        "Private",
+        "domestic_nonbank_non_deposit_funded",
+        "mmf_on_rrp_reserve_user_like",
+    }
+    private_route = route_rows[route_rows["source_key"] == "Private"].iloc[0]
+    assert private_route["ratewall_role"] == (
+        "domestic_nonbank_undifferentiated_current_contract"
+    )
+    assert private_route["central_default_eligible"]
+    non_deposit_route = route_rows[
+        route_rows["source_key"] == "domestic_nonbank_non_deposit_funded"
+    ].iloc[0]
+    assert not non_deposit_route["central_default_eligible"]
+    assert "split_from_current_private_holder_bucket" in non_deposit_route[
+        "binding_blocker"
+    ]
+    mmf_route = route_rows[
+        route_rows["source_key"] == "mmf_on_rrp_reserve_user_like"
+    ].iloc[0]
+    assert not mmf_route["central_default_eligible"]
+    assert "mmf_on_rrp_route_split" in mmf_route["binding_blocker"]
+
+
+def test_ratewall_contract_exports_private_route_sensitivity_sidecar(tmp_path):
+    results, _ = run_simulation(
+        minimal_params(),
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="source_registry_case",
+    )
+    sensitivity_path = tmp_path / "tdc_private_route_sensitivity.csv"
+    pd.DataFrame(
+        [
+            {
+                "contract_version": "tdc_tdcsim_private_route_allocation_sensitivity_v1",
+                "ref_quarter": "2025Q4",
+                "object_family": "stock_interest_quarter_end",
+                "route_class": "deposit_funded_domestic_nonbank_possible",
+                "share_lambda_0": 0.0,
+                "share_lambda_0_5": 0.1,
+                "share_lambda_1": 0.2,
+                "evidence_tier": "bounded_proxy",
+                "measurement_stage": "holder_stock",
+                "mapping_burden": "requires_unobserved_actor_split",
+                "assumption_status": "bounded_assumption",
+                "current_demand_eligible": "false",
+                "canonical_tdc_math_change": "false",
+                "source_backed_private_bucket_split_status": (
+                    "not_source_backed_private_bucket_split"
+                ),
+                "evidence_mode_enabled": "false",
+                "holder_allocation_enabled": "false",
+            }
+        ]
+    ).to_csv(sensitivity_path, index=False)
+
+    paths = export_ratewall_bundle(
+        {"source_registry_case": results},
+        tmp_path / "bundle",
+        config={"private_route_sensitivity_file": str(sensitivity_path)},
+    )
+    sidecar = pd.read_csv(paths["private_route_sensitivity"])
+    registry = pd.read_csv(paths["source_registry"])
+    manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
+
+    assert sidecar["tdcsim_contract_key"].iloc[0] == (
+        "tdcsim_private_route_sensitivity_contract_v1"
+    )
+    assert not sidecar["central_default_eligible"].iloc[0]
+    assert sidecar["sensitivity_only"].iloc[0]
+    assert sidecar["does_not_modify_default_holder_perimeter"].iloc[0]
+    assert "private_route_sensitivity" in manifest["files"]
+    registry_row = registry[
+        registry["source_key"] == "tdc_tdcsim_private_route_allocation_sensitivity_v1"
+    ].iloc[0]
+    assert registry_row["sensitivity_only"]
+    assert not registry_row["central_default_eligible"]
+    assert "requires_source_backed_split" in registry_row["binding_blocker"]
+
+
+def test_ratewall_contract_rejects_promoted_private_route_sensitivity(tmp_path):
+    results, _ = run_simulation(
+        minimal_params(),
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="source_registry_case",
+    )
+    sensitivity_path = tmp_path / "tdc_private_route_sensitivity.csv"
+    pd.DataFrame(
+        [
+            {
+                "contract_version": "tdc_tdcsim_private_route_allocation_sensitivity_v1",
+                "ref_quarter": "2025Q4",
+                "object_family": "stock_interest_quarter_end",
+                "route_class": "deposit_funded_domestic_nonbank_possible",
+                "share_lambda_0": 0.0,
+                "share_lambda_0_5": 0.1,
+                "share_lambda_1": 0.2,
+                "evidence_tier": "source_backed_measurement",
+                "mapping_burden": "none",
+                "assumption_status": "none_source_observed",
+                "current_demand_eligible": "false",
+                "canonical_tdc_math_change": "false",
+                "source_backed_private_bucket_split_status": (
+                    "not_source_backed_private_bucket_split"
+                ),
+                "evidence_mode_enabled": "false",
+                "holder_allocation_enabled": "false",
+            }
+        ]
+    ).to_csv(sensitivity_path, index=False)
+
+    with pytest.raises(ValueError, match="evidence_tier must be bounded_proxy"):
+        export_ratewall_bundle(
+            {"source_registry_case": results},
+            tmp_path / "bundle",
+            config={"private_route_sensitivity_file": str(sensitivity_path)},
+        )
+
+
+def test_ratewall_contract_primary_flow_status_uses_input_manifest(tmp_path):
+    results, _ = _run_contract_case()
+    manifest_path = tmp_path / "input_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "files": {"tdcsim_primary_flow_to_du_path.csv": {"sha256": "abc"}},
+                "source_hierarchy": {
+                    "primary_flow": "CBO total deficit less net interest as aggregate cash proxy",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = export_ratewall_bundle(
+        {"contract_case": results},
+        tmp_path / "bundle",
+        config={"input_manifest": str(manifest_path)},
+    )
+    summary = pd.read_csv(paths["summary"])
+    registry = pd.read_csv(paths["source_registry"])
+    manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
+
+    assert set(summary["primary_flow_status"]) == {
+        "aggregate_cash_proxy_from_cbo_total_deficit_less_net_interest",
+    }
+    assert "tdcsim_primary_flow_to_du_path.csv" in set(registry["source_key"])
+    assert "tdcsim_primary_flow_to_du_path.csv" in manifest["input_artifacts"]
+
+
+def test_ratewall_input_builder_parses_cbo_billions_section():
+    ratewall_root = Path(__file__).resolve().parents[2] / "ratewall"
+    cbo_path = ratewall_root / "data/raw/cbo/51118-2026-02-Budget-Projections.xlsx"
+    if not cbo_path.exists():
+        return
+
+    values = _cbo_budget_values(cbo_path)
+    assert values[2026]["net_interest_bil"] > 1000
+    assert values[2026]["deficit_bil"] < -1000
+    assert -values[2026]["deficit_bil"] - values[2026]["net_interest_bil"] > 800
+
+
+def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    ratewall_root = repo_root.parent / "ratewall"
+    tdcmix_prior = (
+        repo_root.parent
+        / "tdcmix"
+        / "data"
+        / "processed"
+        / "holder_absorption_prior_contract.csv"
+    )
+    z1_absorption = (
+        repo_root.parent
+        / "tdcmix"
+        / "data"
+        / "processed"
+        / "z1_exact_holder_absorption_panel.csv"
+    )
+    bills_primary = (
+        repo_root.parent
+        / "tsyparty"
+        / "data"
+        / "interim"
+        / "bills_quarterly_composition.csv"
+    )
+    coupons_primary = (
+        repo_root.parent
+        / "tsyparty"
+        / "data"
+        / "interim"
+        / "nominal_coupons_quarterly_composition.csv"
+    )
+    if not (ratewall_root.exists() and tdcmix_prior.exists() and z1_absorption.exists()):
+        return
+
+    frame, metadata = build_holder_absorption_path(
+        tmp_path / "holder.csv",
+        tdcmix_prior_path=tdcmix_prior,
+        z1_absorption_path=z1_absorption,
+        bills_primary_path=bills_primary,
+        coupons_primary_path=coupons_primary,
+    )
+
+    assert set(frame["scenario_id"]) == set(SCENARIO_CURVE_MAP)
+    assert "primary_market_instrument_buyer_composition" in metadata["baseline_sources"]
+    current = frame[
+        (frame["scenario_id"] == "current_mix_baseline")
+        & (frame["quarter"] == "2026Q1")
+    ]
+    for column in ["bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"]:
+        assert abs(current[column].astype(float).sum() - 1.0) < 1e-9
+    banks = current[current["holder_type"] == "Banks"].iloc[0]
+    assert banks["bills_pct"] != banks["notes_pct"]
+
+
+def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    ratewall_root = repo_root.parent / "ratewall"
+    tdcmix_prior = (
+        ratewall_root
+        / "data/raw/ratewall_sibling_calibration/tdcsim/tdcsim_ratewall_source_registry.csv"
+    )
+    z1_absorption = (
+        ratewall_root.parent
+        / "tdc_estimates"
+        / "data"
+        / "processed"
+        / "z1_exact_holder_absorption_panel.csv"
+    )
+    bills_primary = (
+        repo_root.parent
+        / "tsyparty"
+        / "data"
+        / "interim"
+        / "bills_quarterly_composition.csv"
+    )
+    coupons_primary = (
+        repo_root.parent
+        / "tsyparty"
+        / "data"
+        / "interim"
+        / "nominal_coupons_quarterly_composition.csv"
+    )
+    if not (ratewall_root.exists() and tdcmix_prior.exists() and z1_absorption.exists()):
+        return
+
+    frame, _ = build_holder_absorption_path(
+        tmp_path / "holder.csv",
+        tdcmix_prior_path=tdcmix_prior,
+        z1_absorption_path=z1_absorption,
+        bills_primary_path=bills_primary,
+        coupons_primary_path=coupons_primary,
+    )
+
+    assert (
+        SCENARIO_CURVE_MAP["domestic_nonbank_absorption_shift_higher_for_longer"]
+        == "higher_for_longer_sensitivity"
+    )
+    assert (
+        SCENARIO_CURVE_MAP["domestic_nonbank_absorption_shift_rapid_easing"]
+        == "rapid_easing_sensitivity"
+    )
+    assert (
+        SCENARIO_CURVE_MAP["reserve_user_absorption_shift_higher_for_longer"]
+        == "higher_for_longer_sensitivity"
+    )
+    assert (
+        SCENARIO_CURVE_MAP["reserve_user_absorption_shift_rapid_easing"]
+        == "rapid_easing_sensitivity"
+    )
+
+    share_columns = ["bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"]
+    checks = [
+        (
+            "domestic_nonbank_absorption_shift_higher_for_longer",
+            "domestic_nonbank_absorption_shift",
+        ),
+        (
+            "domestic_nonbank_absorption_shift_rapid_easing",
+            "domestic_nonbank_absorption_shift",
+        ),
+        (
+            "reserve_user_absorption_shift_higher_for_longer",
+            "reserve_user_absorption_shift",
+        ),
+        (
+            "reserve_user_absorption_shift_rapid_easing",
+            "reserve_user_absorption_shift",
+        ),
+    ]
+    for combined_id, holder_shift_id in checks:
+        combined = frame[frame["scenario_id"] == combined_id].sort_values(["quarter", "holder_type"])
+        holder_shift = frame[frame["scenario_id"] == holder_shift_id].sort_values(["quarter", "holder_type"])
+        assert combined[["quarter", "holder_type"] + share_columns].reset_index(drop=True).equals(
+            holder_shift[["quarter", "holder_type"] + share_columns].reset_index(drop=True)
+        )
+
+
+def test_ratewall_initial_portfolio_converts_mspd_millions_to_billions(tmp_path, monkeypatch):
+    def fake_fetch(endpoint, *, record_date, page_size=10000):
+        if endpoint.endswith("mspd_table_1"):
+            return [
+                {
+                    "security_type_desc": "Marketable",
+                    "security_class_desc": "Bills",
+                    "debt_held_public_mil_amt": "1000000",
+                }
+            ]
+        return [
+            {
+                "security_class1_desc": "Bills Maturity Value",
+                "security_class2_desc": "FAKEBILL",
+                "outstanding_amt": "500000",
+                "issue_date": "2026-01-01",
+                "maturity_date": "2026-04-01",
+                "interest_rate_pct": "0",
+                "yield_pct": "4.0",
+            }
+        ]
+
+    monkeypatch.setattr(rib, "_latest_record_date", lambda endpoint: "2026-04-30")
+    monkeypatch.setattr(rib, "_fetch_fiscaldata_rows", fake_fetch)
+    monkeypatch.setattr(rib, "_load_stock_holder_shares", lambda path: {"Private": 1.0})
+
+    frame, _ = rib.build_initial_portfolio(
+        tmp_path / "cohorts.csv",
+        tsyparty_z1_path=tmp_path / "unused.csv",
+    )
+
+    assert len(frame) == 1
+    row = frame.iloc[0]
+    assert abs(float(row["face_value_bil"]) - 1000.0) < 1e-9
+    assert abs(float(row["FaceValue"]) - 1000.0) < 1e-9
+    assert "converted_to_bil" in row["source_status"]
+
+
+def test_worker_count_respects_config_env_and_upper_bound(monkeypatch):
+    assert resolve_worker_count(configured=None, default=4, upper_bound=7) == 4
+    assert resolve_worker_count(configured=12, default=4, upper_bound=7) == 7
+    assert resolve_worker_count(configured="auto", default=4, upper_bound=7) == 4
+
+    monkeypatch.setenv("TDCSIM_SCENARIO_WORKERS", "3")
+    assert (
+        resolve_worker_count(
+            configured=6,
+            env_var="TDCSIM_SCENARIO_WORKERS",
+            default=4,
+            upper_bound=7,
+        )
+        == 3
+    )
+
+
+def test_ratewall_source_backed_yield_surface_has_curve_scenarios(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    cbo_path = (
+        repo_root.parent
+        / "ratewall"
+        / "data/raw/cbo/51135-2026-02-Economic-Projections.xlsx"
+    )
+    if not cbo_path.exists():
+        return
+
+    frame, _ = build_yield_curve_surface(tmp_path / "curve.csv", cbo_economic_path=cbo_path)
+
+    assert set(frame["scenario_id"]) >= set(SCENARIO_CURVE_MAP.values())
+    baseline = frame[frame["scenario_id"] == "cbo_shape_preserving_baseline"]
+    higher = frame[frame["scenario_id"] == "higher_for_longer_sensitivity"]
+    merged = baseline.merge(
+        higher,
+        on=["curve_date", "tenor_years"],
+        suffixes=("_baseline", "_higher"),
+    )
+    assert (
+        merged["nominal_rate_higher"].astype(float)
+        > merged["nominal_rate_baseline"].astype(float)
+    ).all()

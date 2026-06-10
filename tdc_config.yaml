@@ -104,6 +104,12 @@ yield_curve_lower: &yield_curve_lower
   years: [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
   rates: [0.0375, 0.0385, 0.0400, 0.0425, 0.0450, 0.0475, 0.0490, 0.0500]
 
+# Higher rates (parallel shift up 75bps)
+yield_curve_higher: &yield_curve_higher
+  use_static: True
+  years: [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+  rates: [0.0475, 0.0485, 0.0500, 0.0525, 0.0550, 0.0575, 0.0590, 0.0600]
+
 # --- Sector Preferences ---
 
 # Baseline: column sums = 1. Banks active in bills/notes.
@@ -113,10 +119,10 @@ sector_preferences_default: &sector_preferences_default
   CB:      { bills_pct: 0.15, notes_pct: 0.05, bonds_pct: 0.05 }
   Foreign: { bills_pct: 0.25, notes_pct: 0.25, bonds_pct: 0.25 }
 
-# Banks buy a larger share (especially Notes), Private buys less (Domestic non-banks)
+# Banks buy a modestly larger share (especially Notes), Private buys less (Domestic non-banks)
 sector_preferences_banks_buy_more: &sector_preferences_banks_buy_more
-  Banks:   { bills_pct: 0.25, notes_pct: 0.35, bonds_pct: 0.15 }
-  Private: { bills_pct: 0.35, notes_pct: 0.35, bonds_pct: 0.55 }
+  Banks:   { bills_pct: 0.18, notes_pct: 0.25, bonds_pct: 0.12 }
+  Private: { bills_pct: 0.42, notes_pct: 0.45, bonds_pct: 0.58 }
   CB:      { bills_pct: 0.15, notes_pct: 0.05, bonds_pct: 0.05 }
   Foreign: { bills_pct: 0.25, notes_pct: 0.25, bonds_pct: 0.25 }
 
@@ -126,6 +132,13 @@ sector_preferences_banks_pref_notes: &sector_preferences_banks_pref_notes
   Private: { bills_pct: 0.45, notes_pct: 0.40, bonds_pct: 0.65 }
   CB:      { bills_pct: 0.15, notes_pct: 0.05, bonds_pct: 0.05 }
   Foreign: { bills_pct: 0.25, notes_pct: 0.25, bonds_pct: 0.25 }
+
+# Domestic nonbanks absorb somewhat more issuance.
+sector_preferences_private_buy_more: &sector_preferences_private_buy_more
+  Banks:   { bills_pct: 0.12, notes_pct: 0.17, bonds_pct: 0.09 }
+  Private: { bills_pct: 0.48, notes_pct: 0.53, bonds_pct: 0.63 }
+  CB:      { bills_pct: 0.15, notes_pct: 0.05, bonds_pct: 0.05 }
+  Foreign: { bills_pct: 0.25, notes_pct: 0.25, bonds_pct: 0.23 }
 
 # --- Root defaults used for validation, generated portfolios, and fallback runs ---
 
@@ -255,6 +268,7 @@ scenario_groups:
   - group_name: "TDC vs Debt Management"
     group_output_settings:
       save_plot_filename: "output/tdc_vs_cost"
+      save_results_csv: true
       graphs_to_show: ["TDC_Level", "DebtServiceOutlay_Cumulative", "FinancingCost_Cumulative", "TotalDebt_Agg"]
       output_mode: 'single_file'
 
@@ -279,3 +293,10 @@ scenario_groups:
           treasury_issuance_profile: *policy_issuance_more_notes_fewer_bonds
           yield_curve: *yield_curve_default
           sector_preferences: *sector_preferences_banks_pref_notes
+
+      - name: "Private-Funded + Higher Rates"
+        overrides:
+          fiscal_params: *fiscal_baseline
+          treasury_issuance_profile: *default_issuance_profile
+          sector_preferences: *sector_preferences_private_buy_more
+          yield_curve: *yield_curve_higher

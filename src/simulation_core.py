@@ -14,14 +14,13 @@ import yaml
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
-    PORTFOLIO_DTYPES,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
 )
 from tdc_validation import validate_config
 
 from sim_engine import run_simulation
-from sim_groups import process_scenario_group
+from sim_groups import process_scenario_group, resolve_worker_count
 from sim_helpers import (
     OUTPUT_COLUMN_RENAMES,
     VALID_OVERRIDE_KEYS,
@@ -343,13 +342,22 @@ def main(config_file=None):
             )
         else:
             try:
-                max_workers_outer = min(
-                    num_groups,
-                    max(1, os.cpu_count() - 1 if os.cpu_count() else 1),
-                    4,
-                )
+                cpu_count = os.cpu_count() or 1
             except NotImplementedError:
-                max_workers_outer = min(num_groups, 2)
+                cpu_count = 1
+            parallel_cfg = base_config.get('parallel_execution', {})
+            configured_group_workers = (
+                parallel_cfg.get('group_workers')
+                if isinstance(parallel_cfg, dict)
+                else None
+            )
+            default_group_workers = min(num_groups, max(1, cpu_count - 1), 4)
+            max_workers_outer = resolve_worker_count(
+                configured=configured_group_workers,
+                env_var='TDCSIM_GROUP_WORKERS',
+                default=default_group_workers,
+                upper_bound=num_groups,
+            )
 
             print(
                 f'Running {num_groups} scenario groups in parallel using up to '
@@ -440,4 +448,4 @@ __all__ = [
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

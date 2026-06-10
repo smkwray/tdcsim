@@ -169,6 +169,7 @@ A typical run produces:
 - **Inflation / CPI reference paths** for TIPS accounting
 - **Final tranche-level portfolio**
 - **Scenario comparison charts** (saved as PNG)
+- **Optional scenario CSVs** when a scenario group's `group_output_settings.save_results_csv` is `true`
 
 Key result columns:
 
@@ -261,6 +262,21 @@ The runtime flow:
 4. For each scenario, `sim_engine.py` runs the simulation loop period by period — fiscal flows, debt service, issuance, allocation, optional secondary trading — and accumulates results.
 5. `sim_plotting.py` writes comparison charts across scenarios in each group.
 6. Results are returned as DataFrames with all tracked columns.
+
+Scenario-group CSV export is configured under `group_output_settings`:
+
+```yaml
+group_output_settings:
+  save_plot_filename: "output/tdc_vs_cost"
+  save_results_csv: true
+  # Optional; defaults to save_plot_filename when omitted.
+  save_results_filename: "output/tdc_vs_cost"
+```
+
+This writes one CSV per scenario, a combined long-form file named
+`<base>_results.csv`, and a final-state summary named
+`<base>_final_state.csv`. Each row includes `Scenario` and `Date`, so the
+combined file can be used directly by external charting tools.
 
 ## Project layout
 

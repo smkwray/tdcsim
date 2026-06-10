@@ -14,6 +14,78 @@ from tdc_shared import BOND_PORTFOLIO_COLS
 from sim_engine import run_simulation
 from sim_helpers import VALID_OVERRIDE_KEYS, update_dict_recursive
 from sim_plotting import plot_multi_results
+from ratewall_contract import export_ratewall_bundle
+
+def _clean_filename(value):
+    """Return a filesystem-safe stem for generated output files."""
+    return re.sub('[^\\w\\-]+', '_', str(value)).strip('_') or 'results'
+
+
+def _positive_int(value):
+    """Return a positive integer or None for unset/auto values."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {'', 'auto', 'default'}:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def resolve_worker_count(*, configured=None, env_var=None, default, upper_bound):
+    """Resolve a bounded worker count from config, env override, and default."""
+    env_value = _positive_int(os.environ.get(env_var)) if env_var else None
+    configured_value = _positive_int(configured)
+    requested = env_value or configured_value or default
+    return max(1, min(int(requested), int(upper_bound)))
+
+
+def _resolve_output_base(group_output_settings, group_name, filename_key):
+    configured_filename = group_output_settings.get(filename_key)
+    if not configured_filename:
+        configured_filename = group_output_settings.get('save_plot_filename') or group_name
+    base_name, _ = os.path.splitext(configured_filename)
+    clean_base_name = _clean_filename(os.path.basename(base_name))
+    save_dir = os.path.dirname(configured_filename) or '.'
+    os.makedirs(save_dir, exist_ok=True)
+    return os.path.join(save_dir, clean_base_name)
+
+
+def save_group_results_csv(successful_scenario_results, scenario_order, group_output_settings, group_name):
+    """Write scenario time-series and final-state CSVs for downstream charting."""
+    output_base = _resolve_output_base(group_output_settings, group_name, 'save_results_filename')
+    long_frames = []
+
+    for scenario_name in scenario_order:
+        results_df = successful_scenario_results.get(scenario_name)
+        if results_df is None or results_df.empty:
+            continue
+        scenario_frame = results_df.copy()
+        scenario_frame.insert(0, 'Scenario', scenario_name)
+        scenario_frame.insert(1, 'Date', scenario_frame.index)
+        long_frames.append(scenario_frame.reset_index(drop=True))
+
+        scenario_stem = _clean_filename(scenario_name)
+        scenario_path = f'{output_base}_{scenario_stem}.csv'
+        scenario_frame.to_csv(scenario_path, index=False)
+
+    if not long_frames:
+        print(f"Warning [Group {group_name}]: No successful scenario data available for CSV export.")
+        return
+
+    combined = pd.concat(long_frames, ignore_index=True)
+    combined_path = f'{output_base}_results.csv'
+    combined.to_csv(combined_path, index=False)
+
+    final_state = combined.sort_values('Date').groupby('Scenario', sort=False).tail(1)
+    final_state_path = f'{output_base}_final_state.csv'
+    final_state.to_csv(final_state_path, index=False)
+
+    print(f'[Group {group_name}] Results CSV saved: {combined_path}')
+    print(f'[Group {group_name}] Final-state CSV saved: {final_state_path}')
+
 
 def process_scenario_group(group_def, base_config_subset, initial_bonds_df_global, sim_start_date, sim_end_date, sim_freq, group_index, total_groups):
     """Processes scenarios within a group, runs simulations, and handles plotting."""
@@ -22,6 +94,7 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
     group_scenarios = group_def.get('scenarios', [])
     group_output_settings = group_def.get('group_output_settings', {})
     output_mode = group_output_settings.get('output_mode', 'single_file').lower()
+    save_results_csv = bool(group_output_settings.get('save_results_csv', False))
     show_plots_interactively = total_groups == 1
     save_plots_to_file = total_groups > 1 or (total_groups == 1 and group_output_settings.get('save_plot_filename'))
     actual_save_filename_base = None
@@ -83,9 +156,25 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
         print(f'[Group {group_name}] No valid scenarios prepared for execution. Skipping group.')
         return {'group_name': group_name, 'status': 'skipped', 'message': 'No valid scenarios'}
     try:
-        max_workers_inner = min(num_scenarios_in_group, max(1, os.cpu_count() // 2 if os.cpu_count() else 1), 8)
+        cpu_count = os.cpu_count() or 1
     except NotImplementedError:
-        max_workers_inner = min(num_scenarios_in_group, 4)
+        cpu_count = 1
+    default_inner_workers = min(
+        num_scenarios_in_group,
+        max(1, cpu_count // 2),
+        8,
+    )
+    configured_inner_workers = (
+        group_def.get('parallel_workers')
+        or group_output_settings.get('parallel_workers')
+        or base_config_subset.get('scenario_parallel_workers')
+    )
+    max_workers_inner = resolve_worker_count(
+        configured=configured_inner_workers,
+        env_var='TDCSIM_SCENARIO_WORKERS',
+        default=default_inner_workers,
+        upper_bound=num_scenarios_in_group,
+    )
     print(f'[Group {group_name}] Running {num_scenarios_in_group} scenarios using up to {max_workers_inner} parallel processes...')
     inner_executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers_inner)
     group_sim_success = True
@@ -136,6 +225,35 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
             print(f'   Error generating final state summary: {e}')
         finally:
             pd.reset_option('display.float_format')
+        if save_results_csv:
+            try:
+                save_group_results_csv(
+                    successful_scenario_results,
+                    successful_scenario_names_group,
+                    group_output_settings,
+                    group_name,
+                )
+            except Exception as e:
+                print(f'\nERROR [Group {group_name}]: Results CSV export failed: {e}')
+                traceback.print_exc()
+                return {'group_name': group_name, 'status': 'csv_export_failed', 'message': str(e)}
+        ratewall_contract_cfg = base_config_subset.get('ratewall_contract', {})
+        if isinstance(ratewall_contract_cfg, dict) and ratewall_contract_cfg.get('enabled', False):
+            try:
+                output_dir = ratewall_contract_cfg.get(
+                    'output_dir',
+                    os.path.join('output', 'ratewall_contract'),
+                )
+                export_ratewall_bundle(
+                    successful_scenario_results,
+                    output_dir,
+                    config=ratewall_contract_cfg,
+                )
+                print(f'[Group {group_name}] RateWall contract bundle saved: {output_dir}')
+            except Exception as e:
+                print(f'\nERROR [Group {group_name}]: RateWall contract export failed: {e}')
+                traceback.print_exc()
+                return {'group_name': group_name, 'status': 'ratewall_contract_export_failed', 'message': str(e)}
         try:
             plot_multi_results(successful_scenario_results, plot_config_group, scenario_order=successful_scenario_names_group, base_save_filename=actual_save_filename_base if save_plots_to_file else None, show_plot=show_plots_interactively, output_mode=output_mode)
         except ImportError:
@@ -148,4 +266,4 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
     return {'group_name': group_name, 'status': status, 'execution_time': group_execution_time}
 
 
-__all__ = ['process_scenario_group']
+__all__ = ['process_scenario_group', 'resolve_worker_count', 'save_group_results_csv']

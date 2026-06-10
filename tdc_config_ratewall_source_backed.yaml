@@ -1,0 +1,224 @@
+simulation_period:
+  start_date: '2026-04-30'
+  end_date: '2036-12-31'
+  frequency: W
+  enable_preference_trading: false
+  coarse_frequency_action: warn
+initial_values:
+  reserves: 2500.0
+  tdc_level: 0.0
+  tga: 750.0
+initial_portfolio:
+  mode: file
+  file: data/ratewall_inputs/tdcsim_initial_portfolio_cohorts.csv
+tga_params:
+  target_balance: 750.0
+  floor: 100.0
+fiscal_params:
+  initial_weekly_spending: 0.0
+  initial_weekly_taxes: 0.0
+  spending_growth_qtr: 0.0
+  tax_growth_qtr: 0.0
+treasury_issuance_profile:
+  bills:
+    category_cutoff_years: 1.0
+    target_percentage_of_remainder: 0.22
+    maturities:
+    - 0.25
+    - 0.5
+    - 1.0
+    maturity_distribution:
+    - 0.4
+    - 0.35
+    - 0.25
+  notes:
+    category_cutoff_years: 10.0
+    target_percentage_of_remainder: 0.58
+    maturities:
+    - 2.0
+    - 5.0
+    - 10.0
+    maturity_distribution:
+    - 0.35
+    - 0.35
+    - 0.3
+  bonds:
+    category_cutoff_years: 999.0
+    target_percentage_of_remainder: 0.2
+    maturities:
+    - 20.0
+    - 30.0
+    maturity_distribution:
+    - 0.45
+    - 0.55
+  TIPS:
+    target_percentage: 0.06
+    maturities:
+    - 5.0
+    - 10.0
+    - 30.0
+    maturity_distribution:
+    - 0.4
+    - 0.35
+    - 0.25
+  FRN:
+    target_percentage: 0.04
+    maturities:
+    - 2.0
+    maturity_distribution:
+    - 1.0
+  remainder_maturity_years: 0.5
+yield_curve:
+  use_static: true
+  years:
+  - 0.25
+  - 0.5
+  - 1.0
+  - 2.0
+  - 5.0
+  - 10.0
+  - 20.0
+  - 30.0
+  rates:
+  - 0.04
+  - 0.04
+  - 0.04
+  - 0.04
+  - 0.042
+  - 0.043
+  - 0.045
+  - 0.046
+yield_curve_surface:
+  file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+  scenario_id: cbo_shape_preserving_baseline
+sector_preferences: &id001
+  Banks:
+    bills_pct: 0.25
+    notes_pct: 0.25
+    bonds_pct: 0.25
+    tips_pct: 0.25
+    frn_pct: 0.25
+  CB:
+    bills_pct: 0.25
+    notes_pct: 0.25
+    bonds_pct: 0.25
+    tips_pct: 0.25
+    frn_pct: 0.25
+  Foreign:
+    bills_pct: 0.25
+    notes_pct: 0.25
+    bonds_pct: 0.25
+    tips_pct: 0.25
+    frn_pct: 0.25
+  Private:
+    bills_pct: 0.25
+    notes_pct: 0.25
+    bonds_pct: 0.25
+    tips_pct: 0.25
+    frn_pct: 0.25
+auction_absorption_preferences: *id001
+secondary_target_preferences: *id001
+ratewall_input_paths:
+  primary_flow_to_du_file: data/ratewall_inputs/tdcsim_primary_flow_to_du_path.csv
+  holder_absorption_path_file: data/ratewall_inputs/tdcsim_holder_absorption_path.csv
+tips_params:
+  cpi_start_level: 100.0
+  cpi_annual_inflation: 0.02
+  ref_cpi_lag_months: 3
+  default_real_coupon_rate: 0.005
+frn_params:
+  benchmark_maturity_years: 0.25
+  default_fixed_spread: 0.0005
+nonmarketable_params:
+  interest_rate_basis_maturities:
+  - 5.0
+  - 10.0
+  interest_crediting_frequency: semi-annual
+  initial_holder: TrustFunds
+  rate_setting_method: yield_curve_points
+other_flows:
+  reserve_transfer: 0.0
+  cb_net_expense: 0.0
+  money_minting_transfers: 0.0
+rate_sensitive_demand:
+  enabled: false
+  min_multiplier: 0.25
+  anchor_maturity_years: 5.0
+  slope_short_maturity_years: 2.0
+  slope_long_maturity_years: 10.0
+  auction: {}
+  secondary: {}
+financing_cost_options:
+  include_tips_inflation_accretion: false
+ratewall_contract:
+  enabled: true
+  output_dir: output/ratewall_contract_source_backed
+  input_manifest: data/ratewall_inputs/tdcsim_ratewall_input_manifest.json
+  private_route_sensitivity_file: ../tdcest/data/processed/tdc_tdcsim_private_route_allocation_sensitivity.csv
+parallel_execution:
+  group_workers: auto
+  note: Override with TDCSIM_GROUP_WORKERS for independent scenario groups.
+scenario_parallel_workers: auto
+scenario_groups:
+- group_name: RateWall Source Backed TDC Forward
+  group_output_settings:
+    save_results_csv: true
+    save_results_filename: output/ratewall_source_backed_tdc
+    output_mode: single_file
+    graphs_to_show: []
+  scenarios:
+  - name: current_mix_baseline
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: cbo_shape_preserving_baseline
+  - name: domestic_nonbank_absorption_shift
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: cbo_shape_preserving_baseline
+  - name: reserve_user_absorption_shift
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: cbo_shape_preserving_baseline
+  - name: current_mix_higher_for_longer
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: higher_for_longer_sensitivity
+  - name: current_mix_rapid_easing
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: rapid_easing_sensitivity
+  - name: domestic_nonbank_absorption_shift_higher_for_longer
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: higher_for_longer_sensitivity
+  - name: domestic_nonbank_absorption_shift_rapid_easing
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: rapid_easing_sensitivity
+  - name: reserve_user_absorption_shift_higher_for_longer
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: higher_for_longer_sensitivity
+  - name: reserve_user_absorption_shift_rapid_easing
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: rapid_easing_sensitivity
+  - name: current_mix_bear_steepener
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: bear_steepener_sensitivity
+  - name: current_mix_bull_flattener
+    overrides:
+      yield_curve_surface:
+        file: data/ratewall_inputs/tdcsim_yield_curve_surface.csv
+        scenario_id: bull_flattener_sensitivity

@@ -15,7 +15,7 @@ VALID_OVERRIDE_KEYS = frozenset({
     'sector_preferences', 'auction_absorption_preferences', 'secondary_target_preferences',
     'events', 'tips_params', 'frn_params', 'nonmarketable_params', 'other_flows',
     'rate_sensitive_demand', 'financing_cost_options',
-    'simulation_period',
+    'simulation_period', 'yield_curve_surface', 'ratewall_contract', 'ratewall_input_paths',
 })
 
 VALID_NONMARKETABLE_CREDITING_FREQUENCIES = frozenset({'semi-annual', 'annual'})
