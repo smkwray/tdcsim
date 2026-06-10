@@ -670,6 +670,10 @@ def _expand_year_label(label: str) -> list[int]:
     return []
 
 
+def _federal_fiscal_year_calendar_quarters(year: int) -> list[str]:
+    return [f"{year - 1}Q4", f"{year}Q1", f"{year}Q2", f"{year}Q3"]
+
+
 def build_primary_flow_path(output_path: Path, *, cbo_budget_path: Path, scenario_ids: list[str]) -> tuple[pd.DataFrame, dict]:
     values = _cbo_budget_values(cbo_budget_path)
     rows: list[dict] = []
@@ -679,8 +683,7 @@ def build_primary_flow_path(output_path: Path, *, cbo_budget_path: Path, scenari
         deficit_magnitude = -metrics.get("deficit_bil", 0.0)
         net_interest = metrics.get("net_interest_bil", 0.0)
         primary_deficit = deficit_magnitude - net_interest
-        for quarter_idx in range(1, 5):
-            quarter = f"{year}Q{quarter_idx}"
+        for quarter in _federal_fiscal_year_calendar_quarters(year):
             for scenario_id in scenario_ids:
                 rows.append(
                     {
@@ -697,13 +700,17 @@ def build_primary_flow_path(output_path: Path, *, cbo_budget_path: Path, scenari
                         "central_default_eligible": "true",
                         "source_family": "cbo_budget_projection",
                         "source_key": "51118-2026-02-Budget-Projections.xlsx:Table 1-1",
-                        "source_status": "source_backed_aggregate_primary_deficit_proxy_not_recipient_mapped",
+                        "source_status": "source_backed_federal_fiscal_year_mapped_to_calendar_quarters_aggregate_primary_deficit_proxy_not_recipient_mapped",
                         "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
                     }
                 )
     frame = pd.DataFrame(rows)
     frame.to_csv(output_path, index=False)
-    return frame, {"cbo_budget_path": str(cbo_budget_path), "rows": len(frame)}
+    return frame, {
+        "cbo_budget_path": str(cbo_budget_path),
+        "fiscal_year_calendar_mapping": "federal_fy_y_to_calendar_y_minus_1_q4_through_y_q3",
+        "rows": len(frame),
+    }
 
 
 def _latest_treasury_curve() -> tuple[str, dict[float, float]]:
@@ -879,7 +886,13 @@ def build_holder_absorption_path(
                             "source_status": (
                                 "instrument_specific_holder_absorption_prior_not_holder_allocation_evidence;"
                                 f"{metadata['dealer_bridge_mapping']}"
+                                + (
+                                    ";mmf_collapsed_into_du_current_private_bucket"
+                                    if holder == "Private"
+                                    else ""
+                                )
                             ),
+                            "mmf_collapsed_into_du": "true" if holder == "Private" else "false",
                             "central_default_eligible": (
                                 "true" if scenario_id == "current_mix_baseline" else "false"
                             ),

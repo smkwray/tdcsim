@@ -13,6 +13,7 @@ from ratewall_contract import export_ratewall_bundle
 from ratewall_input_builder import (
     SCENARIO_CURVE_MAP,
     _cbo_budget_values,
+    build_primary_flow_path,
     build_holder_absorption_path,
     build_yield_curve_surface,
 )
@@ -101,6 +102,68 @@ def test_ratewall_contract_splits_bill_discount_from_principal(tmp_path):
     ) < 1e-7
 
 
+def test_ratewall_contract_tips_inflation_compensation_is_memo_default(tmp_path):
+    params = minimal_params()
+    params["initial_values"]["tga"] = 200.0
+    params["tga_params"]["target_balance"] = 200.0
+    params["tips_params"] = {
+        "cpi_start_level": 115.0,
+        "cpi_annual_inflation": 0.0,
+        "ref_cpi_lag_months": 3,
+        "default_real_coupon_rate": 0.0,
+    }
+    params["initial_bonds_df"] = pd.DataFrame(
+        [
+            make_bond_row(
+                BondID=701,
+                SecurityType="TIPS",
+                HolderType="Private",
+                FaceValue=100.0,
+                CouponRate=0.0,
+                MaturityDate=pd.Timestamp("2025-01-10"),
+                OriginalMaturityYears=5.0,
+                MaturityCategory="tips",
+                OriginalPrincipal=100.0,
+                AdjustedPrincipal=115.0,
+                ReferenceCPI_Issue=100.0,
+                IndexRatio=1.15,
+            )
+        ]
+    ).astype("object")
+    results, _ = run_simulation(
+        params,
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="tips_maturity_contract_case",
+    )
+
+    paths = export_ratewall_bundle({"tips_case": results}, tmp_path)
+    summary = pd.read_csv(paths["summary"])
+    components = pd.read_csv(paths["components"])
+    manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
+
+    tips_component = components[
+        components["component_key"] == "tips_inflation_compensation_to_du"
+    ]
+    assert not tips_component.empty
+    assert tips_component["amount_bil"].astype(float).sum() > 0.0
+    assert not tips_component["enters_tdc_deposit_support_default"].astype(str).str.lower().eq("true").any()
+    default_components = components[
+        components["enters_tdc_deposit_support_default"].astype(str).str.lower().eq("true")
+    ]
+    for _, row in summary.iterrows():
+        component_sum = default_components[
+            (default_components["scenario_id"] == row["scenario_id"])
+            & (default_components["quarter"] == row["quarter"])
+        ]["amount_bil"].astype(float).sum()
+        assert abs(
+            component_sum
+            - (row["tdc_change_bil"] - row["overlap_cashflow_bil"])
+        ) < 1e-7
+    assert manifest["validation"]["validation_status"] == "pass"
+
+
 def test_ratewall_contract_exports_remittance_as_non_tdc_component(tmp_path):
     params = minimal_params()
     params["other_flows"]["cb_net_expense"] = 0.0
@@ -172,6 +235,11 @@ def test_ratewall_source_registry_blocks_weak_wamest_rows(tmp_path):
     weak_wamest = registry[registry["source_key"] == "weak_revaluation_wam_rows"].iloc[0]
     assert not weak_wamest["central_default_eligible"]
     assert weak_wamest["sensitivity_only"]
+    mmf_disclosure = registry[
+        registry["source_key"] == "mmf_collapsed_into_du_current_private_bucket"
+    ].iloc[0]
+    assert mmf_disclosure["central_default_eligible"]
+    assert "full_private_mmf_route_split_owner_gated" in mmf_disclosure["binding_blocker"]
 
 
 def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_path):
@@ -352,6 +420,27 @@ def test_ratewall_input_builder_parses_cbo_billions_section():
     assert -values[2026]["deficit_bil"] - values[2026]["net_interest_bil"] > 800
 
 
+def test_primary_flow_path_maps_cbo_fiscal_year_to_calendar_quarters(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rib,
+        "_cbo_budget_values",
+        lambda path: {2026: {"deficit_bil": -1200.0, "net_interest_bil": 200.0}},
+    )
+
+    frame, metadata = build_primary_flow_path(
+        tmp_path / "primary_flow.csv",
+        cbo_budget_path=tmp_path / "fake_cbo.xlsx",
+        scenario_ids=["baseline"],
+    )
+
+    assert metadata["rows"] == 4
+    assert frame["quarter"].tolist() == ["2025Q4", "2026Q1", "2026Q2", "2026Q3"]
+    assert set(frame["primary_fiscal_flow_to_du_bil"].astype(float)) == {250.0}
+    assert frame["source_status"].str.contains(
+        "federal_fiscal_year_mapped_to_calendar_quarters"
+    ).all()
+
+
 def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
     repo_root = Path(__file__).resolve().parents[2]
     ratewall_root = repo_root.parent / "ratewall"
@@ -404,6 +493,9 @@ def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
         assert abs(current[column].astype(float).sum() - 1.0) < 1e-9
     banks = current[current["holder_type"] == "Banks"].iloc[0]
     assert banks["bills_pct"] != banks["notes_pct"]
+    private = current[current["holder_type"] == "Private"].iloc[0]
+    assert str(private["mmf_collapsed_into_du"]).lower() == "true"
+    assert "mmf_collapsed_into_du_current_private_bucket" in private["source_status"]
 
 
 def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tmp_path):

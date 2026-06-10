@@ -124,7 +124,7 @@ def _components_for_summary(summary: pd.DataFrame) -> pd.DataFrame:
         ("coupon_interest_to_du", "coupon_interest_to_du_bil", "DU", "Fixed", "coupon_interest", "true", "false"),
         ("frn_interest_to_du", "frn_interest_to_du_bil", "DU", "FRN", "frn_interest", "true", "false"),
         ("tips_coupon_interest_to_du", "tips_coupon_interest_to_du_bil", "DU", "TIPS", "tips_coupon_interest", "true", "false"),
-        ("tips_inflation_compensation_to_du", "tips_inflation_compensation_to_du_bil", "DU", "TIPS", "tips_inflation_compensation", "false", "true"),
+        ("tips_inflation_compensation_to_du", "tips_inflation_compensation_to_du_bil", "DU", "TIPS", "tips_inflation_compensation", "false", "false"),
         ("central_bank_remittance_to_tga", "cb_remittance_to_tga_bil", "CB", "FedInternal", "central_bank_remittance_to_tga", "false", "false"),
     ]
     for _, summary_row in summary.iterrows():
@@ -185,6 +185,15 @@ def _source_registry_rows(config: dict | None = None) -> list[dict[str, str]]:
             "central_default_eligible": "true",
             "sensitivity_only": "false",
             "binding_blocker": "",
+        },
+        {
+            "source_family": "tdcsim_holder_bucket_limitation",
+            "source_key": "mmf_collapsed_into_du_current_private_bucket",
+            "source_status": "central_path_private_holder_bucket_includes_mmf_cash_fund_route",
+            "ratewall_role": "bias_direction_disclosure_for_holder_absorption_path",
+            "central_default_eligible": "true",
+            "sensitivity_only": "false",
+            "binding_blocker": "full_private_mmf_route_split_owner_gated",
         },
     ]
     input_manifest_path = config.get("input_manifest") if isinstance(config, dict) else None
