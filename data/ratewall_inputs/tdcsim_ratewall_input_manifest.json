@@ -1,0 +1,66 @@
+{
+  "artifacts": {
+    "holder_absorption": {
+      "baseline_sources": "tdcmix_prior_contract;z1_exact_recent_positive_absorption;primary_market_instrument_buyer_composition",
+      "bills_primary_path": "/Users/shanewray/malus/proj/tsyparty/data/interim/bills_quarterly_composition.csv",
+      "coupons_primary_path": "/Users/shanewray/malus/proj/tsyparty/data/interim/nominal_coupons_quarterly_composition.csv",
+      "dealer_bridge_mapping": "dealers_mapped_to_banks_ru_for_auction_settlement_not_final_holder_claim",
+      "rows": 1232,
+      "tdcmix_prior_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/holder_absorption_prior_contract.csv",
+      "z1_absorption_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/z1_exact_holder_absorption_panel.csv"
+    },
+    "initial_portfolio": {
+      "holder_stock_share_source": "/Users/shanewray/malus/proj/tsyparty/data/interim/z1_holdings_wide.csv",
+      "mspd_record_date": "2026-04-30",
+      "rows": 1840,
+      "source_url_table_1": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/debt/mspd/mspd_table_1",
+      "source_url_table_3_market": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/debt/mspd/mspd_table_3_market"
+    },
+    "interest_component": {
+      "rows": 6
+    },
+    "primary_flow": {
+      "cbo_budget_path": "/Users/shanewray/malus/proj/ratewall/data/raw/cbo/51118-2026-02-Budget-Projections.xlsx",
+      "rows": 308
+    },
+    "yield_curve": {
+      "rows": 1760,
+      "treasury_curve_date": "2026-05-21"
+    }
+  },
+  "claim_boundary": "tdcsim_ratewall_source_backed_input_contract_not_evidence_mode",
+  "created_at": "2026-05-22T16:46:49.904410+00:00",
+  "files": {
+    "tdc_config_ratewall_source_backed.yaml": {
+      "bytes": 5031,
+      "sha256": "a683e7ce3ce59d0cdafb8c4433f60689033582c6de19fed0dd7794c16721172c"
+    },
+    "tdcsim_holder_absorption_path.csv": {
+      "bytes": 751692,
+      "sha256": "b91aa2c64b61474ec6adceeae37e9817f8b1e8c21a91418373d716b2a382b0c7"
+    },
+    "tdcsim_initial_portfolio_cohorts.csv": {
+      "bytes": 1277497,
+      "sha256": "fcb17dc61f9ff81f6a01f8a13f395930ea3e3715c71d54a3954ec32927a8cf51"
+    },
+    "tdcsim_interest_component_contract.csv": {
+      "bytes": 1589,
+      "sha256": "708978e9a1da5f9c26740c9ed41b974a835ad14dc34cf0c01812f70c68edb5d0"
+    },
+    "tdcsim_primary_flow_to_du_path.csv": {
+      "bytes": 121257,
+      "sha256": "61708d3e240ca2c3a4ebba26e0afc942ebae821ec5179bceab6c92b0cd361c28"
+    },
+    "tdcsim_yield_curve_surface.csv": {
+      "bytes": 796367,
+      "sha256": "13c8c2d11379179ce13d14a6c68c1bd760f5a02a75aa6c4a58c41fd3cc9eb757"
+    }
+  },
+  "schema_version": "0.1.0",
+  "source_hierarchy": {
+    "bond_history": "FiscalData MSPD security cohorts scaled to MSPD Table 1 class totals plus public aggregate holder constraints",
+    "holder_absorption": "instrument-specific holder absorption priors from tdcmix, recent z1 exact absorption, and tsyparty primary-market buyer composition; not holder-allocation evidence",
+    "primary_flow": "CBO total deficit less net interest as aggregate cash proxy",
+    "yield_curve": "Treasury daily par curve shape shifted to CBO 3-month and 10-year projected anchors"
+  }
+}

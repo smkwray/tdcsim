@@ -34,6 +34,13 @@ from sim_pricing import (
 )
 from sim_trading import execute_preference_trades
 from tdc_validation import is_coarse_frequency
+from ratewall_paths import (
+    holder_preferences_for_period,
+    load_holder_absorption_path,
+    load_primary_flow_path,
+    primary_flow_for_period,
+)
+from yield_curve_path import curve_for_date, load_yield_curve_surface
 
 
 def _get_rate_sensitive_multipliers_config(rate_sensitive_params):
@@ -183,6 +190,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             start_date_pd = start_date_pd - timedelta(days=start_date_pd.weekday())
         dates = pd.date_range(start_date_pd, end_date_pd, freq=freq, name='Date')
         num_periods = len(dates)
+        period_counts_by_quarter = (
+            pd.Series([f"{date.year}Q{date.quarter}" for date in dates[1:]])
+            .value_counts()
+            .astype(int)
+            .to_dict()
+        )
     except Exception as e:
         print(f'ERROR [{scenario_name}]: Failed to create date range: {e}')
         return (pd.DataFrame(), pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
@@ -192,7 +205,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         empty_results = pd.DataFrame(index=dates, columns=results_cols_on_skip, dtype=float).fillna(0.0)
         return (empty_results, pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
     print(f'--- Starting Simulation: {scenario_name} ---')
-    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI']
+    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
     raw_events = params.get('events', [])
     scheduled_events = defaultdict(list)
@@ -223,6 +236,26 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         yield_p = copy.deepcopy(params.get('yield_curve', {}))
         current_yield_curve_years = yield_p.get('years', [])
         current_yield_curve_rates = yield_p.get('rates', [])
+        yield_curve_surface = pd.DataFrame()
+        yield_curve_surface_status = 'static_curve_no_surface'
+        surface_cfg = params.get('yield_curve_surface', {})
+        if isinstance(surface_cfg, dict) and surface_cfg.get('file'):
+            yield_curve_surface = load_yield_curve_surface(surface_cfg.get('file'))
+            surface_years, surface_rates, yield_curve_surface_status = curve_for_date(
+                yield_curve_surface,
+                start_date,
+                scenario_id=surface_cfg.get('scenario_id'),
+            )
+            if surface_years and surface_rates:
+                current_yield_curve_years = surface_years
+                current_yield_curve_rates = surface_rates
+        ratewall_input_cfg = params.get('ratewall_input_paths', {})
+        primary_flow_lookup = {}
+        holder_absorption_lookup = {}
+        if isinstance(ratewall_input_cfg, dict):
+            source_base_dir = ratewall_input_cfg.get('base_dir')
+            primary_flow_lookup = load_primary_flow_path(ratewall_input_cfg, base_dir=source_base_dir)
+            holder_absorption_lookup = load_holder_absorption_path(ratewall_input_cfg, base_dir=source_base_dir)
         fiscal_p = params.get('fiscal_params', {})
         current_fiscal_params = copy.deepcopy(fiscal_p)
         q_start_spending = current_fiscal_params.get('initial_weekly_spending', 0.0)
@@ -324,7 +357,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         bond_portfolio = bond_portfolio[BOND_PORTFOLIO_COLS]
         try:
             bond_portfolio = bond_portfolio.astype(PORTFOLIO_DTYPES, errors='ignore')
-        except Exception as e:
+        except Exception:
             bond_portfolio = pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES)
         if not bond_portfolio.empty:
             issue_price_missing = bond_portfolio['IssuePriceRatio'].isna() | (bond_portfolio['IssuePriceRatio'] <= TGA_FLOOR_TOLERANCE)
@@ -381,7 +414,6 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     bond_id_counter = int(max_existing_id) + 1
     last_quarter_start_date = t0
     weeks_in_quarter = 0
-    last_cpi_update_date = t0
     for i in range(1, num_periods):
         prev_date = dates[i - 1]
         current_date = dates[i]
@@ -431,11 +463,19 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             nonmkt_rate_mats = current_nonmkt_params.get('interest_rate_basis_maturities', nonmkt_rate_mats)
             nonmkt_credit_freq = current_nonmkt_params.get('interest_crediting_frequency', nonmkt_credit_freq)
             include_tips_inflation_accretion = bool(financing_cost_options.get('include_tips_inflation_accretion', include_tips_inflation_accretion))
+        if not yield_curve_surface.empty:
+            surface_cfg = params.get('yield_curve_surface', {})
+            surface_years, surface_rates, yield_curve_surface_status = curve_for_date(
+                yield_curve_surface,
+                current_date,
+                scenario_id=surface_cfg.get('scenario_id') if isinstance(surface_cfg, dict) else None,
+            )
+            if surface_years and surface_rates:
+                current_yield_curve_years = surface_years
+                current_yield_curve_rates = surface_rates
         reserve_change_period = 0.0
         deposit_change_period = 0.0
         tga_change_period = 0.0
-        reserve_change_secondary_mkt = 0.0
-        deposit_change_secondary_mkt = 0.0
         tga_inflow_secondary_mkt = 0.0
         tga_drain_secondary_mkt = 0.0
         pref_trade_monetary_impact = {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0}
@@ -500,6 +540,15 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         interp_weight = min(1.0, weeks_in_quarter / approx_weeks_in_qtr)
         gov_spending_period = q_start_spending + (q_end_target_spending - q_start_spending) * interp_weight
         taxes_period = q_start_taxes + (q_end_target_taxes - q_start_taxes) * interp_weight
+        path_fiscal_flow = primary_flow_for_period(
+            primary_flow_lookup,
+            scenario_name=scenario_name,
+            current_date=current_date,
+            period_counts_by_quarter=period_counts_by_quarter,
+        )
+        if path_fiscal_flow is not None:
+            gov_spending_period = max(float(path_fiscal_flow), 0.0)
+            taxes_period = max(-float(path_fiscal_flow), 0.0)
         results.loc[current_date, 'GovSpending'] = gov_spending_period
         results.loc[current_date, 'Taxes'] = taxes_period
         results.loc[current_date, 'PrimaryDeficit'] = gov_spending_period - taxes_period
@@ -511,6 +560,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         tga_change_period += fiscal_tga_change
         principal_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
         interest_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        principal_component_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        bill_discount_interest_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        coupon_interest_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        frn_interest_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        tips_coupon_interest_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        tips_inflation_compensation_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
         total_principal_paid_period = 0.0
         total_interest_paid_period = 0.0
         maturing_mask = bond_portfolio['MaturityDate'].notna() & (bond_portfolio['MaturityDate'] > prev_date) & (bond_portfolio['MaturityDate'] <= current_date) & (bond_portfolio['Status'] == 'Active')
@@ -521,26 +576,56 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             for idx, bond in maturing_tranches.iterrows():
                 principal_payment = 0.0
                 interest_payment = 0.0
+                bill_discount_interest_payment = 0.0
+                tips_inflation_compensation_payment = 0.0
                 holder = bond['HolderType']
                 face_value = bond['FaceValue']
                 coupon_rate = bond['CouponRate']
-                issue_date = bond['IssueDate']
                 maturity_date = bond['MaturityDate']
                 security_type = bond['SecurityType']
                 if security_type == 'TIPS':
                     principal_payment = max(bond.get('OriginalPrincipal', 0.0), bond.get('AdjustedPrincipal', 0.0))
+                    original_principal = bond.get('OriginalPrincipal', 0.0)
+                    tips_inflation_compensation_payment = max(0.0, principal_payment - original_principal)
                 elif security_type in ['Fixed', 'FRN', 'NonMarketable']:
                     principal_payment = face_value
+                    original_maturity_years = bond.get('OriginalMaturityYears', np.inf)
+                    original_maturity_years = (
+                        np.inf
+                        if pd.isna(original_maturity_years)
+                        else float(original_maturity_years)
+                    )
+                    is_bill = (
+                        security_type == 'Fixed'
+                        and coupon_rate <= TGA_FLOOR_TOLERANCE
+                        and original_maturity_years <= 1.0 + TGA_FLOOR_TOLERANCE
+                    )
+                    if is_bill:
+                        issue_proceeds = bond.get('IssueProceeds', face_value)
+                        issue_proceeds = 0.0 if pd.isna(issue_proceeds) else float(issue_proceeds)
+                        bill_discount_interest_payment = max(0.0, face_value - issue_proceeds)
                 if security_type == 'FRN':
                     interest_payment = bond.get('AccruedInterest_FRN', 0.0)
                     bond_portfolio.loc[idx, 'AccruedInterest_FRN'] = 0.0
+                    frn_interest_paid_by_holder[holder] += interest_payment
                 elif security_type in ['Fixed', 'TIPS'] and coupon_rate > TGA_FLOOR_TOLERANCE:
                     coupon_freq = 2
                     adj_p = bond.get('AdjustedPrincipal') if security_type == 'TIPS' else None
                     principal_base = adj_p if security_type == 'TIPS' and adj_p is not None else face_value
                     interest_payment = principal_base * coupon_rate / coupon_freq
+                    if security_type == 'TIPS':
+                        tips_coupon_interest_paid_by_holder[holder] += interest_payment
+                    else:
+                        coupon_interest_paid_by_holder[holder] += interest_payment
                 principal_paid_by_holder[holder] += principal_payment
                 interest_paid_by_holder[holder] += interest_payment
+                principal_component_paid_by_holder[holder] += max(
+                    0.0, principal_payment - bill_discount_interest_payment
+                )
+                bill_discount_interest_paid_by_holder[holder] += bill_discount_interest_payment
+                tips_inflation_compensation_paid_by_holder[holder] += (
+                    tips_inflation_compensation_payment
+                )
                 total_principal_paid_period += principal_payment
                 total_interest_paid_period += interest_payment
         active_mask = bond_portfolio['Status'] == 'Active'
@@ -560,6 +645,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 pmt_by_holder = payment_amount.groupby(bond_portfolio.loc[frn_paying_indices, 'HolderType']).sum().to_dict()
                 for h, pmt in pmt_by_holder.items():
                     interest_paid_by_holder[h] += pmt
+                    frn_interest_paid_by_holder[h] += pmt
                 bond_portfolio.loc[frn_paying_indices, 'AccruedInterest_FRN'] = 0.0
                 total_interest_paid_period += payment_amount.sum()
         fixed_tips_mask = active_mask & bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS']) & (bond_portfolio['CouponRate'] > TGA_FLOOR_TOLERANCE)
@@ -580,6 +666,16 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 pmt_by_holder = payment_amount.groupby(paying_tranches['HolderType']).sum().to_dict()
                 for h, pmt in pmt_by_holder.items():
                     interest_paid_by_holder[h] += pmt
+                    fixed_payment = paying_tranches.loc[paying_tranches['HolderType'] == h]
+                    if not fixed_payment.empty:
+                        fixed_amount = payment_amount.loc[fixed_payment.index]
+                        tips_mask_for_holder = fixed_payment['SecurityType'] == 'TIPS'
+                        tips_coupon_interest_paid_by_holder[h] += fixed_amount.loc[
+                            tips_mask_for_holder
+                        ].sum()
+                        coupon_interest_paid_by_holder[h] += fixed_amount.loc[
+                            ~tips_mask_for_holder
+                        ].sum()
                 total_interest_paid_period += payment_amount.sum()
         nonmkt_mask = active_mask & (bond_portfolio['SecurityType'] == 'NonMarketable')
         if nonmkt_mask.any():
@@ -689,6 +785,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         issue_discount_cost_period = 0.0
         results.loc[current_date, 'IssuanceProceedsTarget'] = total_issuance_target_period
         if total_issuance_target_period > TGA_FLOOR_TOLERANCE:
+            effective_auction_prefs_for_period = holder_preferences_for_period(
+                holder_absorption_lookup,
+                scenario_name=scenario_name,
+                current_date=current_date,
+                fallback_preferences=current_auction_prefs,
+            )
             tips_pct = issuance_profile.get('TIPS', {}).get('target_percentage', 0.0)
             frn_pct = issuance_profile.get('FRN', {}).get('target_percentage', 0.0)
             nonmkt_pct_profile = issuance_profile.get('NonMarketable', {}).get('target_percentage', 0.0)
@@ -773,7 +875,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 anchor_yield, curve_slope = _get_curve_reference_levels(rate_sensitive_p, current_yield_curve_years, current_yield_curve_rates)
                 holder_share_weights = {}
                 for holder in HOLDER_TYPES:
-                    holder_prefs = current_auction_prefs.get(holder, {})
+                    holder_prefs = effective_auction_prefs_for_period.get(holder, {})
                     base_pref_pct = float(holder_prefs.get(f'{pref_category_key}_pct', 0.0) or 0.0)
                     multiplier = _compute_rate_sensitive_multiplier(
                         rate_sensitive_p, 'auction', holder, pref_category_key, item_yield, anchor_yield, curve_slope
@@ -950,6 +1052,22 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         results.loc[current_date, 'TDC_AuctionAbsorption'] = issuance_deposit_change
         results.loc[current_date, 'TDC_SecondaryTrades'] = pref_trade_monetary_impact.get('deposit_change', 0.0)
         results.loc[current_date, 'TDC_Other'] = other_deposit_change
+        private_secondary_change = pref_trade_monetary_impact.get('deposit_change', 0.0)
+        results.loc[current_date, 'TDC_PrincipalToDU'] = principal_component_paid_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_BillDiscountInterestToDU'] = bill_discount_interest_paid_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_CouponInterestToDU'] = coupon_interest_paid_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_FRNInterestToDU'] = frn_interest_paid_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_TIPSCouponInterestToDU'] = tips_coupon_interest_paid_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_TIPSInflationCompensationToDU'] = tips_inflation_compensation_paid_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_InterestToDU'] = (
+            results.loc[current_date, 'TDC_BillDiscountInterestToDU']
+            + results.loc[current_date, 'TDC_CouponInterestToDU']
+            + results.loc[current_date, 'TDC_FRNInterestToDU']
+            + results.loc[current_date, 'TDC_TIPSCouponInterestToDU']
+        )
+        results.loc[current_date, 'TDC_GrossIssuanceProceedsAbsorbedByDU'] = total_issued_proceeds_by_holder.get('Private', 0.0)
+        results.loc[current_date, 'TDC_SecondaryDUToRU'] = max(0.0, private_secondary_change)
+        results.loc[current_date, 'TDC_SecondaryRUToDU'] = max(0.0, -private_secondary_change)
         results.loc[current_date, 'AuctionDemandShift_AvgAbs'] = (
             auction_shift_weighted_sum / auction_shift_weight_total if auction_shift_weight_total > TGA_FLOOR_TOLERANCE else 0.0
         )
@@ -962,7 +1080,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     if not bond_portfolio.empty:
         try:
             final_portfolio_out = bond_portfolio[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES, errors='ignore')
-        except Exception as e:
+        except Exception:
             final_portfolio_out = bond_portfolio
     results.attrs['run_metadata'] = {
         'scenario_name': scenario_name,
@@ -974,6 +1092,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         'uses_legacy_sector_preferences_for_secondary': uses_legacy_sector_prefs_for_secondary,
         'rate_sensitive_demand_enabled': bool(rate_sensitive_p.get('enabled', False)),
         'includes_tips_inflation_accretion': bool(include_tips_inflation_accretion),
+        'yield_curve_surface_status': yield_curve_surface_status,
         'coarse_frequency_warning': coarse_frequency_warning,
         'auction_demand_shift_avgabs_mean': float(results['AuctionDemandShift_AvgAbs'].iloc[1:].mean()) if len(results.index) > 1 else 0.0,
         'secondary_demand_shift_avgabs_mean': float(results['SecondaryDemandShift_AvgAbs'].iloc[1:].mean()) if len(results.index) > 1 else 0.0,

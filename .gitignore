@@ -35,6 +35,7 @@ htmlcov/
 
 # Agent metadata
 .agent/
+do/
 
 # Local archives
 src.zip
