@@ -20,6 +20,9 @@ def load_yield_curve_surface(path: str | Path | None) -> pd.DataFrame:
 
     if not path:
         return pd.DataFrame()
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"yield curve surface file is missing: {path}")
     surface = pd.read_csv(path)
     missing = REQUIRED_CURVE_COLUMNS - set(surface.columns)
     if missing:
@@ -56,4 +59,3 @@ def curve_for_date(
         [float(v) for v in curve["nominal_rate"].tolist()],
         f"dynamic_curve_surface:{curve_date.date()}",
     )
-

@@ -252,6 +252,9 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         ratewall_input_cfg = params.get('ratewall_input_paths', {})
         primary_flow_lookup = {}
         holder_absorption_lookup = {}
+        primary_flow_warning_cache = set()
+        holder_absorption_warning_cache = set()
+        primary_flow_path_used_count = 0
         if isinstance(ratewall_input_cfg, dict):
             source_base_dir = ratewall_input_cfg.get('base_dir')
             primary_flow_lookup = load_primary_flow_path(ratewall_input_cfg, base_dir=source_base_dir)
@@ -262,6 +265,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         q_start_taxes = current_fiscal_params.get('initial_weekly_taxes', 0.0)
         spending_growth_qtr = current_fiscal_params.get('spending_growth_qtr', 0.0)
         tax_growth_qtr = current_fiscal_params.get('tax_growth_qtr', 0.0)
+        du_share_spending = current_fiscal_params.get('du_share_spending', 1.0)
+        du_share_taxes = current_fiscal_params.get('du_share_taxes', 1.0)
         q_end_target_spending = q_start_spending * (1 + spending_growth_qtr)
         q_end_target_taxes = q_start_taxes * (1 + tax_growth_qtr)
         tga_p = params.get('tga_params', {})
@@ -300,7 +305,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     except Exception as e:
         print(f'ERROR [{scenario_name}]: Failed during parameter extraction/initialization: {e}')
         traceback.print_exc()
-        return (pd.DataFrame(), pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
+        raise
     t0 = dates[0]
     pre_t0_event_actions = []
     for event_date in sorted(scheduled_events.keys()):
@@ -328,6 +333,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         q_start_taxes = current_fiscal_params.get('initial_weekly_taxes', q_start_taxes)
         spending_growth_qtr = current_fiscal_params.get('spending_growth_qtr', spending_growth_qtr)
         tax_growth_qtr = current_fiscal_params.get('tax_growth_qtr', tax_growth_qtr)
+        du_share_spending = current_fiscal_params.get('du_share_spending', du_share_spending)
+        du_share_taxes = current_fiscal_params.get('du_share_taxes', du_share_taxes)
         q_end_target_spending = q_start_spending * (1 + spending_growth_qtr)
         q_end_target_taxes = q_start_taxes * (1 + tax_growth_qtr)
         tga_target = current_tga_params.get('target_balance', tga_target)
@@ -448,6 +455,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             q_start_taxes = current_fiscal_params.get('initial_weekly_taxes', q_start_taxes)
             spending_growth_qtr = current_fiscal_params.get('spending_growth_qtr', spending_growth_qtr)
             tax_growth_qtr = current_fiscal_params.get('tax_growth_qtr', tax_growth_qtr)
+            du_share_spending = current_fiscal_params.get('du_share_spending', du_share_spending)
+            du_share_taxes = current_fiscal_params.get('du_share_taxes', du_share_taxes)
             q_end_target_spending = q_start_spending * (1 + spending_growth_qtr)
             q_end_target_taxes = q_start_taxes * (1 + tax_growth_qtr)
             last_quarter_start_date = current_date
@@ -506,7 +515,6 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             )
             ref_cpi_issue = bond_portfolio.loc[tips_mask, 'ReferenceCPI_Issue']
             index_ratio = np.where(ref_cpi_issue > TGA_FLOOR_TOLERANCE, current_ref_cpi / ref_cpi_issue, 1.0)
-            index_ratio = np.maximum(index_ratio, 1.0)
             bond_portfolio.loc[tips_mask, 'IndexRatio'] = index_ratio
             original_principal = bond_portfolio.loc[tips_mask, 'OriginalPrincipal']
             new_adjusted_principal = original_principal * index_ratio
@@ -545,15 +553,20 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             scenario_name=scenario_name,
             current_date=current_date,
             period_counts_by_quarter=period_counts_by_quarter,
+            warning_cache=primary_flow_warning_cache,
         )
         if path_fiscal_flow is not None:
+            primary_flow_path_used_count += 1
             gov_spending_period = max(float(path_fiscal_flow), 0.0)
             taxes_period = max(-float(path_fiscal_flow), 0.0)
         results.loc[current_date, 'GovSpending'] = gov_spending_period
         results.loc[current_date, 'Taxes'] = taxes_period
         results.loc[current_date, 'PrimaryDeficit'] = gov_spending_period - taxes_period
         fiscal_reserve_change = gov_spending_period - taxes_period
-        fiscal_deposit_change = gov_spending_period - taxes_period
+        fiscal_deposit_change = (
+            gov_spending_period * float(du_share_spending)
+            - taxes_period * float(du_share_taxes)
+        )
         fiscal_tga_change = taxes_period - gov_spending_period
         reserve_change_period += fiscal_reserve_change
         deposit_change_period += fiscal_deposit_change
@@ -790,6 +803,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 scenario_name=scenario_name,
                 current_date=current_date,
                 fallback_preferences=current_auction_prefs,
+                warning_cache=holder_absorption_warning_cache,
             )
             tips_pct = issuance_profile.get('TIPS', {}).get('target_percentage', 0.0)
             frn_pct = issuance_profile.get('FRN', {}).get('target_percentage', 0.0)
@@ -1035,9 +1049,14 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         prev_deposits = results.loc[prev_date, 'TDC_Level']
         prev_tga = results.loc[prev_date, 'TGA']
         projected_tga = prev_tga + tga_change_period
-        current_tga = max(tga_floor, projected_tga)
-        tga_discrepancy = current_tga - projected_tga
-        adjusted_reserve_change_period = reserve_change_period + tga_discrepancy
+        tga_discrepancy = tga_floor - projected_tga
+        if tga_discrepancy > TGA_FLOOR_TOLERANCE:
+            raise RuntimeError(
+                f"TGA floor would bind without explicit financing at {current_date.date()}: "
+                f"shortfall={tga_discrepancy:.12f}"
+            )
+        current_tga = projected_tga
+        adjusted_reserve_change_period = reserve_change_period
         adjusted_deposit_change_period = deposit_change_period
         current_reserves = prev_reserves + adjusted_reserve_change_period
         current_deposits = prev_deposits + adjusted_deposit_change_period
@@ -1093,6 +1112,13 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         'rate_sensitive_demand_enabled': bool(rate_sensitive_p.get('enabled', False)),
         'includes_tips_inflation_accretion': bool(include_tips_inflation_accretion),
         'yield_curve_surface_status': yield_curve_surface_status,
+        'ratewall_primary_flow_status': (
+            'aggregate_cash_proxy_from_cbo_total_deficit_less_net_interest'
+            if primary_flow_path_used_count > 0
+            else 'simulation_fiscal_flow_to_du_proxy'
+        ),
+        'ratewall_primary_flow_loaded_rows': sum(len(rows) for rows in primary_flow_lookup.values()),
+        'ratewall_primary_flow_used_periods': primary_flow_path_used_count,
         'coarse_frequency_warning': coarse_frequency_warning,
         'auction_demand_shift_avgabs_mean': float(results['AuctionDemandShift_AvgAbs'].iloc[1:].mean()) if len(results.index) > 1 else 0.0,
         'secondary_demand_shift_avgabs_mean': float(results['SecondaryDemandShift_AvgAbs'].iloc[1:].mean()) if len(results.index) > 1 else 0.0,

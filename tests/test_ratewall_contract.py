@@ -221,6 +221,99 @@ def test_dynamic_yield_curve_surface_applies_by_period(tmp_path):
     assert status == "dynamic_curve_surface:2025-04-01"
 
 
+def test_dynamic_yield_curve_surface_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="yield curve surface file is missing"):
+        load_yield_curve_surface(tmp_path / "missing_curve.csv")
+
+
+def test_ratewall_configured_missing_input_paths_raise(tmp_path):
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "primary_flow_to_du_file": str(tmp_path / "missing_primary.csv"),
+    }
+
+    with pytest.raises(FileNotFoundError, match="Primary flow path file is missing"):
+        run_simulation(
+            params,
+            "2025-01-01",
+            "2025-01-19",
+            freq="W",
+            scenario_name="missing_primary_case",
+        )
+
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "holder_absorption_path_file": str(tmp_path / "missing_holder.csv"),
+    }
+    with pytest.raises(FileNotFoundError, match="Holder absorption path file is missing"):
+        run_simulation(
+            params,
+            "2025-01-01",
+            "2025-01-19",
+            freq="W",
+            scenario_name="missing_holder_case",
+        )
+
+
+def test_ratewall_primary_flow_fallback_warns_once(tmp_path, capsys):
+    flow_path = tmp_path / "primary_flow.csv"
+    pd.DataFrame(
+        [
+            {
+                "scenario_id": "default",
+                "quarter": "2025Q1",
+                "primary_fiscal_flow_to_du_bil": 30.0,
+            }
+        ]
+    ).to_csv(flow_path, index=False)
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "primary_flow_to_du_file": str(flow_path),
+    }
+
+    results, _ = run_simulation(
+        params,
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="unlisted_scenario",
+    )
+
+    captured = capsys.readouterr()
+    assert "primary_flow path used fallback scenario 'default'" in captured.out
+    assert captured.out.count("primary_flow path used fallback scenario") == 1
+    assert results.attrs["run_metadata"]["ratewall_primary_flow_used_periods"] > 0
+
+
+def test_ratewall_contract_status_reflects_empty_loaded_primary_flow(tmp_path):
+    flow_path = tmp_path / "empty_primary_flow.csv"
+    pd.DataFrame(columns=["scenario_id", "quarter", "primary_fiscal_flow_to_du_bil"]).to_csv(
+        flow_path,
+        index=False,
+    )
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "primary_flow_to_du_file": str(flow_path),
+    }
+    results, _ = run_simulation(
+        params,
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="empty_flow_case",
+    )
+
+    paths = export_ratewall_bundle(
+        {"empty_flow_case": results},
+        tmp_path / "bundle",
+        config={"ratewall_input_paths": {"primary_flow_to_du_file": str(flow_path)}},
+    )
+    summary = pd.read_csv(paths["summary"])
+
+    assert results.attrs["run_metadata"]["ratewall_primary_flow_loaded_rows"] == 0
+    assert set(summary["primary_flow_status"]) == {"simulation_fiscal_flow_to_du_proxy"}
+
+
 def test_ratewall_source_registry_blocks_weak_wamest_rows(tmp_path):
     results, _ = run_simulation(
         minimal_params(),
@@ -401,9 +494,7 @@ def test_ratewall_contract_primary_flow_status_uses_input_manifest(tmp_path):
     registry = pd.read_csv(paths["source_registry"])
     manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
 
-    assert set(summary["primary_flow_status"]) == {
-        "aggregate_cash_proxy_from_cbo_total_deficit_less_net_interest",
-    }
+    assert set(summary["primary_flow_status"]) == {"simulation_fiscal_flow_to_du_proxy"}
     assert "tdcsim_primary_flow_to_du_path.csv" in set(registry["source_key"])
     assert "tdcsim_primary_flow_to_du_path.csv" in manifest["input_artifacts"]
 

@@ -28,3 +28,14 @@ Interpretation:
 
 - the numbers are scenario coefficients, not empirical estimates
 - they are meant to generate moderate comparative statics, not to imply a fitted demand curve
+
+## Source-Backed RateWall Input Builder Notes
+
+These notes document judgment calls in `src/ratewall_input_builder.py`; they are not recalibrations.
+
+- `z1_recent` blend weight `0.50`: equal-weight shrinkage keeps the tdcmix prior live while allowing the latest Z.1 positive-absorption panel to move the central holder mix.
+- primary-market instrument blend weight `0.20`: auction-allotment composition informs instrument-specific shares without overriding the broader stock/flow holder priors.
+- holder-shift scenario blend weight `0.60`: sensitivity scenarios are intentionally more responsive to tdcmix upper/lower priors while retaining continuity with the central baseline.
+- MMF rows collapsed into `Private`: the current tdcsim holder perimeter has no source-backed split for MMF cash-fund routing, so the central path flags the known bias rather than inventing a split.
+- dealers mapped to `Banks`: primary-dealer auction allotments are treated as reserve-user settlement bridge activity, not as final holder evidence.
+- bill price-ratio floor `0.75`: the floor prevents malformed or extreme yield/maturity inputs from generating implausibly low synthetic bill proceeds in source-backed cohort construction.
