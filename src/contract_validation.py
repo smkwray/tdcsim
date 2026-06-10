@@ -80,8 +80,23 @@ def validate_ratewall_contract(
     if not dual_entry.empty:
         failures.append("component_dual_entry")
 
+    tdc_default_components = components[
+        components["enters_tdc_deposit_support_default"].astype(str).str.lower() == "true"
+    ]
+    default_sums: dict[tuple[str, str], Decimal] = {}
+    for _, row in tdc_default_components.iterrows():
+        key = (str(row["scenario_id"]), str(row["quarter"]))
+        default_sums[key] = default_sums.get(key, Decimal("0")) + _decimal(row["amount_bil"])
+    for _, row in summary.iterrows():
+        key = (str(row["scenario_id"]), str(row["quarter"]))
+        expected = _decimal(row["tdc_change_bil"]) - _decimal(row["overlap_cashflow_bil"])
+        actual = default_sums.get(key, Decimal("0"))
+        if abs(actual - expected) > IDENTITY_TOLERANCE:
+            failures.append(
+                f"component_tdc_default_identity:{row['scenario_id']}:{row['quarter']}:{actual}:{expected}"
+            )
+
     return {
         "validation_status": "pass" if not failures else "fail",
         "failure_reasons": "" if not failures else ";".join(failures),
     }
-

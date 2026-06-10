@@ -241,7 +241,7 @@ Mergeable examples live in [examples/optional_feature_scenarios.yaml](/Users/sha
 ## Important assumptions and conventions
 
 1. **TDC is a contribution, not the whole deposit stock.** The model isolates the Treasury-attributable contribution to DU deposit dynamics.
-2. **Private = the DU proxy.** In the implementation, `Private` is the domestic nonbank holder bucket most closely aligned with the DU ledger.
+2. **Private = the DU proxy.** In the implementation, `Private` is the domestic nonbank holder bucket most closely aligned with the DU ledger. Current source-backed holder paths collapse MMFs into `Private`, which can overstate deposit-draining auction absorption and deposit-supporting debt service where MMF routing is material.
 3. **RU is a settlement label.** It includes entities outside the DU deposit ledger and does not mean every included entity literally holds reserves.
 4. **Intragovernmental holders are split into FedInternal and TrustFunds.** Both are intragovernmental (P&I is a TGA/TOC wash, no reserve or deposit impact).
 5. **Monetary units are billions USD.** Time units are years (for yields, TTM, WAM).

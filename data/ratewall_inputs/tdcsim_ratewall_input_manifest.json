@@ -5,7 +5,7 @@
       "bills_primary_path": "/Users/shanewray/malus/proj/tsyparty/data/interim/bills_quarterly_composition.csv",
       "coupons_primary_path": "/Users/shanewray/malus/proj/tsyparty/data/interim/nominal_coupons_quarterly_composition.csv",
       "dealer_bridge_mapping": "dealers_mapped_to_banks_ru_for_auction_settlement_not_final_holder_claim",
-      "rows": 1232,
+      "rows": 1936,
       "tdcmix_prior_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/holder_absorption_prior_contract.csv",
       "z1_absorption_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/z1_exact_holder_absorption_panel.csv"
     },
@@ -21,7 +21,8 @@
     },
     "primary_flow": {
       "cbo_budget_path": "/Users/shanewray/malus/proj/ratewall/data/raw/cbo/51118-2026-02-Budget-Projections.xlsx",
-      "rows": 308
+      "fiscal_year_calendar_mapping": "federal_fy_y_to_calendar_y_minus_1_q4_through_y_q3",
+      "rows": 484
     },
     "yield_curve": {
       "rows": 1760,
@@ -36,8 +37,8 @@
       "sha256": "a683e7ce3ce59d0cdafb8c4433f60689033582c6de19fed0dd7794c16721172c"
     },
     "tdcsim_holder_absorption_path.csv": {
-      "bytes": 751692,
-      "sha256": "b91aa2c64b61474ec6adceeae37e9817f8b1e8c21a91418373d716b2a382b0c7"
+      "bytes": 1227970,
+      "sha256": "d3a14b75caa068aa9aa2538d2dc409b63e44ed68decf05d7a565cdf2bcc545cd"
     },
     "tdcsim_initial_portfolio_cohorts.csv": {
       "bytes": 1277497,
@@ -48,8 +49,8 @@
       "sha256": "708978e9a1da5f9c26740c9ed41b974a835ad14dc34cf0c01812f70c68edb5d0"
     },
     "tdcsim_primary_flow_to_du_path.csv": {
-      "bytes": 121257,
-      "sha256": "61708d3e240ca2c3a4ebba26e0afc942ebae821ec5179bceab6c92b0cd361c28"
+      "bytes": 217089,
+      "sha256": "e8d9ea0a918c38163b7c4f87133292264b5b7611483b05c9757efebd641c663b"
     },
     "tdcsim_yield_curve_surface.csv": {
       "bytes": 796367,
