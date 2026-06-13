@@ -4,7 +4,7 @@
 # --- Core Columns ---
 BOND_PORTFOLIO_COLS = [
     'BondID', 'SecurityType', 'IssueDate', 'MaturityDate',
-    'OriginalMaturityYears', 'FaceValue', 'CouponRate', 'HolderType', 'Status',
+    'OriginalMaturityYears', 'FaceValue', 'CouponRate', 'HolderType', 'HolderSubBucket', 'Status',
     'MaturityCategory',
     'OriginalPrincipal', 'AdjustedPrincipal', 'ReferenceCPI_Issue', 'IndexRatio',
     'FixedSpread', 'AccruedInterest_FRN', 'BenchmarkRate_FRN', 'LastAccrualDate',
@@ -18,6 +18,15 @@ INTRAGOV_HOLDERS = frozenset({'FedInternal', 'TrustFunds'})
 SECURITY_TYPES = ['Fixed', 'TIPS', 'FRN', 'NonMarketable']
 MATURITY_CATEGORIES = ['bills', 'notes', 'bonds']
 PREFERENCE_CATEGORIES = ['bills', 'notes', 'bonds', 'tips', 'frn', 'nonmarketable']
+PRIVATE_SUBBUCKET_DOMESTIC_NONBANK = 'domestic_nonbank_deposit_funded'
+PRIVATE_SUBBUCKET_MMF = 'mmf_cash_fund_route'
+PRIVATE_SUBBUCKETS = [
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKET_MMF,
+]
+MMF_DEPOSIT_PASS_THROUGH_DEFAULT = 0.15
+MMF_DEPOSIT_PASS_THROUGH_STATUS = 'source_grounded_model_default_not_measured'
+MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID = [0.00, 0.15, 0.25, 0.50, 1.00]
 
 # --- Global Constants ---
 TGA_FLOOR_TOLERANCE = 1.0e-9
@@ -34,6 +43,7 @@ PORTFOLIO_DTYPES = {
     'FaceValue': 'float64',
     'CouponRate': 'float64',
     'HolderType': 'string',
+    'HolderSubBucket': 'string',
     'Status': 'string',
     'MaturityCategory': 'string',
     'OriginalPrincipal': 'float64',

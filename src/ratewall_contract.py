@@ -16,9 +16,16 @@ import pandas as pd
 from contract_validation import validate_ratewall_contract
 from holder_mapping import mapping_rows
 from quarterly_aggregation import add_quarter_column
+from tdc_shared import (
+    MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
+    MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
+    MMF_DEPOSIT_PASS_THROUGH_STATUS,
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKET_MMF,
+)
 
 
-CONTRACT_VERSION = "0.1.1"
+CONTRACT_VERSION = "0.2.0"
 CLAIM_BOUNDARY = "tdcsim_forward_scenario_not_forecast_or_evidence_mode"
 PRIVATE_ROUTE_SENSITIVITY_KEY = "tdcsim_private_route_sensitivity_contract_v1"
 PRIVATE_ROUTE_SENSITIVITY_BLOCKER = (
@@ -72,6 +79,28 @@ def _quarterly_summary_for_scenario(
         auction = _series(group, "TDC_AuctionAbsorption").sum()
         secondary = _series(group, "TDC_SecondaryTrades").sum()
         other = _series(group, "TDC_Other").sum()
+        principal_dn = _series(group, "TDC_PrincipalToDU_DomesticNonbank").sum()
+        principal_mmf = _series(group, "TDC_PrincipalToDU_MMF").sum()
+        bill_dn = _series(group, "TDC_BillDiscountInterestToDU_DomesticNonbank").sum()
+        bill_mmf = _series(group, "TDC_BillDiscountInterestToDU_MMF").sum()
+        coupon_dn = _series(group, "TDC_CouponInterestToDU_DomesticNonbank").sum()
+        coupon_mmf = _series(group, "TDC_CouponInterestToDU_MMF").sum()
+        frn_dn = _series(group, "TDC_FRNInterestToDU_DomesticNonbank").sum()
+        frn_mmf = _series(group, "TDC_FRNInterestToDU_MMF").sum()
+        tips_coupon_dn = _series(group, "TDC_TIPSCouponInterestToDU_DomesticNonbank").sum()
+        tips_coupon_mmf = _series(group, "TDC_TIPSCouponInterestToDU_MMF").sum()
+        tips_infl_dn = _series(group, "TDC_TIPSInflationCompensationToDU_DomesticNonbank").sum()
+        tips_infl_mmf = _series(group, "TDC_TIPSInflationCompensationToDU_MMF").sum()
+        auction_dn = _series(group, "TDC_AuctionAbsorption_DomesticNonbank").sum()
+        auction_mmf = _series(group, "TDC_AuctionAbsorption_MMF").sum()
+        secondary_dn = _series(group, "TDC_SecondaryTrades_DomesticNonbank").sum()
+        secondary_mmf = _series(group, "TDC_SecondaryTrades_MMF").sum()
+        mmf_plumbing = (
+            _series(group, "TDC_PrincipalToDU_MMFPlumbing").sum()
+            + _series(group, "TDC_DebtService_MMFPlumbing").sum()
+            + _series(group, "TDC_AuctionAbsorption_MMFPlumbing").sum()
+            + _series(group, "TDC_SecondaryTrades_MMFPlumbing").sum()
+        )
         tdc_change = _series(group, "TDC_Change").sum()
         cb_remittance = _series(group, "CB_Remittance").sum()
         cb_deferred_asset_end = _series(group, "CB_DeferredAsset").iloc[-1]
@@ -90,6 +119,25 @@ def _quarterly_summary_for_scenario(
                 "tdc_auction_absorption_du_bil": f"{auction:.12f}",
                 "tdc_secondary_trades_bil": f"{secondary:.12f}",
                 "tdc_other_bil": f"{other:.12f}",
+                "principal_to_du_domestic_nonbank_bil": f"{principal_dn:.12f}",
+                "principal_to_du_mmf_cash_fund_route_bil": f"{principal_mmf:.12f}",
+                "bill_discount_interest_to_du_domestic_nonbank_bil": f"{bill_dn:.12f}",
+                "bill_discount_interest_to_du_mmf_cash_fund_route_bil": f"{bill_mmf:.12f}",
+                "coupon_interest_to_du_domestic_nonbank_bil": f"{coupon_dn:.12f}",
+                "coupon_interest_to_du_mmf_cash_fund_route_bil": f"{coupon_mmf:.12f}",
+                "frn_interest_to_du_domestic_nonbank_bil": f"{frn_dn:.12f}",
+                "frn_interest_to_du_mmf_cash_fund_route_bil": f"{frn_mmf:.12f}",
+                "tips_coupon_interest_to_du_domestic_nonbank_bil": f"{tips_coupon_dn:.12f}",
+                "tips_coupon_interest_to_du_mmf_cash_fund_route_bil": f"{tips_coupon_mmf:.12f}",
+                "tips_inflation_compensation_to_du_domestic_nonbank_bil": f"{tips_infl_dn:.12f}",
+                "tips_inflation_compensation_to_du_mmf_cash_fund_route_bil": f"{tips_infl_mmf:.12f}",
+                "auction_absorption_domestic_nonbank_bil": f"{auction_dn:.12f}",
+                "auction_absorption_mmf_cash_fund_route_bil": f"{auction_mmf:.12f}",
+                "secondary_trades_domestic_nonbank_bil": f"{secondary_dn:.12f}",
+                "secondary_trades_mmf_cash_fund_route_bil": f"{secondary_mmf:.12f}",
+                "mmf_ru_plumbing_bil": f"{mmf_plumbing:.12f}",
+                "mmf_deposit_pass_through": f"{MMF_DEPOSIT_PASS_THROUGH_DEFAULT:.12f}",
+                "mmf_deposit_pass_through_status": MMF_DEPOSIT_PASS_THROUGH_STATUS,
                 "overlap_cashflow_bil": f"{overlap:.12f}",
                 "tdc_change_ex_overlap_bil": f"{tdc_change - overlap:.12f}",
                 "gross_issuance_cash_proceeds_bil": f"{_series(group, 'AuctionProceeds').sum():.12f}",
@@ -118,44 +166,141 @@ def _quarterly_summary_for_scenario(
 def _components_for_summary(summary: pd.DataFrame) -> pd.DataFrame:
     rows = []
     component_specs = [
-        ("primary_fiscal_flow_to_du", "tdc_fiscal_flow_bil", "DU", "aggregate", "fiscal_flow", "false", "true"),
-        ("principal_to_du", "tdc_debt_service_principal_to_du_bil", "DU", "multiple", "principal", "false", "true"),
-        ("interest_to_du", "tdc_debt_service_interest_to_du_bil", "DU", "multiple", "interest", "true", "false"),
-        ("auction_absorption_by_du", "tdc_auction_absorption_du_bil", "DU", "multiple", "issuance_cash_proceeds", "false", "true"),
-        ("secondary_trades", "tdc_secondary_trades_bil", "DU_RU", "multiple", "secondary_settlement", "false", "true"),
-        ("other", "tdc_other_bil", "DU", "aggregate", "other_explicit_or_zero", "false", "true"),
-        ("bill_discount_interest_to_du", "bill_discount_interest_to_du_bil", "DU", "Fixed", "bill_discount_interest", "true", "false"),
-        ("coupon_interest_to_du", "coupon_interest_to_du_bil", "DU", "Fixed", "coupon_interest", "true", "false"),
-        ("frn_interest_to_du", "frn_interest_to_du_bil", "DU", "FRN", "frn_interest", "true", "false"),
-        ("tips_coupon_interest_to_du", "tips_coupon_interest_to_du_bil", "DU", "TIPS", "tips_coupon_interest", "true", "false"),
-        ("tips_inflation_compensation_to_du", "tips_inflation_compensation_to_du_bil", "DU", "TIPS", "tips_inflation_compensation", "false", "false"),
-        ("central_bank_remittance_to_tga", "cb_remittance_to_tga_bil", "CB", "FedInternal", "central_bank_remittance_to_tga", "false", "false"),
+        ("primary_fiscal_flow_to_du", "tdc_fiscal_flow_bil", "DU", "", "aggregate", "fiscal_flow", "false", "true"),
+        ("principal_to_du", "tdc_debt_service_principal_to_du_bil", "Private", "", "multiple", "principal", "false", "false"),
+        ("interest_to_du", "tdc_debt_service_interest_to_du_bil", "Private", "", "multiple", "interest", "true", "false"),
+        ("auction_absorption_by_du", "tdc_auction_absorption_du_bil", "Private", "", "multiple", "issuance_cash_proceeds", "false", "false"),
+        ("secondary_trades", "tdc_secondary_trades_bil", "Private", "", "multiple", "secondary_settlement", "false", "false"),
+        ("other", "tdc_other_bil", "DU", "", "aggregate", "other_explicit_or_zero", "false", "true"),
+        ("bill_discount_interest_to_du", "bill_discount_interest_to_du_bil", "Private", "", "Fixed", "bill_discount_interest", "true", "false"),
+        ("coupon_interest_to_du", "coupon_interest_to_du_bil", "Private", "", "Fixed", "coupon_interest", "true", "false"),
+        ("frn_interest_to_du", "frn_interest_to_du_bil", "Private", "", "FRN", "frn_interest", "true", "false"),
+        ("tips_coupon_interest_to_du", "tips_coupon_interest_to_du_bil", "Private", "", "TIPS", "tips_coupon_interest", "true", "false"),
+        ("tips_inflation_compensation_to_du", "tips_inflation_compensation_to_du_bil", "Private", "", "TIPS", "tips_inflation_compensation", "false", "false"),
+        ("central_bank_remittance_to_tga", "cb_remittance_to_tga_bil", "CB", "", "FedInternal", "central_bank_remittance_to_tga", "false", "false"),
     ]
+    split_specs = [
+        ("principal_to_du", "principal", "principal_to_du_domestic_nonbank_bil", "principal_to_du_mmf_cash_fund_route_bil", "false", "true"),
+        ("auction_absorption_by_du", "issuance_cash_proceeds", "auction_absorption_domestic_nonbank_bil", "auction_absorption_mmf_cash_fund_route_bil", "false", "true"),
+        ("secondary_trades", "secondary_settlement", "secondary_trades_domestic_nonbank_bil", "secondary_trades_mmf_cash_fund_route_bil", "false", "true"),
+        ("bill_discount_interest_to_du", "bill_discount_interest", "bill_discount_interest_to_du_domestic_nonbank_bil", "bill_discount_interest_to_du_mmf_cash_fund_route_bil", "true", "false"),
+        ("coupon_interest_to_du", "coupon_interest", "coupon_interest_to_du_domestic_nonbank_bil", "coupon_interest_to_du_mmf_cash_fund_route_bil", "true", "false"),
+        ("frn_interest_to_du", "frn_interest", "frn_interest_to_du_domestic_nonbank_bil", "frn_interest_to_du_mmf_cash_fund_route_bil", "true", "false"),
+        ("tips_coupon_interest_to_du", "tips_coupon_interest", "tips_coupon_interest_to_du_domestic_nonbank_bil", "tips_coupon_interest_to_du_mmf_cash_fund_route_bil", "true", "false"),
+        ("tips_inflation_compensation_to_du", "tips_inflation_compensation", "tips_inflation_compensation_to_du_domestic_nonbank_bil", "tips_inflation_compensation_to_du_mmf_cash_fund_route_bil", "false", "false"),
+    ]
+
+    def add_row(summary_row, *, component_key, amount, holder_bucket, holder_subbucket, security_type, cash_component, direct, tdc_default, source_key, route_class=""):
+        rows.append(
+            {
+                "schema_version": CONTRACT_VERSION,
+                "scenario_id": summary_row["scenario_id"],
+                "quarter": summary_row["quarter"],
+                "component_key": component_key,
+                "holder_bucket": holder_bucket,
+                "holder_subbucket": holder_subbucket,
+                "source_holder_bucket": (
+                    "domestic_nonbank"
+                    if holder_subbucket == PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+                    else "mmf"
+                    if holder_subbucket == PRIVATE_SUBBUCKET_MMF
+                    else holder_bucket
+                ),
+                "ratewall_perimeter": "DU" if holder_bucket in {"DU", "Private"} else "bridge",
+                "route_class": route_class,
+                "security_type": security_type,
+                "cash_component_key": cash_component,
+                "amount_bil": f"{float(amount):.12f}",
+                "deposit_pass_through": (
+                    "1.000000000000"
+                    if holder_subbucket == PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+                    else f"{MMF_DEPOSIT_PASS_THROUGH_DEFAULT:.12f}"
+                    if holder_subbucket == PRIVATE_SUBBUCKET_MMF
+                    else ""
+                ),
+                "ru_plumbing_pass_through": (
+                    "0.000000000000"
+                    if holder_subbucket == PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+                    else f"{1.0 - MMF_DEPOSIT_PASS_THROUGH_DEFAULT:.12f}"
+                    if holder_subbucket == PRIVATE_SUBBUCKET_MMF
+                    else ""
+                ),
+                "mmf_split_status": MMF_DEPOSIT_PASS_THROUGH_STATUS if holder_subbucket else "",
+                "sign_convention": "positive_support_or_cash_to_du;auction_absorption_negative",
+                "enters_direct_interest_support": direct,
+                "enters_tdc_deposit_support_default": tdc_default,
+                "source_family": "tdcsim",
+                "source_key": source_key,
+                "observability_tier": "simulation_contract",
+                "assumption_status": "assumption_mode_scenario",
+                "claim_boundary": CLAIM_BOUNDARY,
+            }
+        )
+
     for _, summary_row in summary.iterrows():
-        for component_key, field, holder_bucket, security_type, cash_component, direct, tdc_default in component_specs:
+        for component_key, field, holder_bucket, holder_subbucket, security_type, cash_component, direct, tdc_default in component_specs:
             amount = float(summary_row.get(field, 0.0) or 0.0)
             if abs(amount) <= 1e-12 and component_key not in {"other", "secondary_trades"}:
                 continue
-            rows.append(
-                {
-                    "schema_version": CONTRACT_VERSION,
-                    "scenario_id": summary_row["scenario_id"],
-                    "quarter": summary_row["quarter"],
-                    "component_key": component_key,
-                    "holder_bucket": holder_bucket,
-                    "ratewall_perimeter": holder_bucket if holder_bucket in {"DU", "RU"} else "bridge",
-                    "security_type": security_type,
-                    "cash_component_key": cash_component,
-                    "amount_bil": summary_row.get(field, "0"),
-                    "sign_convention": "positive_support_or_cash_to_du;auction_absorption_negative",
-                    "enters_direct_interest_support": direct,
-                    "enters_tdc_deposit_support_default": tdc_default,
-                    "source_family": "tdcsim",
-                    "source_key": "simulated_component",
-                    "observability_tier": "simulation_contract",
-                    "assumption_status": "assumption_mode_scenario",
-                    "claim_boundary": CLAIM_BOUNDARY,
-                }
+            add_row(
+                summary_row,
+                component_key=component_key,
+                amount=amount,
+                holder_bucket=holder_bucket,
+                holder_subbucket=holder_subbucket,
+                security_type=security_type,
+                cash_component=cash_component,
+                direct=direct,
+                tdc_default=tdc_default,
+                source_key="simulated_component_aggregate_memo"
+                if holder_bucket == "Private"
+                else "simulated_component",
+            )
+        for component_key, cash_component, domestic_field, mmf_field, direct, tdc_default in split_specs:
+            domestic_amount = float(summary_row.get(domestic_field, 0.0) or 0.0)
+            mmf_amount = float(summary_row.get(mmf_field, 0.0) or 0.0)
+            if abs(domestic_amount) > 1e-12 or tdc_default == "true":
+                add_row(
+                    summary_row,
+                    component_key=f"{component_key}__{PRIVATE_SUBBUCKET_DOMESTIC_NONBANK}",
+                    amount=domestic_amount,
+                    holder_bucket="Private",
+                    holder_subbucket=PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+                    security_type="multiple",
+                    cash_component=cash_component,
+                    direct=direct,
+                    tdc_default=tdc_default,
+                    source_key="simulated_component_private_subbucket",
+                    route_class="du_deposit_funded",
+                )
+            if abs(mmf_amount) > 1e-12 or tdc_default == "true":
+                add_row(
+                    summary_row,
+                    component_key=f"{component_key}__{PRIVATE_SUBBUCKET_MMF}",
+                    amount=mmf_amount,
+                    holder_bucket="Private",
+                    holder_subbucket=PRIVATE_SUBBUCKET_MMF,
+                    security_type="multiple",
+                    cash_component=cash_component,
+                    direct=direct,
+                    tdc_default=tdc_default,
+                    source_key="simulated_component_private_subbucket",
+                    route_class="mmf_cash_fund_route",
+                )
+        plumbing_amount = float(summary_row.get("mmf_ru_plumbing_bil", 0.0) or 0.0)
+        if abs(plumbing_amount) > 1e-12:
+            add_row(
+                summary_row,
+                component_key="mmf_residual_ru_plumbing",
+                amount=plumbing_amount,
+                holder_bucket="Private",
+                holder_subbucket=PRIVATE_SUBBUCKET_MMF,
+                security_type="multiple",
+                cash_component="mmf_residual_plumbing",
+                direct="false",
+                tdc_default="false",
+                source_key="simulated_component_private_subbucket_residual_plumbing",
+                route_class="mmf_cash_fund_plumbing",
             )
     return pd.DataFrame(rows)
 
@@ -193,11 +338,29 @@ def _source_registry_rows(config: dict | None = None) -> list[dict[str, str]]:
         {
             "source_family": "tdcsim_holder_bucket_limitation",
             "source_key": "mmf_collapsed_into_du_current_private_bucket",
-            "source_status": "central_path_private_holder_bucket_includes_mmf_cash_fund_route",
-            "ratewall_role": "bias_direction_disclosure_for_holder_absorption_path",
+            "source_status": "superseded_by_private_route_split",
+            "ratewall_role": "legacy_audit_memo",
+            "central_default_eligible": "false",
+            "sensitivity_only": "true",
+            "binding_blocker": "superseded_by_private_subbucket_split_contract_0_2_0",
+        },
+        {
+            "source_family": "tdcsim_private_subbucket",
+            "source_key": PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+            "source_status": "source_grounded_private_subbucket_split",
+            "ratewall_role": "du_deposit_funded_private_route",
             "central_default_eligible": "true",
             "sensitivity_only": "false",
-            "binding_blocker": "full_private_mmf_route_split_owner_gated",
+            "binding_blocker": "",
+        },
+        {
+            "source_family": "tdcsim_private_subbucket",
+            "source_key": PRIVATE_SUBBUCKET_MMF,
+            "source_status": MMF_DEPOSIT_PASS_THROUGH_STATUS,
+            "ratewall_role": "mmf_cash_fund_route_pass_through_0_15_residual_plumbing",
+            "central_default_eligible": "true",
+            "sensitivity_only": "false",
+            "binding_blocker": "",
         },
     ]
     input_manifest_path = config.get("input_manifest") if isinstance(config, dict) else None
@@ -330,6 +493,45 @@ def _load_private_route_sensitivity(config: dict | None) -> pd.DataFrame:
     return out
 
 
+def _mmf_pass_through_sensitivity(summary: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    central_p = MMF_DEPOSIT_PASS_THROUGH_DEFAULT
+    for _, row in summary.iterrows():
+        effective_auction = float(row.get("auction_absorption_mmf_cash_fund_route_bil", 0.0) or 0.0)
+        effective_principal = float(row.get("principal_to_du_mmf_cash_fund_route_bil", 0.0) or 0.0)
+        effective_secondary = float(row.get("secondary_trades_mmf_cash_fund_route_bil", 0.0) or 0.0)
+        gross_auction = effective_auction / central_p if central_p else 0.0
+        gross_principal = effective_principal / central_p if central_p else 0.0
+        gross_secondary = effective_secondary / central_p if central_p else 0.0
+        gross_total = gross_auction + gross_principal + gross_secondary
+        for rung in MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID:
+            delta_auction = (float(rung) - 1.0) * gross_auction
+            delta_principal = (float(rung) - 1.0) * gross_principal
+            delta_secondary = (float(rung) - 1.0) * gross_secondary
+            rows.append(
+                {
+                    "schema_version": CONTRACT_VERSION,
+                    "scenario_id": row["scenario_id"],
+                    "quarter": row["quarter"],
+                    "mmf_deposit_pass_through": f"{float(rung):.12f}",
+                    "legacy_reference_pass_through": "1.000000000000",
+                    "central_default_pass_through": f"{central_p:.12f}",
+                    "gross_mmf_auction_absorption_bil": f"{gross_auction:.12f}",
+                    "gross_mmf_principal_to_du_bil": f"{gross_principal:.12f}",
+                    "gross_mmf_secondary_trades_bil": f"{gross_secondary:.12f}",
+                    "gross_mmf_total_signed_bil": f"{gross_total:.12f}",
+                    "tdc_delta_vs_legacy_auction_bil": f"{delta_auction:.12f}",
+                    "tdc_delta_vs_legacy_principal_bil": f"{delta_principal:.12f}",
+                    "tdc_delta_vs_legacy_secondary_bil": f"{delta_secondary:.12f}",
+                    "tdc_delta_vs_legacy_bil": f"{delta_auction + delta_principal + delta_secondary:.12f}",
+                    "mmf_residual_plumbing_bil": f"{(1.0 - float(rung)) * gross_total:.12f}",
+                    "source_status": MMF_DEPOSIT_PASS_THROUGH_STATUS,
+                    "claim_boundary": CLAIM_BOUNDARY,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def export_ratewall_bundle(
     scenario_results: dict[str, pd.DataFrame],
     output_dir: str | Path,
@@ -354,6 +556,7 @@ def export_ratewall_bundle(
     components = _components_for_summary(summary) if not summary.empty else pd.DataFrame()
     source_registry = pd.DataFrame(_source_registry_rows(config))
     private_route_sensitivity = _load_private_route_sensitivity(config)
+    mmf_pass_through_sensitivity = _mmf_pass_through_sensitivity(summary) if not summary.empty else pd.DataFrame()
     validation = validate_ratewall_contract(summary, components)
     input_artifacts = {}
     source_hierarchy = {}
@@ -372,6 +575,7 @@ def export_ratewall_bundle(
     private_route_sensitivity_path = (
         output_path / "tdcsim_private_route_sensitivity_contract.csv"
     )
+    mmf_pass_through_sensitivity_path = output_path / "tdcsim_mmf_pass_through_sensitivity.csv"
     manifest_path = output_path / "tdcsim_ratewall_manifest.json"
 
     summary.to_csv(summary_path, index=False)
@@ -379,6 +583,8 @@ def export_ratewall_bundle(
     source_registry.to_csv(source_registry_path, index=False)
     if not private_route_sensitivity.empty:
         private_route_sensitivity.to_csv(private_route_sensitivity_path, index=False)
+    if not mmf_pass_through_sensitivity.empty:
+        mmf_pass_through_sensitivity.to_csv(mmf_pass_through_sensitivity_path, index=False)
 
     files = {
         "summary": summary_path.name,
@@ -387,6 +593,8 @@ def export_ratewall_bundle(
     }
     if not private_route_sensitivity.empty:
         files["private_route_sensitivity"] = private_route_sensitivity_path.name
+    if not mmf_pass_through_sensitivity.empty:
+        files["mmf_pass_through_sensitivity"] = mmf_pass_through_sensitivity_path.name
     manifest_payload = {
         "contract_version": CONTRACT_VERSION,
         "schema": "tdcsim_ratewall_bundle",
@@ -414,4 +622,6 @@ def export_ratewall_bundle(
     }
     if not private_route_sensitivity.empty:
         result["private_route_sensitivity"] = private_route_sensitivity_path
+    if not mmf_pass_through_sensitivity.empty:
+        result["mmf_pass_through_sensitivity"] = mmf_pass_through_sensitivity_path
     return result

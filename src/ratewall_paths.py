@@ -12,7 +12,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from tdc_shared import HOLDER_TYPES, PREFERENCE_CATEGORIES
+from tdc_shared import (
+    HOLDER_TYPES,
+    PREFERENCE_CATEGORIES,
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKET_MMF,
+    PRIVATE_SUBBUCKETS,
+)
 
 
 def _resolve_path(path_value: str | None, base_dir: str | os.PathLike[str] | None = None) -> Path | None:
@@ -107,18 +113,51 @@ def load_holder_absorption_path(config: dict, *, base_dir: str | os.PathLike[str
         raise ValueError("Holder absorption path has no *_pct preference columns.")
 
     lookup: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+    route_values: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
     for _, row in frame.iterrows():
         holder = str(row["holder_type"])
         if holder not in HOLDER_TYPES:
             raise ValueError(f"Unsupported holder_type in holder path: {holder}")
         scenario_id = str(row["scenario_id"])
         quarter = str(row["quarter"])
+        subbucket = str(row.get("holder_subbucket", "") or "")
         prefs = {
             col: float(row[col])
             for col in pref_cols
             if pd.notna(row[col])
         }
-        lookup.setdefault(scenario_id, {}).setdefault(quarter, {})[holder] = prefs
+        holder_rows = lookup.setdefault(scenario_id, {}).setdefault(quarter, {})
+        target = holder_rows.setdefault(holder, {})
+        for col, value in prefs.items():
+            target[col] = target.get(col, 0.0) + value
+        if holder == "Private" and subbucket in PRIVATE_SUBBUCKETS:
+            route_row = route_values.setdefault(scenario_id, {}).setdefault(quarter, {}).setdefault(
+                subbucket,
+                {},
+            )
+            for col, value in prefs.items():
+                route_row[col] = route_row.get(col, 0.0) + value
+    for scenario_id, quarters in route_values.items():
+        for quarter, route_rows in quarters.items():
+            private_prefs = lookup.setdefault(scenario_id, {}).setdefault(quarter, {}).setdefault("Private", {})
+            shares_by_category = {}
+            for category in PREFERENCE_CATEGORIES:
+                col = f"{category}_pct"
+                total = float(private_prefs.get(col, 0.0) or 0.0)
+                if total <= 0.0:
+                    continue
+                shares_by_category[category] = {
+                    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: float(
+                        route_rows.get(PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, {}).get(col, 0.0) or 0.0
+                    )
+                    / total,
+                    PRIVATE_SUBBUCKET_MMF: float(
+                        route_rows.get(PRIVATE_SUBBUCKET_MMF, {}).get(col, 0.0) or 0.0
+                    )
+                    / total,
+                }
+            if shares_by_category:
+                lookup[scenario_id][quarter]["__private_subbucket_shares__"] = shares_by_category
     return lookup
 
 
@@ -149,6 +188,10 @@ def holder_preferences_for_period(
                 warning_cache.add(key)
         prefs = {holder: dict(fallback_preferences.get(holder, {})) for holder in HOLDER_TYPES}
         for holder, holder_prefs in scenario_rows[quarter].items():
+            if holder == "__private_subbucket_shares__":
+                continue
             prefs.setdefault(holder, {}).update(holder_prefs)
+        if "__private_subbucket_shares__" in scenario_rows[quarter]:
+            prefs["__private_subbucket_shares__"] = scenario_rows[quarter]["__private_subbucket_shares__"]
         return prefs
     return fallback_preferences

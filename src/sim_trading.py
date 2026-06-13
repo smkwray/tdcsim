@@ -12,6 +12,9 @@ from tdc_shared import (
     HOLDER_TYPES,
     INTRAGOV_HOLDERS,
     PORTFOLIO_DTYPES,
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKET_MMF,
+    PRIVATE_SUBBUCKETS,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
 )
@@ -21,6 +24,17 @@ from sim_pricing import (
     get_security_category_for_prefs,
     get_yield_for_maturity,
 )
+
+
+def _private_subbucket(row_or_value) -> str:
+    value = row_or_value.get('HolderSubBucket', '') if hasattr(row_or_value, 'get') else row_or_value
+    value = '' if pd.isna(value) else str(value)
+    return value if value in PRIVATE_SUBBUCKETS else PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+
+
+def _zero_private_routes() -> dict[str, float]:
+    return {route: 0.0 for route in PRIVATE_SUBBUCKETS}
+
 
 def calculate_portfolio_value_and_composition(portfolio_df, current_date, yield_curve_years, yield_curve_rates):
     """
@@ -86,7 +100,7 @@ def calculate_portfolio_value_and_composition(portfolio_df, current_date, yield_
         if portfolio_df.index.equals(active_portfolio.index):
             cols_to_update_cache = ['TimeToMaturity', 'DiscountYield', 'CleanPrice', 'AccruedInterest', 'DirtyValue', 'DirtyPriceRatio']
             portfolio_df.update(active_portfolio[cols_to_update_cache])
-    except Exception as e:
+    except Exception:
         pass
     return (value_by_holder, composition_by_holder, value_by_type)
 
@@ -97,15 +111,20 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
     """
     tradeable_mask = (bond_portfolio['SecurityType'] != 'NonMarketable') & (bond_portfolio['Status'] == 'Active')
     if not tradeable_mask.any():
-        return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0})
+        return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0, 'deposit_change_private_deposit_funded': 0.0, 'deposit_change_private_mmf': 0.0})
     try:
         bond_portfolio = bond_portfolio.astype(PORTFOLIO_DTYPES, errors='ignore')
-    except Exception as e:
-        return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0})
+    except Exception:
+        return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0, 'deposit_change_private_deposit_funded': 0.0, 'deposit_change_private_mmf': 0.0})
+    if 'HolderSubBucket' not in bond_portfolio.columns:
+        bond_portfolio['HolderSubBucket'] = ''
+    private_mask = bond_portfolio['HolderType'] == 'Private'
+    bond_portfolio.loc[private_mask, 'HolderSubBucket'] = bond_portfolio.loc[private_mask, 'HolderSubBucket'].apply(_private_subbucket)
+    bond_portfolio.loc[~private_mask, 'HolderSubBucket'] = ''
     tradeable_portfolio = bond_portfolio[tradeable_mask].copy()
     calculate_portfolio_value_and_composition(tradeable_portfolio, current_date, yield_curve_years, yield_curve_rates)
     if 'DirtyValue' not in tradeable_portfolio.columns or tradeable_portfolio['DirtyValue'].isnull().any():
-        return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0})
+        return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0, 'deposit_change_private_deposit_funded': 0.0, 'deposit_change_private_mmf': 0.0})
     value_by_holder_tradeable = tradeable_portfolio.groupby('HolderType')['DirtyValue'].sum().to_dict()
     imbalance_values = {}
     for holder in HOLDER_TYPES:
@@ -151,9 +170,9 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
     potential_trades.sort(key=lambda x: x['magnitude_value'], reverse=True)
     net_reserve_change = 0.0
     net_deposit_change = 0.0
+    net_deposit_change_by_private_route = _zero_private_routes()
     net_tga_change_inflow = 0.0
     net_tga_drain_outflow = 0.0
-    traded_this_round = False
     max_trades_per_round = 250
     trade_count = 0
     modified_portfolio = bond_portfolio.copy()
@@ -193,6 +212,7 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
         if original_indices.empty:
             continue
         original_tranche_idx = original_indices[0]
+        seller_private_route = _private_subbucket(modified_portfolio.loc[original_tranche_idx])
         seller_tranche_face_value = modified_portfolio.loc[original_tranche_idx, 'FaceValue']
         if seller_tranche_face_value < TGA_FLOOR_TOLERANCE:
             continue
@@ -229,9 +249,14 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
                     modified_portfolio.loc[original_tranche_idx, _fld] = _orig * (1.0 - _transfer_ratio)
             buyer_tranche_mask = (modified_portfolio['BondID'] == bond_id_to_trade) & (modified_portfolio['HolderType'] == buyer) & (modified_portfolio['Status'] == 'Active')
             existing_buyer_tranche = modified_portfolio[buyer_tranche_mask]
+            buyer_private_route = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+            if buyer == 'Private' and not existing_buyer_tranche.empty:
+                buyer_private_route = _private_subbucket(existing_buyer_tranche.iloc[0])
             if not existing_buyer_tranche.empty:
                 buyer_idx = existing_buyer_tranche.index[0]
                 modified_portfolio.loc[buyer_idx, 'FaceValue'] += face_value_to_trade
+                if buyer == 'Private':
+                    modified_portfolio.loc[buyer_idx, 'HolderSubBucket'] = buyer_private_route
                 if modified_portfolio.loc[buyer_idx, 'SecurityType'] == 'FRN':
                     current_buyer_accrued = modified_portfolio.loc[buyer_idx, 'AccruedInterest_FRN']
                     current_buyer_accrued = 0.0 if pd.isna(current_buyer_accrued) else float(current_buyer_accrued)
@@ -247,6 +272,7 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
             else:
                 new_buyer_tranche_dict = modified_portfolio.loc[original_tranche_idx].to_dict()
                 new_buyer_tranche_dict['HolderType'] = buyer
+                new_buyer_tranche_dict['HolderSubBucket'] = buyer_private_route if buyer == 'Private' else ''
                 new_buyer_tranche_dict['FaceValue'] = face_value_to_trade
                 new_buyer_tranche_dict['Status'] = 'Active'
                 if new_buyer_tranche_dict['SecurityType'] == 'FRN':
@@ -259,7 +285,6 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
                 new_row_df = pd.DataFrame([new_buyer_tranche_dict], columns=BOND_PORTFOLIO_COLS)
                 new_row_df = new_row_df.astype(PORTFOLIO_DTYPES, errors='ignore')
                 modified_portfolio = pd.concat([modified_portfolio, new_row_df], ignore_index=True)
-            traded_this_round = True
             trade_count += 1
             buyer_is_gov = buyer in INTRAGOV_HOLDERS
             seller_is_gov = seller in INTRAGOV_HOLDERS
@@ -272,6 +297,7 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
                     net_reserve_change += actual_dirty_value_traded
                 elif seller == 'Private':
                     net_deposit_change += actual_dirty_value_traded
+                    net_deposit_change_by_private_route[seller_private_route] += actual_dirty_value_traded
                     net_reserve_change += actual_dirty_value_traded
                 elif seller == 'Foreign':
                     net_reserve_change += actual_dirty_value_traded
@@ -283,6 +309,7 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
                     net_reserve_change -= actual_dirty_value_traded
                 elif buyer == 'Private':
                     net_deposit_change -= actual_dirty_value_traded
+                    net_deposit_change_by_private_route[buyer_private_route] -= actual_dirty_value_traded
                     net_reserve_change -= actual_dirty_value_traded
                 elif buyer == 'Foreign':
                     net_reserve_change -= actual_dirty_value_traded
@@ -290,26 +317,32 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
                     pass
             elif buyer == 'Private' and seller == 'Banks':
                 net_deposit_change -= actual_dirty_value_traded
+                net_deposit_change_by_private_route[buyer_private_route] -= actual_dirty_value_traded
             elif buyer == 'Banks' and seller == 'Private':
                 net_deposit_change += actual_dirty_value_traded
+                net_deposit_change_by_private_route[seller_private_route] += actual_dirty_value_traded
             elif buyer == 'CB' and seller == 'Banks':
                 net_reserve_change += actual_dirty_value_traded
             elif buyer == 'CB' and seller == 'Private':
                 net_reserve_change += actual_dirty_value_traded
                 net_deposit_change += actual_dirty_value_traded
+                net_deposit_change_by_private_route[seller_private_route] += actual_dirty_value_traded
             elif buyer == 'Banks' and seller == 'CB':
                 net_reserve_change -= actual_dirty_value_traded
             elif buyer == 'Private' and seller == 'CB':
                 net_reserve_change -= actual_dirty_value_traded
                 net_deposit_change -= actual_dirty_value_traded
+                net_deposit_change_by_private_route[buyer_private_route] -= actual_dirty_value_traded
             elif buyer == 'Foreign' and seller == 'Banks':
                 pass
             elif buyer == 'Banks' and seller == 'Foreign':
                 pass
             elif buyer == 'Foreign' and seller == 'Private':
                 net_deposit_change += actual_dirty_value_traded
+                net_deposit_change_by_private_route[seller_private_route] += actual_dirty_value_traded
             elif buyer == 'Private' and seller == 'Foreign':
                 net_deposit_change -= actual_dirty_value_traded
+                net_deposit_change_by_private_route[buyer_private_route] -= actual_dirty_value_traded
             elif buyer == 'Foreign' and seller == 'CB':
                 net_reserve_change -= actual_dirty_value_traded
             elif buyer == 'CB' and seller == 'Foreign':
@@ -322,14 +355,21 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
                 tradeable_portfolio_indexed.loc[tradeable_idx, 'DirtyValue'] = new_seller_fv * dirty_price_ratio
                 if new_seller_fv < TGA_FLOOR_TOLERANCE:
                     tradeable_portfolio_indexed = tradeable_portfolio_indexed.drop(index=tradeable_idx)
-        except KeyError as e:
+        except KeyError:
             continue
         except Exception as e:
             print(f'ERROR [{scenario_name}@{current_date.date()}]: Unexpected error during preference trade execution: {e}')
             traceback.print_exc()
             continue
     final_portfolio = modified_portfolio[modified_portfolio['FaceValue'] > TGA_FLOOR_TOLERANCE].reset_index(drop=True)
-    monetary_impact = {'reserve_change': net_reserve_change, 'deposit_change': net_deposit_change, 'tga_change': net_tga_change_inflow, 'tga_drain': net_tga_drain_outflow}
+    monetary_impact = {
+        'reserve_change': net_reserve_change,
+        'deposit_change': net_deposit_change,
+        'tga_change': net_tga_change_inflow,
+        'tga_drain': net_tga_drain_outflow,
+        'deposit_change_private_deposit_funded': net_deposit_change_by_private_route[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK],
+        'deposit_change_private_mmf': net_deposit_change_by_private_route[PRIVATE_SUBBUCKET_MMF],
+    }
     try:
         final_portfolio = final_portfolio.astype(PORTFOLIO_DTYPES, errors='ignore')
     except Exception:

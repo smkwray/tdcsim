@@ -29,7 +29,7 @@ HOLDER_ROUTE_CONTRACT = [
         ),
     },
     {
-        "source_key": "mmf_on_rrp_reserve_user_like",
+        "source_key": "mmf_cash_fund_route",
         "ratewall_role": "target_route_not_current_holder_type",
         "central_default_eligible": "false",
         "sensitivity_only": "true",

@@ -23,6 +23,14 @@ from zipfile import ZipFile
 import pandas as pd
 import yaml
 
+from tdc_shared import (
+    MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
+    MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
+    MMF_DEPOSIT_PASS_THROUGH_STATUS,
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKET_MMF,
+)
+
 
 FISCALDATA_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
 TREASURY_CURVE_XML = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve"
@@ -30,6 +38,10 @@ RATEWALL_CLAIM_BOUNDARY = "tdcsim_ratewall_source_backed_input_contract_not_evid
 TENORS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
 TDCSIM_HOLDERS = ["Banks", "CB", "Foreign", "Private"]
 PREFERENCE_CATEGORIES = ["bills", "notes", "bonds", "tips", "frn"]
+PRIVATE_SUBBUCKET_SOURCE_BUCKETS = {
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: "domestic_nonbank",
+    PRIVATE_SUBBUCKET_MMF: "mmf",
+}
 Z1_LOOKBACK_QUARTERS = 8
 Z1_SHRINKAGE_K_QUARTERS = 8.0
 Z1_POSITIVE_ABSORPTION_FLOOR_BN_SAAR = 25.0
@@ -214,12 +226,72 @@ def _load_stock_holder_shares(tsyparty_z1_path: Path) -> dict[str, float]:
     return {holder: value / total for holder, value in raw.items()}
 
 
+def _load_stock_private_subbucket_shares(tsyparty_z1_path: Path) -> dict[str, float]:
+    if not tsyparty_z1_path.exists():
+        return {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 1.0, PRIVATE_SUBBUCKET_MMF: 0.0}
+    frame = pd.read_csv(tsyparty_z1_path)
+    frame["date"] = pd.to_datetime(frame["date"])
+    row = frame.sort_values("date").iloc[-1]
+    mmf = _safe_float(row.get("money_market_funds"))
+    domestic_nonbank = sum(
+        _safe_float(row.get(col))
+        for col in [
+            "dealers",
+            "households_residual",
+            "insurers",
+            "mutual_funds_etfs",
+            "nonfinancial_corporates",
+            "other_financial",
+            "pensions",
+            "state_local_governments",
+        ]
+    )
+    total = domestic_nonbank + mmf
+    if total <= 0:
+        return {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 1.0, PRIVATE_SUBBUCKET_MMF: 0.0}
+    return {
+        PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: domestic_nonbank / total,
+        PRIVATE_SUBBUCKET_MMF: mmf / total,
+    }
+
+
 def _normalize_holder_shares(raw: dict[str, float]) -> dict[str, float]:
     clipped = {holder: max(0.0, float(raw.get(holder, 0.0))) for holder in TDCSIM_HOLDERS}
     total = sum(clipped.values())
     if total <= 0:
         return {holder: 1.0 / len(TDCSIM_HOLDERS) for holder in TDCSIM_HOLDERS}
     return {holder: value / total for holder, value in clipped.items()}
+
+
+def _normalize_private_subbucket_shares(raw: dict[str, float]) -> dict[str, float]:
+    clipped = {
+        PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: max(
+            0.0,
+            float(raw.get(PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, 0.0)),
+        ),
+        PRIVATE_SUBBUCKET_MMF: max(0.0, float(raw.get(PRIVATE_SUBBUCKET_MMF, 0.0))),
+    }
+    total = sum(clipped.values())
+    if total <= 0.0:
+        return {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 1.0, PRIVATE_SUBBUCKET_MMF: 0.0}
+    return {key: value / total for key, value in clipped.items()}
+
+
+def _blend_private_subbucket_shares(
+    left: dict[str, float],
+    right: dict[str, float] | None,
+    *,
+    right_weight: float,
+) -> dict[str, float]:
+    if right is None:
+        return _normalize_private_subbucket_shares(left)
+    return _normalize_private_subbucket_shares(
+        {
+            route: (1.0 - right_weight) * left.get(route, 0.0)
+            + right_weight * right.get(route, 0.0)
+            for route in PRIVATE_SUBBUCKET_SOURCE_BUCKETS
+        }
+    )
 
 
 def _blend_shares(
@@ -300,6 +372,27 @@ def _load_tdcmix_targets(tdcmix_prior_path: Path) -> dict[str, dict[str, float]]
     }
 
 
+def _load_tdcmix_private_subbucket_targets(tdcmix_prior_path: Path) -> dict[str, dict[str, float]]:
+    frame = pd.read_csv(tdcmix_prior_path)
+    rows = {str(row["bucket"]): row for _, row in frame.iterrows()}
+
+    def route_split(dn_field: str, mmf_field: str) -> dict[str, float]:
+        return _normalize_private_subbucket_shares(
+            {
+                PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: _safe_float(
+                    rows.get("domestic_nonbank", {}).get(dn_field)
+                ),
+                PRIVATE_SUBBUCKET_MMF: _safe_float(rows.get("mmf", {}).get(mmf_field)),
+            }
+        )
+
+    return {
+        "current_mix_baseline": route_split("default_prior_value", "default_prior_value"),
+        "domestic_nonbank_absorption_shift": route_split("upper_prior_value", "upper_prior_value"),
+        "reserve_user_absorption_shift": route_split("lower_prior_value", "lower_prior_value"),
+    }
+
+
 def _latest_z1_absorption_shares(z1_absorption_path: Path) -> tuple[dict[str, float] | None, float]:
     if not z1_absorption_path.exists():
         return None, 0.0
@@ -367,6 +460,61 @@ def _latest_z1_absorption_shares(z1_absorption_path: Path) -> tuple[dict[str, fl
     return _normalize_holder_shares({holder: value / n_eff for holder, value in weighted.items()}), n_eff
 
 
+def _latest_z1_private_subbucket_absorption_shares(z1_absorption_path: Path) -> tuple[dict[str, float] | None, float]:
+    if not z1_absorption_path.exists():
+        return None, 0.0
+    frame = pd.read_csv(z1_absorption_path)
+    if "quarter" not in frame.columns:
+        return None, 0.0
+    required = [
+        "positive_absorption_total",
+        "pos_abs_share_mmf",
+        "pos_abs_share_domestic_nonbank",
+    ]
+    if not set(required) <= set(frame.columns):
+        return None, 0.0
+    frame["quarter_date"] = pd.to_datetime(frame["quarter"], errors="coerce")
+    for column in required:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = (
+        frame.dropna(subset=["quarter_date"])
+        .dropna(subset=required)
+        .sort_values("quarter_date")
+        .tail(Z1_LOOKBACK_QUARTERS)
+    )
+    if frame.empty:
+        return None, 0.0
+    private_eff = frame["positive_absorption_total"].clip(lower=0.0) * (
+        frame["pos_abs_share_mmf"].clip(lower=0.0)
+        + frame["pos_abs_share_domestic_nonbank"].clip(lower=0.0)
+    )
+    positive_eff = private_eff[private_eff > 0.0]
+    if positive_eff.empty:
+        return None, 0.0
+    floor = max(
+        Z1_POSITIVE_ABSORPTION_FLOOR_BN_SAAR,
+        Z1_FLOOR_MEDIAN_MULTIPLIER * float(positive_eff.median()),
+    )
+    quarter_credit = (private_eff / floor).clip(lower=0.0, upper=1.0)
+    n_eff = float(quarter_credit.sum())
+    if n_eff <= 0.0:
+        return None, 0.0
+    weighted = {route: 0.0 for route in PRIVATE_SUBBUCKET_SOURCE_BUCKETS}
+    for idx, row in frame.iterrows():
+        credit = float(quarter_credit.loc[idx])
+        if credit <= 0.0:
+            continue
+        shares = _normalize_private_subbucket_shares(
+            {
+                PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: _safe_float(row["pos_abs_share_domestic_nonbank"]),
+                PRIVATE_SUBBUCKET_MMF: _safe_float(row["pos_abs_share_mmf"]),
+            }
+        )
+        for route in PRIVATE_SUBBUCKET_SOURCE_BUCKETS:
+            weighted[route] += credit * shares[route]
+    return _normalize_private_subbucket_shares({route: value / n_eff for route, value in weighted.items()}), n_eff
+
+
 def _latest_primary_market_instrument_shares(
     path: Path,
     *,
@@ -403,16 +551,28 @@ def _load_absorption_scenarios(
     bills_primary_path: Path,
     coupons_primary_path: Path,
     holder_absorption_calibration: dict[str, float | list[float]] | None = None,
-) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, str]]:
+) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, str], dict[str, dict[str, dict[str, float]]]]:
     calibration = holder_absorption_calibration or _default_holder_absorption_calibration()
     scenario_shift_lambda_default = float(calibration["scenario_shift_lambda_default"])
     scenario_shift_lambda_grid = [float(value) for value in calibration["scenario_shift_lambda_grid"]]
     tdcmix_targets = _load_tdcmix_targets(tdcmix_prior_path)
+    tdcmix_private_targets = _load_tdcmix_private_subbucket_targets(tdcmix_prior_path)
     z1_recent, z1_n_eff = _latest_z1_absorption_shares(z1_absorption_path)
+    z1_private_recent, z1_private_n_eff = _latest_z1_private_subbucket_absorption_shares(z1_absorption_path)
     z1_weight = z1_n_eff / (z1_n_eff + Z1_SHRINKAGE_K_QUARTERS) if z1_n_eff > 0.0 else 0.0
+    z1_private_weight = (
+        z1_private_n_eff / (z1_private_n_eff + Z1_SHRINKAGE_K_QUARTERS)
+        if z1_private_n_eff > 0.0
+        else 0.0
+    )
     baseline_scalar = tdcmix_targets["current_mix_baseline"]
     if z1_recent is not None:
         baseline_scalar = _blend_shares(baseline_scalar, z1_recent, right_weight=z1_weight)
+    baseline_private_split = _blend_private_subbucket_shares(
+        tdcmix_private_targets["current_mix_baseline"],
+        z1_private_recent,
+        right_weight=z1_private_weight,
+    )
 
     bills_primary = _latest_primary_market_instrument_shares(
         bills_primary_path,
@@ -423,12 +583,14 @@ def _load_absorption_scenarios(
         baseline_scalar=baseline_scalar,
     )
     baseline_by_category: dict[str, dict[str, float]] = {}
+    baseline_private_by_category: dict[str, dict[str, float]] = {}
     for category in PREFERENCE_CATEGORIES:
         instrument_prior = bills_primary if category == "bills" else coupons_primary
         shares = baseline_scalar
         if instrument_prior is not None:
             shares = _blend_shares(shares, instrument_prior, right_weight=PRIMARY_MARKET_OVERLAY_WEIGHT)
         baseline_by_category[category] = shares
+        baseline_private_by_category[category] = baseline_private_split
 
     scenarios: dict[str, dict[str, dict[str, float]]] = {
         "current_mix_baseline": baseline_by_category,
@@ -436,6 +598,13 @@ def _load_absorption_scenarios(
         "current_mix_rapid_easing": baseline_by_category,
         "current_mix_bear_steepener": baseline_by_category,
         "current_mix_bull_flattener": baseline_by_category,
+    }
+    private_subbucket_scenarios: dict[str, dict[str, dict[str, float]]] = {
+        "current_mix_baseline": baseline_private_by_category,
+        "current_mix_higher_for_longer": baseline_private_by_category,
+        "current_mix_rapid_easing": baseline_private_by_category,
+        "current_mix_bear_steepener": baseline_private_by_category,
+        "current_mix_bull_flattener": baseline_private_by_category,
     }
     holder_shift_specs = [
         ("domestic_nonbank_absorption_shift", "domestic_nonbank_absorption_shift"),
@@ -463,6 +632,15 @@ def _load_absorption_scenarios(
             category: _blend_shares(shares, target, right_weight=scenario_shift_lambda_default)
             for category, shares in baseline_by_category.items()
         }
+        target_private = tdcmix_private_targets[target_key]
+        private_subbucket_scenarios[scenario_id] = {
+            category: _blend_private_subbucket_shares(
+                baseline_private_by_category[category],
+                target_private,
+                right_weight=scenario_shift_lambda_default,
+            )
+            for category in PREFERENCE_CATEGORIES
+        }
 
     metadata = {
         "baseline_sources": (
@@ -473,6 +651,8 @@ def _load_absorption_scenarios(
         "dealer_bridge_mapping": "dealer_bridge_redistributed_by_pre_overlay_baseline_not_mapped_to_banks",
         "z1_effective_quarters_n_eff": f"{z1_n_eff:.12f}",
         "z1_shrinkage_weight": f"{z1_weight:.12f}",
+        "z1_private_subbucket_effective_quarters_n_eff": f"{z1_private_n_eff:.12f}",
+        "z1_private_subbucket_shrinkage_weight": f"{z1_private_weight:.12f}",
         "z1_shrinkage_k_quarters": f"{Z1_SHRINKAGE_K_QUARTERS:.1f}",
         "primary_market_overlay_weight": f"{PRIMARY_MARKET_OVERLAY_WEIGHT:.2f}",
         "primary_market_overlay_coverage": (
@@ -484,7 +664,7 @@ def _load_absorption_scenarios(
         "scenario_shift_lambda_grid": ",".join(f"{value:.2f}" for value in scenario_shift_lambda_grid),
         "tic_foreign_cross_check_status": "DEFERRED_new_plumbing_QA_only_not_blocking_blend_weight_grounding",
     }
-    return scenarios, metadata
+    return scenarios, metadata, private_subbucket_scenarios
 
 
 def build_initial_portfolio(
@@ -501,6 +681,7 @@ def build_initial_portfolio(
         if row.get("security_type_desc") == "Marketable"
     }
     holder_shares = _load_stock_holder_shares(tsyparty_z1_path)
+    private_subbucket_stock_shares = _load_stock_private_subbucket_shares(tsyparty_z1_path)
 
     candidate_rows: list[dict] = []
     for row in table3:
@@ -558,60 +739,83 @@ def build_initial_portfolio(
         # cohort ladder consumed by the simulator.
         total_face = item["outstanding"] * class_scale / 1000.0
         for holder, share in holder_shares.items():
-            face_value = total_face * share
-            if face_value <= 1e-9:
-                continue
-            original_principal = face_value if item["security_type"] == "TIPS" else 0.0
-            output_rows.append(
-                {
-                    "BondID": bond_id,
-                    "SecurityType": item["security_type"],
-                    "IssueDate": item["issue_date"].date().isoformat(),
-                    "MaturityDate": item["maturity_date"].date().isoformat(),
-                    "OriginalMaturityYears": f"{maturity_years:.8f}",
-                    "FaceValue": f"{face_value:.12f}",
-                    "CouponRate": f"{coupon_rate:.12f}",
-                    "HolderType": holder,
-                    "Status": "Active",
-                    "MaturityCategory": maturity_category or "",
-                    "OriginalPrincipal": f"{original_principal:.12f}",
-                    "AdjustedPrincipal": f"{original_principal:.12f}",
-                    "ReferenceCPI_Issue": "100.0" if item["security_type"] == "TIPS" else "0.0",
-                    "IndexRatio": "1.0" if item["security_type"] == "TIPS" else "0.0",
-                    "FixedSpread": "0.0005" if item["security_type"] == "FRN" else "0.0",
-                    "AccruedInterest_FRN": "0.0",
-                    "BenchmarkRate_FRN": f"{issue_yield:.12f}" if item["security_type"] == "FRN" else "0.0",
-                    "LastAccrualDate": item["issue_date"].date().isoformat() if item["security_type"] == "FRN" else "",
-                    "IssuePriceRatio": f"{price_ratio:.12f}",
-                    "IssueProceeds": f"{face_value * price_ratio:.12f}",
-                    "IssueYieldAtIssue": f"{issue_yield:.12f}",
-                    "TimeToMaturity": "",
-                    "DiscountYield": "",
-                    "CleanPrice": "",
-                    "AccruedInterest": "",
-                    "DirtyValue": "",
-                    "DirtyPriceRatio": "",
-                    "cohort_id": f"mspd_{latest_date}_{cusip}_{bond_id}",
-                    "cusip_or_synthetic_id": cusip,
-                    "issue_proceeds_bil": f"{face_value * price_ratio:.12f}",
-                    "face_value_bil": f"{face_value:.12f}",
-                    "adjusted_principal_bil": f"{original_principal:.12f}",
-                    "holder_bucket": holder,
-                    "ratewall_perimeter": "DU" if holder == "Private" else "RU",
-                    "source_family": "fiscaldata_mspd_table_3_market;tsyparty_z1_holder_constraints",
-                    "source_key": f"{latest_date}:{class_desc}:{cusip}",
-                    "observability_tier": "security_cohort_total_with_constrained_holder_allocation",
-                    "central_default_eligible": "true",
-                    "sensitivity_only": "false",
-                    "source_status": (
-                        "mspd_million_amounts_scaled_to_table1_class_total_and_converted_to_bil;"
-                        "holder_split_from_latest_z1_aggregate_not_cusip_holder_evidence;"
-                        "cusip_by_holder_public_source_unavailable"
+            holder_routes = [("", share)]
+            if holder == "Private":
+                holder_routes = [
+                    (
+                        PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+                        share * private_subbucket_stock_shares[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK],
                     ),
-                    "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
-                }
-            )
-            bond_id += 1
+                    (
+                        PRIVATE_SUBBUCKET_MMF,
+                        share * private_subbucket_stock_shares[PRIVATE_SUBBUCKET_MMF],
+                    ),
+                ]
+            for holder_subbucket, routed_share in holder_routes:
+                face_value = total_face * routed_share
+                if face_value <= 1e-9:
+                    continue
+                original_principal = face_value if item["security_type"] == "TIPS" else 0.0
+                output_rows.append(
+                    {
+                        "BondID": bond_id,
+                        "SecurityType": item["security_type"],
+                        "IssueDate": item["issue_date"].date().isoformat(),
+                        "MaturityDate": item["maturity_date"].date().isoformat(),
+                        "OriginalMaturityYears": f"{maturity_years:.8f}",
+                        "FaceValue": f"{face_value:.12f}",
+                        "CouponRate": f"{coupon_rate:.12f}",
+                        "HolderType": holder,
+                        "HolderSubBucket": holder_subbucket,
+                        "Status": "Active",
+                        "MaturityCategory": maturity_category or "",
+                        "OriginalPrincipal": f"{original_principal:.12f}",
+                        "AdjustedPrincipal": f"{original_principal:.12f}",
+                        "ReferenceCPI_Issue": "100.0" if item["security_type"] == "TIPS" else "0.0",
+                        "IndexRatio": "1.0" if item["security_type"] == "TIPS" else "0.0",
+                        "FixedSpread": "0.0005" if item["security_type"] == "FRN" else "0.0",
+                        "AccruedInterest_FRN": "0.0",
+                        "BenchmarkRate_FRN": f"{issue_yield:.12f}" if item["security_type"] == "FRN" else "0.0",
+                        "LastAccrualDate": item["issue_date"].date().isoformat() if item["security_type"] == "FRN" else "",
+                        "IssuePriceRatio": f"{price_ratio:.12f}",
+                        "IssueProceeds": f"{face_value * price_ratio:.12f}",
+                        "IssueYieldAtIssue": f"{issue_yield:.12f}",
+                        "TimeToMaturity": "",
+                        "DiscountYield": "",
+                        "CleanPrice": "",
+                        "AccruedInterest": "",
+                        "DirtyValue": "",
+                        "DirtyPriceRatio": "",
+                        "cohort_id": f"mspd_{latest_date}_{cusip}_{bond_id}",
+                        "cusip_or_synthetic_id": cusip,
+                        "issue_proceeds_bil": f"{face_value * price_ratio:.12f}",
+                        "face_value_bil": f"{face_value:.12f}",
+                        "adjusted_principal_bil": f"{original_principal:.12f}",
+                        "holder_bucket": holder,
+                        "holder_subbucket": holder_subbucket,
+                        "source_holder_bucket": (
+                            "domestic_nonbank"
+                            if holder_subbucket == PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+                            else "mmf"
+                            if holder_subbucket == PRIVATE_SUBBUCKET_MMF
+                            else holder
+                        ),
+                        "ratewall_perimeter": "DU" if holder == "Private" else "RU",
+                        "source_family": "fiscaldata_mspd_table_3_market;tsyparty_z1_holder_constraints",
+                        "source_key": f"{latest_date}:{class_desc}:{cusip}",
+                        "observability_tier": "security_cohort_total_with_constrained_holder_allocation",
+                        "central_default_eligible": "true",
+                        "sensitivity_only": "false",
+                        "source_status": (
+                            "mspd_million_amounts_scaled_to_table1_class_total_and_converted_to_bil;"
+                            "holder_split_from_latest_z1_aggregate_not_cusip_holder_evidence;"
+                            "private_subbucket_split_from_latest_z1_stock_share;"
+                            "cusip_by_holder_public_source_unavailable"
+                        ),
+                        "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
+                    }
+                )
+                bond_id += 1
 
     frame = pd.DataFrame(output_rows)
     frame.to_csv(output_path, index=False)
@@ -953,7 +1157,7 @@ def build_holder_absorption_path(
     coupons_primary_path: Path,
     holder_absorption_calibration: dict[str, float | list[float]] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    scenarios, metadata = _load_absorption_scenarios(
+    scenarios, metadata, private_subbucket_scenarios = _load_absorption_scenarios(
         tdcmix_prior_path,
         z1_absorption_path=z1_absorption_path,
         bills_primary_path=bills_primary_path,
@@ -966,49 +1170,105 @@ def build_holder_absorption_path(
             for quarter_idx in range(1, 5):
                 quarter = f"{year}Q{quarter_idx}"
                 for holder in TDCSIM_HOLDERS:
-                    rows.append(
-                        {
-                            "scenario_id": scenario_id,
-                            "quarter": quarter,
-                            "holder_type": holder,
-                            "bills_pct": f"{category_shares['bills'].get(holder, 0.0):.12f}",
-                            "notes_pct": f"{category_shares['notes'].get(holder, 0.0):.12f}",
-                            "bonds_pct": f"{category_shares['bonds'].get(holder, 0.0):.12f}",
-                            "tips_pct": f"{category_shares['tips'].get(holder, 0.0):.12f}",
-                            "frn_pct": f"{category_shares['frn'].get(holder, 0.0):.12f}",
-                            "nonmarketable_pct": "0.0",
-                            "source_family": (
-                                "tdcmix_holder_absorption_prior_contract;"
-                                "tdcmix_z1_exact_recent_absorption;"
-                                "tsyparty_primary_market_buyer_composition"
+                    holder_rows = [("", holder, None)]
+                    if holder == "Private":
+                        holder_rows = [
+                            (
+                                PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+                                "domestic_nonbank",
+                                1.0,
                             ),
-                            "source_key": (
-                                f"{tdcmix_prior_path.name};"
-                                f"{z1_absorption_path.name};"
-                                f"{bills_primary_path.name};"
-                                f"{coupons_primary_path.name}"
+                            (
+                                PRIVATE_SUBBUCKET_MMF,
+                                "mmf",
+                                MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
                             ),
-                            "source_status": (
-                                "instrument_specific_holder_absorption_prior_not_holder_allocation_evidence;"
-                                f"{metadata['dealer_bridge_mapping']}"
-                                f";primary_market_overlay_{metadata['primary_market_overlay_coverage']}"
-                                + (
-                                    ";mmf_collapsed_into_du_current_private_bucket"
+                        ]
+                    for holder_subbucket, source_holder_bucket, pass_through in holder_rows:
+                        values = {}
+                        for category in PREFERENCE_CATEGORIES:
+                            holder_share = category_shares[category].get(holder, 0.0)
+                            if holder == "Private":
+                                route_share = private_subbucket_scenarios[scenario_id][category].get(
+                                    holder_subbucket,
+                                    0.0,
+                                )
+                                holder_share *= route_share
+                            values[category] = holder_share
+                        rows.append(
+                            {
+                                "scenario_id": scenario_id,
+                                "quarter": quarter,
+                                "holder_type": holder,
+                                "holder_subbucket": holder_subbucket,
+                                "source_holder_bucket": source_holder_bucket,
+                                "route_class": (
+                                    "du_deposit_funded"
+                                    if holder_subbucket == PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+                                    else "mmf_cash_fund_plumbing"
+                                    if holder_subbucket == PRIVATE_SUBBUCKET_MMF
+                                    else ""
+                                ),
+                                "deposit_pass_through": (
+                                    "" if pass_through is None else f"{pass_through:.2f}"
+                                ),
+                                "mmf_deposit_pass_through": (
+                                    f"{MMF_DEPOSIT_PASS_THROUGH_DEFAULT:.2f}" if holder == "Private" else ""
+                                ),
+                                "mmf_ru_plumbing_pass_through": (
+                                    f"{1.0 - MMF_DEPOSIT_PASS_THROUGH_DEFAULT:.2f}"
                                     if holder == "Private"
                                     else ""
-                                )
-                            ),
-                            "mmf_collapsed_into_du": "true" if holder == "Private" else "false",
-                            "central_default_eligible": (
-                                "true" if scenario_id == "current_mix_baseline" else "false"
-                            ),
-                            "sensitivity_only": (
-                                "false" if scenario_id == "current_mix_baseline" else "true"
-                            ),
-                            "blocked_unmapped_share": "0.0",
-                            "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
-                        }
-                    )
+                                ),
+                                "mmf_deposit_pass_through_status": (
+                                    MMF_DEPOSIT_PASS_THROUGH_STATUS if holder == "Private" else ""
+                                ),
+                                "mmf_deposit_pass_through_sensitivity_grid": (
+                                    "|".join(
+                                        f"{value:.2f}"
+                                        for value in MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID
+                                    )
+                                    if holder == "Private"
+                                    else ""
+                                ),
+                                "bills_pct": f"{values['bills']:.12f}",
+                                "notes_pct": f"{values['notes']:.12f}",
+                                "bonds_pct": f"{values['bonds']:.12f}",
+                                "tips_pct": f"{values['tips']:.12f}",
+                                "frn_pct": f"{values['frn']:.12f}",
+                                "nonmarketable_pct": "0.0",
+                                "source_family": (
+                                    "tdcmix_holder_absorption_prior_contract;"
+                                    "tdcmix_z1_exact_recent_absorption;"
+                                    "tsyparty_primary_market_buyer_composition"
+                                ),
+                                "source_key": (
+                                    f"{tdcmix_prior_path.name};"
+                                    f"{z1_absorption_path.name};"
+                                    f"{bills_primary_path.name};"
+                                    f"{coupons_primary_path.name}"
+                                ),
+                                "source_status": (
+                                    "instrument_specific_holder_absorption_prior_not_holder_allocation_evidence;"
+                                    f"{metadata['dealer_bridge_mapping']}"
+                                    f";primary_market_overlay_{metadata['primary_market_overlay_coverage']}"
+                                    + (
+                                        ";mmf_split_from_du_private_subbucket_explicit"
+                                        if holder == "Private"
+                                        else ""
+                                    )
+                                ),
+                                "mmf_collapsed_into_du": "false",
+                                "central_default_eligible": (
+                                    "true" if scenario_id == "current_mix_baseline" else "false"
+                                ),
+                                "sensitivity_only": (
+                                    "false" if scenario_id == "current_mix_baseline" else "true"
+                                ),
+                                "blocked_unmapped_share": "0.0",
+                                "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
+                            }
+                        )
     frame = pd.DataFrame(rows)
     frame.to_csv(output_path, index=False)
     return frame, {
@@ -1105,6 +1365,13 @@ def build_ratewall_config(
         "sector_preferences": base_prefs,
         "auction_absorption_preferences": base_prefs,
         "secondary_target_preferences": base_prefs,
+        "private_mmf_split": {
+            "enabled": True,
+            "mmf_deposit_pass_through": MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
+            "mmf_deposit_pass_through_status": MMF_DEPOSIT_PASS_THROUGH_STATUS,
+            "mmf_ru_plumbing_pass_through": 1.0 - MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
+            "sensitivity_grid": MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
+        },
         "ratewall_input_paths": {
             "primary_flow_to_du_file": str((input_dir / "tdcsim_primary_flow_to_du_path.csv").relative_to(output_path.parent)),
             "holder_absorption_path_file": str((input_dir / "tdcsim_holder_absorption_path.csv").relative_to(output_path.parent)),
