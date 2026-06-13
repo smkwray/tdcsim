@@ -118,6 +118,17 @@ sector_preferences: &id001
     frn_pct: 0.25
 auction_absorption_preferences: *id001
 secondary_target_preferences: *id001
+private_mmf_split:
+  enabled: true
+  mmf_deposit_pass_through: 0.15
+  mmf_deposit_pass_through_status: source_grounded_model_default_not_measured
+  mmf_ru_plumbing_pass_through: 0.85
+  sensitivity_grid:
+  - 0.0
+  - 0.15
+  - 0.25
+  - 0.5
+  - 1.0
 ratewall_input_paths:
   primary_flow_to_du_file: data/ratewall_inputs/tdcsim_primary_flow_to_du_path.csv
   holder_absorption_path_file: data/ratewall_inputs/tdcsim_holder_absorption_path.csv

@@ -16,6 +16,7 @@ VALID_OVERRIDE_KEYS = frozenset({
     'events', 'tips_params', 'frn_params', 'nonmarketable_params', 'other_flows',
     'rate_sensitive_demand', 'financing_cost_options',
     'simulation_period', 'yield_curve_surface', 'ratewall_contract', 'ratewall_input_paths',
+    'private_mmf_split',
 })
 
 VALID_NONMARKETABLE_CREDITING_FREQUENCIES = frozenset({'semi-annual', 'annual'})
@@ -67,6 +68,7 @@ HOLDER_PREF_BLOCKS: frozenset = frozenset({
 # Parameter blocks with complex nested structure validated elsewhere
 COMPLEX_REPLACEMENT_BLOCKS: frozenset = frozenset({
     'yield_curve', 'treasury_issuance_profile', 'rate_sensitive_demand', 'financing_cost_options',
+    'private_mmf_split',
 })
 
 _VALID_RATE_SENSITIVE_SECTIONS = frozenset({'auction', 'secondary'})

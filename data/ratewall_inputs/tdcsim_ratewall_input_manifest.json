@@ -7,20 +7,22 @@
       "dealer_bridge_mapping": "dealer_bridge_redistributed_by_pre_overlay_baseline_not_mapped_to_banks",
       "primary_market_overlay_coverage": "low_coverage_only_dealers_fed_foreign_official_share_weighted",
       "primary_market_overlay_weight": "0.20",
-      "rows": 1936,
+      "rows": 2420,
       "scenario_shift_lambda_default": "0.50",
       "scenario_shift_lambda_grid": "0.25,0.50,0.75,1.00",
       "tdcmix_prior_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/holder_absorption_prior_contract.csv",
       "tic_foreign_cross_check_status": "DEFERRED_new_plumbing_QA_only_not_blocking_blend_weight_grounding",
       "z1_absorption_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/z1_exact_holder_absorption_panel.csv",
       "z1_effective_quarters_n_eff": "8.000000000000",
+      "z1_private_subbucket_effective_quarters_n_eff": "8.000000000000",
+      "z1_private_subbucket_shrinkage_weight": "0.500000000000",
       "z1_shrinkage_k_quarters": "8.0",
       "z1_shrinkage_weight": "0.500000000000"
     },
     "initial_portfolio": {
       "holder_stock_share_source": "/Users/shanewray/malus/proj/tsyparty/data/interim/z1_holdings_wide.csv",
       "mspd_record_date": "2026-05-31",
-      "rows": 1832,
+      "rows": 2290,
       "source_url_table_1": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/debt/mspd/mspd_table_1",
       "source_url_table_3_market": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/debt/mspd/mspd_table_3_market"
     },
@@ -38,19 +40,19 @@
     }
   },
   "claim_boundary": "tdcsim_ratewall_source_backed_input_contract_not_evidence_mode",
-  "created_at": "2026-06-13T16:57:53.977052+00:00",
+  "created_at": "2026-06-13T17:58:12.869243+00:00",
   "files": {
     "tdc_config_ratewall_source_backed.yaml": {
-      "bytes": 6130,
-      "sha256": "a390c17145b6a4789430dfc72c299b150c85f56c2af943fd8d5ad21e2e75b168"
+      "bytes": 6375,
+      "sha256": "8ecfb7d4fe01d24e8026085e530b076c987491f855b0cd652eb33daae14fd7b0"
     },
     "tdcsim_holder_absorption_path.csv": {
-      "bytes": 1390594,
-      "sha256": "a32ba012510b70c906a181f58cf675f38ba48cb23fdf150cf5e846daf7c69255"
+      "bytes": 1910081,
+      "sha256": "c22665b33c8121a8834b30b4d40875b282aa5ab8dc255fe51092ee5e2b0ca509"
     },
     "tdcsim_initial_portfolio_cohorts.csv": {
-      "bytes": 1272035,
-      "sha256": "80a371e463871bd7ce86aeb986b3f1cbd29b2021890f6528970650f6036f082d"
+      "bytes": 1775775,
+      "sha256": "dadd14be1a17c0431031be7032317a4e9fb09eb34baefd4945ee157b0ed0393e"
     },
     "tdcsim_interest_component_contract.csv": {
       "bytes": 1589,

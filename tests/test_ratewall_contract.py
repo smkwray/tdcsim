@@ -331,8 +331,13 @@ def test_ratewall_source_registry_blocks_weak_wamest_rows(tmp_path):
     mmf_disclosure = registry[
         registry["source_key"] == "mmf_collapsed_into_du_current_private_bucket"
     ].iloc[0]
-    assert mmf_disclosure["central_default_eligible"]
-    assert "full_private_mmf_route_split_owner_gated" in mmf_disclosure["binding_blocker"]
+    assert not mmf_disclosure["central_default_eligible"]
+    assert "superseded_by_private_subbucket_split_contract_0_2_0" in mmf_disclosure["binding_blocker"]
+    split_routes = registry[registry["source_family"] == "tdcsim_private_subbucket"]
+    assert set(split_routes["source_key"]) == {
+        "domestic_nonbank_deposit_funded",
+        "mmf_cash_fund_route",
+    }
 
 
 def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_path):
@@ -350,7 +355,7 @@ def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_pa
     assert set(route_rows["source_key"]) >= {
         "Private",
         "domestic_nonbank_non_deposit_funded",
-        "mmf_on_rrp_reserve_user_like",
+        "mmf_cash_fund_route",
     }
     private_route = route_rows[route_rows["source_key"] == "Private"].iloc[0]
     assert private_route["ratewall_role"] == (
@@ -365,7 +370,7 @@ def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_pa
         "binding_blocker"
     ]
     mmf_route = route_rows[
-        route_rows["source_key"] == "mmf_on_rrp_reserve_user_like"
+        route_rows["source_key"] == "mmf_cash_fund_route"
     ].iloc[0]
     assert not mmf_route["central_default_eligible"]
     assert "mmf_on_rrp_route_split" in mmf_route["binding_blocker"]
@@ -713,12 +718,22 @@ def test_ratewall_absorption_scenario_lambda_comes_from_calibration(tmp_path):
     current = frame[
         (frame["scenario_id"] == "domestic_nonbank_absorption_shift")
         & (frame["quarter"] == "2026Q1")
-    ].set_index("holder_type")
+    ]
+    current_by_holder = (
+        current.assign(bills_pct=current["bills_pct"].astype(float))
+        .groupby("holder_type")["bills_pct"]
+        .sum()
+    )
     assert metadata["scenario_shift_lambda_default"] == "1.00"
-    assert float(current.loc["CB", "bills_pct"]) == pytest.approx(0.1)
-    assert float(current.loc["Banks", "bills_pct"]) == pytest.approx(0.1)
-    assert float(current.loc["Foreign", "bills_pct"]) == pytest.approx(0.1)
-    assert float(current.loc["Private", "bills_pct"]) == pytest.approx(0.7)
+    assert current_by_holder["CB"] == pytest.approx(0.1)
+    assert current_by_holder["Banks"] == pytest.approx(0.1)
+    assert current_by_holder["Foreign"] == pytest.approx(0.1)
+    assert current_by_holder["Private"] == pytest.approx(0.7)
+    private_rows = current[current["holder_type"] == "Private"]
+    assert set(private_rows["holder_subbucket"]) == {
+        "domestic_nonbank_deposit_funded",
+        "mmf_cash_fund_route",
+    }
 
 
 def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tmp_path):
@@ -837,6 +852,7 @@ def test_ratewall_initial_portfolio_converts_mspd_millions_to_billions(tmp_path,
 
     assert len(frame) == 1
     row = frame.iloc[0]
+    assert row["HolderSubBucket"] == "domestic_nonbank_deposit_funded"
     assert abs(float(row["face_value_bil"]) - 1000.0) < 1e-9
     assert abs(float(row["FaceValue"]) - 1000.0) < 1e-9
     assert "converted_to_bil" in row["source_status"]

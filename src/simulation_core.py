@@ -14,6 +14,8 @@ import yaml
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
+    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKETS,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
 )
@@ -139,6 +141,18 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
     initial_bonds_df_global['HolderType'] = initial_bonds_df_global['HolderType'].astype(str).apply(
         lambda x: x if x in HOLDER_TYPES else default_nm_holder
     )
+    initial_bonds_df_global['HolderSubBucket'] = (
+        initial_bonds_df_global['HolderSubBucket']
+        .fillna("")
+        .astype(str)
+        .replace({"<NA>": "", "nan": "", "None": ""})
+    )
+    private_mask = initial_bonds_df_global['HolderType'] == 'Private'
+    valid_private_subbucket = initial_bonds_df_global['HolderSubBucket'].isin(PRIVATE_SUBBUCKETS)
+    initial_bonds_df_global.loc[private_mask & ~valid_private_subbucket, 'HolderSubBucket'] = (
+        PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+    )
+    initial_bonds_df_global.loc[~private_mask, 'HolderSubBucket'] = ""
     initial_bonds_df_global['Status'] = initial_bonds_df_global['Status'].fillna('Active').astype(str)
 
     tips_init_mask = (initial_bonds_df_global['SecurityType'] == 'TIPS') & (
