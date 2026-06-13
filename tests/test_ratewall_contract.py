@@ -538,7 +538,7 @@ def test_primary_flow_path_maps_cbo_fiscal_year_to_calendar_quarters(tmp_path, m
 
 
 def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[1]
     ratewall_root = repo_root.parent / "ratewall"
     tdcmix_prior = (
         repo_root.parent
@@ -568,8 +568,9 @@ def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
         / "interim"
         / "nominal_coupons_quarterly_composition.csv"
     )
-    if not (ratewall_root.exists() and tdcmix_prior.exists() and z1_absorption.exists()):
-        return
+    assert ratewall_root.exists()
+    assert tdcmix_prior.exists()
+    assert z1_absorption.exists()
 
     frame, metadata = build_holder_absorption_path(
         tmp_path / "holder.csv",
@@ -597,8 +598,8 @@ def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
     banks = current[current["holder_type"] == "Banks"].iloc[0]
     assert banks["bills_pct"] != banks["notes_pct"]
     private = current[current["holder_type"] == "Private"].iloc[0]
-    assert str(private["mmf_collapsed_into_du"]).lower() == "true"
-    assert "mmf_collapsed_into_du_current_private_bucket" in private["source_status"]
+    assert str(private["mmf_collapsed_into_du"]).lower() == "false"
+    assert "mmf_split_from_du_private_subbucket_explicit" in private["source_status"]
     assert "dealer_bridge_redistributed_by_pre_overlay_baseline_not_mapped_to_banks" in private["source_status"]
     assert "primary_market_overlay_low_coverage_only_dealers_fed_foreign_official_share_weighted" in private["source_status"]
 
