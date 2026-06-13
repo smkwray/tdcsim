@@ -4,15 +4,23 @@
       "baseline_sources": "tdcmix_prior_contract;z1_exact_recent_positive_absorption;primary_market_instrument_buyer_composition",
       "bills_primary_path": "/Users/shanewray/malus/proj/tsyparty/data/interim/bills_quarterly_composition.csv",
       "coupons_primary_path": "/Users/shanewray/malus/proj/tsyparty/data/interim/nominal_coupons_quarterly_composition.csv",
-      "dealer_bridge_mapping": "dealers_mapped_to_banks_ru_for_auction_settlement_not_final_holder_claim",
+      "dealer_bridge_mapping": "dealer_bridge_redistributed_by_pre_overlay_baseline_not_mapped_to_banks",
+      "primary_market_overlay_coverage": "low_coverage_only_dealers_fed_foreign_official_share_weighted",
+      "primary_market_overlay_weight": "0.20",
       "rows": 1936,
+      "scenario_shift_lambda_default": "0.50",
+      "scenario_shift_lambda_grid": "0.25,0.50,0.75,1.00",
       "tdcmix_prior_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/holder_absorption_prior_contract.csv",
-      "z1_absorption_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/z1_exact_holder_absorption_panel.csv"
+      "tic_foreign_cross_check_status": "DEFERRED_new_plumbing_QA_only_not_blocking_blend_weight_grounding",
+      "z1_absorption_path": "/Users/shanewray/malus/proj/tdcmix/data/processed/z1_exact_holder_absorption_panel.csv",
+      "z1_effective_quarters_n_eff": "8.000000000000",
+      "z1_shrinkage_k_quarters": "8.0",
+      "z1_shrinkage_weight": "0.500000000000"
     },
     "initial_portfolio": {
       "holder_stock_share_source": "/Users/shanewray/malus/proj/tsyparty/data/interim/z1_holdings_wide.csv",
-      "mspd_record_date": "2026-04-30",
-      "rows": 1840,
+      "mspd_record_date": "2026-05-31",
+      "rows": 1832,
       "source_url_table_1": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/debt/mspd/mspd_table_1",
       "source_url_table_3_market": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/debt/mspd/mspd_table_3_market"
     },
@@ -26,23 +34,23 @@
     },
     "yield_curve": {
       "rows": 1760,
-      "treasury_curve_date": "2026-05-21"
+      "treasury_curve_date": "2026-06-12"
     }
   },
   "claim_boundary": "tdcsim_ratewall_source_backed_input_contract_not_evidence_mode",
-  "created_at": "2026-05-22T16:46:49.904410+00:00",
+  "created_at": "2026-06-13T16:57:53.977052+00:00",
   "files": {
     "tdc_config_ratewall_source_backed.yaml": {
-      "bytes": 5031,
-      "sha256": "a683e7ce3ce59d0cdafb8c4433f60689033582c6de19fed0dd7794c16721172c"
+      "bytes": 6130,
+      "sha256": "a390c17145b6a4789430dfc72c299b150c85f56c2af943fd8d5ad21e2e75b168"
     },
     "tdcsim_holder_absorption_path.csv": {
-      "bytes": 1227970,
-      "sha256": "d3a14b75caa068aa9aa2538d2dc409b63e44ed68decf05d7a565cdf2bcc545cd"
+      "bytes": 1390594,
+      "sha256": "a32ba012510b70c906a181f58cf675f38ba48cb23fdf150cf5e846daf7c69255"
     },
     "tdcsim_initial_portfolio_cohorts.csv": {
-      "bytes": 1277497,
-      "sha256": "fcb17dc61f9ff81f6a01f8a13f395930ea3e3715c71d54a3954ec32927a8cf51"
+      "bytes": 1272035,
+      "sha256": "80a371e463871bd7ce86aeb986b3f1cbd29b2021890f6528970650f6036f082d"
     },
     "tdcsim_interest_component_contract.csv": {
       "bytes": 1589,
@@ -54,7 +62,7 @@
     },
     "tdcsim_yield_curve_surface.csv": {
       "bytes": 796367,
-      "sha256": "13c8c2d11379179ce13d14a6c68c1bd760f5a02a75aa6c4a58c41fd3cc9eb757"
+      "sha256": "f5b78db16d2aa8c4942a2a343cf2c118f7638c286ba6655c9d7ffd683ffffd65"
     }
   },
   "schema_version": "0.1.0",

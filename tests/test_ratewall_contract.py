@@ -576,6 +576,13 @@ def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
 
     assert set(frame["scenario_id"]) == set(SCENARIO_CURVE_MAP)
     assert "primary_market_instrument_buyer_composition" in metadata["baseline_sources"]
+    assert metadata["z1_effective_quarters_n_eff"] != "0.000000000000"
+    assert metadata["z1_shrinkage_weight"] != "0.000000000000"
+    assert metadata["primary_market_overlay_coverage"] == (
+        "low_coverage_only_dealers_fed_foreign_official_share_weighted"
+    )
+    assert metadata["scenario_shift_lambda_default"] == "0.50"
+    assert metadata["tic_foreign_cross_check_status"].startswith("DEFERRED")
     current = frame[
         (frame["scenario_id"] == "current_mix_baseline")
         & (frame["quarter"] == "2026Q1")
@@ -587,6 +594,131 @@ def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
     private = current[current["holder_type"] == "Private"].iloc[0]
     assert str(private["mmf_collapsed_into_du"]).lower() == "true"
     assert "mmf_collapsed_into_du_current_private_bucket" in private["source_status"]
+    assert "dealer_bridge_redistributed_by_pre_overlay_baseline_not_mapped_to_banks" in private["source_status"]
+    assert "primary_market_overlay_low_coverage_only_dealers_fed_foreign_official_share_weighted" in private["source_status"]
+
+
+def test_ratewall_absorption_z1_shrinkage_drops_trailing_all_nan_quarter(tmp_path):
+    rows = []
+    for quarter in [
+        "2024-03-31",
+        "2024-06-30",
+        "2024-09-30",
+        "2024-12-31",
+        "2025-03-31",
+        "2025-06-30",
+        "2025-09-30",
+        "2025-12-31",
+    ]:
+        rows.append(
+            {
+                "quarter": quarter,
+                "positive_absorption_total": 100.0,
+                "pos_abs_share_fed": 0.2,
+                "pos_abs_share_banks": 0.1,
+                "pos_abs_share_dealer_bridge": 0.5,
+                "pos_abs_share_row": 0.3,
+                "pos_abs_share_mmf": 0.0,
+                "pos_abs_share_domestic_nonbank": 0.4,
+            }
+        )
+    rows.append(
+        {
+            "quarter": "2026-03-31",
+            "positive_absorption_total": float("nan"),
+            "pos_abs_share_fed": float("nan"),
+            "pos_abs_share_banks": float("nan"),
+            "pos_abs_share_dealer_bridge": float("nan"),
+            "pos_abs_share_row": float("nan"),
+            "pos_abs_share_mmf": float("nan"),
+            "pos_abs_share_domestic_nonbank": float("nan"),
+        }
+    )
+    path = tmp_path / "z1.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    shares, n_eff = rib._latest_z1_absorption_shares(path)
+
+    assert n_eff == pytest.approx(8.0)
+    assert shares == pytest.approx(
+        {
+            "CB": 0.2,
+            "Banks": 0.1,
+            "Foreign": 0.3,
+            "Private": 0.4,
+        }
+    )
+
+
+def test_ratewall_absorption_primary_dealers_are_redistributed_by_baseline(tmp_path):
+    path = tmp_path / "primary.csv"
+    pd.DataFrame(
+        [
+            {"date": "2026-03-31", "buyer_class": "dealers", "share": 0.8},
+            {"date": "2026-03-31", "buyer_class": "fed", "share": 0.05},
+            {"date": "2026-03-31", "buyer_class": "foreign_official", "share": 0.15},
+        ]
+    ).to_csv(path, index=False)
+
+    shares = rib._latest_primary_market_instrument_shares(
+        path,
+        baseline_scalar={"Banks": 0.2, "CB": 0.1, "Foreign": 0.3, "Private": 0.4},
+    )
+
+    assert shares == pytest.approx(
+        {
+            "Banks": 0.16,
+            "CB": 0.13,
+            "Foreign": 0.39,
+            "Private": 0.32,
+        }
+    )
+
+
+def test_ratewall_absorption_scenario_lambda_comes_from_calibration(tmp_path):
+    tdcmix_path = tmp_path / "tdcmix.csv"
+    pd.DataFrame(
+        [
+            {"bucket": "fed", "default_prior_value": 0.25, "lower_prior_value": 0.8, "upper_prior_value": 0.1},
+            {"bucket": "banks", "default_prior_value": 0.25, "lower_prior_value": 0.1, "upper_prior_value": 0.1},
+            {"bucket": "row", "default_prior_value": 0.25, "lower_prior_value": 0.1, "upper_prior_value": 0.1},
+            {
+                "bucket": "domestic_nonbank",
+                "default_prior_value": 0.25,
+                "lower_prior_value": 0.0,
+                "upper_prior_value": 0.7,
+            },
+            {"bucket": "mmf", "default_prior_value": 0.0, "lower_prior_value": 0.0, "upper_prior_value": 0.0},
+            {"bucket": "dealer_bridge", "default_prior_value": 0.0, "lower_prior_value": 0.0, "upper_prior_value": 0.0},
+        ]
+    ).to_csv(tdcmix_path, index=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "holder_absorption_calibration:\n"
+        "  scenario_shift_lambda_grid: [0.25, 0.50, 0.75, 1.00]\n"
+        "  scenario_shift_lambda_default: 1.00\n",
+        encoding="utf-8",
+    )
+    calibration = rib._load_holder_absorption_calibration(config_path)
+
+    frame, metadata = build_holder_absorption_path(
+        tmp_path / "holder.csv",
+        tdcmix_prior_path=tdcmix_path,
+        z1_absorption_path=tmp_path / "missing_z1.csv",
+        bills_primary_path=tmp_path / "missing_bills.csv",
+        coupons_primary_path=tmp_path / "missing_coupons.csv",
+        holder_absorption_calibration=calibration,
+    )
+
+    current = frame[
+        (frame["scenario_id"] == "domestic_nonbank_absorption_shift")
+        & (frame["quarter"] == "2026Q1")
+    ].set_index("holder_type")
+    assert metadata["scenario_shift_lambda_default"] == "1.00"
+    assert float(current.loc["CB", "bills_pct"]) == pytest.approx(0.1)
+    assert float(current.loc["Banks", "bills_pct"]) == pytest.approx(0.1)
+    assert float(current.loc["Foreign", "bills_pct"]) == pytest.approx(0.1)
+    assert float(current.loc["Private", "bills_pct"]) == pytest.approx(0.7)
 
 
 def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tmp_path):

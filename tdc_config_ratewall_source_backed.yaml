@@ -121,6 +121,13 @@ secondary_target_preferences: *id001
 ratewall_input_paths:
   primary_flow_to_du_file: data/ratewall_inputs/tdcsim_primary_flow_to_du_path.csv
   holder_absorption_path_file: data/ratewall_inputs/tdcsim_holder_absorption_path.csv
+holder_absorption_calibration:
+  scenario_shift_lambda_grid:
+  - 0.25
+  - 0.5
+  - 0.75
+  - 1.0
+  scenario_shift_lambda_default: 0.5
 tips_params:
   cpi_start_level: 100.0
   cpi_annual_inflation: 0.02
