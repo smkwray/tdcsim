@@ -30,6 +30,14 @@ RATEWALL_CLAIM_BOUNDARY = "tdcsim_ratewall_source_backed_input_contract_not_evid
 TENORS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
 TDCSIM_HOLDERS = ["Banks", "CB", "Foreign", "Private"]
 PREFERENCE_CATEGORIES = ["bills", "notes", "bonds", "tips", "frn"]
+Z1_LOOKBACK_QUARTERS = 8
+Z1_SHRINKAGE_K_QUARTERS = 8.0
+Z1_POSITIVE_ABSORPTION_FLOOR_BN_SAAR = 25.0
+Z1_FLOOR_MEDIAN_MULTIPLIER = 0.10
+PRIMARY_MARKET_LOOKBACK_QUARTERS = 8
+PRIMARY_MARKET_OVERLAY_WEIGHT = 0.20
+SCENARIO_SHIFT_LAMBDA_GRID = [0.25, 0.50, 0.75, 1.00]
+SCENARIO_SHIFT_LAMBDA_DEFAULT = 0.50
 RATE_SCENARIOS = {
     "cbo_shape_preserving_baseline": {
         "short_shift": 0.0,
@@ -229,6 +237,35 @@ def _blend_shares(
     )
 
 
+def _default_holder_absorption_calibration() -> dict[str, float | list[float]]:
+    return {
+        "scenario_shift_lambda_grid": list(SCENARIO_SHIFT_LAMBDA_GRID),
+        "scenario_shift_lambda_default": SCENARIO_SHIFT_LAMBDA_DEFAULT,
+    }
+
+
+def _load_holder_absorption_calibration(config_path: Path) -> dict[str, float | list[float]]:
+    defaults = _default_holder_absorption_calibration()
+    if not config_path.exists():
+        return defaults
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    section = loaded.get("holder_absorption_calibration", {})
+    if not isinstance(section, dict):
+        return defaults
+    grid_raw = section.get("scenario_shift_lambda_grid", defaults["scenario_shift_lambda_grid"])
+    if not isinstance(grid_raw, list) or not grid_raw:
+        grid = list(SCENARIO_SHIFT_LAMBDA_GRID)
+    else:
+        grid = [float(value) for value in grid_raw]
+    return {
+        "scenario_shift_lambda_grid": grid,
+        "scenario_shift_lambda_default": _safe_float(
+            section.get("scenario_shift_lambda_default"),
+            float(defaults["scenario_shift_lambda_default"]),
+        ),
+    }
+
+
 def _load_tdcmix_targets(tdcmix_prior_path: Path) -> dict[str, dict[str, float]]:
     frame = pd.read_csv(tdcmix_prior_path)
     rows = {str(row["bucket"]): row for _, row in frame.iterrows()}
@@ -263,39 +300,78 @@ def _load_tdcmix_targets(tdcmix_prior_path: Path) -> dict[str, dict[str, float]]
     }
 
 
-def _latest_z1_absorption_shares(z1_absorption_path: Path) -> dict[str, float] | None:
+def _latest_z1_absorption_shares(z1_absorption_path: Path) -> tuple[dict[str, float] | None, float]:
     if not z1_absorption_path.exists():
-        return None
+        return None, 0.0
     frame = pd.read_csv(z1_absorption_path)
     if "quarter" not in frame.columns:
-        return None
+        return None, 0.0
+    required = [
+        "positive_absorption_total",
+        "pos_abs_share_fed",
+        "pos_abs_share_banks",
+        "pos_abs_share_dealer_bridge",
+        "pos_abs_share_row",
+        "pos_abs_share_mmf",
+        "pos_abs_share_domestic_nonbank",
+    ]
+    if not set(required) <= set(frame.columns):
+        return None, 0.0
     frame["quarter_date"] = pd.to_datetime(frame["quarter"], errors="coerce")
-    frame = frame.dropna(subset=["quarter_date"]).sort_values("quarter_date").tail(8)
-    if frame.empty:
-        return None
-    raw = {
-        "CB": frame.get("pos_abs_share_fed", pd.Series(dtype=float)).mean(),
-        "Banks": (
-            frame.get("pos_abs_share_banks", pd.Series(dtype=float)).mean()
-            + frame.get("pos_abs_share_dealer_bridge", pd.Series(dtype=float)).mean()
-        ),
-        "Foreign": frame.get("pos_abs_share_row", pd.Series(dtype=float)).mean(),
-        "Private": (
-            frame.get("pos_abs_share_domestic_nonbank", pd.Series(dtype=float)).mean()
-            + frame.get("pos_abs_share_mmf", pd.Series(dtype=float)).mean()
-        ),
-    }
-    if all(pd.isna(value) for value in raw.values()):
-        return None
-    return _normalize_holder_shares(
-        {
-            holder: 0.0 if pd.isna(value) else float(value)
-            for holder, value in raw.items()
-        }
+    for column in required:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = (
+        frame.dropna(subset=["quarter_date"])
+        .dropna(subset=required)
+        .sort_values("quarter_date")
+        .tail(Z1_LOOKBACK_QUARTERS)
     )
+    if frame.empty:
+        return None, 0.0
+    core_share = (
+        frame["pos_abs_share_fed"]
+        + frame["pos_abs_share_banks"]
+        + frame["pos_abs_share_row"]
+        + frame["pos_abs_share_mmf"]
+        + frame["pos_abs_share_domestic_nonbank"]
+    )
+    eff_q = frame["positive_absorption_total"].clip(lower=0.0) * core_share.clip(lower=0.0, upper=1.0)
+    positive_eff = eff_q[eff_q > 0.0]
+    if positive_eff.empty:
+        return None, 0.0
+    floor = max(
+        Z1_POSITIVE_ABSORPTION_FLOOR_BN_SAAR,
+        Z1_FLOOR_MEDIAN_MULTIPLIER * float(positive_eff.median()),
+    )
+    quarter_credit = (eff_q / floor).clip(lower=0.0, upper=1.0)
+    n_eff = float(quarter_credit.sum())
+    if n_eff <= 0.0:
+        return None, 0.0
+
+    weighted = {holder: 0.0 for holder in TDCSIM_HOLDERS}
+    for idx, row in frame.iterrows():
+        credit = float(quarter_credit.loc[idx])
+        if credit <= 0.0:
+            continue
+        shares = _normalize_holder_shares(
+            {
+                "CB": _safe_float(row["pos_abs_share_fed"]),
+                "Banks": _safe_float(row["pos_abs_share_banks"]),
+                "Foreign": _safe_float(row["pos_abs_share_row"]),
+                "Private": _safe_float(row["pos_abs_share_domestic_nonbank"])
+                + _safe_float(row["pos_abs_share_mmf"]),
+            }
+        )
+        for holder in TDCSIM_HOLDERS:
+            weighted[holder] += credit * shares[holder]
+    return _normalize_holder_shares({holder: value / n_eff for holder, value in weighted.items()}), n_eff
 
 
-def _latest_primary_market_instrument_shares(path: Path) -> dict[str, float] | None:
+def _latest_primary_market_instrument_shares(
+    path: Path,
+    *,
+    baseline_scalar: dict[str, float],
+) -> dict[str, float] | None:
     if not path.exists():
         return None
     frame = pd.read_csv(path)
@@ -303,15 +379,19 @@ def _latest_primary_market_instrument_shares(path: Path) -> dict[str, float] | N
     if not required <= set(frame.columns):
         return None
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    frame = frame.dropna(subset=["date"]).sort_values("date").tail(24)
+    frame = frame.dropna(subset=["date"]).sort_values("date")
+    recent_dates = sorted(frame["date"].dropna().unique())[-PRIMARY_MARKET_LOOKBACK_QUARTERS:]
+    frame = frame[frame["date"].isin(recent_dates)]
     if frame.empty:
         return None
     grouped = frame.groupby("buyer_class")["share"].mean()
+    dealer_bridge_share = float(grouped.get("dealers", 0.0))
     raw = {
-        "Banks": float(grouped.get("dealers", 0.0)),
-        "CB": float(grouped.get("fed", 0.0)),
-        "Foreign": float(grouped.get("foreign_official", 0.0)),
-        "Private": 0.0,
+        "Banks": dealer_bridge_share * baseline_scalar.get("Banks", 0.0),
+        "CB": float(grouped.get("fed", 0.0)) + dealer_bridge_share * baseline_scalar.get("CB", 0.0),
+        "Foreign": float(grouped.get("foreign_official", 0.0))
+        + dealer_bridge_share * baseline_scalar.get("Foreign", 0.0),
+        "Private": dealer_bridge_share * baseline_scalar.get("Private", 0.0),
     }
     return _normalize_holder_shares(raw)
 
@@ -322,21 +402,32 @@ def _load_absorption_scenarios(
     z1_absorption_path: Path,
     bills_primary_path: Path,
     coupons_primary_path: Path,
+    holder_absorption_calibration: dict[str, float | list[float]] | None = None,
 ) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, str]]:
+    calibration = holder_absorption_calibration or _default_holder_absorption_calibration()
+    scenario_shift_lambda_default = float(calibration["scenario_shift_lambda_default"])
+    scenario_shift_lambda_grid = [float(value) for value in calibration["scenario_shift_lambda_grid"]]
     tdcmix_targets = _load_tdcmix_targets(tdcmix_prior_path)
-    z1_recent = _latest_z1_absorption_shares(z1_absorption_path)
+    z1_recent, z1_n_eff = _latest_z1_absorption_shares(z1_absorption_path)
+    z1_weight = z1_n_eff / (z1_n_eff + Z1_SHRINKAGE_K_QUARTERS) if z1_n_eff > 0.0 else 0.0
     baseline_scalar = tdcmix_targets["current_mix_baseline"]
     if z1_recent is not None:
-        baseline_scalar = _blend_shares(baseline_scalar, z1_recent, right_weight=0.50)
+        baseline_scalar = _blend_shares(baseline_scalar, z1_recent, right_weight=z1_weight)
 
-    bills_primary = _latest_primary_market_instrument_shares(bills_primary_path)
-    coupons_primary = _latest_primary_market_instrument_shares(coupons_primary_path)
+    bills_primary = _latest_primary_market_instrument_shares(
+        bills_primary_path,
+        baseline_scalar=baseline_scalar,
+    )
+    coupons_primary = _latest_primary_market_instrument_shares(
+        coupons_primary_path,
+        baseline_scalar=baseline_scalar,
+    )
     baseline_by_category: dict[str, dict[str, float]] = {}
     for category in PREFERENCE_CATEGORIES:
         instrument_prior = bills_primary if category == "bills" else coupons_primary
         shares = baseline_scalar
         if instrument_prior is not None:
-            shares = _blend_shares(shares, instrument_prior, right_weight=0.20)
+            shares = _blend_shares(shares, instrument_prior, right_weight=PRIMARY_MARKET_OVERLAY_WEIGHT)
         baseline_by_category[category] = shares
 
     scenarios: dict[str, dict[str, dict[str, float]]] = {
@@ -369,7 +460,7 @@ def _load_absorption_scenarios(
     for scenario_id, target_key in holder_shift_specs:
         target = tdcmix_targets[target_key]
         scenarios[scenario_id] = {
-            category: _blend_shares(shares, target, right_weight=0.60)
+            category: _blend_shares(shares, target, right_weight=scenario_shift_lambda_default)
             for category, shares in baseline_by_category.items()
         }
 
@@ -379,7 +470,19 @@ def _load_absorption_scenarios(
             + (";z1_exact_recent_positive_absorption" if z1_recent is not None else "")
             + (";primary_market_instrument_buyer_composition" if bills_primary or coupons_primary else "")
         ),
-        "dealer_bridge_mapping": "dealers_mapped_to_banks_ru_for_auction_settlement_not_final_holder_claim",
+        "dealer_bridge_mapping": "dealer_bridge_redistributed_by_pre_overlay_baseline_not_mapped_to_banks",
+        "z1_effective_quarters_n_eff": f"{z1_n_eff:.12f}",
+        "z1_shrinkage_weight": f"{z1_weight:.12f}",
+        "z1_shrinkage_k_quarters": f"{Z1_SHRINKAGE_K_QUARTERS:.1f}",
+        "primary_market_overlay_weight": f"{PRIMARY_MARKET_OVERLAY_WEIGHT:.2f}",
+        "primary_market_overlay_coverage": (
+            "low_coverage_only_dealers_fed_foreign_official_share_weighted"
+            if bills_primary or coupons_primary
+            else "not_available"
+        ),
+        "scenario_shift_lambda_default": f"{scenario_shift_lambda_default:.2f}",
+        "scenario_shift_lambda_grid": ",".join(f"{value:.2f}" for value in scenario_shift_lambda_grid),
+        "tic_foreign_cross_check_status": "DEFERRED_new_plumbing_QA_only_not_blocking_blend_weight_grounding",
     }
     return scenarios, metadata
 
@@ -848,12 +951,14 @@ def build_holder_absorption_path(
     z1_absorption_path: Path,
     bills_primary_path: Path,
     coupons_primary_path: Path,
+    holder_absorption_calibration: dict[str, float | list[float]] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     scenarios, metadata = _load_absorption_scenarios(
         tdcmix_prior_path,
         z1_absorption_path=z1_absorption_path,
         bills_primary_path=bills_primary_path,
         coupons_primary_path=coupons_primary_path,
+        holder_absorption_calibration=holder_absorption_calibration,
     )
     rows: list[dict] = []
     for scenario_id, category_shares in scenarios.items():
@@ -886,6 +991,7 @@ def build_holder_absorption_path(
                             "source_status": (
                                 "instrument_specific_holder_absorption_prior_not_holder_allocation_evidence;"
                                 f"{metadata['dealer_bridge_mapping']}"
+                                f";primary_market_overlay_{metadata['primary_market_overlay_coverage']}"
                                 + (
                                     ";mmf_collapsed_into_du_current_private_bucket"
                                     if holder == "Private"
@@ -943,7 +1049,14 @@ def build_interest_component_contract(output_path: Path) -> tuple[pd.DataFrame, 
     return frame, {"rows": len(frame)}
 
 
-def build_ratewall_config(output_path: Path, *, input_dir: Path, contract_output_dir: Path) -> None:
+def build_ratewall_config(
+    output_path: Path,
+    *,
+    input_dir: Path,
+    contract_output_dir: Path,
+    holder_absorption_calibration: dict[str, float | list[float]] | None = None,
+) -> None:
+    calibration = holder_absorption_calibration or _default_holder_absorption_calibration()
     base_curve = {
         "use_static": True,
         "years": TENORS,
@@ -996,6 +1109,7 @@ def build_ratewall_config(output_path: Path, *, input_dir: Path, contract_output
             "primary_flow_to_du_file": str((input_dir / "tdcsim_primary_flow_to_du_path.csv").relative_to(output_path.parent)),
             "holder_absorption_path_file": str((input_dir / "tdcsim_holder_absorption_path.csv").relative_to(output_path.parent)),
         },
+        "holder_absorption_calibration": calibration,
         "tips_params": {"cpi_start_level": 100.0, "cpi_annual_inflation": 0.02, "ref_cpi_lag_months": 3, "default_real_coupon_rate": 0.005},
         "frn_params": {"benchmark_maturity_years": 0.25, "default_fixed_spread": 0.0005},
         "nonmarketable_params": {"interest_rate_basis_maturities": [5.0, 10.0], "interest_crediting_frequency": "semi-annual", "initial_holder": "TrustFunds", "rate_setting_method": "yield_curve_points"},
@@ -1006,6 +1120,7 @@ def build_ratewall_config(output_path: Path, *, input_dir: Path, contract_output
             "enabled": True,
             "output_dir": str(contract_output_dir.relative_to(output_path.parent)),
             "input_manifest": str((input_dir / "tdcsim_ratewall_input_manifest.json").relative_to(output_path.parent)),
+            "private_route_sensitivity_file": "../tdcest/data/processed/tdc_tdcsim_private_route_allocation_sensitivity.csv",
         },
         "parallel_execution": {
             "group_workers": "auto",
@@ -1040,6 +1155,7 @@ def build_all(
     cbo_budget_path = ratewall_root / "data" / "raw" / "cbo" / "51118-2026-02-Budget-Projections.xlsx"
     cbo_economic_path = ratewall_root / "data" / "raw" / "cbo" / "51135-2026-02-Economic-Projections.xlsx"
     scenario_ids = list(SCENARIO_CURVE_MAP)
+    holder_absorption_calibration = _load_holder_absorption_calibration(config_path)
 
     artifacts = {}
     _, artifacts["initial_portfolio"] = build_initial_portfolio(
@@ -1061,11 +1177,17 @@ def build_all(
         z1_absorption_path=z1_absorption_path,
         bills_primary_path=bills_primary_path,
         coupons_primary_path=coupons_primary_path,
+        holder_absorption_calibration=holder_absorption_calibration,
     )
     _, artifacts["interest_component"] = build_interest_component_contract(
         output_dir / "tdcsim_interest_component_contract.csv"
     )
-    build_ratewall_config(config_path, input_dir=output_dir, contract_output_dir=contract_output_dir)
+    build_ratewall_config(
+        config_path,
+        input_dir=output_dir,
+        contract_output_dir=contract_output_dir,
+        holder_absorption_calibration=holder_absorption_calibration,
+    )
 
     files = sorted(output_dir.glob("*.csv")) + [config_path]
     manifest = {
