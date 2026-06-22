@@ -212,7 +212,7 @@ def test_zero_pass_through_zeros_all_mmf_du_legs(tmp_path):
 
 def test_mmf_pass_through_is_symmetric_and_conserved_across_all_channels(tmp_path):
     """The same p applies to auction drains, debt-service credits, and secondary trades."""
-    p = 0.15
+    p = 0.97
     results = _run_case(tmp_path, p=p)
 
     auction_gross = results["TDC_AuctionAbsorption_MMF"] + results["TDC_AuctionAbsorption_MMFPlumbing"]
@@ -253,7 +253,7 @@ def test_mmf_du_effect_is_monotone_over_sensitivity_grid(tmp_path):
         results = _run_case(tmp_path, p=p)
         principal_by_p.append(results["TDC_PrincipalToDU_MMF"].sum())
 
-    assert MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID == [0.00, 0.15, 0.25, 0.50, 1.00]
+    assert MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID == [0.00, 0.50, 0.90, 0.95, 0.97, 1.00]
     assert all(left < right for left, right in zip(principal_by_p, principal_by_p[1:]))
     gross_principal = principal_by_p[-1]
     assert gross_principal > 0.0

@@ -30,11 +30,13 @@ HOLDER_ROUTE_CONTRACT = [
     },
     {
         "source_key": "mmf_cash_fund_route",
-        "ratewall_role": "target_route_not_current_holder_type",
-        "central_default_eligible": "false",
-        "sensitivity_only": "true",
+        "ratewall_role": "source_backed_mmf_cash_fund_route_static_0_97_deposit_weight",
+        "central_default_eligible": "true",
+        "sensitivity_only": "false",
         "binding_blocker": (
-            "requires_source_backed_mmf_on_rrp_route_split_before_ru_like_use"
+            "cleared_for_static_central_split_by_owner_t4_5;"
+            "justification=on_rrp_drained_regime_tdcest_2025q4_source_of_funds_anchor_0_986_rounded_0_97;"
+            "known_limitation=sec_nmfp_fund_scope_does_not_identify_final_deposit_recipient"
         ),
     },
 ]

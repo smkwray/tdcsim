@@ -68,3 +68,21 @@ def test_validate_route_support_rows_rejects_bounded_evidence_promotion() -> Non
         "non_promoting_tier_enabled:evidence_mode_enabled" in reason
         for reason in report.failure_reasons
     )
+
+
+def test_validate_route_support_rows_allows_promoting_tier_private_split() -> None:
+    report = validate_route_support_rows(
+        pd.DataFrame(
+            [
+                _support_row(
+                    evidence_tier="source_backed_measurement",
+                    assumption_status="none_source_observed",
+                    source_backed_private_bucket_split_status="source_backed_private_bucket_split",
+                    source_backed_private_bucket_split_row="true",
+                    canonical_tdc_math_change="true",
+                )
+            ]
+        )
+    )
+
+    assert report.passed
