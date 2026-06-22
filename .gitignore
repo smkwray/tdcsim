@@ -49,3 +49,6 @@ output/*
 plots/
 *.pdf
 *.svg
+
+# Local historical replay data/evidence
+data/historical_replay/

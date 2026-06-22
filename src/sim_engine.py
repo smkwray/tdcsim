@@ -221,6 +221,11 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     Tracks key monetary aggregates and debt composition.
     """
     sim_start_time = time.time()
+    sim_mode = str(params.get('simulation_period', {}).get('mode', 'forward')).strip().lower()
+    if sim_mode == 'historical_replay':
+        from historical_replay import run_historical_replay
+
+        return run_historical_replay(params, start_date, end_date, scenario_name=scenario_name)
     validate_run_params(params, scenario_name=scenario_name)
     coarse_frequency_warning = None
     try:
