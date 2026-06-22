@@ -214,8 +214,13 @@ def build_route_component_verdict(registry: pd.DataFrame) -> pd.DataFrame:
     counts = registry["normalized_route_component_id"].value_counts().to_dict()
     verdicts = {
         "mmf_onrrp_like": (
-            "bounded_proxy",
-            "MMF/ON-RRP-like support is bounded plumbing context, not final current demand.",
+            "source_backed_measurement",
+            (
+                "MMF deposit weight promoted only for the static central private-bucket "
+                "split: ON-RRP-drained regime plus tdcest 2025Q4 source-of-funds "
+                "anchor around 0.986, rounded conservatively to 0.97. Known limitation: "
+                "SEC N-MFP fund scope does not identify the final deposit recipient."
+            ),
         ),
         "foreign_official_private_iro": (
             "source_backed_measurement",
@@ -245,16 +250,22 @@ def build_route_component_verdict(registry: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for component in VERDICT_COMPONENTS:
         tier, boundary = verdicts[component]
+        if component == "mmf_onrrp_like":
+            admissible_use = "canonical_tdcsim_input;assumption_mode_support_ledger"
+            blocked_use = "evidence_mode;final_current_demand;holder_allocation"
+        else:
+            admissible_use = "assumption_mode_support_ledger"
+            blocked_use = (
+                "source_backed_private_bucket_split;canonical_tdc_math;"
+                "evidence_mode;final_current_demand;holder_allocation"
+            )
         rows.append(
             {
                 "route_component_id": component,
                 "support_row_count": str(int(counts.get(component, 0))),
                 "verdict_tier": tier,
-                "admissible_use": "assumption_mode_support_ledger",
-                "blocked_use": (
-                    "source_backed_private_bucket_split;canonical_tdc_math;"
-                    "evidence_mode;final_current_demand;holder_allocation"
-                ),
+                "admissible_use": admissible_use,
+                "blocked_use": blocked_use,
                 "claim_boundary": boundary,
             }
         )

@@ -25,7 +25,7 @@ from tdc_shared import (
 )
 
 
-CONTRACT_VERSION = "0.2.0"
+CONTRACT_VERSION = "0.3.0"
 CLAIM_BOUNDARY = "tdcsim_forward_scenario_not_forecast_or_evidence_mode"
 PRIVATE_ROUTE_SENSITIVITY_KEY = "tdcsim_private_route_sensitivity_contract_v1"
 PRIVATE_ROUTE_SENSITIVITY_BLOCKER = (
@@ -342,7 +342,7 @@ def _source_registry_rows(config: dict | None = None) -> list[dict[str, str]]:
             "ratewall_role": "legacy_audit_memo",
             "central_default_eligible": "false",
             "sensitivity_only": "true",
-            "binding_blocker": "superseded_by_private_subbucket_split_contract_0_2_0",
+            "binding_blocker": "superseded_by_private_subbucket_split_contract_0_3_0",
         },
         {
             "source_family": "tdcsim_private_subbucket",
@@ -357,7 +357,7 @@ def _source_registry_rows(config: dict | None = None) -> list[dict[str, str]]:
             "source_family": "tdcsim_private_subbucket",
             "source_key": PRIVATE_SUBBUCKET_MMF,
             "source_status": MMF_DEPOSIT_PASS_THROUGH_STATUS,
-            "ratewall_role": "mmf_cash_fund_route_pass_through_0_15_residual_plumbing",
+            "ratewall_role": "mmf_cash_fund_route_pass_through_0_97_residual_plumbing",
             "central_default_eligible": "true",
             "sensitivity_only": "false",
             "binding_blocker": "",

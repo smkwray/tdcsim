@@ -241,7 +241,7 @@ Mergeable examples live in [examples/optional_feature_scenarios.yaml](/Users/sha
 ## Important assumptions and conventions
 
 1. **TDC is a contribution, not the whole deposit stock.** The model isolates the Treasury-attributable contribution to DU deposit dynamics.
-2. **Private remains the RateWall-facing DU proxy, with internal source-backed sub-buckets.** Source-backed holder paths keep the exact `Private` holder string but split the route internally into `domestic_nonbank_deposit_funded` (1.0 deposit pass-through) and `mmf_cash_fund_route` (0.15 deposit pass-through by default). The MMF residual is reserve/plumbing, not DU deposit support.
+2. **Private remains the RateWall-facing DU proxy, with internal source-backed sub-buckets.** Source-backed holder paths keep the exact `Private` holder string but split the route internally into `domestic_nonbank_deposit_funded` (1.0 deposit pass-through) and `mmf_cash_fund_route` (97% to DU, regime-aware and ON-RRP-drained, by default). The MMF residual is reserve/plumbing, not DU deposit support.
 3. **RU is a settlement label.** It includes entities outside the DU deposit ledger and does not mean every included entity literally holds reserves.
 4. **Intragovernmental holders are split into FedInternal and TrustFunds.** Both are intragovernmental (P&I is a TGA/TOC wash, no reserve or deposit impact).
 5. **Monetary units are billions USD.** Time units are years (for yields, TTM, WAM).

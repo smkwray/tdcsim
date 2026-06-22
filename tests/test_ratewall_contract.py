@@ -332,7 +332,7 @@ def test_ratewall_source_registry_blocks_weak_wamest_rows(tmp_path):
         registry["source_key"] == "mmf_collapsed_into_du_current_private_bucket"
     ].iloc[0]
     assert not mmf_disclosure["central_default_eligible"]
-    assert "superseded_by_private_subbucket_split_contract_0_2_0" in mmf_disclosure["binding_blocker"]
+    assert "superseded_by_private_subbucket_split_contract_0_3_0" in mmf_disclosure["binding_blocker"]
     split_routes = registry[registry["source_family"] == "tdcsim_private_subbucket"]
     assert set(split_routes["source_key"]) == {
         "domestic_nonbank_deposit_funded",
@@ -372,8 +372,12 @@ def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_pa
     mmf_route = route_rows[
         route_rows["source_key"] == "mmf_cash_fund_route"
     ].iloc[0]
-    assert not mmf_route["central_default_eligible"]
-    assert "mmf_on_rrp_route_split" in mmf_route["binding_blocker"]
+    assert mmf_route["central_default_eligible"]
+    assert not mmf_route["sensitivity_only"]
+    assert "tdcest_2025q4_source_of_funds_anchor_0_986_rounded_0_97" in mmf_route[
+        "binding_blocker"
+    ]
+    assert "does_not_identify_final_deposit_recipient" in mmf_route["binding_blocker"]
 
 
 def test_ratewall_contract_exports_private_route_sensitivity_sidecar(tmp_path):

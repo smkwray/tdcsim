@@ -120,14 +120,15 @@ auction_absorption_preferences: *id001
 secondary_target_preferences: *id001
 private_mmf_split:
   enabled: true
-  mmf_deposit_pass_through: 0.15
-  mmf_deposit_pass_through_status: source_grounded_model_default_not_measured
-  mmf_ru_plumbing_pass_through: 0.85
+  mmf_deposit_pass_through: 0.97
+  mmf_deposit_pass_through_status: source_backed_measurement_regime_aware_static_0_97_tdcest_rrp_runoff_anchor
+  mmf_ru_plumbing_pass_through: 0.03
   sensitivity_grid:
   - 0.0
-  - 0.15
-  - 0.25
   - 0.5
+  - 0.9
+  - 0.95
+  - 0.97
   - 1.0
 ratewall_input_paths:
   primary_flow_to_du_file: data/ratewall_inputs/tdcsim_primary_flow_to_du_path.csv

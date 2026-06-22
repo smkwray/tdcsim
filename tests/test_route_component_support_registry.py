@@ -107,6 +107,15 @@ def test_route_component_verdict_has_expected_components(tmp_path: Path) -> None
     auction = verdict.loc[verdict["route_component_id"].eq("auction_buyer_mix")].iloc[0]
     assert auction["support_row_count"] == "1"
     assert auction["verdict_tier"] == "direct_input"
+    mmf = verdict.loc[verdict["route_component_id"].eq("mmf_onrrp_like")].iloc[0]
+    assert mmf["verdict_tier"] == "source_backed_measurement"
+    assert "canonical_tdcsim_input" in mmf["admissible_use"]
+    assert "source_backed_private_bucket_split" not in mmf["blocked_use"]
+    assert "SEC N-MFP fund scope does not identify the final deposit recipient" in mmf[
+        "claim_boundary"
+    ]
+    dealer = verdict.loc[verdict["route_component_id"].eq("dealer_warehousing")].iloc[0]
+    assert "source_backed_private_bucket_split" in dealer["blocked_use"]
 
 
 def test_write_support_registry_bundle_hashes_inputs(tmp_path: Path) -> None:
