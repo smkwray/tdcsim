@@ -12,7 +12,7 @@ from forecast_paths import compiled_forecast_input_paths
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
 from tdcsim_cbo._json import read_json, sha256_file, write_json
 from tdcsim_cbo.compiler import digest_input_tree, input_tree_hashes
-from tdcsim_cbo.output import write_scenario_outputs
+from tdcsim_cbo.output import hash_output_tree, write_scenario_outputs
 from tdcsim_cbo.runner import build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
 from simulation_calendar import build_simulation_calendar
@@ -203,6 +203,101 @@ def test_verifier_rejects_wrong_baseline_identity(tmp_path: Path) -> None:
 
     with pytest.raises(VerificationError, match="baseline package hash"):
         verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
+
+
+def test_verifier_rejects_failing_manifest_validation(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["validation"]["status"] = "fail"
+    manifest["validation"]["gates"][0]["status"] = "fail"
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="validation.status must be pass"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_cash_residual_true_even_if_validation_claims_pass(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["boundary_checks"]["cash_residual_affects_issuance_size"] = ["False", "True"]
+    manifest["boundary_checks"]["cash_residual_nonfunding_flags"]["affects_issuance_size"] = ["False", "True"]
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="cash_residual_affects_issuance_size must be exactly false"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_fabricated_release_verified_grade(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["verification_grade"] = "release_verified"
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="release_verified grade"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_forged_runtime_package_identity(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["code_environment"]["package_name"] = "not-tdcsim"
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="package_name"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_forged_code_environment_source_hash(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["code_environment"]["runner_source_sha256"] = "f" * 64
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="runner_source_sha256"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_unbacked_wheel_identity(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["code_environment"]["wheel_sha256"] = "f" * 64
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="wheel_sha256"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_forged_requirements_lock_identity(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["code_environment"]["requirements_lock_sha256"] = "f" * 64
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="requirements lock hash"):
+        verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
+
+
+def test_verifier_rejects_missing_summary_key_even_with_fresh_hashes(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    summary_path = run.output_dir / "outputs" / "summary.json"
+    summary = read_json(summary_path)
+    summary.pop("CBOFedAuctionShare_max_abs")
+    write_json(summary_path, summary)
+    manifest = read_json(run.manifest_path)
+    _refresh_manifest_artifact(run.output_dir, manifest, "outputs/summary.json")
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="summary missing required keys"):
+        verify_scenario_run(run.output_dir)
 
 
 def test_runtime_params_use_compiled_fiscal_incidence_policy(tmp_path: Path) -> None:
@@ -533,6 +628,16 @@ def _refresh_result_hashes(run_dir: Path, manifest: dict) -> None:
                 "bytes": result_path.stat().st_size,
                 "sha256": sha256_file(result_path),
             }
+
+
+def _refresh_manifest_artifact(run_dir: Path, manifest: dict, relative_path: str) -> None:
+    path = run_dir / relative_path
+    for item in manifest["outputs"]:
+        if item["relative_path"] == relative_path:
+            item["sha256"] = sha256_file(path)
+            item["bytes"] = path.stat().st_size
+            return
+    raise AssertionError(f"missing output artifact in manifest: {relative_path}")
 
 
 def _refresh_compiled_input_hashes(run_dir: Path, manifest: dict) -> None:

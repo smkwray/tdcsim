@@ -59,6 +59,62 @@ def test_scenario_spec_rejects_mode_missing_required_control(tmp_path: Path) -> 
         CboScenarioSpec.from_mapping(scenario)
 
 
+@pytest.mark.parametrize(
+    ("name", "override", "field"),
+    [
+        ("nominal_yield_curve", {"mode": "parallel_bp", "shock_bp": 10, "interpolation": "pchip_log_tenor"}, "interpolation"),
+        ("nominal_yield_curve", {"mode": "parallel_bp", "shock_bp": 10, "shocks": [{"tenor_years": 10, "shock_bp": 1}]}, "shocks"),
+        ("frn_benchmark", {"mode": "linked_to_nominal_curve", "spread_bp": 5, "shock_bp": 10}, "shock_bp"),
+        ("inflation_cpi", {"mode": "cpi_level_scale", "scale": 1.02, "terminal_rule": "carry_last_scenario_growth"}, "terminal_rule"),
+        ("tips_real_yield", {"mode": "parallel_bp", "shock_bp": 10, "additional_parallel_bp": 5}, "additional_parallel_bp"),
+        ("operating_cash", {"mode": "scale_baseline", "scale": 1.1, "file": {"relative_path": "cash.csv", "sha256": "0" * 64}}, "file"),
+        ("cash_reconciliation", {"mode": "zero", "file": {"relative_path": "cash.csv", "sha256": "0" * 64}}, "file"),
+        ("fed_holdings", {"mode": "scale_path", "scale": 1.1, "additive_bil": 5}, "additive_bil"),
+        ("debt_target", {"mode": "scale_path", "scale": 1.1, "anchors": [{"fiscal_year": 2027, "value_bil": 1}]}, "anchors"),
+    ],
+)
+def test_scenario_spec_rejects_mode_inapplicable_controls(tmp_path: Path, name: str, override: dict, field: str) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"][name] = override
+
+    with pytest.raises(ValueError, match=rf"mode-inapplicable fields.*{field}"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_primary_deficit_scale_path_ignored_controls(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"]["primary_deficit"] = {
+        "mode": "scale_path",
+        "scale": 1.0,
+        "additive_bil": 999999,
+        "freeze_pre_start_actuals": True,
+        "anchors": [{"fiscal_year": 2027, "value_bil": 1}],
+    }
+
+    with pytest.raises(ValueError, match="mode-inapplicable fields.*additive_bil.*anchors.*freeze_pre_start_actuals"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_allows_mode_specific_optional_controls(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "nominal_yield_curve": {"mode": "key_rate_bp", "shocks": [{"tenor_years": 10, "shock_bp": 1}], "interpolation": "pchip_log_tenor"},
+        "frn_benchmark": {"mode": "linked_to_nominal_curve", "spread_bp": 5},
+        "inflation_cpi": {"mode": "annualized_inflation_shift_bp", "shock_bp": 25, "terminal_rule": "carry_last_scenario_growth"},
+        "tips_real_yield": {"mode": "linked_recompute", "additional_parallel_bp": 2},
+        "primary_deficit": {
+            "mode": "fy_endpoint_anchors",
+            "anchors": [{"fiscal_year": 2027, "value_bil": 1}],
+            "freeze_pre_start_actuals": True,
+        },
+    }
+
+    CboScenarioSpec.from_mapping(scenario)
+
+
 def test_scenario_spec_rejects_holder_temporal_or_file_surface(tmp_path: Path) -> None:
     baseline = _baseline(tmp_path)
     scenario = _scenario_mapping(baseline)

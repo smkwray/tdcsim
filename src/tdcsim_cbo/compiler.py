@@ -8,6 +8,7 @@ writes a manifest with canonical input digests. It does not invoke the simulator
 from __future__ import annotations
 
 import csv
+import math
 import shutil
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -533,7 +534,16 @@ def _write_csv(path: Path, rows: Iterable[Mapping[str, Any]], *, preferred_heade
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in materialized:
-            writer.writerow(row)
+            writer.writerow({key: _csv_value(value) for key, value in row.items()})
+
+
+def _csv_value(value: Any) -> Any:
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return value
+        text = f"{value:.12f}".rstrip("0").rstrip(".")
+        return text or "0"
+    return value
 
 
 def _compile_holder_preferences(

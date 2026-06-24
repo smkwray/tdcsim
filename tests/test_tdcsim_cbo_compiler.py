@@ -151,6 +151,22 @@ def test_primary_deficit_fy_anchors_write_period_flows_not_annual_value_per_row(
     assert float(rows[0]["annual_or_remaining_primary_deficit_bil"]) == pytest.approx(1000.0)
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"nominal_yield_curve": {"mode": "parallel_bp", "shock_bp": 100, "interpolation": "pchip_log_tenor"}},
+        {"primary_deficit": {"mode": "scale_path", "scale": 1.0, "additive_bil": 999999}},
+    ],
+)
+def test_compiler_boundary_rejects_mode_inapplicable_controls_before_compile(tmp_path: Path, override: dict) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = override
+
+    with pytest.raises(ValueError, match="mode-inapplicable fields"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
 def test_compiler_rejects_frn_file_mode_with_linked_coupling(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
     replacement = tmp_path / "frn.csv"
@@ -212,10 +228,8 @@ def test_compiler_rejects_file_reference_on_non_file_mode(tmp_path: Path) -> Non
             "file": {"relative_path": "curve.csv", "sha256": "0" * 64, "media_type": "text/csv"},
         }
     }
-    spec = CboScenarioSpec.from_mapping(scenario)
-
-    with pytest.raises(CompilerError, match="file reference"):
-        CboScenarioCompiler().compile(baseline, spec, tmp_path / "work")
+    with pytest.raises(ValueError, match="mode-inapplicable fields.*file"):
+        CboScenarioSpec.from_mapping(scenario)
 
 
 def test_file_backed_override_sha_mismatch_rejected(tmp_path: Path) -> None:
