@@ -34,12 +34,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify = sub.add_parser("verify", help="Verify compiled or run outputs")
     verify.add_argument("--compiled-dir")
     verify.add_argument("--run-dir")
+    verify.add_argument("--baseline", type=Path)
+    verify.add_argument("--attestation", type=Path)
 
     args = parser.parse_args(argv)
     if args.command == "verify":
         if bool(args.compiled_dir) == bool(args.run_dir):
             parser.error("verify requires exactly one of --compiled-dir or --run-dir")
-        result = verify_compiled_scenario(args.compiled_dir) if args.compiled_dir else verify_scenario_run(args.run_dir)
+        result = (
+            verify_compiled_scenario(args.compiled_dir)
+            if args.compiled_dir
+            else verify_scenario_run(
+                args.run_dir,
+                baseline_package=args.baseline,
+                attestation=args.attestation,
+            )
+        )
         print(result["status"])
         return 0
 
@@ -55,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "run":
         run = run_cbo_scenario(baseline, spec, args.output_dir, output_profile=args.profile)
-        print(run.run_manifest["outputs"]["summary"]["sha256"])
+        print(run.run_manifest["output_manifest"]["summary"]["sha256"])
         return 0
     parser.error(f"unsupported command: {args.command}")
     return 2

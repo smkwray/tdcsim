@@ -12,6 +12,7 @@ from forecast_paths import compiled_forecast_input_paths
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
 from tdcsim_cbo._json import sha256_file, write_json
 from tdcsim_cbo.output import write_scenario_outputs
+from tdcsim_cbo.runner import build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
 from simulation_calendar import build_simulation_calendar
 from test_cbo_engine_integration import (
@@ -48,6 +49,7 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     assert run.run_manifest["boundary_checks"]["fed_target_holder_allocation_only"] is True
     assert verify_compiled_scenario(run.compiled.compiled_dir)["status"] == "pass"
     assert verify_scenario_run(run.output_dir)["status"] == "pass"
+    assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)["status"] == "pass"
 
 
 def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(tmp_path: Path) -> None:
@@ -121,6 +123,73 @@ def test_verifier_rejects_tampered_output_bytes(tmp_path: Path) -> None:
 
     with pytest.raises(VerificationError, match="output hash"):
         verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_coordinated_manifest_and_output_tamper(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    results = pd.read_csv(run.results_path)
+    results.loc[0, "CBOControlledDebtTargetError"] = 99.0
+    results.to_csv(run.results_path, index=False)
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    _refresh_result_hashes(run.output_dir, manifest)
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="CBO target error"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_runtime_params_use_compiled_fiscal_incidence_policy(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    scenario = _write_scenario(
+        tmp_path / "fiscal-incidence.json",
+        baseline,
+        overrides={
+            "fiscal_incidence": {
+                "mode": "static_shares",
+                "domestic_ultimate_share": 0.50,
+                "rest_of_world_share": 0.25,
+                "foreign_official_share": 0.25,
+                "other_share": 0.0,
+            }
+        },
+    )
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-fiscal")
+
+    policy = build_runtime_params(run.compiled.forecast_inputs_dir)["fiscal_incidence_policy"]
+
+    assert policy["du_share"] == pytest.approx(0.50)
+    assert policy["ru_share"] == pytest.approx(0.25)
+    assert policy["foreign_share"] == pytest.approx(0.25)
+
+
+def test_runtime_params_use_compiled_issuance_mix_artifact(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    scenario = _write_scenario(
+        tmp_path / "issuance-mix.json",
+        baseline,
+        overrides={"issuance_mix": _issuance_mix_override()},
+    )
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-issuance")
+
+    params = build_runtime_params(run.compiled.forecast_inputs_dir)
+
+    assert (run.compiled.forecast_inputs_dir / "tdcsim_issuance_mix_assumptions.json").exists()
+    assert params["treasury_issuance_profile"]["TIPS"]["target_percentage"] == pytest.approx(0.08)
+    assert params["treasury_issuance_profile"]["FRN"]["target_percentage"] == pytest.approx(0.04)
+    assert params["funding_rule"]["negative_required_issuance_action"] == "retire_shortest_public_marketable"
+
+
+def test_cb_auction_preferences_rejected_with_baseline_fed_target(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    scenario = _write_scenario(
+        tmp_path / "cb-holder.json",
+        baseline,
+        overrides={"holder_preferences": {"mode": "static_shares", "rows": _holder_preference_rows(cb_share=0.10)}},
+    )
+
+    with pytest.raises(ValueError, match="CB auction share"):
+        run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-cb-holder")
 
 
 def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
@@ -249,7 +318,7 @@ def _write_scenario(path: Path, baseline: CboBaselinePackage, *, overrides: dict
                 "primary_deficit_to_debt_target": "independent_no_plug",
             },
             "overrides": overrides,
-            "output": {"profile": "compact", "compression": "none", "include_final_portfolio": True},
+            "output": {"profile": "compact", "compression": "none"},
         },
     )
     return path
@@ -375,3 +444,61 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _refresh_result_hashes(run_dir: Path, manifest: dict) -> None:
+    result_item = next(item for item in manifest["outputs"] if str(item["logical_name"]).startswith("results_"))
+    result_rel = result_item["relative_path"]
+    result_path = run_dir / result_rel
+    result_record = {
+        "logical_name": result_path.name,
+        "relative_path": result_rel,
+        "sha256": sha256_file(result_path),
+        "bytes": result_path.stat().st_size,
+        "media_type": "text/csv",
+    }
+    for index, item in enumerate(manifest["outputs"]):
+        if item["relative_path"] == result_rel:
+            manifest["outputs"][index] = result_record
+    for index, item in enumerate(manifest["output_hashes"]):
+        if item["path"] == Path(result_rel).name:
+            manifest["output_hashes"][index] = {
+                "path": Path(result_rel).name,
+                "bytes": result_path.stat().st_size,
+                "sha256": sha256_file(result_path),
+            }
+
+
+def _holder_preference_rows(*, cb_share: float = 0.0) -> list[dict]:
+    private_share = 1.0 - cb_share
+    return [
+        {
+            "security_type": security_type,
+            "shares": {
+                "Banks": 0.0,
+                "CB": cb_share,
+                "Foreign": 0.0,
+                "Private": private_share,
+                "TrustFunds": 0.0,
+                "FedInternal": 0.0,
+            },
+        }
+        for security_type in ("bills", "notes", "bonds", "tips", "frn")
+    ]
+
+
+def _issuance_mix_override() -> dict:
+    return {
+        "mode": "replace_shares",
+        "tips_share": 0.08,
+        "frn_share": 0.04,
+        "fixed_remainder_shares": {"bills": 0.30, "notes": 0.50, "bonds": 0.20},
+        "maturity_distributions": {
+            "bills": [{"maturity_years": 0.5, "share": 1.0}],
+            "notes": [{"maturity_years": 5.0, "share": 1.0}],
+            "bonds": [{"maturity_years": 20.0, "share": 1.0}],
+            "tips": [{"maturity_years": 10.0, "share": 1.0}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        },
+        "negative_issuance_action": "retire_shortest_public_marketable",
+    }

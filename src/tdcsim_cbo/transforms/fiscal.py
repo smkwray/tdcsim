@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import date
 from typing import Any
 
 
@@ -26,6 +27,7 @@ def apply_operating_cash_override(
     rows: Iterable[Mapping[str, Any]],
     override: Mapping[str, Any],
     *,
+    inflation_rows: Iterable[Mapping[str, Any]] | None = None,
     replacement_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> list[Row]:
     """Apply operating-cash overrides without creating issuance effects."""
@@ -53,7 +55,13 @@ def apply_operating_cash_override(
         return []
     out: list[Row] = []
     base_values = {col: float(baseline[0].get(col, 0.0) or 0.0) for col in _cash_columns(baseline[0])}
-    base_index = float(baseline[0].get("inflation_index_level", 0.0) or 0.0)
+    inflation_index = _inflation_index_by_date(inflation_rows)
+    first_period = str(baseline[0].get("period_end") or "")
+    base_index = _nearest_inflation_index(
+        inflation_index,
+        first_period,
+        float(baseline[0].get("inflation_index_level", 0.0) or 0.0),
+    )
     for row in baseline:
         new = dict(row)
         if mode == "constant_nominal":
@@ -63,9 +71,16 @@ def apply_operating_cash_override(
         elif mode == "constant_real":
             if base_index <= 0:
                 raise FiscalTransformError("constant_real requires positive inflation_index_level in first row")
-            scalar = float(new.get("inflation_index_level", base_index) or base_index) / base_index
+            key = str(new.get("period_end") or "")
+            row_index = _nearest_inflation_index(
+                inflation_index,
+                key,
+                float(new.get("inflation_index_level", base_index) or base_index),
+            )
+            scalar = row_index / base_index
             for col, value in base_values.items():
                 new[col] = value * scalar
+            new["inflation_index_level"] = row_index
             new["construction_mode"] = "scenario_constant_real"
         elif mode == "scale_baseline":
             scale = _number(override, "scale")
@@ -132,6 +147,7 @@ def apply_primary_deficit_override(
         value_columns=("primary_deficit_bil", "annual_or_remaining_primary_deficit_bil"),
         mode_label="primary_deficit",
         replacement_rows=replacement_rows,
+        annual_flow_anchor=True,
     )
 
 
@@ -149,6 +165,7 @@ def apply_debt_target_override(
         value_columns=("cbo_federal_debt_held_public_target_bil", "marketable_treasury_public_target_bil"),
         mode_label="debt_target",
         replacement_rows=replacement_rows,
+        annual_flow_anchor=False,
     )
 
 
@@ -181,6 +198,7 @@ def _apply_path_override(
     value_columns: Sequence[str],
     mode_label: str,
     replacement_rows: Iterable[Mapping[str, Any]] | None,
+    annual_flow_anchor: bool,
 ) -> list[Row]:
     mode = _required_mode(override)
     if mode == "absolute_path_file":
@@ -200,6 +218,16 @@ def _apply_path_override(
     if mode == "fy_endpoint_anchors":
         anchors = _anchors(override)
         first_anchor = min(anchors)
+        if annual_flow_anchor:
+            return _apply_annual_flow_anchors(
+                baseline,
+                anchors,
+                first_anchor=first_anchor,
+                freeze_pre_start_actuals=bool(override.get("freeze_pre_start_actuals", False)),
+                value_columns=value_columns,
+                mode=mode,
+                mode_label=mode_label,
+            )
         out = []
         for row in baseline:
             fiscal_year = _fiscal_year(row)
@@ -218,6 +246,43 @@ def _apply_path_override(
             out.append(_mark(new, mode, claim_boundary=f"{mode_label}_scenario_transform_no_plug"))
         return out
     raise FiscalTransformError(f"unsupported {mode_label} mode: {mode}")
+
+
+def _apply_annual_flow_anchors(
+    rows: Sequence[Mapping[str, Any]],
+    anchors: Mapping[int, float],
+    *,
+    first_anchor: int,
+    freeze_pre_start_actuals: bool,
+    value_columns: Sequence[str],
+    mode: str,
+    mode_label: str,
+) -> list[Row]:
+    primary_col = value_columns[0]
+    totals: dict[int, float] = {}
+    for row in rows:
+        fiscal_year = _fiscal_year(row)
+        totals[fiscal_year] = totals.get(fiscal_year, 0.0) + float(row.get(primary_col, 0.0) or 0.0)
+    out: list[Row] = []
+    for row in rows:
+        fiscal_year = _fiscal_year(row)
+        if freeze_pre_start_actuals and fiscal_year < first_anchor:
+            out.append(_mark(dict(row), mode, claim_boundary=f"{mode_label}_pre_start_actuals_frozen"))
+            continue
+        target = _interpolate_anchor(fiscal_year, anchors)
+        base_total = totals.get(fiscal_year, 0.0)
+        new = dict(row)
+        if abs(base_total) > 1e-12:
+            ratio = target / base_total
+            new[primary_col] = float(new.get(primary_col, 0.0) or 0.0) * ratio
+        else:
+            year_rows = [candidate for candidate in rows if _fiscal_year(candidate) == fiscal_year]
+            new[primary_col] = target / max(len(year_rows), 1)
+        for col in value_columns[1:]:
+            if col in new:
+                new[col] = target
+        out.append(_mark(new, mode, claim_boundary=f"{mode_label}_annual_flow_anchor_preserves_fy_sum"))
+    return out
 
 
 def _required_mode(override: Mapping[str, Any]) -> str:
@@ -264,6 +329,32 @@ def _cash_delta_by_date(rows: Iterable[Mapping[str, Any]] | None) -> dict[str, f
         out[key] = 0.0 if previous is None else value - previous
         previous = value
     return out
+
+
+def _inflation_index_by_date(rows: Iterable[Mapping[str, Any]] | None) -> dict[str, float]:
+    if rows is None:
+        return {}
+    points: list[tuple[date, float]] = []
+    for row in rows:
+        key = row.get("month") or row.get("period_end")
+        value = row.get("tips_cpi_u_index", row.get("cbo_cpi_u_index", row.get("inflation_index_level")))
+        if key in ("", None) or value in ("", None):
+            continue
+        points.append((date.fromisoformat(str(key)[:10]), float(value)))
+    if not points:
+        return {}
+    points.sort(key=lambda item: item[0])
+    return {point[0].isoformat(): point[1] for point in points}
+
+
+def _nearest_inflation_index(index: Mapping[str, float], key: str, default: float) -> float:
+    if not index:
+        return default
+    if key in index:
+        return index[key]
+    target = date.fromisoformat(key[:10])
+    nearest = min(index, key=lambda candidate: abs((date.fromisoformat(candidate) - target).days))
+    return index[nearest]
 
 
 def _scale_values(row: Mapping[str, Any], columns: Sequence[str], scale: float) -> Row:

@@ -2572,6 +2572,19 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         results.loc[current_date, 'AuctionProceeds'] = actual_auction_proceeds
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
+            cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))
+            cbo_fed_auction_share = (
+                cbo_fed_auction_addons_current / actual_issued_amount
+                if actual_issued_amount > TGA_FLOOR_TOLERANCE
+                else 0.0
+            )
+            results.loc[current_date, 'CBOFedAuctionShare'] = cbo_fed_auction_share
+            if cbo_fed_allocation_override_active and abs(cbo_fed_auction_addons_current) > TGA_FLOOR_TOLERANCE:
+                raise RuntimeError(
+                    f"CBO Fed holdings target must be met without Fed auction issuance at {current_date.date()}: "
+                    f"cb_auction_face={cbo_fed_auction_addons_current:.12f}, "
+                    f"total_issued_face={actual_issued_amount:.12f}"
+                )
         results.loc[current_date, 'IssueDiscountCost_Period'] = issue_discount_cost_period
         results.loc[current_date, 'IssueDiscountCost_Cumulative'] = results.loc[prev_date, 'IssueDiscountCost_Cumulative'] + issue_discount_cost_period
         results.loc[current_date, 'FinancingCost_Period'] = results.loc[current_date, 'InterestOutlay_Period'] + issue_discount_cost_period + nonmkt_interest_capitalized_period + tips_inflation_accretion_period

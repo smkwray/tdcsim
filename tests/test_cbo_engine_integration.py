@@ -1211,7 +1211,7 @@ def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_pat
     assert period["TDC_Level"] == pytest.approx(-59.44761904761904)
 
 
-def test_cbo_fed_zero_target_does_not_silently_rewrite_explicit_cb_preferences(tmp_path: Path) -> None:
+def test_cbo_fed_zero_target_rejects_explicit_cb_auction_preferences(tmp_path: Path) -> None:
     paths = _build_temp_forecast_inputs(tmp_path, cbo_public_debt_target_bil=1_250.0)
     fed_rows = build_fed_holdings_path_rows(
         scenario_id="baseline",
@@ -1229,24 +1229,14 @@ def test_cbo_fed_zero_target_does_not_silently_rewrite_explicit_cb_preferences(t
     params["sector_preferences"]["CB"]["bills_pct"] = 1.0
     params["sector_preferences"]["Private"]["bills_pct"] = 0.0
 
-    results, _ = run_simulation(
-        params,
-        "2026-09-20",
-        "2026-09-30",
-        freq="10D",
-        scenario_name="baseline",
-    )
-    period = results.iloc[-1]
-
-    assert period["CBOFedHoldingsTarget"] == pytest.approx(0.0)
-    assert period["CBOFedHoldingsTargetApplicable"] == pytest.approx(1.0)
-    assert period["CBOFedAuctionShare"] == pytest.approx(0.0)
-    assert period["DebtHeld_CentralBank"] == pytest.approx(0.0)
-    assert period["CBOFedHoldingsTargetError"] == pytest.approx(0.0)
-    assert period["CBOFedSyntheticSecondarySales"] == pytest.approx(125.0)
-    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(0.0)
-    assert period["CBOFedSecondaryPurchaseCash"] == pytest.approx(0.0)
-    assert period["NewDebtIssued"] == pytest.approx(125.0)
+    with pytest.raises(RuntimeError, match="must be met without Fed auction issuance"):
+        run_simulation(
+            params,
+            "2026-09-20",
+            "2026-09-30",
+            freq="10D",
+            scenario_name="baseline",
+        )
 
 
 def test_cbo_fiscal_baseline_diagnostics_do_not_resize_issuance_or_cash(tmp_path: Path) -> None:

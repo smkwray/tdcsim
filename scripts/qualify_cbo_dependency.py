@@ -11,33 +11,118 @@ from pathlib import Path
 
 
 SCENARIO_SNIPPET = r"""
-import json
 import sys
 from pathlib import Path
 
 from tdcsim_cbo import CboBaselinePackage
 
 baseline = CboBaselinePackage.open(sys.argv[1], attestation_path=sys.argv[2])
-scenario = {
-    "schema_version": "tdcsim_cbo_scenario_v1",
-    "scenario_id": "dependency_noop_v1",
-    "baseline": {
+out = Path(sys.argv[3])
+out.mkdir(parents=True, exist_ok=True)
+materialized = baseline.materialize(out / "baseline")
+
+def rows(path):
+    import csv
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+primary = rows(materialized / "forecast_inputs" / "tdcsim_primary_deficit_path.csv")
+debt = rows(materialized / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
+if primary and primary[0].get("period_start") and primary[0].get("period_end"):
+    start_date = primary[0]["period_start"]
+    end_date = primary[min(9, len(primary) - 1)]["period_end"]
+else:
+    dates = [row["period_end"] for row in debt if row.get("period_end")]
+    start_date = dates[0]
+    end_date = dates[min(9, len(dates) - 1)]
+
+baseline_block = {
         "package_id": baseline.package_id,
         "package_sha256": baseline.package_sha256,
         "manifest_sha256": baseline.manifest_sha256,
         "release_attestation_sha256": baseline.attestation.sha256,
-    },
-    "provenance": {"kind": "tdcsim_transform_of_cbo_baseline", "label": "dependency qualification noop"},
+}
+
+base = {
+    "schema_version": "tdcsim_cbo_scenario_v1",
+    "baseline": baseline_block,
+    "simulation": {"frequency": "daily", "start_date": start_date, "end_date": end_date},
     "coupling": {
         "frn_benchmark": "independent_explicit_path",
         "tips_real_yield": "recompute_from_nominal_and_scenario_inflation",
         "operating_cash_inflation": "baseline_cpi",
         "primary_deficit_to_debt_target": "independent_no_plug",
     },
-    "overrides": {},
     "output": {"profile": "summary", "compression": "gzip"},
 }
-Path(sys.argv[3]).write_text(json.dumps(scenario, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+noop = {
+    **base,
+    "scenario_id": "dependency_noop_v1",
+    "provenance": {"kind": "tdcsim_transform_of_cbo_baseline", "label": "dependency qualification noop"},
+    "overrides": {},
+}
+compound = {
+    **base,
+    "scenario_id": "dependency_compound_v1",
+    "provenance": {"kind": "user_stress_assumption", "label": "dependency qualification compound scenario"},
+    "coupling": {
+        "frn_benchmark": "derive_from_scenario_nominal_curve",
+        "tips_real_yield": "recompute_from_nominal_and_scenario_inflation",
+        "operating_cash_inflation": "scenario_cpi",
+        "primary_deficit_to_debt_target": "independent_no_plug",
+    },
+    "overrides": {
+        "nominal_yield_curve": {"mode": "parallel_bp", "shock_bp": 25},
+        "frn_benchmark": {"mode": "linked_to_nominal_curve", "spread_bp": 5},
+        "inflation_cpi": {"mode": "annualized_inflation_shift_bp", "shock_bp": 25, "terminal_rule": "carry_last_scenario_growth"},
+        "tips_real_yield": {"mode": "linked_recompute", "additional_parallel_bp": 0},
+        "operating_cash": {"mode": "constant_real"},
+        "cash_reconciliation": {"mode": "zero", "funding_effect": "none"},
+        "primary_deficit": {"mode": "scale_path", "scale": 1.01},
+        "fiscal_incidence": {
+            "mode": "static_shares",
+            "domestic_ultimate_share": 0.50,
+            "rest_of_world_share": 0.25,
+            "foreign_official_share": 0.25,
+            "other_share": 0.0,
+        },
+        "fed_holdings": {"mode": "scale_path", "scale": 1.0},
+        "holder_preferences": {
+            "mode": "static_shares",
+            "rows": [
+                {
+                    "security_type": security_type,
+                    "shares": {
+                        "Banks": 0.10,
+                        "CB": 0.0,
+                        "Foreign": 0.20,
+                        "Private": 0.70,
+                        "TrustFunds": 0.0,
+                        "FedInternal": 0.0,
+                    },
+                }
+                for security_type in ("bills", "notes", "bonds", "tips", "frn")
+            ],
+        },
+        "issuance_mix": {
+            "mode": "replace_shares",
+            "tips_share": 0.08,
+            "frn_share": 0.04,
+            "fixed_remainder_shares": {"bills": 0.30, "notes": 0.50, "bonds": 0.20},
+            "maturity_distributions": {
+                "bills": [{"maturity_years": 0.5, "share": 1.0}],
+                "notes": [{"maturity_years": 5.0, "share": 1.0}],
+                "bonds": [{"maturity_years": 20.0, "share": 1.0}],
+                "tips": [{"maturity_years": 10.0, "share": 1.0}],
+                "frn": [{"maturity_years": 2.0, "share": 1.0}],
+            },
+            "negative_issuance_action": "retire_shortest_public_marketable",
+        },
+    },
+}
+for name, payload in {"noop": noop, "compound": compound}.items():
+    (out / f"{name}.json").write_text(__import__("json").dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 """
 
 
@@ -46,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wheel", required=True, type=Path)
     parser.add_argument("--baseline", type=Path, default=Path("output/cbo_forecast_release_bound_package.zip"))
     parser.add_argument("--attestation", type=Path, default=Path("output/cbo_forecast_release_bound_attestation.json"))
-    parser.add_argument("--run-scenario", action="store_true", help="also execute tdcsim-cbo run; can be slow on full packages")
+    parser.add_argument("--compile-only", action="store_true", help="skip run/verify execution after validating and compiling scenarios")
     args = parser.parse_args(argv)
     wheel = args.wheel.resolve()
     if not wheel.exists():
@@ -65,15 +150,20 @@ def main(argv: list[str] | None = None) -> int:
             [
                 str(python),
                 "-c",
-                "from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, CboScenarioCompiler, run_cbo_scenario",
+                "import ratewall_paths; from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, CboScenarioCompiler, run_cbo_scenario",
             ],
             check=True,
         )
         subprocess.run([str(cli), "--help"], check=True, stdout=subprocess.DEVNULL)
-        if baseline.exists() and attestation.exists():
-            scenario = tmp_path / "dependency_noop_scenario.json"
-            compiled_root = tmp_path / "compiled"
-            subprocess.run([str(python), "-c", SCENARIO_SNIPPET, str(baseline), str(attestation), str(scenario)], check=True)
+        if not baseline.exists():
+            raise FileNotFoundError(baseline)
+        if not attestation.exists():
+            raise FileNotFoundError(attestation)
+        scenarios = tmp_path / "scenarios"
+        subprocess.run([str(python), "-c", SCENARIO_SNIPPET, str(baseline), str(attestation), str(scenarios)], check=True)
+        for name in ("noop", "compound"):
+            scenario = scenarios / f"{name}.json"
+            compiled_root = tmp_path / f"compiled-{name}"
             subprocess.run(
                 [
                     str(cli),
@@ -109,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
                 check=True,
                 stdout=subprocess.DEVNULL,
             )
-            if args.run_scenario:
+            if not args.compile_only:
+                run_dir = tmp_path / f"run-{name}"
                 subprocess.run(
                     [
                         str(cli),
@@ -121,7 +212,21 @@ def main(argv: list[str] | None = None) -> int:
                         "--scenario",
                         str(scenario),
                         "--output-dir",
-                        str(tmp_path / "run"),
+                        str(run_dir),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    [
+                        str(cli),
+                        "verify",
+                        "--run-dir",
+                        str(run_dir),
+                        "--baseline",
+                        str(baseline),
+                        "--attestation",
+                        str(attestation),
                     ],
                     check=True,
                     stdout=subprocess.DEVNULL,

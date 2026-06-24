@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import platform
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +18,8 @@ from forecast_paths import compiled_forecast_input_paths
 from sim_engine import run_simulation
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
 
-from ._json import write_json
+from ._json import read_json, sha256_file, write_json
+from ._schema import validate_schema
 from .baseline import CboBaselinePackage
 from .compiler import CboCompiledScenario, CboScenarioCompiler
 from .contract import CboScenarioSpec
@@ -50,9 +56,11 @@ def run_cbo_scenario(
         raise RunnerError(f"scenario output directory already exists: {out}")
     out.mkdir(parents=True)
     compiled = CboScenarioCompiler().compile(baseline, spec, out / "compile")
+    scenario_path = out / "scenario.json"
+    write_json(scenario_path, spec.data)
     inputs = compiled.forecast_inputs_dir
     start, end = _simulation_dates(spec, inputs)
-    params = build_runtime_params(inputs, spec)
+    params = build_runtime_params(inputs)
     engine_scenario_id = _compiled_scenario_id(inputs)
     results, final_portfolio = run_simulation(
         params,
@@ -80,13 +88,26 @@ def run_cbo_scenario(
         scenario_sha256=spec.canonical_sha256(),
         compiled=compiled,
         compiled_manifest_relpath=compiled.manifest_path.relative_to(out).as_posix(),
+        baseline=baseline,
+        scenario=spec,
+        scenario_relpath=scenario_path.relative_to(out).as_posix(),
+        scenario_file_sha256=sha256_file(scenario_path),
         start_date=start,
         end_date=end,
         outputs=outputs,
         output_hashes=hash_output_tree(out / "outputs"),
         boundary_checks=boundaries,
+        code_environment=_code_environment(),
+        generated_at_utc=datetime.now(timezone.utc).isoformat(),
     )
     manifest_path = out / "tdcsim_cbo_run_manifest.json"
+    with files("tdcsim_cbo").joinpath("schemas/cbo-run-manifest-v1.schema.json").open("r", encoding="utf-8") as handle:
+        run_manifest_schema = json.load(handle)
+    validate_schema(
+        run_manifest,
+        run_manifest_schema,
+        label="run_manifest",
+    )
     write_json(manifest_path, run_manifest)
     result_path = out / "outputs" / f"results_{profile}{'.csv.gz' if compression == 'gzip' else '.csv'}"
     return CboScenarioRun(
@@ -98,13 +119,16 @@ def run_cbo_scenario(
     )
 
 
-def build_runtime_params(inputs_dir: str | Path, spec: CboScenarioSpec) -> dict[str, Any]:
+def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
     """Build simulator params from compiled forecast inputs and scenario config."""
 
     inputs = Path(inputs_dir)
     initial_portfolio = _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv")
     operating_cash = pd.read_csv(inputs / "tdcsim_operating_cash_path.csv")
     base_tga = float(operating_cash.iloc[0].get("operating_cash_target_bil", 0.0))
+    holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
+    if _fed_target_active(inputs / "tdcsim_fed_holdings_path.csv"):
+        _assert_no_cb_auction_preferences(holder_preferences)
     return {
         "initial_values": {"reserves": 3000.0, "tdc_level": 0.0, "tga": base_tga},
         "tga_params": {"target_balance": base_tga, "floor": -1e15},
@@ -115,14 +139,14 @@ def build_runtime_params(inputs_dir: str | Path, spec: CboScenarioSpec) -> dict[
             "tax_growth_qtr": 0.0,
         },
         "other_flows": {"reserve_transfer": 0.0, "cb_net_expense": 0.0, "money_minting_transfers": 0.0},
-        "treasury_issuance_profile": _issuance_profile(spec),
+        "treasury_issuance_profile": _issuance_profile(inputs),
         "yield_curve": {
             "use_static": True,
             "years": [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0],
             "rates": [0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04],
         },
         "yield_curve_surface": {"file": str(inputs / "tdcsim_yield_curve_surface.csv"), "interpolation_method": "pchip", "floor_zero": False},
-        "sector_preferences": _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv"),
+        "sector_preferences": holder_preferences,
         "private_mmf_split": {"bills": 0.25, "notes": 0.10, "bonds": 0.05, "tips": 0.05, "frn": 0.20},
         "tips_params": {
             "cpi_start_level": 100.0,
@@ -139,19 +163,12 @@ def build_runtime_params(inputs_dir: str | Path, spec: CboScenarioSpec) -> dict[
         "funding_rule": {
             "mode": "cbo_public_debt_target",
             "target_enforcement": "every_period",
-            "negative_required_issuance_action": _negative_issuance_action(spec),
+            "negative_required_issuance_action": _negative_issuance_action(inputs),
             "target_tolerance_bil": 0.000001,
         },
         "baseline_input_paths": compiled_forecast_input_paths(inputs),
         "data_vintage": {"actuals_available_as_of": "9999-12-31", "allow_lookahead": False},
-        "fiscal_incidence_policy": {
-            "mode": "explicit_scenario_assumption",
-            "incidence_basis": "signed_net_primary_proxy",
-            "du_share": 0.99,
-            "ru_share": 0.01,
-            "foreign_share": 0.0,
-            "other_share": 0.0,
-        },
+        "fiscal_incidence_policy": _fiscal_incidence_policy(inputs / "tdcsim_fiscal_incidence_policy.csv"),
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
     }
 
@@ -172,12 +189,17 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
     ):
         if col in residual.columns:
             residual_flags[col] = sorted(str(value) for value in residual[col].dropna().unique())
-    fed_auction_max = _max_abs(results, "CBOFedAuctionShare")
+    fed_auction_share_max = _max_abs(results, "CBOFedAuctionShare")
+    fed_auction_face_max = _max_abs(results, "CBOFedAuctionRolloverAddons")
+    fed_auction_face_sum = _sum_abs(results, "CBOFedAuctionRolloverAddons")
+    fed_boundary_pass = fed_auction_share_max <= 1e-12 and fed_auction_face_max <= 1e-12
     return {
         "cash_residual_nonfunding_flags": residual_flags,
         "cash_residual_affects_issuance_size": residual_flags.get("affects_issuance_size", []),
-        "max_abs_fed_auction_share": fed_auction_max,
-        "fed_target_holder_allocation_only": fed_auction_max <= 1e-12,
+        "max_abs_fed_auction_share": fed_auction_share_max,
+        "max_abs_fed_auction_face": fed_auction_face_max,
+        "sum_abs_fed_auction_face": fed_auction_face_sum,
+        "fed_target_holder_allocation_only": fed_boundary_pass,
         "net_interest_role": "diagnostic_nonbinding",
         "remittance_deferred_asset_status": "unsupported_in_cbo_scenario_lane",
     }
@@ -239,20 +261,29 @@ def _holder_preferences(path: Path) -> dict[str, dict[str, float]]:
     return prefs
 
 
-def _issuance_profile(spec: CboScenarioSpec) -> dict[str, Any]:
-    override = _override(spec, "issuance_mix")
-    if not override:
+def _issuance_profile(inputs: Path) -> dict[str, Any]:
+    path = inputs / "tdcsim_issuance_mix_assumptions.json"
+    if not path.exists():
         return _default_issuance_profile()
-    tips_share = float(override["tips_share"])
-    frn_share = float(override["frn_share"])
-    fixed = override["fixed_remainder_shares"]
-    maturity = override["maturity_distributions"]
+    payload = read_json(path)
+    if not isinstance(payload, Mapping):
+        raise RunnerError("compiled issuance mix assumptions must be a JSON object")
+    if payload.get("mode") != "replace_shares":
+        return _default_issuance_profile()
+    shares = payload["security_shares"]
+    maturity = payload["maturity_distributions"]
+    fixed_total = float(shares["bills"]) + float(shares["notes"]) + float(shares["bonds"])
+    fixed = {
+        "bills": 0.0 if fixed_total == 0 else float(shares["bills"]) / fixed_total,
+        "notes": 0.0 if fixed_total == 0 else float(shares["notes"]) / fixed_total,
+        "bonds": 0.0 if fixed_total == 0 else float(shares["bonds"]) / fixed_total,
+    }
     return {
         "bills": _fixed_profile(float(fixed["bills"]), maturity["bills"], cutoff=1.0),
         "notes": _fixed_profile(float(fixed["notes"]), maturity["notes"], cutoff=10.0),
         "bonds": _fixed_profile(float(fixed["bonds"]), maturity["bonds"], cutoff=999.0),
-        "TIPS": _special_profile(tips_share, maturity["tips"]),
-        "FRN": _special_profile(frn_share, maturity["frn"]),
+        "TIPS": _special_profile(float(shares["tips"]), maturity["tips"]),
+        "FRN": _special_profile(float(shares["frn"]), maturity["frn"]),
         "NonMarketable": {"target_percentage": 0.0, "maturities": [30.0], "maturity_distribution": [1.0]},
         "remainder_maturity_years": 1.0,
     }
@@ -287,18 +318,45 @@ def _special_profile(share: float, rows: list[Mapping[str, Any]]) -> dict[str, A
     }
 
 
-def _negative_issuance_action(spec: CboScenarioSpec) -> str:
-    override = _override(spec, "issuance_mix")
-    if override:
-        return str(override.get("negative_issuance_action") or "retire_shortest_public_marketable")
+def _negative_issuance_action(inputs: Path) -> str:
+    path = inputs / "tdcsim_issuance_mix_assumptions.json"
+    if path.exists():
+        payload = read_json(path)
+        if isinstance(payload, Mapping) and payload.get("negative_issuance_action"):
+            return str(payload["negative_issuance_action"])
     return "retire_shortest_public_marketable"
 
 
-def _override(spec: CboScenarioSpec, key: str) -> Mapping[str, Any] | None:
-    overrides = spec.data.get("overrides", {})
-    if isinstance(overrides, Mapping) and isinstance(overrides.get(key), Mapping):
-        return overrides[key]
-    return None
+def _fiscal_incidence_policy(path: Path) -> dict[str, Any]:
+    frame = pd.read_csv(path)
+    if frame.empty:
+        raise RunnerError("compiled fiscal incidence policy is empty")
+    row = frame.iloc[0]
+    return {
+        "mode": "explicit_scenario_assumption",
+        "incidence_basis": "signed_net_primary_proxy",
+        "du_share": float(row.get("du_share", 0.0) or 0.0),
+        "ru_share": float(row.get("ru_share", 0.0) or 0.0),
+        "foreign_share": float(row.get("foreign_share", 0.0) or 0.0),
+        "other_share": float(row.get("other_share", 0.0) or 0.0),
+    }
+
+
+def _fed_target_active(path: Path) -> bool:
+    if not path.exists():
+        return False
+    frame = pd.read_csv(path)
+    if frame.empty or "cbo_fed_holdings_target_bil" not in frame.columns:
+        return False
+    values = pd.to_numeric(frame["cbo_fed_holdings_target_bil"], errors="coerce").fillna(0.0)
+    return bool((values.abs() > 1e-12).any())
+
+
+def _assert_no_cb_auction_preferences(prefs: Mapping[str, Mapping[str, float]]) -> None:
+    cb = prefs.get("CB", {})
+    nonzero = {key: value for key, value in cb.items() if abs(float(value)) > 1e-12}
+    if nonzero:
+        raise RunnerError(f"CB auction preferences must be zero when a CBO Fed stock target path is active: {nonzero}")
 
 
 def _opening_tips_reference_cpi(portfolio: pd.DataFrame) -> float:
@@ -313,6 +371,44 @@ def _max_abs(frame: pd.DataFrame, column: str) -> float:
     if column not in frame.columns:
         return 0.0
     return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().max())
+
+
+def _sum_abs(frame: pd.DataFrame, column: str) -> float:
+    if column not in frame.columns:
+        return 0.0
+    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().sum())
+
+
+def _code_environment() -> dict[str, Any]:
+    return {
+        "code_commit_sha": _git_value(["rev-parse", "HEAD"], default="0" * 40),
+        "dirty_state": bool(_git_value(["status", "--short"], default="")),
+        "requirements_lock_sha256": _requirements_lock_sha(),
+        "python_version": platform.python_version(),
+        "runner_version": "tdcsim_cbo_runner_v1",
+        "verifier_version": "tdcsim_cbo_verifier_v1",
+        "runner_source_sha256": sha256_file(Path(__file__)),
+    }
+
+
+def _git_value(args: list[str], *, default: str) -> str:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=Path.cwd(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return default
+
+
+def _requirements_lock_sha() -> str:
+    for path in (Path("requirements.lock.txt"), Path("output/cbo_forecast_release_bound/requirements.lock.txt")):
+        if path.exists():
+            return sha256_file(path)
+    return "0" * 64
 
 
 __all__ = ["CboScenarioRun", "RunnerError", "build_runtime_params", "run_cbo_scenario", "validate_run_boundaries"]
