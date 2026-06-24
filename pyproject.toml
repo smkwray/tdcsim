@@ -21,7 +21,7 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["tdcsim_cbo", "tdcsim_cbo.schemas"]
+packages = ["tdcsim_cbo", "tdcsim_cbo.schemas", "tdcsim_cbo.transforms"]
 py-modules = [
   "budget_interest",
   "cbo_policy_bundle",
