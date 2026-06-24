@@ -197,6 +197,7 @@ for name, payload in {"noop": noop, "compound": compound, "file_backed": file_ba
 NEGATIVE_VERIFIER_SNIPPET = r"""
 import gzip
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -204,7 +205,7 @@ from pathlib import Path
 import pandas as pd
 
 from tdcsim_cbo._json import read_json, write_json
-from tdcsim_cbo.output import hash_output_tree
+from tdcsim_cbo.output import hash_output_tree, write_scenario_outputs
 from tdcsim_cbo.verifier import VerificationError, verify_scenario_run
 
 root = Path(sys.argv[1])
@@ -240,6 +241,56 @@ def forge_identity(_target, manifest):
     manifest["code_environment"]["requirements_lock_sha256"] = "0" * 64
     manifest["code_environment"]["wheel_sha256"] = "f" * 64
 
+def forge_claim_boundary(_target, manifest):
+    manifest["claim_boundary"]["net_interest_role"] = "binding_budgetary_net_interest"
+    manifest["unsupported_components"] = []
+
+def forge_python_version(_target, manifest):
+    manifest["code_environment"]["python_version"] = "0.0.0-fabricated"
+
+def forge_wheel_env_match(target, manifest):
+    fake_wheel = target / "runtime" / "fake.whl"
+    fake_wheel.parent.mkdir(exist_ok=True)
+    fake_wheel.write_bytes(b"not a wheel")
+    import hashlib
+    fake_sha = hashlib.sha256(fake_wheel.read_bytes()).hexdigest()
+    manifest["code_environment"]["wheel_sha256"] = fake_sha
+    manifest["code_environment"]["wheel_artifact"] = {
+        "logical_name": "fake.whl",
+        "relative_path": "runtime/fake.whl",
+        "sha256": fake_sha,
+        "bytes": fake_wheel.stat().st_size,
+        "media_type": "application/zip",
+    }
+    os.environ["TDCSIM_CBO_WHEEL_SHA256"] = fake_sha
+
+def forge_one_row_output(target, manifest):
+    results_item = next(item for item in manifest["outputs"] if str(item["logical_name"]).startswith("results_"))
+    result_path = target / results_item["relative_path"]
+    compression = "gzip" if str(result_path).endswith(".gz") else None
+    results = pd.read_csv(result_path, compression=compression).iloc[[0]].copy()
+    output_manifest = write_scenario_outputs(
+        results,
+        pd.DataFrame(),
+        target / "outputs",
+        profile=str(manifest["output_manifest"].get("profile", "summary")),
+        compression=str(manifest["output_manifest"].get("compression", "gzip")),
+        catalog_sqlite="catalog_sqlite" in manifest["output_manifest"],
+    )
+    output_hashes = hash_output_tree(target / "outputs")
+    manifest["output_manifest"] = output_manifest
+    manifest["output_hashes"] = output_hashes
+    manifest["outputs"] = [
+        {
+            "logical_name": item["path"],
+            "relative_path": f"outputs/{item['path']}",
+            "sha256": item["sha256"],
+            "bytes": item["bytes"],
+            "media_type": "application/json" if item["path"].endswith(".json") else "text/csv",
+        }
+        for item in output_hashes
+    ]
+
 def remove_summary_key(target, manifest):
     results_item = next(item for item in manifest["outputs"] if str(item["logical_name"]).startswith("results_"))
     result_path = target / results_item["relative_path"]
@@ -264,7 +315,12 @@ def remove_summary_key(target, manifest):
 
 expect_reject("validation-fail", fail_validation, "validation")
 expect_reject("forged-identity", forge_identity, "code_environment")
-expect_reject("missing-summary-key", remove_summary_key, "summary")
+expect_reject("claim-boundary", forge_claim_boundary, "claim_boundary")
+expect_reject("python-version", forge_python_version, "python_version")
+expect_reject("wheel-env-match", forge_wheel_env_match, "wheel artifact digest")
+os.environ["TDCSIM_CBO_WHEEL_SHA256"] = sys.argv[4]
+expect_reject("one-row-output", forge_one_row_output, "engine replay output hash mismatch")
+expect_reject("missing-summary-key", remove_summary_key, "engine replay output hash mismatch")
 """
 
 
@@ -286,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
     constraints = args.constraints.resolve()
     if not constraints.exists():
         raise FileNotFoundError(constraints)
+    code_commit = _git_output(["rev-parse", "HEAD"])
+    dirty_status = _git_output(["status", "--short"])
+    if dirty_status:
+        raise RuntimeError("CBO dependency qualification requires a clean git worktree")
     with _qualification_root(args.evidence_dir) as tmp_path:
         env = tmp_path / "venv"
         subprocess.run([sys.executable, "-m", "venv", str(env)], check=True)
@@ -294,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
         cli = env / "bin" / "tdcsim-cbo"
         run_env = os.environ.copy()
         run_env["TDCSIM_CBO_WHEEL_SHA256"] = wheel_sha256
+        run_env["TDCSIM_CBO_WHEEL_PATH"] = str(wheel)
+        run_env["TDCSIM_CBO_CODE_COMMIT_SHA"] = code_commit
+        run_env["TDCSIM_CBO_DIRTY_STATE"] = "false"
+        run_env["TDCSIM_CBO_REQUIREMENTS_LOCK_SHA256"] = _sha256(constraints)
         commands = []
         _run(commands, [str(pip), "install", "-q", "-r", str(constraints)], env=run_env)
         _run(commands, [str(pip), "install", "-q", "--no-deps", str(wheel)], env=run_env)
@@ -396,7 +460,11 @@ def main(argv: list[str] | None = None) -> int:
                     stdout=subprocess.DEVNULL,
                 )
         if not args.compile_only:
-            _run(commands, [str(python), "-c", NEGATIVE_VERIFIER_SNIPPET, str(tmp_path), str(baseline), str(attestation)], env=run_env)
+            _run(
+                commands,
+                [str(python), "-c", NEGATIVE_VERIFIER_SNIPPET, str(tmp_path), str(baseline), str(attestation), wheel_sha256],
+                env=run_env,
+            )
         freeze_sha256 = _sha256(tmp_path / "pip-freeze.txt")
         manifest = {
             "schema_version": "tdcsim_cbo_dependency_qualification_v1",
@@ -439,6 +507,10 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_output(args: list[str]) -> str:
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
 def _artifact_hashes(root: Path, *, exclude_dirs: set[str]) -> list[dict[str, object]]:

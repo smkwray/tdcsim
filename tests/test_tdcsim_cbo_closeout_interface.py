@@ -267,9 +267,47 @@ def test_verifier_rejects_unbacked_wheel_identity(tmp_path: Path) -> None:
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
     manifest = read_json(run.manifest_path)
     manifest["code_environment"]["wheel_sha256"] = "f" * 64
+    manifest["code_environment"]["code_commit_sha"] = "a" * 40
+    manifest["code_environment"]["dirty_state"] = False
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="wheel_sha256"):
+    with pytest.raises(VerificationError, match="wheel_artifact"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_environment_matched_fake_wheel_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    fake_wheel = run.output_dir / "runtime" / "fake.whl"
+    fake_wheel.parent.mkdir()
+    fake_wheel.write_bytes(b"not a wheel")
+    fake_sha = sha256_file(fake_wheel)
+    manifest = read_json(run.manifest_path)
+    manifest["code_environment"]["wheel_sha256"] = fake_sha
+    manifest["code_environment"]["code_commit_sha"] = "a" * 40
+    manifest["code_environment"]["dirty_state"] = False
+    manifest["code_environment"]["wheel_artifact"] = {
+        "logical_name": "fake.whl",
+        "relative_path": "runtime/fake.whl",
+        "sha256": fake_sha,
+        "bytes": fake_wheel.stat().st_size,
+        "media_type": "application/zip",
+    }
+    write_json(run.manifest_path, manifest)
+    monkeypatch.setenv("TDCSIM_CBO_WHEEL_SHA256", fake_sha)
+
+    with pytest.raises(VerificationError, match="wheel artifact digest"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_fabricated_python_version(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["code_environment"]["python_version"] = "0.0.0-fabricated"
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="python_version"):
         verify_scenario_run(run.output_dir)
 
 
@@ -281,6 +319,38 @@ def test_verifier_rejects_forged_requirements_lock_identity(tmp_path: Path) -> N
     write_json(run.manifest_path, manifest)
 
     with pytest.raises(VerificationError, match="requirements lock hash"):
+        verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
+
+
+def test_verifier_rejects_claim_boundary_tamper(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["claim_boundary"]["net_interest_role"] = "binding_budgetary_net_interest"
+    manifest["unsupported_components"] = []
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="claim_boundary|schema validation"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_hash_consistent_fabricated_output_replay(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    results = pd.read_csv(run.results_path).iloc[[0]].copy()
+    final_portfolio = pd.read_csv(run.output_dir / "outputs" / "final_portfolio_compact.csv")
+    output_manifest = write_scenario_outputs(
+        results,
+        final_portfolio,
+        run.output_dir / "outputs",
+        profile="compact",
+        compression="none",
+    )
+    manifest = read_json(run.manifest_path)
+    _replace_output_artifacts(run.output_dir, manifest, output_manifest)
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="engine replay output hash mismatch"):
         verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
 
 
@@ -638,6 +708,22 @@ def _refresh_manifest_artifact(run_dir: Path, manifest: dict, relative_path: str
             item["bytes"] = path.stat().st_size
             return
     raise AssertionError(f"missing output artifact in manifest: {relative_path}")
+
+
+def _replace_output_artifacts(run_dir: Path, manifest: dict, output_manifest: dict) -> None:
+    output_hashes = hash_output_tree(run_dir / "outputs")
+    manifest["output_manifest"] = output_manifest
+    manifest["output_hashes"] = output_hashes
+    manifest["outputs"] = [
+        {
+            "logical_name": item["path"],
+            "relative_path": f"outputs/{item['path']}",
+            "sha256": item["sha256"],
+            "bytes": item["bytes"],
+            "media_type": "application/json" if item["path"].endswith(".json") else "text/csv",
+        }
+        for item in output_hashes
+    ]
 
 
 def _refresh_compiled_input_hashes(run_dir: Path, manifest: dict) -> None:

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import shutil
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -28,6 +26,7 @@ from .compiler import CboCompiledScenario, CboScenarioCompiler
 from .contract import CboScenarioSpec
 from .manifest import build_run_manifest
 from .output import hash_output_tree, write_scenario_outputs
+from .runtime_identity import distribution_identity
 
 
 class RunnerError(ValueError):
@@ -102,7 +101,7 @@ def run_cbo_scenario(
         outputs=outputs,
         output_hashes=hash_output_tree(out / "outputs"),
         boundary_checks=boundaries,
-        code_environment=_code_environment(baseline),
+        code_environment=_code_environment(baseline, out),
         generated_at_utc=datetime.now(timezone.utc).isoformat(),
     )
     manifest_path = out / "tdcsim_cbo_run_manifest.json"
@@ -462,26 +461,86 @@ def _media_type(path: str) -> str:
         return "text/csv"
     if path.endswith(".sqlite"):
         return "application/vnd.sqlite3"
+    if path.endswith(".whl"):
+        return "application/zip"
     return "application/octet-stream"
 
 
-def _code_environment(baseline: CboBaselinePackage) -> dict[str, Any]:
-    dist = _distribution_identity()
+def _code_environment(baseline: CboBaselinePackage, run_root: Path) -> dict[str, Any]:
+    dist = distribution_identity()
+    wheel_artifact = _copy_release_wheel(run_root)
+    wheel_sha256 = str(wheel_artifact["sha256"]) if wheel_artifact else ""
+    env_commit = os.environ.get("TDCSIM_CBO_CODE_COMMIT_SHA", "")
+    git_commit = _module_git_value(["rev-parse", "HEAD"], default="")
+    dirty_state = _dirty_state(wheel_artifact is not None)
+    if wheel_artifact is not None and not _is_commit_sha(env_commit):
+        raise RunnerError("release wheel runs require TDCSIM_CBO_CODE_COMMIT_SHA")
+    if wheel_artifact is not None and dirty_state:
+        raise RunnerError("release wheel runs require TDCSIM_CBO_DIRTY_STATE=false")
     return {
-        "code_commit_sha": _module_git_value(["rev-parse", "HEAD"], default="0" * 40),
-        "dirty_state": bool(_module_git_value(["status", "--short"], default="")),
-        "requirements_lock_sha256": str(baseline.attestation.data.get("requirements_lock_sha256") or "0" * 64),
-        "python_version": platform.python_version(),
+        "code_commit_sha": env_commit or git_commit or "0" * 40,
+        "dirty_state": dirty_state,
+        "requirements_lock_sha256": str(
+            os.environ.get("TDCSIM_CBO_REQUIREMENTS_LOCK_SHA256")
+            or baseline.attestation.data.get("requirements_lock_sha256")
+            or "0" * 64
+        ),
+        "python_version": _python_version(),
         "runner_version": "tdcsim_cbo_runner_v1",
         "verifier_version": "tdcsim_cbo_verifier_v1",
         "runner_source_sha256": sha256_file(Path(__file__)),
         "sim_engine_source_sha256": sha256_file(Path(run_simulation.__code__.co_filename)),
         "package_name": dist["name"],
         "package_version": dist["version"],
-        "distribution_record_digest": dist["record_digest"],
-        "wheel_sha256": os.environ.get("TDCSIM_CBO_WHEEL_SHA256", ""),
+        "distribution_file_digest": dist["file_digest"],
+        "wheel_sha256": wheel_sha256,
+        "wheel_artifact": wheel_artifact,
         "runtime_identity_source": dist["identity_source"],
     }
+
+
+def _copy_release_wheel(run_root: Path) -> dict[str, Any] | None:
+    wheel_sha = os.environ.get("TDCSIM_CBO_WHEEL_SHA256", "")
+    wheel_path_raw = os.environ.get("TDCSIM_CBO_WHEEL_PATH", "")
+    if wheel_sha and not wheel_path_raw:
+        raise RunnerError("TDCSIM_CBO_WHEEL_SHA256 requires TDCSIM_CBO_WHEEL_PATH so the run package retains wheel bytes")
+    if not wheel_path_raw:
+        return None
+    source = Path(wheel_path_raw).expanduser().resolve()
+    if not source.is_file():
+        raise RunnerError(f"TDCSIM_CBO_WHEEL_PATH does not point to a file: {source}")
+    actual_sha = sha256_file(source)
+    if wheel_sha and actual_sha != wheel_sha:
+        raise RunnerError("TDCSIM_CBO_WHEEL_SHA256 does not match TDCSIM_CBO_WHEEL_PATH")
+    runtime_dir = run_root / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    dest = runtime_dir / source.name
+    shutil.copy2(source, dest)
+    return _artifact_record(run_root, dest, logical_name=source.name)
+
+
+def _python_version() -> str:
+    import platform
+
+    return platform.python_version()
+
+
+def _dirty_state(is_release_wheel_run: bool) -> bool:
+    raw = os.environ.get("TDCSIM_CBO_DIRTY_STATE")
+    if raw is not None:
+        lowered = raw.strip().lower()
+        if lowered in {"false", "0", "no"}:
+            return False
+        if lowered in {"true", "1", "yes"}:
+            return True
+        raise RunnerError("TDCSIM_CBO_DIRTY_STATE must be true or false")
+    if is_release_wheel_run:
+        return True
+    return bool(_module_git_value(["status", "--short"], default=""))
+
+
+def _is_commit_sha(value: str) -> bool:
+    return len(value) == 40 and all(char in "0123456789abcdef" for char in value)
 
 
 def _module_git_value(args: list[str], *, default: str) -> str:
@@ -512,42 +571,6 @@ def _module_git_root() -> Path | None:
     except Exception:
         return None
     return Path(root) if root else None
-
-
-def _distribution_identity() -> dict[str, str]:
-    try:
-        dist = metadata.distribution("tdcsim")
-        files_list = sorted(str(item) for item in (dist.files or []))
-        record_path = _distribution_record_path(dist)
-        return {
-            "name": dist.metadata.get("Name", "tdcsim"),
-            "version": dist.version,
-            "record_digest": sha256_file(record_path) if record_path is not None else _record_digest(files_list),
-            "identity_source": "installed_distribution_record" if record_path is not None else "installed_distribution_metadata",
-        }
-    except metadata.PackageNotFoundError:
-        return {
-            "name": "tdcsim",
-            "version": "source-tree",
-            "record_digest": "0" * 64,
-            "identity_source": "source_tree_no_installed_distribution",
-        }
-
-
-def _distribution_record_path(dist: metadata.Distribution) -> Path | None:
-    for item in dist.files or []:
-        if str(item).endswith(".dist-info/RECORD"):
-            path = Path(dist.locate_file(item))
-            if path.exists():
-                return path
-    return None
-
-
-def _record_digest(records: list[str]) -> str:
-    import hashlib
-
-    payload = "\n".join(records).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 __all__ = ["CboScenarioRun", "RunnerError", "build_runtime_params", "run_cbo_scenario", "validate_run_boundaries"]

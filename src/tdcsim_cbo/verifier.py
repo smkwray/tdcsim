@@ -5,9 +5,8 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import platform
 import tempfile
-import subprocess
-from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,9 @@ from ._json import read_json, sha256_file
 from .baseline import CboBaselinePackage
 from .compiler import CboScenarioCompiler, digest_input_tree
 from .contract import CboScenarioSpec
-from .output import hash_output_tree
+from .manifest import RUN_CLAIM_BOUNDARY, RUN_UNSUPPORTED_COMPONENTS
+from .output import hash_output_tree, write_scenario_outputs
+from .runtime_identity import distribution_identity, wheel_file_digest
 from . import runner as runner_module
 from ._schema import validate_schema
 
@@ -71,7 +72,8 @@ def verify_scenario_run(
     manifest = _manifest(root / "tdcsim_cbo_run_manifest.json")
     _validate_run_manifest_schema(manifest)
     _verify_release_claims(manifest)
-    _verify_code_environment(manifest)
+    _verify_run_claim_boundary(manifest)
+    _verify_code_environment(root, manifest)
     _verify_validation_block(manifest)
     compiled_rel = Path(str(manifest.get("compiled_manifest") or ""))
     if compiled_rel.is_absolute() or ".." in compiled_rel.parts:
@@ -153,105 +155,93 @@ def _verify_release_claims(manifest: dict[str, Any]) -> None:
         raise VerificationError(f"unsupported verification_grade: {grade!r}")
 
 
-def _verify_code_environment(manifest: dict[str, Any]) -> None:
+def _verify_code_environment(root: Path, manifest: dict[str, Any]) -> None:
     env = manifest.get("code_environment")
     if not isinstance(env, dict):
         raise VerificationError("run manifest code_environment must be an object")
     expected = _actual_code_environment()
+    _verify_python_version(str(env.get("python_version") or ""))
     for key, expected_value in expected.items():
         if env.get(key) != expected_value:
             raise VerificationError(f"run manifest code_environment {key} does not match verifier runtime")
     lock_sha = str(env.get("requirements_lock_sha256") or "")
     if not lock_sha or lock_sha == "0" * 64:
         raise VerificationError("run manifest code environment requirements lock hash is not release-bound")
+    expected_lock = os.environ.get("TDCSIM_CBO_REQUIREMENTS_LOCK_SHA256", "")
+    if expected_lock and lock_sha != expected_lock:
+        raise VerificationError("run manifest code environment requirements lock hash does not match verifier runtime")
+    _verify_wheel_artifact(root, env)
+
+
+def _verify_wheel_artifact(root: Path, env: dict[str, Any]) -> None:
     wheel_sha = str(env.get("wheel_sha256") or "")
+    artifact = env.get("wheel_artifact")
     expected_wheel_sha = os.environ.get("TDCSIM_CBO_WHEEL_SHA256", "")
-    if wheel_sha and not expected_wheel_sha:
-        raise VerificationError("run manifest code environment wheel_sha256 cannot be verified")
+    if not wheel_sha:
+        if artifact is not None:
+            raise VerificationError("run manifest wheel_artifact is present without wheel_sha256")
+        return
+    commit = str(env.get("code_commit_sha") or "")
+    if len(commit) != 40 or commit == "0" * 40 or any(char not in "0123456789abcdef" for char in commit):
+        raise VerificationError("run manifest code environment code_commit_sha is not release-bound")
+    expected_commit = os.environ.get("TDCSIM_CBO_CODE_COMMIT_SHA", "")
+    if expected_commit and commit != expected_commit:
+        raise VerificationError("run manifest code environment code_commit_sha does not match verifier runtime")
+    if env.get("dirty_state") is not False:
+        raise VerificationError("run manifest code environment dirty_state must be false for release wheel runs")
+    if not isinstance(artifact, dict):
+        raise VerificationError("run manifest code environment wheel_artifact is required when wheel_sha256 is set")
     if wheel_sha and wheel_sha != expected_wheel_sha:
         raise VerificationError("run manifest code environment wheel_sha256 does not match verifier runtime")
+    rel = Path(str(artifact.get("relative_path") or ""))
+    if rel.is_absolute() or ".." in rel.parts:
+        raise VerificationError("run manifest wheel_artifact path must be package-relative")
+    path = root / rel
+    if not path.is_file():
+        raise VerificationError("run manifest wheel_artifact is missing")
+    if sha256_file(path) != artifact.get("sha256") or artifact.get("sha256") != wheel_sha:
+        raise VerificationError("run manifest wheel_artifact SHA does not match wheel_sha256")
+    if path.stat().st_size != int(artifact.get("bytes", -1)):
+        raise VerificationError("run manifest wheel_artifact byte count mismatch")
+    try:
+        wheel_digest = wheel_file_digest(path)
+    except Exception as exc:
+        raise VerificationError("run manifest wheel artifact digest could not be computed") from exc
+    if wheel_digest != env.get("distribution_file_digest"):
+        raise VerificationError("run manifest wheel artifact digest does not match installed runtime files")
+
+
+def _verify_python_version(version: str) -> None:
+    parts = version.split(".")
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:3]):
+        raise VerificationError("run manifest code_environment python_version is not a numeric X.Y.Z version")
+    major, minor, _patch = (int(part) for part in parts[:3])
+    current = platform.python_version_tuple()
+    if (major, minor) != (int(current[0]), int(current[1])):
+        raise VerificationError("run manifest code_environment python_version does not match verifier Python major.minor")
+    if major < 3 or (major == 3 and minor < 11):
+        raise VerificationError("run manifest code_environment python_version is below the supported floor")
 
 
 def _actual_code_environment() -> dict[str, Any]:
-    dist = _distribution_identity()
+    dist = distribution_identity()
     return {
-        "code_commit_sha": _module_git_value(["rev-parse", "HEAD"], default="0" * 40),
-        "dirty_state": bool(_module_git_value(["status", "--short"], default="")),
         "runner_version": "tdcsim_cbo_runner_v1",
         "verifier_version": "tdcsim_cbo_verifier_v1",
         "runner_source_sha256": sha256_file(Path(runner_module.__file__)),
         "sim_engine_source_sha256": sha256_file(Path(run_simulation.__code__.co_filename)),
         "package_name": dist["name"],
         "package_version": dist["version"],
-        "distribution_record_digest": dist["record_digest"],
+        "distribution_file_digest": dist["file_digest"],
         "runtime_identity_source": dist["identity_source"],
     }
 
 
-def _distribution_identity() -> dict[str, str]:
-    try:
-        dist = metadata.distribution("tdcsim")
-        files_list = sorted(str(item) for item in (dist.files or []))
-        record_path = _distribution_record_path(dist)
-        return {
-            "name": dist.metadata.get("Name", "tdcsim"),
-            "version": dist.version,
-            "record_digest": sha256_file(record_path) if record_path is not None else _record_digest(files_list),
-            "identity_source": "installed_distribution_record" if record_path is not None else "installed_distribution_metadata",
-        }
-    except metadata.PackageNotFoundError:
-        return {
-            "name": "tdcsim",
-            "version": "source-tree",
-            "record_digest": "0" * 64,
-            "identity_source": "source_tree_no_installed_distribution",
-        }
-
-
-def _distribution_record_path(dist: metadata.Distribution) -> Path | None:
-    for item in dist.files or []:
-        if str(item).endswith(".dist-info/RECORD"):
-            path = Path(dist.locate_file(item))
-            if path.exists():
-                return path
-    return None
-
-
-def _record_digest(records: list[str]) -> str:
-    import hashlib
-
-    payload = "\n".join(records).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _module_git_value(args: list[str], *, default: str) -> str:
-    git_root = _module_git_root()
-    if git_root is None:
-        return default
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=git_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except Exception:
-        return default
-
-
-def _module_git_root() -> Path | None:
-    try:
-        root = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=Path(__file__).resolve().parent,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except Exception:
-        return None
-    return Path(root) if root else None
+def _verify_run_claim_boundary(manifest: dict[str, Any]) -> None:
+    if manifest.get("claim_boundary") != RUN_CLAIM_BOUNDARY:
+        raise VerificationError("run manifest claim_boundary does not match the supported CBO lane claim")
+    if manifest.get("unsupported_components") != RUN_UNSUPPORTED_COMPONENTS:
+        raise VerificationError("run manifest unsupported_components does not match the supported CBO lane claim")
 
 
 def _verify_validation_block(manifest: dict[str, Any]) -> None:
@@ -394,8 +384,37 @@ def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: st
     spec = CboScenarioSpec.from_file(root / scenario_rel)
     with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-recompile-") as tmp:
         compiled = CboScenarioCompiler().compile(baseline, spec, Path(tmp) / "work")
-    if compiled.compiled_inputs_digest != manifest.get("compiled_inputs_digest"):
-        raise VerificationError("recompiled input digest mismatch")
+        if compiled.compiled_inputs_digest != manifest.get("compiled_inputs_digest"):
+            raise VerificationError("recompiled input digest mismatch")
+        _verify_engine_replay(root, manifest, compiled.forecast_inputs_dir)
+
+
+def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path) -> None:
+    simulation = manifest.get("simulation")
+    if not isinstance(simulation, dict):
+        raise VerificationError("run manifest simulation must be an object")
+    start = str(simulation.get("start_date") or "")
+    end = str(simulation.get("end_date") or "")
+    params = runner_module.build_runtime_params(inputs_dir)
+    engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
+    results, final_portfolio = run_simulation(params, start, end, freq="D", scenario_name=engine_scenario_id)
+    output_manifest = manifest.get("output_manifest")
+    if not isinstance(output_manifest, dict):
+        raise VerificationError("run manifest output_manifest must be an object")
+    profile = str(output_manifest.get("profile") or "compact")
+    compression = str(output_manifest.get("compression") or "gzip")
+    with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-output-") as tmp:
+        replay_outputs = Path(tmp) / "outputs"
+        write_scenario_outputs(
+            results,
+            final_portfolio,
+            replay_outputs,
+            profile=profile,
+            compression=compression,
+            catalog_sqlite="catalog_sqlite" in output_manifest,
+        )
+        if hash_output_tree(replay_outputs) != manifest.get("output_hashes"):
+            raise VerificationError("engine replay output hash mismatch")
 
 
 def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str, float]:
