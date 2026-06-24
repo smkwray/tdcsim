@@ -1133,6 +1133,12 @@ def _first_interest_payment_date(issue_date, maturity_date, frequency):
     return pd.NaT
 
 
+def _maturity_date_from_years(issue_date, maturity_years):
+    total_months = int(round(float(maturity_years) * 12.0))
+    years, months = divmod(max(total_months, 0), 12)
+    return pd.Timestamp(issue_date) + relativedelta(years=years, months=months)
+
+
 def run_simulation(params, start_date, end_date, freq='W', scenario_name='Default'):
     """
     Runs the core economic simulation including Treasury operations, fiscal flows,
@@ -1220,7 +1226,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             if event_date_str and isinstance(actions, list):
                 try:
                     event_date = pd.to_datetime(event_date_str)
-                    if configured_start_date_pd <= event_date <= end_date_pd:
+                    if event_date <= end_date_pd:
                         valid_actions = []
                         for action in actions:
                             if isinstance(action, dict) and 'parameter_path' in action and ('new_value' in action):
@@ -2517,7 +2523,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     for holder_subbucket, route_face_value in route_face_values:
                         if route_face_value < TGA_FLOOR_TOLERANCE:
                             continue
-                        maturity_date = current_date + relativedelta(years=int(round(mat_yrs)), months=int(round(mat_yrs % 1 * 12)))
+                        maturity_date = _maturity_date_from_years(current_date, mat_yrs)
                         coupon_rate_val = details.get('coupon', 0.0)
                         fixed_spread_val = details.get('spread', 0.0) if sec_type == 'FRN' else 0.0
                         issue_price_ratio_val = details.get('issue_price_ratio', 1.0)

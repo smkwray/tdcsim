@@ -46,6 +46,22 @@ def test_issuance_mix_rejects_invalid_share_sums() -> None:
         compile_issuance_mix_override(override)
 
 
+def test_issuance_mix_rejects_false_frn_maturity_knob() -> None:
+    override = _issuance_override()
+    override["maturity_distributions"]["frn"] = [{"maturity_years": 5.0, "share": 1.0}]
+
+    with pytest.raises(PortfolioTransformError, match="frn maturity distribution"):
+        compile_issuance_mix_override(override)
+
+
+def test_issuance_mix_rejects_mislabeled_fixed_maturities() -> None:
+    override = _issuance_override()
+    override["maturity_distributions"]["notes"] = [{"maturity_years": 0.75, "share": 1.0}]
+
+    with pytest.raises(PortfolioTransformError, match="notes maturity_years"):
+        compile_issuance_mix_override(override)
+
+
 def test_fed_holdings_scale_is_bounded_by_marketable_debt() -> None:
     rows = [{"period_end": "2027-01-01", "source_fiscal_year": 2027, "holder_type": "CB", "cbo_fed_holdings_target_bil": 1000.0}]
     debt = [{"period_end": "2027-01-01", "marketable_treasury_public_target_bil": 1200.0}]

@@ -913,6 +913,31 @@ def test_cbo_dynamic_yield_surface_prices_bills_with_decimal_runtime_rates(tmp_p
     assert issued["IssuePriceRatio"] > 0.99
 
 
+def test_cbo_fractional_issuance_maturities_use_remainder_months(tmp_path: Path) -> None:
+    paths = _build_temp_forecast_inputs(tmp_path, pre_issuance_controlled_debt_bil=0.0)
+    params = _minimal_engine_params(paths, opening_controlled_debt_bil=0.0)
+    params["treasury_issuance_profile"]["bills"]["target_percentage_of_remainder"] = 0.5
+    params["treasury_issuance_profile"]["bills"]["maturities"] = [0.75]
+    params["treasury_issuance_profile"]["bills"]["maturity_distribution"] = [1.0]
+    params["treasury_issuance_profile"]["notes"]["target_percentage_of_remainder"] = 0.5
+    params["treasury_issuance_profile"]["notes"]["maturities"] = [1.5]
+    params["treasury_issuance_profile"]["notes"]["maturity_distribution"] = [1.0]
+
+    _, portfolio = run_simulation(
+        params,
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+    )
+
+    issued = portfolio[portfolio["IssueDate"] == pd.Timestamp("2026-09-30")]
+    bill = issued[(issued["OriginalMaturityYears"] - 0.75).abs() < 1e-12].iloc[0]
+    note = issued[(issued["OriginalMaturityYears"] - 1.5).abs() < 1e-12].iloc[0]
+    assert bill["MaturityDate"] == pd.Timestamp("2027-06-30")
+    assert note["MaturityDate"] == pd.Timestamp("2028-03-30")
+
+
 def test_cbo_tips_issuance_uses_real_yield_path_for_premium_pricing(tmp_path: Path) -> None:
     paths = _build_temp_forecast_inputs(tmp_path, pre_issuance_controlled_debt_bil=0.0)
     paths.update(_write_tips_forward_paths(tmp_path))
