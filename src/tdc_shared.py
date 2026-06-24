@@ -4,6 +4,7 @@
 # --- Core Columns ---
 BOND_PORTFOLIO_COLS = [
     'BondID', 'SecurityType', 'IssueDate', 'MaturityDate',
+    'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'InterestPaymentFrequency',
     'OriginalMaturityYears', 'FaceValue', 'CouponRate', 'HolderType', 'HolderSubBucket', 'Status',
     'MaturityCategory',
     'OriginalPrincipal', 'AdjustedPrincipal', 'ReferenceCPI_Issue', 'IndexRatio',
@@ -44,6 +45,10 @@ PORTFOLIO_DTYPES = {
     'SecurityType': 'string',
     'IssueDate': 'datetime64[ns]',
     'MaturityDate': 'datetime64[ns]',
+    'DatedDate': 'datetime64[ns]',
+    'OriginalDatedDate': 'datetime64[ns]',
+    'FirstInterestPaymentDate': 'datetime64[ns]',
+    'InterestPaymentFrequency': 'float64',
     'OriginalMaturityYears': 'float64',
     'FaceValue': 'float64',
     'CouponRate': 'float64',

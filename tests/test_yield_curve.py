@@ -48,3 +48,20 @@ def test_zero_maturity():
     """Very short maturity should return a finite value."""
     result = get_yield_for_maturity(0.01, YIELD_CURVE_YEARS, YIELD_CURVE_RATES)
     assert not np.isnan(result), "Near-zero maturity returned NaN"
+
+
+def test_no_floor_mode_preserves_negative_rates():
+    """CBO/runtime contract mode can preserve negative generated rates."""
+    result = get_yield_for_maturity(
+        1.0,
+        [0.25, 2.0],
+        [-0.005, -0.010],
+        method='pchip',
+        floor_zero=False,
+    )
+    assert result < 0.0
+
+
+def test_legacy_default_still_floors_negative_rates():
+    result = get_yield_for_maturity(1.0, [0.25, 2.0], [-0.005, -0.010], method='pchip')
+    assert result == pytest.approx(0.0)

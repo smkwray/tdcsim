@@ -1284,11 +1284,128 @@ class TestAccountingIdentities:
 
 
 # ---------------------------------------------------------------------------
-# GPT Pro Round 3 — Validation hardening tests
+# Validation hardening tests
 # ---------------------------------------------------------------------------
 
 class TestStrictConfigValidation:
     """Tests for strict config and override validation rules."""
+
+    def test_generic_cbo_config_blocks_are_admitted(self):
+        """Phase 0 CBO root blocks should validate with generic TDCSim names."""
+        config = {
+            'funding_rule': {
+                'mode': 'cbo_public_debt_target',
+                'target_scope': 'cbo_public_debt',
+                'controlled_scope': 'marketable_treasury_public',
+                'target_tolerance_bil': 0.000001,
+            },
+            'baseline_input_paths': {
+                'source_contract_file': 'source-contract.md',
+                'source_fixture_file': 'tdcsim_cbo_source_fixtures.csv',
+                'cbo_fiscal_baseline_file': 'tdcsim_cbo_fiscal_baseline.csv',
+                'debt_stock_path_file': 'tdcsim_debt_stock_path.csv',
+                'primary_deficit_path_file': 'tdcsim_primary_deficit_path.csv',
+                'operating_cash_path_file': 'tdcsim_operating_cash_path.csv',
+                'fiscal_incidence_policy_file': 'tdcsim_fiscal_incidence_policy.csv',
+                'net_interest_bridge_file': 'tdcsim_net_interest_bridge.csv',
+                'fed_holdings_path_file': 'tdcsim_fed_holdings_path.csv',
+            },
+            'data_vintage': {
+                'forecast_name': 'cbo_2026_02_baseline',
+                'forecast_publication_date': '2026-02-11',
+                'actuals_available_as_of': '2026-06-12',
+                'opening_state_date': '2026-06-12',
+                'fiscal_actuals_through': '2026-05-31',
+                'simulation_start_date': '2026-06-30',
+                'simulation_end_date': '2036-09-30',
+                'lookahead_policy': 'production_no_lookahead',
+                'allow_lookahead': False,
+            },
+            'operating_cash_policy': {
+                'mode': 'path',
+                'fallback_mode': 'fail_closed',
+                'operating_cash_definition': 'tga_only',
+                'reserve_settlement_component': 'tga',
+                'inflation_scalar': 1.0,
+                'required_sensitivity_scalars': [0.0, 1.0],
+            },
+            'public_debt_bridge': {
+                'mode': 'cbo_public_to_marketable_treasury_public',
+                'claim_boundary': 'federal_public_debt_bridge',
+                'missing_bridge_action': 'error',
+                'treasury_only_allowed': False,
+            },
+            'fiscal_baseline': {
+                'primary_deficit_mode': 'hard_input',
+                'net_interest_mode': 'check_only',
+                'total_deficit_mode': 'identity_check',
+                'current_fy_splice': 'strict',
+                'cb_remittance_cash_treatment': 'memo_only',
+            },
+            'fiscal_incidence_policy': {
+                'mode': 'required',
+                'policy_mode': 'explicit_scenario_assumption',
+                'incidence_basis': 'signed_net_primary_proxy',
+                'du_share': 0.99,
+                'ru_share': 0.01,
+                'required_sensitivities': [
+                    {'du_share': 1.0, 'ru_share': 0.0},
+                    {'du_share': 0.95, 'ru_share': 0.05},
+                ],
+            },
+            'budget_interest': {
+                'cbo_comparison_role': 'nonbinding_check',
+                'scope_status': 'partial',
+                'residual_policy': 'diagnostic',
+                'calibration_mode': 'none',
+                'warning_threshold': {'absolute_bil': 10.0, 'percent': 1.0},
+                'red_threshold': {'absolute_bil': 25.0, 'percent': 2.5},
+            },
+        }
+
+        assert validate_config(config) == []
+
+    def test_generic_cbo_root_key_typo_rejected(self):
+        """Root key typos should fail loudly instead of being ignored."""
+        errors = validate_config({
+            'funding_rules': {'mode': 'cbo_public_debt_target'},
+        })
+
+        assert any('unknown keys' in e.lower() and 'funding_rules' in e for e in errors)
+
+    def test_generic_cbo_nested_key_typo_rejected(self):
+        """Nested key typos inside admitted CBO blocks should fail loudly."""
+        errors = validate_config({
+            'funding_rule': {
+                'mode': 'cbo_public_debt_target',
+                'debt_target_tolrance_bil': 0.000001,
+            },
+        })
+
+        assert any('funding_rule' in e and 'debt_target_tolrance_bil' in e for e in errors)
+
+    def test_generic_cbo_block_accepted_in_scenario_override(self):
+        """Scenario overrides may use admitted CBO blocks while typos still reject."""
+        config = {
+            'scenario_groups': [
+                {
+                    'group_name': 'CBO overrides',
+                    'scenarios': [
+                        {
+                            'name': 'CBO debt target',
+                            'overrides': {
+                                'funding_rule': {
+                                    'mode': 'cbo_public_debt_target',
+                                    'target_tolerance_bil': 0.000001,
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        assert validate_config(config) == []
 
     def test_unknown_override_key_rejected_by_validate_config(self):
         """Unknown scenario override keys should produce validation errors."""

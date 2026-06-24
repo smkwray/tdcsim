@@ -73,6 +73,96 @@ def minimal_params() -> dict:
     }
 
 
+def cbo_phase0_blocks() -> dict:
+    return {
+        'funding_rule': {
+            'mode': 'cbo_public_debt_target',
+            'target_scope': 'federal_debt_held_by_public',
+            'controlled_scope': 'treasury_marketable_debt_held_by_public',
+            'stock_basis': 'principal_adjusted_tips',
+            'target_enforcement': 'every_period',
+            'negative_required_issuance_action': 'error',
+            'target_tolerance_bil': 0.000001,
+        },
+        'baseline_input_paths': {
+            'source_contract_file': 'data/forecast_inputs/source_contract.json',
+            'source_fixture_file': 'data/forecast_inputs/source_fixtures.csv',
+            'cbo_fiscal_baseline_file': 'data/forecast_inputs/tdcsim_cbo_fiscal_baseline.csv',
+            'current_fy_splice_file': 'data/forecast_inputs/tdcsim_current_fy_splice.csv',
+            'debt_stock_path_file': 'data/forecast_inputs/tdcsim_debt_stock_path.csv',
+            'primary_deficit_path_file': 'data/forecast_inputs/tdcsim_primary_deficit_path.csv',
+            'operating_cash_path_file': 'data/forecast_inputs/tdcsim_operating_cash_path.csv',
+            'cash_reconciliation_residual_file': 'data/forecast_inputs/tdcsim_cash_reconciliation_residual.csv',
+            'macro_forecast_path_file': 'data/forecast_inputs/tdcsim_macro_forecast_path.csv',
+            'yield_curve_surface_file': 'data/forecast_inputs/tdcsim_yield_curve_surface.csv',
+            'fiscal_incidence_policy_file': 'data/forecast_inputs/tdcsim_fiscal_incidence_policy.csv',
+            'net_interest_bridge_file': 'data/forecast_inputs/tdcsim_net_interest_bridge.csv',
+            'holder_absorption_path_file': 'data/forecast_inputs/tdcsim_holder_absorption_path.csv',
+        },
+        'data_vintage': {
+            'forecast_name': 'cbo_2026_02_baseline',
+            'forecast_publication_date': '2026-02-11',
+            'actuals_available_as_of': '2026-04-30',
+            'opening_state_date': '2026-04-30',
+            'fiscal_actuals_through': '2026-03-31',
+            'allow_lookahead': False,
+            'lookahead_policy': 'production_no_future_actuals',
+        },
+        'operating_cash_policy': {
+            'mode': 'explicit_path',
+            'fallback_mode': 'scalar_indexed_anchor',
+            'operating_cash_definition': 'tga_only',
+            'inflation_index': 'cbo_cpi_u',
+            'inflation_scalar': 1.0,
+            'required_sensitivity_scalars': [0.0],
+            'floor_bil': None,
+            'enforcement': 'target_with_cash_reconciliation_residual',
+        },
+        'public_debt_bridge': {
+            'mode': 'latest_actual_constant_nominal_by_component',
+            'claim_boundary': 'full_public_debt_after_bridge',
+            'missing_bridge_action': 'error',
+            'treasury_only_allowed': False,
+        },
+        'fiscal_baseline': {
+            'primary_deficit_mode': 'hard',
+            'net_interest_mode': 'nonbinding_validation_check',
+            'total_deficit_mode': 'identity_check',
+            'current_fy_splice': 'required_when_start_after_fy_begin',
+            'cb_remittance_cash_treatment': 'memo_only_zero_tga_effect',
+        },
+        'fiscal_incidence_policy': {
+            'mode': 'explicit_scenario_assumption',
+            'incidence_basis': 'signed_net_primary_proxy',
+            'du_share': 0.99,
+            'ru_share': 0.01,
+            'foreign_share': 0.0,
+            'other_share': 0.0,
+            'required_sensitivities': [
+                {'du_share': 1.0, 'ru_share': 0.0},
+                {'du_share': 0.95, 'ru_share': 0.05},
+            ],
+        },
+        'budget_interest': {
+            'cbo_comparison_role': 'nonbinding_validation_check',
+            'scope_status': 'incomplete',
+            'residual_policy': 'warning_only_until_scope_complete',
+            'calibration_mode': 'none',
+            'warning_threshold': {'absolute_bil': 10, 'percent': 1.0, 'combination': 'max'},
+            'red_threshold': {'absolute_bil': 25, 'percent': 2.5, 'combination': 'max'},
+            'allowed_calibration_modes': [
+                'none',
+                'opening_book_reconciliation',
+                'named_component_bridge',
+                'bounded_curve_shape_fit',
+                'reporting_only_cbo_overlay',
+            ],
+            'modeled_interest_affects_cash_and_issuance': True,
+            'cbo_reported_interest_affects_cash_and_issuance': False,
+        },
+    }
+
+
 def first_active_period(results: pd.DataFrame) -> pd.Series:
     assert len(results.index) >= 2
     return results.iloc[1]
@@ -120,6 +210,112 @@ def test_shipped_config_validates():
         cfg = yaml.safe_load(f)
     errors = validate_config(cfg)
     assert errors == []
+
+
+@pytest.mark.parametrize('config_name', [
+    'tdc_config.yaml',
+    'tdc_config_optional.yaml',
+    'tdc_config_ratewall_source_backed.yaml',
+])
+def test_shipped_configs_validate_with_root_key_allowlist(config_name):
+    cfg_path = Path(__file__).resolve().parent.parent / config_name
+    with cfg_path.open('r') as f:
+        cfg = yaml.safe_load(f)
+    errors = validate_config(cfg)
+    assert errors == []
+
+
+def test_cbo_phase0_config_sketch_blocks_validate_without_runtime_semantics():
+    cfg = cbo_phase0_blocks()
+    cfg['simulation_period'] = {
+        'start_date': '2026-04-30',
+        'end_date': '2036-09-30',
+        'frequency': 'W',
+        'insert_control_dates': True,
+        'control_dates': ['09-30'],
+        'interval_convention': '[start, end)',
+    }
+    assert validate_config(cfg) == []
+
+
+def test_cbo_phase0_unknown_root_key_rejected_by_validate_config():
+    errors = validate_config({'funding_rul': {'mode': 'cbo_public_debt_target'}})
+    assert any('Configuration root contains unknown keys' in e and 'funding_rul' in e for e in errors)
+
+
+@pytest.mark.parametrize('block_name', [
+    'funding_rule',
+    'baseline_input_paths',
+    'data_vintage',
+    'operating_cash_policy',
+    'public_debt_bridge',
+    'fiscal_baseline',
+    'fiscal_incidence_policy',
+    'budget_interest',
+])
+def test_cbo_phase0_unknown_nested_key_rejected_in_each_new_block(block_name):
+    cfg = {block_name: dict(cbo_phase0_blocks()[block_name])}
+    cfg[block_name]['typo_key'] = 'bad'
+    errors = validate_config(cfg)
+    assert any(block_name in e and 'typo_key' in e for e in errors), errors
+
+
+def test_cbo_phase0_unknown_deep_nested_key_rejected():
+    cfg = {'budget_interest': dict(cbo_phase0_blocks()['budget_interest'])}
+    cfg['budget_interest']['warning_threshold'] = {
+        'absolute_bil': 10,
+        'percent': 1.0,
+        'combination': 'max',
+        'typo_threshold': True,
+    }
+    errors = validate_config(cfg)
+    assert any('budget_interest.warning_threshold' in e and 'typo_threshold' in e for e in errors), errors
+
+
+def test_cbo_phase0_new_blocks_allowed_in_scenario_and_group_overrides():
+    config = {
+        'scenario_groups': [
+            {
+                'group_name': 'CBO admission',
+                'overrides': {'data_vintage': cbo_phase0_blocks()['data_vintage']},
+                'scenarios': [
+                    {
+                        'name': 'Debt target',
+                        'overrides': {'funding_rule': cbo_phase0_blocks()['funding_rule']},
+                    }
+                ],
+            }
+        ],
+    }
+    assert validate_config(config) == []
+
+
+def test_cbo_phase0_group_override_unknown_key_rejected():
+    errors = validate_config({
+        'scenario_groups': [
+            {
+                'group_name': 'Bad group override',
+                'overrides': {'funding_rul': {'mode': 'cbo_public_debt_target'}},
+                'scenarios': [{'name': 'baseline'}],
+            }
+        ],
+    })
+    assert any('unknown override keys' in e.lower() and 'funding_rul' in e for e in errors), errors
+
+
+def test_cbo_phase0_admitted_blocks_are_runtime_inert_in_cash_mode():
+    baseline = minimal_params()
+    cbo_admitted = minimal_params()
+    cbo_admitted.update(cbo_phase0_blocks())
+    cbo_admitted['funding_rule'] = {'mode': 'cash_tga_target'}
+
+    baseline_results, _ = run_simulation(baseline, '2025-01-01', '2025-01-19', freq='W', scenario_name='baseline')
+    cbo_results, _ = run_simulation(cbo_admitted, '2025-01-01', '2025-01-19', freq='W', scenario_name='cbo_admitted')
+
+    assert first_active_period(cbo_results)['AuctionProceeds'] == pytest.approx(
+        first_active_period(baseline_results)['AuctionProceeds'], rel=1e-6
+    )
+    assert cbo_results.attrs['run_metadata']['validation_status'] == 'passed'
 
 
 def test_bill_issuance_uses_discounted_proceeds():

@@ -17,7 +17,123 @@ VALID_OVERRIDE_KEYS = frozenset({
     'rate_sensitive_demand', 'financing_cost_options',
     'simulation_period', 'yield_curve_surface', 'ratewall_contract', 'ratewall_input_paths',
     'private_mmf_split',
+    'funding_rule', 'baseline_input_paths', 'data_vintage', 'operating_cash_policy',
+    'public_debt_bridge', 'fiscal_baseline', 'fiscal_incidence_policy', 'budget_interest',
 })
+
+VALID_CONFIG_ROOT_KEYS = VALID_OVERRIDE_KEYS | frozenset({
+    'initial_values', 'initial_portfolio', 'initial_portfolio_generation',
+    'default_issuance_profile', 'policy_issuance_more_notes_fewer_bonds',
+    'yield_curve_default', 'yield_curve_lower', 'yield_curve_higher',
+    'sector_preferences_default', 'sector_preferences_banks_buy_more',
+    'sector_preferences_banks_pref_notes', 'sector_preferences_private_buy_more',
+    'scenario_groups', 'scenario_parallel_workers', 'parallel_execution',
+    'holder_absorption_calibration',
+})
+
+_SHARE_SCHEMA = {
+    'du_share': None,
+    'ru_share': None,
+    'foreign_share': None,
+    'other_share': None,
+}
+
+CBO_CONFIG_BLOCK_SCHEMAS = {
+    'funding_rule': {
+        'mode': None,
+        'target_scope': None,
+        'controlled_scope': None,
+        'stock_basis': None,
+        'target_enforcement': None,
+        'negative_required_issuance_action': None,
+        'target_tolerance_bil': None,
+    },
+    'baseline_input_paths': {
+        'source_contract_file': None,
+        'source_fixture_file': None,
+        'cbo_fiscal_baseline_file': None,
+        'current_fy_splice_file': None,
+        'debt_stock_path_file': None,
+        'primary_deficit_path_file': None,
+        'operating_cash_path_file': None,
+        'cash_reconciliation_residual_file': None,
+        'macro_forecast_path_file': None,
+        'yield_curve_surface_file': None,
+        'fiscal_incidence_policy_file': None,
+        'net_interest_bridge_file': None,
+        'holder_absorption_path_file': None,
+        'fed_holdings_path_file': None,
+        'frn_rate_path_file': None,
+        'tips_cpi_path_file': None,
+        'tips_real_yield_path_file': None,
+    },
+    'data_vintage': {
+        'forecast_name': None,
+        'forecast_publication_date': None,
+        'actuals_available_as_of': None,
+        'opening_state_date': None,
+        'fiscal_actuals_through': None,
+        'simulation_start_date': None,
+        'simulation_end_date': None,
+        'lookahead_policy': None,
+        'allow_lookahead': None,
+    },
+    'operating_cash_policy': {
+        'mode': None,
+        'fallback_mode': None,
+        'operating_cash_definition': None,
+        'inflation_index': None,
+        'inflation_scalar': None,
+        'required_sensitivity_scalars': None,
+        'floor_bil': None,
+        'enforcement': None,
+        'base_balance_bil': None,
+        'reserve_settlement_component': None,
+    },
+    'public_debt_bridge': {
+        'mode': None,
+        'claim_boundary': None,
+        'missing_bridge_action': None,
+        'treasury_only_allowed': None,
+    },
+    'fiscal_baseline': {
+        # Existing shipped configs use fiscal_baseline as a YAML anchor for fiscal_params.
+        'initial_weekly_spending': None,
+        'initial_weekly_taxes': None,
+        'spending_growth_qtr': None,
+        'tax_growth_qtr': None,
+        'du_share_spending': None,
+        'du_share_taxes': None,
+        # Generic CBO baseline admission keys.
+        'primary_deficit_mode': None,
+        'net_interest_mode': None,
+        'total_deficit_mode': None,
+        'current_fy_splice': None,
+        'cb_remittance_cash_treatment': None,
+    },
+    'fiscal_incidence_policy': {
+        'mode': None,
+        'policy_mode': None,
+        'incidence_basis': None,
+        'du_share': None,
+        'ru_share': None,
+        'foreign_share': None,
+        'other_share': None,
+        'required_sensitivities': _SHARE_SCHEMA,
+        'ratewall_compatibility_adapter_allowed': None,
+    },
+    'budget_interest': {
+        'cbo_comparison_role': None,
+        'scope_status': None,
+        'residual_policy': None,
+        'calibration_mode': None,
+        'warning_threshold': {'absolute_bil': None, 'percent': None, 'combination': None},
+        'red_threshold': {'absolute_bil': None, 'percent': None, 'combination': None},
+        'allowed_calibration_modes': None,
+        'modeled_interest_affects_cash_and_issuance': None,
+        'cbo_reported_interest_affects_cash_and_issuance': None,
+    },
+}
 
 VALID_NONMARKETABLE_CREDITING_FREQUENCIES = frozenset({'semi-annual', 'annual'})
 
@@ -80,6 +196,17 @@ _VALID_RATE_SENSITIVE_TOP_LEVEL_KEYS = frozenset({
 })
 _VALID_FINANCING_COST_OPTION_KEYS = frozenset({'include_tips_inflation_accretion'})
 VALID_COARSE_FREQUENCY_ACTIONS = frozenset({'allow', 'warn', 'error'})
+VALID_SIMULATION_PERIOD_KEYS = frozenset({
+    'start_date',
+    'end_date',
+    'frequency',
+    'enable_preference_trading',
+    'coarse_frequency_action',
+    'mode',
+    'insert_control_dates',
+    'control_dates',
+    'interval_convention',
+})
 
 _VALID_PREF_CATEGORIES = frozenset({'bills', 'notes', 'bonds', 'tips', 'frn', 'nonmarketable'})
 _HOLDER_TYPES_SET = frozenset(HOLDER_TYPES)
@@ -386,6 +513,13 @@ def validate_simulation_period(params: dict, label: str = 'simulation_period') -
     if not isinstance(params, collections.abc.Mapping):
         return [f"{label} must be a mapping."]
 
+    unknown_keys = set(params.keys()) - VALID_SIMULATION_PERIOD_KEYS
+    if unknown_keys:
+        errors.append(
+            f"{label} contains unexpected key(s): {sorted(unknown_keys)}. "
+            f"Valid keys: {sorted(VALID_SIMULATION_PERIOD_KEYS)}"
+        )
+
     for date_key in ['start_date', 'end_date']:
         if date_key in params:
             try:
@@ -485,6 +619,49 @@ def validate_financing_cost_options(params: dict, label: str = 'financing_cost_o
     return errors
 
 
+def _validate_mapping_keys(value, schema, label: str) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(value, collections.abc.Mapping):
+        return [f"{label} must be a mapping."]
+
+    valid_keys = frozenset(schema.keys())
+    unknown_keys = set(value.keys()) - valid_keys
+    if unknown_keys:
+        errors.append(
+            f"{label} contains unexpected key(s): {sorted(unknown_keys)}. "
+            f"Valid keys: {sorted(valid_keys)}"
+        )
+
+    for key, child_schema in schema.items():
+        if key not in value or child_schema is None:
+            continue
+        child_value = value.get(key)
+        child_label = f"{label}.{key}"
+        if isinstance(child_value, list):
+            for idx, item in enumerate(child_value):
+                errors.extend(_validate_mapping_keys(item, child_schema, f"{child_label}[{idx}]"))
+        elif isinstance(child_value, collections.abc.Mapping):
+            errors.extend(_validate_mapping_keys(child_value, child_schema, child_label))
+        else:
+            errors.append(f"{child_label} must be a mapping or list of mappings.")
+    return errors
+
+
+def validate_cbo_config_blocks(params: dict, label: str = 'config') -> List[str]:
+    errors: List[str] = []
+    if params is None:
+        return errors
+    if not isinstance(params, collections.abc.Mapping):
+        return [f"{label} must be a mapping."]
+    for block_name, schema in CBO_CONFIG_BLOCK_SCHEMAS.items():
+        if block_name not in params:
+            continue
+        block = params.get(block_name)
+        block_label = block_name if label == 'config' else f"{label}.{block_name}"
+        errors.extend(_validate_mapping_keys(block, schema, block_label))
+    return errors
+
+
 def validate_events(events: Iterable[dict], label: str = 'events') -> List[str]:
     import pandas as _pd
     errors: List[str] = []
@@ -533,6 +710,14 @@ def validate_config(base_config: dict) -> List[str]:
     if not isinstance(base_config, collections.abc.Mapping):
         return ['Configuration root must be a mapping.']
 
+    unknown_root_keys = set(base_config.keys()) - VALID_CONFIG_ROOT_KEYS
+    if unknown_root_keys:
+        errors.append(
+            f"Configuration root contains unknown keys: {sorted(unknown_root_keys)}. "
+            f"Valid keys: {sorted(VALID_CONFIG_ROOT_KEYS)}"
+        )
+    errors.extend(validate_cbo_config_blocks(base_config))
+
     if 'nonmarketable_params' in base_config:
         errors.extend(validate_nonmarketable_params(base_config.get('nonmarketable_params', {})))
     if 'simulation_period' in base_config:
@@ -576,6 +761,24 @@ def validate_config(base_config: dict) -> List[str]:
             if not isinstance(group, collections.abc.Mapping):
                 errors.append(f"scenario_groups[{group_idx}] must be a mapping.")
                 continue
+            group_overrides = group.get('overrides', {})
+            if group_overrides:
+                if not isinstance(group_overrides, collections.abc.Mapping):
+                    errors.append(f"scenario_groups[{group_idx}].overrides must be a mapping.")
+                else:
+                    unknown_group_keys = set(group_overrides.keys()) - VALID_OVERRIDE_KEYS
+                    if unknown_group_keys:
+                        group_name = group.get('group_name', group_idx)
+                        errors.append(
+                            f"Group '{group_name}' has unknown override keys: {sorted(unknown_group_keys)}. "
+                            f"Valid keys: {sorted(VALID_OVERRIDE_KEYS)}"
+                        )
+                    errors.extend(
+                        validate_cbo_config_blocks(
+                            group_overrides,
+                            label=f"scenario_groups[{group_idx}].overrides",
+                        )
+                    )
             for scen_idx, scenario in enumerate(group.get('scenarios', [])):
                 if not isinstance(scenario, collections.abc.Mapping):
                     errors.append(f"scenario_groups[{group_idx}].scenarios[{scen_idx}] must be a mapping.")
@@ -628,6 +831,12 @@ def validate_config(base_config: dict) -> List[str]:
                             label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides.financing_cost_options",
                         )
                     )
+                errors.extend(
+                    validate_cbo_config_blocks(
+                        overrides,
+                        label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides",
+                    )
+                )
                 if 'events' in overrides:
                     errors.extend(validate_events(overrides['events'], label=f"scenario_groups[{group_idx}].scenarios[{scen_idx}].overrides.events"))
     return errors

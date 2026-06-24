@@ -22,7 +22,14 @@ def _is_bill_like_fixed(security_type, original_maturity_years, coupon_rate):
         coupon_val = np.nan
     return not pd.isna(maturity_val) and maturity_val <= 1.0 + TGA_FLOOR_TOLERANCE and (pd.isna(coupon_val) or coupon_val <= TGA_FLOOR_TOLERANCE)
 
-def calculate_issue_price_ratio(security_type, maturity_years, coupon_rate, yield_at_issuance):
+def calculate_issue_price_ratio(
+    security_type,
+    maturity_years,
+    coupon_rate,
+    yield_at_issuance,
+    *,
+    apply_rate_floor=True,
+):
     """
     Returns the cash-proceeds-to-face ratio at auction.
 
@@ -31,13 +38,65 @@ def calculate_issue_price_ratio(security_type, maturity_years, coupon_rate, yiel
     used elsewhere in the model's pricing logic.
     """
     if _is_bill_like_fixed(security_type, maturity_years, coupon_rate):
-        eff_yield = 0.0 if pd.isna(yield_at_issuance) else max(0.0, float(yield_at_issuance))
+        eff_yield = 0.0 if pd.isna(yield_at_issuance) else float(yield_at_issuance)
+        if apply_rate_floor:
+            eff_yield = max(0.0, eff_yield)
         maturity_val = 0.0 if pd.isna(maturity_years) else max(0.0, float(maturity_years))
         try:
             return max(TGA_FLOOR_TOLERANCE, 1.0 / (1.0 + eff_yield) ** maturity_val)
         except Exception:
             return 1.0
+    if security_type == 'TIPS':
+        return calculate_tips_issue_price_ratio(
+            maturity_years,
+            coupon_rate,
+            yield_at_issuance,
+        )
     return 1.0
+
+
+def calculate_tips_auction_coupon_rate(
+    real_yield,
+    *,
+    minimum_coupon_rate=0.00125,
+    coupon_increment=0.00125,
+):
+    """Return a Treasury-style TIPS coupon rounded down to 1/8 percentage point."""
+
+    if pd.isna(real_yield):
+        return max(0.0, float(minimum_coupon_rate))
+    yld = float(real_yield)
+    increment = max(TGA_FLOOR_TOLERANCE, float(coupon_increment))
+    rounded = np.floor(max(yld, 0.0) / increment) * increment
+    return max(float(minimum_coupon_rate), float(rounded))
+
+
+def calculate_tips_issue_price_ratio(
+    maturity_years,
+    coupon_rate,
+    real_yield,
+    *,
+    frequency=2,
+):
+    """Price new TIPS on real cash flows per dollar of original principal."""
+
+    if pd.isna(maturity_years) or float(maturity_years) <= TGA_FLOOR_TOLERANCE:
+        return 1.0
+    if pd.isna(real_yield):
+        return 1.0
+    maturity_val = max(0.0, float(maturity_years))
+    freq = max(1, int(round(float(frequency))))
+    periods = max(1, int(round(maturity_val * freq)))
+    yld_per_period = float(real_yield) / freq
+    if yld_per_period <= -1.0 + 1e-9:
+        yld_per_period = -1.0 + 1e-9
+    coupon_per_period = max(0.0, float(coupon_rate)) / freq
+    if abs(yld_per_period) <= 1e-12:
+        price = 1.0 + coupon_per_period * periods
+    else:
+        discounts = np.array([(1.0 + yld_per_period) ** -period for period in range(1, periods + 1)])
+        price = coupon_per_period * float(discounts.sum()) + float(discounts[-1])
+    return round(max(TGA_FLOOR_TOLERANCE, float(price)), 8)
 
 def calculate_face_from_proceeds_target(security_type, maturity_years, coupon_rate, yield_at_issuance, proceeds_target):
     """Convert a proceeds target into face issued, accounting for bill discounts."""
@@ -49,6 +108,31 @@ def calculate_face_from_proceeds_target(security_type, maturity_years, coupon_ra
     face_value = proceeds_target / issue_price_ratio
     actual_proceeds = face_value * issue_price_ratio
     return (face_value, actual_proceeds, issue_price_ratio)
+
+def quote_issuance_from_face_target(
+    security_type,
+    maturity_years,
+    coupon_rate,
+    yield_at_issuance,
+    face_target,
+    *,
+    apply_rate_floor=False,
+):
+    """Convert a face issuance target into auction proceeds and issue price."""
+    if face_target <= TGA_FLOOR_TOLERANCE:
+        return (0.0, 0.0, 1.0)
+    issue_price_ratio = calculate_issue_price_ratio(
+        security_type,
+        maturity_years,
+        coupon_rate,
+        yield_at_issuance,
+        apply_rate_floor=apply_rate_floor,
+    )
+    if issue_price_ratio <= TGA_FLOOR_TOLERANCE:
+        return (0.0, 0.0, issue_price_ratio)
+    face_value = float(face_target)
+    auction_proceeds = face_value * issue_price_ratio
+    return (face_value, auction_proceeds, issue_price_ratio)
 
 def infer_issue_data_for_loaded_bill(face_value, original_maturity_years, issue_yield_at_issue=None, yield_curve_years=None, yield_curve_rates=None):
     """Infer bill issue proceeds for legacy portfolios missing issue data."""
@@ -93,7 +177,13 @@ def get_security_category_for_prefs(security_type, maturity_years, issuance_prof
         return get_maturity_category(maturity_years, issuance_profile)
     return None
 
-def get_yield_for_maturity(target_maturity_years, yield_curve_years, yield_curve_rates, method='linear'):
+def get_yield_for_maturity(
+    target_maturity_years,
+    yield_curve_years,
+    yield_curve_rates,
+    method='linear',
+    floor_zero=True,
+):
     """
     Interpolates yield for a given maturity from the provided yield curve data.
     Supports 'linear', 'pchip' (Piecewise Cubic Hermite Interpolating Polynomial), and 'cubic' (Cubic Spline).
@@ -111,7 +201,8 @@ def get_yield_for_maturity(target_maturity_years, yield_curve_years, yield_curve
         sort_idx = np.argsort(yield_curve_years_np)
         yield_curve_years_np = yield_curve_years_np[sort_idx]
         yield_curve_rates_np = yield_curve_rates_np[sort_idx]
-    yield_curve_rates_np = np.maximum(yield_curve_rates_np, 0.0)
+    if floor_zero:
+        yield_curve_rates_np = np.maximum(yield_curve_rates_np, 0.0)
     if target_maturity_years <= yield_curve_years_np[0]:
         return yield_curve_rates_np[0]
     if target_maturity_years >= yield_curve_years_np[-1]:
@@ -125,7 +216,7 @@ def get_yield_for_maturity(target_maturity_years, yield_curve_years, yield_curve
             interp_rate = float(interpolator(target_maturity_years))
         else:
             interp_rate = np.interp(target_maturity_years, yield_curve_years_np, yield_curve_rates_np)
-        return max(0.0, interp_rate)
+        return max(0.0, interp_rate) if floor_zero else interp_rate
     except Exception as e:
         return np.nan
 
@@ -143,6 +234,8 @@ def calculate_coupon_rate(security_type, maturity_years, yield_at_issuance, tips
         else:
             return max(0.0, yield_at_issuance)
     elif security_type == 'TIPS':
+        if not pd.isna(yield_at_issuance):
+            return calculate_tips_auction_coupon_rate(yield_at_issuance)
         return max(0.0, tips_real_coupon)
     elif security_type == 'FRN':
         return 0.0
@@ -164,20 +257,31 @@ def get_payment_date(year, month, day):
         except ValueError:
             raise ValueError(f'Invalid year/month combination for payment date: {year}-{month}')
 
-def get_coupon_dates_in_period(issue_date, maturity_date, prev_date, current_date, frequency=2):
+def get_coupon_dates_in_period(
+    issue_date,
+    maturity_date,
+    prev_date,
+    current_date,
+    frequency=2,
+    first_interest_payment_date=None,
+    interest_payment_frequency=None,
+):
     """
     Returns a list of coupon payment dates that fall in the half-open interval
     (prev_date, current_date] for a bond with the given issue/maturity dates.
 
     Correctly handles multi-year bonds by computing recurring coupon months from
-    the issue date and checking all relevant years.
+    explicit Treasury-style interest terms when available. Legacy rows without
+    those fields fall back to the maturity-date month/day schedule.
 
     Parameters:
         issue_date:    pd.Timestamp — bond issue date
         maturity_date: pd.Timestamp — bond maturity date
         prev_date:     pd.Timestamp — start of period (exclusive)
         current_date:  pd.Timestamp — end of period (inclusive)
-        frequency:     int — payments per year (2=semi-annual, 4=quarterly)
+        frequency:     int — fallback payments per year (2=semi-annual, 4=quarterly)
+        first_interest_payment_date: optional first contractual coupon date
+        interest_payment_frequency: optional contractual payments per year
 
     Returns:
         List[pd.Timestamp] — coupon dates in the period, sorted ascending.
@@ -186,29 +290,58 @@ def get_coupon_dates_in_period(issue_date, maturity_date, prev_date, current_dat
         - Coupon dates ON the maturity date are excluded (the maturity handler
           pays the final coupon + principal separately).
         - Coupon dates ON or before the issue date are excluded.
-        - The day-of-month follows the issue date's day, with fallback to
+        - The day-of-month follows FirstInterestPaymentDate when supplied.
+          Otherwise it follows the maturity date's month/day, with fallback to
           month-end for invalid days (e.g., Feb 29 in non-leap years).
     """
     if pd.isna(issue_date) or pd.isna(maturity_date):
         return []
+    issue_date = pd.Timestamp(issue_date).normalize()
+    maturity_date = pd.Timestamp(maturity_date).normalize()
+    prev_date = pd.Timestamp(prev_date).normalize()
+    current_date = pd.Timestamp(current_date).normalize()
+    frequency = _normalize_payment_frequency(interest_payment_frequency, frequency)
     months_between = 12 // frequency
-    issue_month = issue_date.month
-    issue_day = issue_date.day
+    first_interest = (
+        pd.Timestamp(first_interest_payment_date).normalize()
+        if first_interest_payment_date is not None and not pd.isna(first_interest_payment_date)
+        else pd.NaT
+    )
+    anchor = first_interest if not pd.isna(first_interest) else maturity_date
+    anchor_month = anchor.month
+    anchor_day = anchor.day
     coupon_months = set()
-    for i in range(1, frequency + 1):
-        m = (issue_month + months_between * i - 1) % 12 + 1
+    for i in range(frequency):
+        m = (anchor_month + months_between * i - 1) % 12 + 1
         coupon_months.add(m)
     dates_in_period = []
     for year in range(prev_date.year, current_date.year + 1):
         for month in coupon_months:
             try:
-                pmt_date = get_payment_date(year, month, issue_day)
+                pmt_date = get_payment_date(year, month, anchor_day)
             except ValueError:
                 continue
-            if pmt_date > issue_date and pmt_date < maturity_date and (prev_date < pmt_date <= current_date):
+            if (
+                pmt_date > issue_date
+                and pmt_date < maturity_date
+                and (pd.isna(first_interest) or pmt_date >= first_interest)
+                and (prev_date < pmt_date <= current_date)
+            ):
                 dates_in_period.append(pmt_date)
     dates_in_period.sort()
     return dates_in_period
+
+
+def _normalize_payment_frequency(value, fallback):
+    if value is None or pd.isna(value):
+        value = fallback
+    try:
+        frequency = int(round(float(value)))
+    except (TypeError, ValueError):
+        frequency = int(round(float(fallback)))
+    if frequency <= 0 or 12 % frequency != 0:
+        return int(round(float(fallback)))
+    return frequency
 
 def find_last_coupon_date(settlement_date, issue_date, frequency=2):
     """
@@ -374,6 +507,9 @@ __all__ = [
     '_is_bill_like_fixed',
     'calculate_issue_price_ratio',
     'calculate_face_from_proceeds_target',
+    'quote_issuance_from_face_target',
+    'calculate_tips_auction_coupon_rate',
+    'calculate_tips_issue_price_ratio',
     'infer_issue_data_for_loaded_bill',
     'get_maturity_category',
     'get_security_category_for_prefs',
