@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tdcsim.local/schemas/cbo-baseline-package-v1.schema.json",
+  "title": "TDCSIM CBO baseline dependency package manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_id",
+    "baseline_scenario_id",
+    "status",
+    "forecast_vintage",
+    "simulation_domain",
+    "logical_inputs",
+    "opening_portfolio",
+    "model_defaults",
+    "mechanics_contract",
+    "claim_boundary",
+    "build_provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "tdcsim_cbo_baseline_package_v1"
+    },
+    "package_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$"
+    },
+    "baseline_scenario_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$"
+    },
+    "status": {
+      "enum": [
+        "release_bound_dependency",
+        "local_unbound_build"
+      ]
+    },
+    "forecast_vintage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publication_date",
+        "actuals_available_as_of",
+        "fiscal_actuals_through"
+      ],
+      "properties": {
+        "publication_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "actuals_available_as_of": {
+          "type": "string",
+          "format": "date"
+        },
+        "fiscal_actuals_through": {
+          "type": "string",
+          "format": "date"
+        },
+        "source_contract_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "simulation_domain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "opening_state_date",
+        "start_date",
+        "end_date",
+        "frequency"
+      ],
+      "properties": {
+        "opening_state_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "start_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "end_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "frequency": {
+          "const": "daily"
+        }
+      }
+    },
+    "logical_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cbo_fiscal_baseline",
+        "current_fy_splice",
+        "debt_stock_path",
+        "primary_deficit_path",
+        "operating_cash_path",
+        "cash_reconciliation_residual",
+        "macro_forecast_path",
+        "nominal_yield_curve_surface",
+        "fiscal_incidence_policy",
+        "net_interest_bridge",
+        "fed_holdings_path",
+        "frn_rate_path",
+        "tips_cpi_path",
+        "tips_real_yield_path"
+      ],
+      "properties": {
+        "cbo_fiscal_baseline": {
+          "$ref": "#/$defs/artifact"
+        },
+        "current_fy_splice": {
+          "$ref": "#/$defs/artifact"
+        },
+        "debt_stock_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "primary_deficit_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "operating_cash_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "cash_reconciliation_residual": {
+          "$ref": "#/$defs/artifact"
+        },
+        "macro_forecast_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "nominal_yield_curve_surface": {
+          "$ref": "#/$defs/artifact"
+        },
+        "fiscal_incidence_policy": {
+          "$ref": "#/$defs/artifact"
+        },
+        "net_interest_bridge": {
+          "$ref": "#/$defs/artifact"
+        },
+        "holder_absorption_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "fed_holdings_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "frn_rate_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "tips_cpi_path": {
+          "$ref": "#/$defs/artifact"
+        },
+        "tips_real_yield_path": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "opening_portfolio": {
+      "$ref": "#/$defs/artifact"
+    },
+    "model_defaults": {
+      "$ref": "#/$defs/artifact"
+    },
+    "mechanics_contract": {
+      "$ref": "#/$defs/artifact"
+    },
+    "source_package": {
+      "$ref": "#/$defs/artifact"
+    },
+    "requirements_lock": {
+      "$ref": "#/$defs/artifact"
+    },
+    "claim_boundary": {
+      "$ref": "#/$defs/claimBoundary"
+    },
+    "build_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code_commit_sha",
+        "dirty_state",
+        "builder_version",
+        "python_version"
+      ],
+      "properties": {
+        "code_commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "dirty_state": {
+          "type": "boolean"
+        },
+        "builder_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "python_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generated_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "release_attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "media_type": {
+          "type": "string",
+          "enum": [
+            "text/csv",
+            "application/json"
+          ]
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "schema_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "semantic_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_role": {
+          "enum": [
+            "official_source",
+            "tdcsim_derived_baseline",
+            "diagnostic_only"
+          ]
+        }
+      }
+    },
+    "claimBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "net_interest_role",
+        "issuance_mix_role",
+        "cash_role",
+        "fed_holdings_role",
+        "remittance_role",
+        "excluded_claims"
+      ],
+      "properties": {
+        "net_interest_role": {
+          "const": "diagnostic_nonbinding_no_cash_or_issuance_plug"
+        },
+        "issuance_mix_role": {
+          "const": "tdcsim_assumption_not_cbo_prescription"
+        },
+        "cash_role": {
+          "const": "operating_cash_sensitivity_not_debt_or_issuance_driver"
+        },
+        "fed_holdings_role": {
+          "const": "synthetic_stock_target_par_reallocation"
+        },
+        "remittance_role": {
+          "const": "not_modeled_in_cbo_lane"
+        },
+        "excluded_claims": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}
