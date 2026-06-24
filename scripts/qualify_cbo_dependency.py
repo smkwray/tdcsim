@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -16,6 +17,9 @@ from pathlib import Path
 
 
 SCENARIO_SNIPPET = r"""
+import csv
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -33,6 +37,7 @@ def rows(path):
 
 primary = rows(materialized / "forecast_inputs" / "tdcsim_primary_deficit_path.csv")
 debt = rows(materialized / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
+cash_residual = rows(materialized / "forecast_inputs" / "tdcsim_cash_reconciliation_residual.csv")
 if primary and primary[0].get("period_start") and primary[0].get("period_end"):
     start_date = primary[0]["period_start"]
     end_date = primary[min(9, len(primary) - 1)]["period_end"]
@@ -126,8 +131,140 @@ compound = {
         },
     },
 }
-for name, payload in {"noop": noop, "compound": compound}.items():
-    (out / f"{name}.json").write_text(__import__("json").dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+cash_path = out / "file_backed_cash_residual.csv"
+with cash_path.open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.DictWriter(
+        handle,
+        fieldnames=[
+            "schema_version",
+            "scenario_id",
+            "period_start",
+            "period_end",
+            "cash_reconciliation_residual_bil",
+            "component_type",
+            "affects_operating_cash",
+            "affects_primary_deficit",
+            "affects_net_interest",
+            "affects_total_deficit",
+            "affects_debt_target",
+            "affects_issuance_size",
+            "affects_tdc_fiscal_flow",
+        ],
+    )
+    writer.writeheader()
+    for row in cash_residual:
+        writer.writerow(
+            {
+                "schema_version": "tdcsim_cash_reconciliation_residual_v1",
+                "scenario_id": row.get("scenario_id", "baseline"),
+                "period_start": row["period_start"],
+                "period_end": row["period_end"],
+                "cash_reconciliation_residual_bil": "1.25",
+                "component_type": "dependency_qualification_file_backed",
+                "affects_operating_cash": "True",
+                "affects_primary_deficit": "False",
+                "affects_net_interest": "False",
+                "affects_total_deficit": "False",
+                "affects_debt_target": "False",
+                "affects_issuance_size": "False",
+                "affects_tdc_fiscal_flow": "False",
+            }
+        )
+
+file_backed = {
+    **base,
+    "scenario_id": "dependency_file_backed_v1",
+    "provenance": {"kind": "user_stress_assumption", "label": "dependency qualification file-backed scenario"},
+    "overrides": {
+        "cash_reconciliation": {
+            "mode": "explicit_path_file",
+            "file": {
+                "relative_path": cash_path.name,
+                "sha256": hashlib.sha256(cash_path.read_bytes()).hexdigest(),
+                "media_type": "text/csv",
+            },
+            "funding_effect": "none",
+        }
+    },
+}
+
+for name, payload in {"noop": noop, "compound": compound, "file_backed": file_backed}.items():
+    (out / f"{name}.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+"""
+
+
+NEGATIVE_VERIFIER_SNIPPET = r"""
+import gzip
+import json
+import shutil
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+from tdcsim_cbo._json import read_json, write_json
+from tdcsim_cbo.output import hash_output_tree
+from tdcsim_cbo.verifier import VerificationError, verify_scenario_run
+
+root = Path(sys.argv[1])
+baseline = sys.argv[2]
+attestation = sys.argv[3]
+source = root / "run-noop"
+
+def expect_reject(name, mutate, pattern):
+    target = root / f"negative-{name}"
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+    manifest_path = target / "tdcsim_cbo_run_manifest.json"
+    manifest = read_json(manifest_path)
+    mutate(target, manifest)
+    write_json(manifest_path, manifest)
+    try:
+        verify_scenario_run(target, baseline_package=baseline, attestation=attestation)
+    except VerificationError as exc:
+        if pattern not in str(exc):
+            raise AssertionError(f"{name} rejected with wrong error: {exc}") from exc
+        return
+    raise AssertionError(f"{name} was not rejected")
+
+def fail_validation(_target, manifest):
+    manifest["validation"]["status"] = "fail"
+    manifest["validation"]["invariants"][0]["status"] = "fail"
+    manifest["boundary_checks"]["cash_residual_affects_issuance_size"] = ["True"]
+    manifest["boundary_checks"]["cash_residual_nonfunding_flags"]["affects_issuance_size"] = ["True"]
+
+def forge_identity(_target, manifest):
+    manifest["code_environment"]["package_name"] = "fake-tdcsim"
+    manifest["code_environment"]["requirements_lock_sha256"] = "0" * 64
+    manifest["code_environment"]["wheel_sha256"] = "f" * 64
+
+def remove_summary_key(target, manifest):
+    results_item = next(item for item in manifest["outputs"] if str(item["logical_name"]).startswith("results_"))
+    result_path = target / results_item["relative_path"]
+    compression = "gzip" if str(result_path).endswith(".gz") else None
+    results = pd.read_csv(result_path, compression=compression)
+    if compression == "gzip":
+        with gzip.open(result_path, "wt", encoding="utf-8", newline="") as handle:
+            results.to_csv(handle, index=False)
+    else:
+        results.to_csv(result_path, index=False)
+    summary_path = target / "outputs" / "summary.json"
+    summary = read_json(summary_path)
+    summary.pop("CBOFedAuctionShare_max_abs", None)
+    write_json(summary_path, summary)
+    manifest["output_hashes"] = hash_output_tree(target / "outputs")
+    for item in manifest["outputs"]:
+        path = target / item["relative_path"]
+        for record in manifest["output_hashes"]:
+            if record["path"] == Path(item["relative_path"]).relative_to("outputs").as_posix():
+                item["sha256"] = record["sha256"]
+                item["bytes"] = record["bytes"]
+
+expect_reject("validation-fail", fail_validation, "validation")
+expect_reject("forged-identity", forge_identity, "code_environment")
+expect_reject("missing-summary-key", remove_summary_key, "summary")
 """
 
 
@@ -137,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline", type=Path, default=Path("output/cbo_forecast_release_bound_package.zip"))
     parser.add_argument("--attestation", type=Path, default=Path("output/cbo_forecast_release_bound_attestation.json"))
     parser.add_argument("--compile-only", action="store_true", help="skip run/verify execution after validating and compiling scenarios")
+    parser.add_argument("--constraints", type=Path, default=Path("requirements.lock.txt"), help="exact dependency lock to install before the wheel")
     parser.add_argument("--evidence-dir", type=Path, help="persist installed-wheel qualification evidence instead of using a temporary directory")
     args = parser.parse_args(argv)
     wheel = args.wheel.resolve()
@@ -145,6 +283,9 @@ def main(argv: list[str] | None = None) -> int:
     wheel_sha256 = _sha256(wheel)
     baseline = args.baseline.resolve()
     attestation = args.attestation.resolve()
+    constraints = args.constraints.resolve()
+    if not constraints.exists():
+        raise FileNotFoundError(constraints)
     with _qualification_root(args.evidence_dir) as tmp_path:
         env = tmp_path / "venv"
         subprocess.run([sys.executable, "-m", "venv", str(env)], check=True)
@@ -154,7 +295,8 @@ def main(argv: list[str] | None = None) -> int:
         run_env = os.environ.copy()
         run_env["TDCSIM_CBO_WHEEL_SHA256"] = wheel_sha256
         commands = []
-        _run(commands, [str(pip), "install", "-q", str(wheel)], env=run_env)
+        _run(commands, [str(pip), "install", "-q", "-r", str(constraints)], env=run_env)
+        _run(commands, [str(pip), "install", "-q", "--no-deps", str(wheel)], env=run_env)
         _run(
             commands,
             [
@@ -168,13 +310,14 @@ def main(argv: list[str] | None = None) -> int:
         freeze = subprocess.run([str(pip), "freeze"], check=True, capture_output=True, text=True, env=run_env).stdout
         (tmp_path / "pip-freeze.txt").write_text(freeze, encoding="utf-8")
         shutil.copyfile(wheel, tmp_path / wheel.name)
+        shutil.copyfile(constraints, tmp_path / constraints.name)
         if not baseline.exists():
             raise FileNotFoundError(baseline)
         if not attestation.exists():
             raise FileNotFoundError(attestation)
         scenarios = tmp_path / "scenarios"
         _run(commands, [str(python), "-c", SCENARIO_SNIPPET, str(baseline), str(attestation), str(scenarios)], env=run_env)
-        for name in ("noop", "compound"):
+        for name in ("noop", "compound", "file_backed"):
             scenario = scenarios / f"{name}.json"
             compiled_root = tmp_path / f"compiled-{name}"
             _run(
@@ -234,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
                     env=run_env,
                     stdout=subprocess.DEVNULL,
                 )
+                if name == "file_backed":
+                    scenario.unlink()
+                    (scenarios / "file_backed_cash_residual.csv").unlink()
                 _run(
                     commands,
                     [
@@ -249,11 +395,17 @@ def main(argv: list[str] | None = None) -> int:
                     env=run_env,
                     stdout=subprocess.DEVNULL,
                 )
+        if not args.compile_only:
+            _run(commands, [str(python), "-c", NEGATIVE_VERIFIER_SNIPPET, str(tmp_path), str(baseline), str(attestation)], env=run_env)
+        freeze_sha256 = _sha256(tmp_path / "pip-freeze.txt")
         manifest = {
             "schema_version": "tdcsim_cbo_dependency_qualification_v1",
             "wheel": {"path": wheel.name, "sha256": wheel_sha256, "bytes": wheel.stat().st_size},
+            "constraints": {"path": constraints.name, "sha256": _sha256(constraints), "bytes": constraints.stat().st_size},
             "baseline_package_sha256": _sha256(baseline),
             "attestation_sha256": _sha256(attestation),
+            "pip_freeze_sha256": freeze_sha256,
+            "artifact_hashes": _artifact_hashes(tmp_path, exclude_dirs={"venv"}),
             "compile_only": bool(args.compile_only),
             "commands": commands,
         }
@@ -287,6 +439,16 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _artifact_hashes(root: Path, *, exclude_dirs: set[str]) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root)
+        if any(part in exclude_dirs for part in rel.parts):
+            continue
+        records.append({"path": rel.as_posix(), "sha256": _sha256(path), "bytes": path.stat().st_size})
+    return records
 
 
 if __name__ == "__main__":

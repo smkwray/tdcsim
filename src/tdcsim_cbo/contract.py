@@ -14,6 +14,7 @@ from .baseline import CboBaselinePackage
 
 
 SCENARIO_SCHEMA_RESOURCE = "schemas/cbo-scenario-v1.schema.json"
+_ModeFields = Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]]
 
 
 @dataclass(frozen=True)
@@ -119,47 +120,112 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
             raise ValueError(f"scenario.overrides.{name}: override must be a mapping")
         mode = str(override.get("mode") or "")
         if name == "nominal_yield_curve":
-            _require_by_mode(name, override, mode, {"parallel_bp": ("shock_bp",), "key_rate_bp": ("shocks",), "full_surface_file": ("file",)})
+            _validate_by_mode(name, override, mode, _nominal_curve_fields())
         elif name == "frn_benchmark":
-            _require_by_mode(name, override, mode, {"parallel_bp": ("shock_bp",), "absolute_path_file": ("file",), "linked_to_nominal_curve": ()})
+            _validate_by_mode(name, override, mode, _frn_fields())
         elif name == "inflation_cpi":
-            _require_by_mode(name, override, mode, {"annualized_inflation_shift_bp": ("shock_bp",), "cpi_level_scale": ("scale",), "monthly_path_file": ("file",)})
+            _validate_by_mode(name, override, mode, _cpi_fields())
         elif name == "tips_real_yield":
-            _require_by_mode(name, override, mode, {"parallel_bp": ("shock_bp",), "key_rate_bp": ("shocks",), "absolute_path_file": ("file",), "linked_recompute": ()})
+            _validate_by_mode(name, override, mode, _tips_real_yield_fields())
         elif name == "operating_cash":
-            _require_by_mode(name, override, mode, {"constant_real": (), "constant_nominal": (), "scale_baseline": ("scale",), "aggregate_path_file": ("file",), "component_path_file": ("file",)})
+            _validate_by_mode(name, override, mode, _operating_cash_fields())
         elif name == "cash_reconciliation":
-            _require_by_mode(name, override, mode, {"zero": (), "track_operating_cash_target": (), "explicit_path_file": ("file",)})
+            _validate_by_mode(name, override, mode, _cash_reconciliation_fields())
         elif name == "fed_holdings":
-            _require_by_mode(name, override, mode, _stock_path_requirements())
+            _validate_by_mode(name, override, mode, _stock_path_fields())
         elif name in {"primary_deficit", "debt_target"}:
-            _require_by_mode(name, override, mode, _stock_path_requirements())
+            _validate_by_mode(name, override, mode, _fiscal_path_fields())
         elif name == "holder_preferences":
-            _require_by_mode(name, override, mode, {"static_shares": ("rows",)})
+            _validate_by_mode(name, override, mode, {"static_shares": (("rows",), ())})
         elif name == "net_interest_comparator":
-            _require_by_mode(name, override, mode, {"official_cbo_baseline": ("role",)})
+            _validate_by_mode(name, override, mode, {"official_cbo_baseline": (("role",), ())})
 
 
-def _stock_path_requirements() -> dict[str, tuple[str, ...]]:
+def _nominal_curve_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
     return {
-        "scale_path": ("scale",),
-        "additive_bil": ("additive_bil",),
-        "fy_endpoint_anchors": ("anchors",),
-        "absolute_path_file": ("file",),
+        "parallel_bp": (("shock_bp",), ()),
+        "key_rate_bp": (("shocks",), ("interpolation",)),
+        "full_surface_file": (("file",), ()),
     }
 
 
-def _require_by_mode(
+def _frn_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "parallel_bp": (("shock_bp",), ()),
+        "absolute_path_file": (("file",), ()),
+        "linked_to_nominal_curve": ((), ("spread_bp",)),
+    }
+
+
+def _cpi_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "annualized_inflation_shift_bp": (("shock_bp",), ("terminal_rule",)),
+        "cpi_level_scale": (("scale",), ()),
+        "monthly_path_file": (("file",), ()),
+    }
+
+
+def _tips_real_yield_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "parallel_bp": (("shock_bp",), ()),
+        "key_rate_bp": (("shocks",), ("interpolation",)),
+        "absolute_path_file": (("file",), ()),
+        "linked_recompute": ((), ("additional_parallel_bp",)),
+    }
+
+
+def _operating_cash_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "constant_real": ((), ()),
+        "constant_nominal": ((), ()),
+        "scale_baseline": (("scale",), ()),
+        "aggregate_path_file": (("file",), ()),
+        "component_path_file": (("file",), ("tga_settlement_component", "toc_components_are_exogenous_diagnostics")),
+    }
+
+
+def _cash_reconciliation_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "zero": ((), ("funding_effect",)),
+        "track_operating_cash_target": ((), ("funding_effect",)),
+        "explicit_path_file": (("file",), ("funding_effect",)),
+    }
+
+
+def _stock_path_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "scale_path": (("scale",), ()),
+        "additive_bil": (("additive_bil",), ()),
+        "fy_endpoint_anchors": (("anchors",), ()),
+        "absolute_path_file": (("file",), ()),
+    }
+
+
+def _fiscal_path_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    return {
+        "scale_path": (("scale",), ()),
+        "additive_bil": (("additive_bil",), ()),
+        "fy_endpoint_anchors": (("anchors",), ("freeze_pre_start_actuals",)),
+        "absolute_path_file": (("file",), ()),
+    }
+
+
+def _validate_by_mode(
     name: str,
     override: Mapping[str, Any],
     mode: str,
-    requirements: Mapping[str, tuple[str, ...]],
+    fields_by_mode: _ModeFields,
 ) -> None:
-    if mode not in requirements:
+    if mode not in fields_by_mode:
         return
-    missing = [key for key in requirements[mode] if key not in override]
+    required, optional = fields_by_mode[mode]
+    missing = [key for key in required if key not in override]
     if missing:
         raise ValueError(f"scenario.overrides.{name}.{mode}: missing required fields {missing}")
+    allowed = {"mode", *required, *optional}
+    inapplicable = sorted(str(key) for key in override if key not in allowed)
+    if inapplicable:
+        raise ValueError(f"scenario.overrides.{name}.{mode}: mode-inapplicable fields {inapplicable}")
 
 
 __all__ = [

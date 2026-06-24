@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import tempfile
+import subprocess
+from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from sim_engine import run_simulation
+
 from ._json import read_json, sha256_file
 from .baseline import CboBaselinePackage
 from .compiler import CboScenarioCompiler, digest_input_tree
 from .contract import CboScenarioSpec
 from .output import hash_output_tree
+from . import runner as runner_module
 from ._schema import validate_schema
 
 
@@ -64,6 +70,9 @@ def verify_scenario_run(
     root = Path(run_dir).expanduser().resolve()
     manifest = _manifest(root / "tdcsim_cbo_run_manifest.json")
     _validate_run_manifest_schema(manifest)
+    _verify_release_claims(manifest)
+    _verify_code_environment(manifest)
+    _verify_validation_block(manifest)
     compiled_rel = Path(str(manifest.get("compiled_manifest") or ""))
     if compiled_rel.is_absolute() or ".." in compiled_rel.parts:
         raise VerificationError("run manifest compiled_manifest must be package-relative")
@@ -132,6 +141,172 @@ def _validate_run_manifest_schema(manifest: dict[str, Any]) -> None:
         validate_schema(manifest, schema, label="run_manifest")
     except Exception as exc:
         raise VerificationError(f"run manifest schema validation failed: {exc}") from exc
+
+
+def _verify_release_claims(manifest: dict[str, Any]) -> None:
+    if manifest.get("status") != "complete":
+        raise VerificationError("run manifest status must be complete")
+    grade = manifest.get("verification_grade")
+    if grade == "release_verified":
+        raise VerificationError("release_verified grade requires external package identity evidence")
+    if grade not in {"local", "release_reproducible"}:
+        raise VerificationError(f"unsupported verification_grade: {grade!r}")
+
+
+def _verify_code_environment(manifest: dict[str, Any]) -> None:
+    env = manifest.get("code_environment")
+    if not isinstance(env, dict):
+        raise VerificationError("run manifest code_environment must be an object")
+    expected = _actual_code_environment()
+    for key, expected_value in expected.items():
+        if env.get(key) != expected_value:
+            raise VerificationError(f"run manifest code_environment {key} does not match verifier runtime")
+    lock_sha = str(env.get("requirements_lock_sha256") or "")
+    if not lock_sha or lock_sha == "0" * 64:
+        raise VerificationError("run manifest code environment requirements lock hash is not release-bound")
+    wheel_sha = str(env.get("wheel_sha256") or "")
+    expected_wheel_sha = os.environ.get("TDCSIM_CBO_WHEEL_SHA256", "")
+    if wheel_sha and not expected_wheel_sha:
+        raise VerificationError("run manifest code environment wheel_sha256 cannot be verified")
+    if wheel_sha and wheel_sha != expected_wheel_sha:
+        raise VerificationError("run manifest code environment wheel_sha256 does not match verifier runtime")
+
+
+def _actual_code_environment() -> dict[str, Any]:
+    dist = _distribution_identity()
+    return {
+        "code_commit_sha": _module_git_value(["rev-parse", "HEAD"], default="0" * 40),
+        "dirty_state": bool(_module_git_value(["status", "--short"], default="")),
+        "runner_version": "tdcsim_cbo_runner_v1",
+        "verifier_version": "tdcsim_cbo_verifier_v1",
+        "runner_source_sha256": sha256_file(Path(runner_module.__file__)),
+        "sim_engine_source_sha256": sha256_file(Path(run_simulation.__code__.co_filename)),
+        "package_name": dist["name"],
+        "package_version": dist["version"],
+        "distribution_record_digest": dist["record_digest"],
+        "runtime_identity_source": dist["identity_source"],
+    }
+
+
+def _distribution_identity() -> dict[str, str]:
+    try:
+        dist = metadata.distribution("tdcsim")
+        files_list = sorted(str(item) for item in (dist.files or []))
+        record_path = _distribution_record_path(dist)
+        return {
+            "name": dist.metadata.get("Name", "tdcsim"),
+            "version": dist.version,
+            "record_digest": sha256_file(record_path) if record_path is not None else _record_digest(files_list),
+            "identity_source": "installed_distribution_record" if record_path is not None else "installed_distribution_metadata",
+        }
+    except metadata.PackageNotFoundError:
+        return {
+            "name": "tdcsim",
+            "version": "source-tree",
+            "record_digest": "0" * 64,
+            "identity_source": "source_tree_no_installed_distribution",
+        }
+
+
+def _distribution_record_path(dist: metadata.Distribution) -> Path | None:
+    for item in dist.files or []:
+        if str(item).endswith(".dist-info/RECORD"):
+            path = Path(dist.locate_file(item))
+            if path.exists():
+                return path
+    return None
+
+
+def _record_digest(records: list[str]) -> str:
+    import hashlib
+
+    payload = "\n".join(records).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _module_git_value(args: list[str], *, default: str) -> str:
+    git_root = _module_git_root()
+    if git_root is None:
+        return default
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=git_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return default
+
+
+def _module_git_root() -> Path | None:
+    try:
+        root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return None
+    return Path(root) if root else None
+
+
+def _verify_validation_block(manifest: dict[str, Any]) -> None:
+    validation = manifest.get("validation")
+    if not isinstance(validation, dict):
+        raise VerificationError("run manifest validation must be an object")
+    if validation.get("status") != "pass":
+        raise VerificationError("run manifest validation.status must be pass")
+    for section in ("gates", "invariants"):
+        items = validation.get(section)
+        if not isinstance(items, list) or not items:
+            raise VerificationError(f"run manifest validation.{section} must be a nonempty array")
+        for item in items:
+            if not isinstance(item, dict):
+                raise VerificationError(f"run manifest validation.{section} item must be an object")
+            if item.get("status") != "pass":
+                raise VerificationError(f"run manifest validation item failed: {item.get('id')}")
+    boundaries = manifest.get("boundary_checks")
+    if not isinstance(boundaries, dict):
+        raise VerificationError("run manifest boundary_checks must be an object")
+    cash_flags = _normalized_bool_set(boundaries.get("cash_residual_affects_issuance_size"))
+    nested_flags = boundaries.get("cash_residual_nonfunding_flags")
+    if isinstance(nested_flags, dict) and "affects_issuance_size" in nested_flags:
+        nested_cash_flags = _normalized_bool_set(nested_flags.get("affects_issuance_size"))
+        if nested_cash_flags != cash_flags:
+            raise VerificationError("cash_residual_affects_issuance_size disagrees with nonfunding flags")
+    if cash_flags != {False}:
+        raise VerificationError("cash_residual_affects_issuance_size must be exactly false")
+    invariant_ids = {str(item.get("id")) for item in validation.get("invariants", []) if isinstance(item, dict)}
+    if "cash_residual_not_issuance_sizing" not in invariant_ids:
+        raise VerificationError("cash_residual_not_issuance_sizing validation invariant is required")
+
+
+def _normalized_bool_set(values: Any) -> set[bool]:
+    if isinstance(values, (str, bool)) or values is None:
+        iterable = [values]
+    elif isinstance(values, list):
+        iterable = values
+    else:
+        return set()
+    out: set[bool] = set()
+    for value in iterable:
+        if isinstance(value, bool):
+            out.add(value)
+        elif isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered == "false":
+                out.add(False)
+            elif lowered == "true":
+                out.add(True)
+            else:
+                return set()
+        else:
+            return set()
+    return out
 
 
 def _verify_manifest_artifacts(root: Path, artifacts: Any, *, base: Path) -> None:
@@ -211,6 +386,11 @@ def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: st
         raise VerificationError("verification baseline manifest hash does not match run manifest")
     if baseline.attestation.sha256 != baseline_manifest.get("release_attestation_sha256"):
         raise VerificationError("verification attestation hash does not match run manifest")
+    code_env = manifest.get("code_environment")
+    if not isinstance(code_env, dict):
+        raise VerificationError("run manifest code_environment must be an object")
+    if code_env.get("requirements_lock_sha256") != baseline.attestation.data.get("requirements_lock_sha256"):
+        raise VerificationError("run manifest requirements lock hash does not match baseline attestation")
     spec = CboScenarioSpec.from_file(root / scenario_rel)
     with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-recompile-") as tmp:
         compiled = CboScenarioCompiler().compile(baseline, spec, Path(tmp) / "work")

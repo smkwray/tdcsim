@@ -97,6 +97,9 @@ def build_run_manifest(
 
 
 def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
+    cash_residual_affects_issuance_size = _normalized_bool_set(
+        boundary_checks.get("cash_residual_affects_issuance_size", [])
+    )
     gates = [
         {
             "id": "fed_target_holder_allocation_only",
@@ -114,19 +117,47 @@ def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
             else "fail",
         },
     ]
+    invariants = [
+        {
+            "id": "cash_residual_not_issuance_sizing",
+            "status": "pass"
+            if cash_residual_affects_issuance_size == {False}
+            else "fail",
+            "observed": ",".join(str(value) for value in boundary_checks.get("cash_residual_affects_issuance_size", [])),
+        }
+    ]
     return {
-        "status": "pass" if all(item["status"] == "pass" for item in gates) else "fail",
+        "status": "pass"
+        if all(item["status"] == "pass" for item in gates)
+        and all(item["status"] == "pass" for item in invariants)
+        else "fail",
         "gates": gates,
-        "invariants": [
-            {
-                "id": "cash_residual_not_issuance_sizing",
-                "status": "pass"
-                if "False" in boundary_checks.get("cash_residual_affects_issuance_size", [])
-                or boundary_checks.get("cash_residual_affects_issuance_size", []) == []
-                else "fail",
-            }
-        ],
+        "invariants": invariants,
     }
+
+
+def _normalized_bool_set(values: Any) -> set[bool]:
+    if isinstance(values, (str, bool)) or values is None:
+        iterable = [values]
+    elif isinstance(values, list):
+        iterable = values
+    else:
+        return set()
+    out: set[bool] = set()
+    for value in iterable:
+        if isinstance(value, bool):
+            out.add(value)
+        elif isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered == "false":
+                out.add(False)
+            elif lowered == "true":
+                out.add(True)
+            else:
+                return set()
+        else:
+            return set()
+    return out
 
 
 def _referenced_file_hashes(scenario: CboScenarioSpec) -> dict[str, str]:

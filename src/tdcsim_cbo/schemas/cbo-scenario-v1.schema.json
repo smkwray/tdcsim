@@ -333,7 +333,94 @@
         "file": {
           "$ref": "#/$defs/fileRef"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "parallel_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "shock_bp"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "interpolation"
+                ]
+              },
+              {
+                "required": [
+                  "shocks"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "key_rate_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "shocks"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "full_surface_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "interpolation"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              },
+              {
+                "required": [
+                  "shocks"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "frnOverride": {
       "type": "object",
@@ -362,7 +449,83 @@
         "file": {
           "$ref": "#/$defs/fileRef"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "linked_to_nominal_curve"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "parallel_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "shock_bp"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "spread_bp"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "absolute_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              },
+              {
+                "required": [
+                  "spread_bp"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "cpiOverride": {
       "type": "object",
@@ -397,7 +560,94 @@
             "carry_last_scenario_growth"
           ]
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "annualized_inflation_shift_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "shock_bp"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "cpi_level_scale"
+            }
+          },
+          "required": [
+            "mode",
+            "scale"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              },
+              {
+                "required": [
+                  "terminal_rule"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "monthly_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "scale"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              },
+              {
+                "required": [
+                  "terminal_rule"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "tipsRealYieldOverride": {
       "type": "object",
@@ -431,10 +681,152 @@
             "$ref": "#/$defs/keyRateShock"
           }
         },
+        "interpolation": {
+          "enum": [
+            "log_tenor_linear",
+            "pchip_log_tenor"
+          ]
+        },
         "file": {
           "$ref": "#/$defs/fileRef"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "linked_recompute"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "interpolation"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              },
+              {
+                "required": [
+                  "shocks"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "parallel_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "shock_bp"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additional_parallel_bp"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "interpolation"
+                ]
+              },
+              {
+                "required": [
+                  "shocks"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "key_rate_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "shocks"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additional_parallel_bp"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "absolute_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additional_parallel_bp"
+                ]
+              },
+              {
+                "required": [
+                  "interpolation"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              },
+              {
+                "required": [
+                  "shocks"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "operatingCashOverride": {
       "type": "object",
@@ -468,7 +860,157 @@
           "type": "boolean",
           "const": true
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "constant_real"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              },
+              {
+                "required": [
+                  "tga_settlement_component"
+                ]
+              },
+              {
+                "required": [
+                  "toc_components_are_exogenous_diagnostics"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "constant_nominal"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              },
+              {
+                "required": [
+                  "tga_settlement_component"
+                ]
+              },
+              {
+                "required": [
+                  "toc_components_are_exogenous_diagnostics"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "scale_baseline"
+            }
+          },
+          "required": [
+            "mode",
+            "scale"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "tga_settlement_component"
+                ]
+              },
+              {
+                "required": [
+                  "toc_components_are_exogenous_diagnostics"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "aggregate_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "scale"
+                ]
+              },
+              {
+                "required": [
+                  "tga_settlement_component"
+                ]
+              },
+              {
+                "required": [
+                  "toc_components_are_exogenous_diagnostics"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "component_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "cashResidualOverride": {
       "type": "object",
@@ -490,7 +1032,58 @@
         "funding_effect": {
           "const": "none"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "zero"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "track_operating_cash_target"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "explicit_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ]
+        }
+      ]
     },
     "maturityWeight": {
       "type": "object",
@@ -652,7 +1245,129 @@
         "file": {
           "$ref": "#/$defs/fileRef"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "scale_path"
+            }
+          },
+          "required": [
+            "mode",
+            "scale"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additive_bil"
+                ]
+              },
+              {
+                "required": [
+                  "anchors"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "additive_bil"
+            }
+          },
+          "required": [
+            "mode",
+            "additive_bil"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "anchors"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "fy_endpoint_anchors"
+            }
+          },
+          "required": [
+            "mode",
+            "anchors"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additive_bil"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "absolute_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additive_bil"
+                ]
+              },
+              {
+                "required": [
+                  "anchors"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "holderShares": {
       "type": "object",
@@ -797,7 +1512,144 @@
           "type": "boolean",
           "const": true
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "scale_path"
+            }
+          },
+          "required": [
+            "mode",
+            "scale"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additive_bil"
+                ]
+              },
+              {
+                "required": [
+                  "anchors"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "freeze_pre_start_actuals"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "additive_bil"
+            }
+          },
+          "required": [
+            "mode",
+            "additive_bil"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "anchors"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "freeze_pre_start_actuals"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "fy_endpoint_anchors"
+            }
+          },
+          "required": [
+            "mode",
+            "anchors"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additive_bil"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "absolute_path_file"
+            }
+          },
+          "required": [
+            "mode",
+            "file"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "additive_bil"
+                ]
+              },
+              {
+                "required": [
+                  "anchors"
+                ]
+              },
+              {
+                "required": [
+                  "freeze_pre_start_actuals"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     },
     "fiscalIncidenceOverride": {
       "type": "object",

@@ -172,7 +172,7 @@ def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
             "target_tolerance_bil": 0.000001,
         },
         "baseline_input_paths": compiled_forecast_input_paths(inputs),
-        "data_vintage": {"actuals_available_as_of": "9999-12-31", "allow_lookahead": False},
+        "data_vintage": {"actuals_available_as_of": "2200-12-31", "allow_lookahead": False},
         "fiscal_incidence_policy": _fiscal_incidence_policy(inputs / "tdcsim_fiscal_incidence_policy.csv"),
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
     }
