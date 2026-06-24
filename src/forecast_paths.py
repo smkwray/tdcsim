@@ -52,6 +52,37 @@ BASELINE_INPUT_PATH_KEYS = (
     "tips_real_yield_path_file",
 )
 
+COMPILED_FORECAST_INPUT_FILES = {
+    "source_contract_file": "source_contract_smoke.json",
+    "source_fixture_file": "source_fixtures.csv",
+    "cbo_fiscal_baseline_file": "tdcsim_cbo_fiscal_baseline.csv",
+    "current_fy_splice_file": "tdcsim_current_fy_splice.csv",
+    "debt_stock_path_file": "tdcsim_debt_stock_path.csv",
+    "primary_deficit_path_file": "tdcsim_primary_deficit_path.csv",
+    "operating_cash_path_file": "tdcsim_operating_cash_path.csv",
+    "cash_reconciliation_residual_file": "tdcsim_cash_reconciliation_residual.csv",
+    "macro_forecast_path_file": "tdcsim_macro_forecast_path.csv",
+    "yield_curve_surface_file": "tdcsim_yield_curve_surface.csv",
+    "fiscal_incidence_policy_file": "tdcsim_fiscal_incidence_policy.csv",
+    "net_interest_bridge_file": "tdcsim_net_interest_bridge.csv",
+    "holder_absorption_path_file": "tdcsim_holder_profile_assumptions.csv",
+    "fed_holdings_path_file": "tdcsim_fed_holdings_path.csv",
+    "frn_rate_path_file": "tdcsim_frn_rate_path.csv",
+    "tips_cpi_path_file": "tdcsim_tips_cpi_path.csv",
+    "tips_real_yield_path_file": "tdcsim_tips_real_yield_path.csv",
+}
+
+
+def compiled_forecast_input_paths(inputs_dir: str | os.PathLike[str]) -> dict[str, str]:
+    """Return logical engine path keys for a compiled CBO forecast-input directory."""
+
+    root = Path(inputs_dir)
+    paths = {key: str(root / filename) for key, filename in COMPILED_FORECAST_INPUT_FILES.items()}
+    missing = [key for key, path in paths.items() if not Path(path).exists()]
+    if missing:
+        raise FileNotFoundError(f"compiled CBO forecast inputs missing required files: {missing}")
+    return paths
+
 
 @dataclass(frozen=True)
 class BaselineInputPaths:
