@@ -20,6 +20,45 @@ def _scenario_frame(start_value: int) -> pd.DataFrame:
     )
 
 
+def _cbo_export_frame(start_value: int) -> pd.DataFrame:
+    """Return a tiny frame with CBO diagnostics and renamed holder columns."""
+    frame = pd.DataFrame(
+        {
+            'DebtHeld_DomesticNonBanks': [200 + start_value, 210 + start_value],
+            'DebtHeld_CentralBank': [300 + start_value, 320 + start_value],
+            'CBOFundingModeActive': [1.0, 1.0],
+            'FundingMode': ['cbo_public_debt_target', 'cbo_public_debt_target'],
+            'CBOPrimaryDeficitFlow': [25.0, 27.5],
+            'CBOControlledDebtTarget': [1_100.0, 1_125.0],
+            'CBOControlledDebtPreIssuance': [1_000.0, 1_010.0],
+            'CBOControlledDebtPostIssuance': [1_100.0, 1_125.0],
+            'CBOControlledDebtTargetError': [0.0, 0.0],
+            'CBORequiredFaceIssuance': [100.0, 115.0],
+            'CBOOperatingCashTarget': [800.0, 805.0],
+            'CBOCashResidual': [3.0, 4.5],
+            'CBOCashReconciliationResidual': [2.0, 2.5],
+            'CBOFiscalIncidencePolicyPresent': [1.0, 1.0],
+            'FiscalIncidenceStatus': ['explicit_policy_present', 'explicit_policy_present'],
+            'CBORemittanceCashEffect': [0.0, 0.0],
+            'CBONetInterestDiagnostic': [120.0, 125.0],
+            'CBOTotalDeficitDiagnostic': [200.0, 207.5],
+            'NetInterestDiagnosticStatus': ['cbo_reported_check_only', 'cbo_reported_check_only'],
+            'CBONetInterestBridgeRows': [3.0, 3.0],
+            'CBOCashResidualStatus': ['operating_cash_target_loaded', 'operating_cash_target_loaded'],
+        },
+        index=pd.to_datetime(['2026-09-20', '2026-09-30']),
+    )
+    frame.attrs['run_metadata'] = {
+        'scenario_name': f'cbo_{start_value}',
+        'funding_rule_mode': 'cbo_public_debt_target',
+        'cbo_funding_mode_active': True,
+        'cbo_net_interest_bridge_rows': 3,
+        'mmf_deposit_pass_through_sensitivity_grid': [0.9, 0.97, 1.0],
+        'nested_debug_payload': {'not': 'csv-friendly'},
+    }
+    return frame
+
+
 def test_save_group_results_csv_writes_long_form_and_final_state(tmp_path):
     """Downstream charting expects per-scenario and combined CSVs keyed by Scenario/Date."""
     output_file = tmp_path / 'group export.csv'
@@ -43,6 +82,7 @@ def test_save_group_results_csv_writes_long_form_and_final_state(tmp_path):
     }
     for path in expected_paths.values():
         assert path.exists()
+    assert not (tmp_path / 'group_export_metadata.csv').exists()
 
     baseline = pd.read_csv(expected_paths['baseline'])
     combined = pd.read_csv(expected_paths['combined'])
@@ -65,6 +105,75 @@ def test_save_group_results_csv_writes_long_form_and_final_state(tmp_path):
         expected_last_rows,
         check_dtype=False,
     )
+
+
+def test_save_group_results_csv_preserves_cbo_diagnostics_and_renamed_holder_columns(tmp_path):
+    """CBO engine output columns should pass through every group CSV surface unchanged."""
+    output_file = tmp_path / 'cbo export.csv'
+    results = {
+        'baseline': _cbo_export_frame(0),
+        'policy-shift': _cbo_export_frame(50),
+    }
+
+    save_group_results_csv(
+        results,
+        ['baseline', 'policy-shift'],
+        {'save_results_filename': str(output_file)},
+        'CBO Group',
+    )
+
+    per_scenario = pd.read_csv(tmp_path / 'cbo_export_baseline.csv')
+    combined = pd.read_csv(tmp_path / 'cbo_export_results.csv')
+    final_state = pd.read_csv(tmp_path / 'cbo_export_final_state.csv')
+    metadata = pd.read_csv(tmp_path / 'cbo_export_metadata.csv')
+
+    expected_columns = [
+        'DebtHeld_DomesticNonBanks',
+        'DebtHeld_CentralBank',
+        'CBOFundingModeActive',
+        'FundingMode',
+        'CBOPrimaryDeficitFlow',
+        'CBOControlledDebtTarget',
+        'CBOControlledDebtPreIssuance',
+        'CBOControlledDebtPostIssuance',
+        'CBOControlledDebtTargetError',
+        'CBORequiredFaceIssuance',
+        'CBOOperatingCashTarget',
+        'CBOCashResidual',
+        'CBOCashReconciliationResidual',
+        'CBOFiscalIncidencePolicyPresent',
+        'FiscalIncidenceStatus',
+        'CBORemittanceCashEffect',
+        'CBONetInterestDiagnostic',
+        'CBOTotalDeficitDiagnostic',
+        'NetInterestDiagnosticStatus',
+        'CBONetInterestBridgeRows',
+        'CBOCashResidualStatus',
+    ]
+    for frame in (per_scenario, combined, final_state):
+        assert list(frame.columns[:2]) == ['Scenario', 'Date']
+        for column in expected_columns:
+            assert column in frame.columns
+        assert 'DebtHeld_Private' not in frame.columns
+        assert 'DebtHeld_CB' not in frame.columns
+
+    assert len(combined) == 4
+    assert len(final_state) == 2
+    assert set(final_state['Scenario']) == {'baseline', 'policy-shift'}
+    baseline_final = final_state[final_state['Scenario'] == 'baseline'].iloc[0]
+    assert baseline_final['Date'] == '2026-09-30'
+    assert baseline_final['DebtHeld_DomesticNonBanks'] == 210
+    assert baseline_final['DebtHeld_CentralBank'] == 320
+    assert baseline_final['CBOControlledDebtTarget'] == 1_125.0
+    assert baseline_final['CBOCashResidualStatus'] == 'operating_cash_target_loaded'
+    assert baseline_final['NetInterestDiagnosticStatus'] == 'cbo_reported_check_only'
+
+    assert list(metadata['Scenario']) == ['baseline', 'policy-shift']
+    assert metadata.loc[0, 'funding_rule_mode'] == 'cbo_public_debt_target'
+    assert bool(metadata.loc[0, 'cbo_funding_mode_active']) is True
+    assert metadata.loc[0, 'cbo_net_interest_bridge_rows'] == 3
+    assert metadata.loc[0, 'mmf_deposit_pass_through_sensitivity_grid'] == '[0.9, 0.97, 1.0]'
+    assert 'nested_debug_payload' not in metadata.columns
 
 
 def test_save_group_results_csv_uses_plot_filename_then_group_name(tmp_path, monkeypatch):

@@ -525,7 +525,7 @@ def generate_initial_portfolio(gen_config, sim_start_date, base_config=None):
 def save_portfolio_csv(df, filepath):
     """Save a portfolio DataFrame to CSV with proper formatting."""
     df_out = df.copy()
-    for col in ['IssueDate', 'MaturityDate', 'LastAccrualDate']:
+    for col in ['IssueDate', 'MaturityDate', 'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'LastAccrualDate']:
         df_out[col] = pd.to_datetime(df_out[col], errors='coerce').dt.strftime('%Y-%m-%d')
         df_out[col] = df_out[col].replace('NaT', '')
 
@@ -533,7 +533,8 @@ def save_portfolio_csv(df, filepath):
         if col in ['FaceValue', 'CouponRate', 'OriginalMaturityYears',
                    'OriginalPrincipal', 'AdjustedPrincipal', 'ReferenceCPI_Issue',
                    'IndexRatio', 'FixedSpread', 'AccruedInterest_FRN', 'BenchmarkRate_FRN',
-                   'IssuePriceRatio', 'IssueProceeds', 'IssueYieldAtIssue']:
+                   'IssuePriceRatio', 'IssueProceeds', 'IssueYieldAtIssue',
+                   'InterestPaymentFrequency']:
             df_out[col] = pd.to_numeric(df_out[col], errors='coerce').fillna(0.0)
             if col in ['FaceValue', 'OriginalPrincipal', 'AdjustedPrincipal', 'AccruedInterest_FRN']:
                  df_out[col] = df_out[col].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else '')
@@ -547,7 +548,7 @@ def save_portfolio_csv(df, filepath):
                  df_out[col] = df_out[col].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else '')
         elif col == 'BondID':
             pass
-        elif col not in ['IssueDate', 'MaturityDate', 'LastAccrualDate']:
+        elif col not in ['IssueDate', 'MaturityDate', 'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'LastAccrualDate']:
             df_out[col] = df_out[col].fillna('')
 
     for calc_col in ['TimeToMaturity', 'DiscountYield', 'CleanPrice', 'AccruedInterest', 'DirtyValue', 'DirtyPriceRatio']:

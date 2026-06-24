@@ -3,16 +3,18 @@
 
 import concurrent.futures
 import copy
+import json
 import os
 import re
 import time
 import traceback
+from collections.abc import Mapping, Sequence
 
 import pandas as pd
 
 from tdc_shared import BOND_PORTFOLIO_COLS
 from sim_engine import run_simulation
-from sim_helpers import VALID_OVERRIDE_KEYS, update_dict_recursive
+from sim_helpers import VALID_OVERRIDE_KEYS, update_dict_recursive, validate_cbo_config_blocks
 from sim_plotting import plot_multi_results
 from ratewall_contract import export_ratewall_bundle
 
@@ -53,15 +55,44 @@ def _resolve_output_base(group_output_settings, group_name, filename_key):
     return os.path.join(save_dir, clean_base_name)
 
 
+def _metadata_value_for_csv(value):
+    """Return a stable CSV-friendly metadata value, or None for nested objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        simple_values = []
+        for item in value:
+            if item is None or isinstance(item, (str, int, float, bool)):
+                simple_values.append(item)
+            else:
+                return None
+        return json.dumps(simple_values, sort_keys=True)
+    return None
+
+
+def _metadata_row_for_scenario(scenario_name, results_df):
+    run_metadata = getattr(results_df, 'attrs', {}).get('run_metadata')
+    if not isinstance(run_metadata, Mapping) or not run_metadata:
+        return None
+    row = {'Scenario': scenario_name}
+    for key in sorted(run_metadata):
+        value = _metadata_value_for_csv(run_metadata[key])
+        if value is not None:
+            row[str(key)] = value
+    return row
+
+
 def save_group_results_csv(successful_scenario_results, scenario_order, group_output_settings, group_name):
     """Write scenario time-series and final-state CSVs for downstream charting."""
     output_base = _resolve_output_base(group_output_settings, group_name, 'save_results_filename')
     long_frames = []
+    metadata_rows = []
 
     for scenario_name in scenario_order:
         results_df = successful_scenario_results.get(scenario_name)
         if results_df is None or results_df.empty:
             continue
+        metadata_rows.append(_metadata_row_for_scenario(scenario_name, results_df) or {'Scenario': scenario_name})
         scenario_frame = results_df.copy()
         scenario_frame.insert(0, 'Scenario', scenario_name)
         scenario_frame.insert(1, 'Date', scenario_frame.index)
@@ -82,6 +113,12 @@ def save_group_results_csv(successful_scenario_results, scenario_order, group_ou
     final_state = combined.sort_values('Date').groupby('Scenario', sort=False).tail(1)
     final_state_path = f'{output_base}_final_state.csv'
     final_state.to_csv(final_state_path, index=False)
+
+    if any(len(row) > 1 for row in metadata_rows):
+        metadata_path = f'{output_base}_metadata.csv'
+        metadata = pd.DataFrame(metadata_rows)
+        metadata.to_csv(metadata_path, index=False)
+        print(f'[Group {group_name}] Metadata CSV saved: {metadata_path}')
 
     print(f'[Group {group_name}] Results CSV saved: {combined_path}')
     print(f'[Group {group_name}] Final-state CSV saved: {final_state_path}')
@@ -127,6 +164,19 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
     plot_config_group['group_name'] = group_name
     if isinstance(group_output_settings, dict):
         plot_config_group = update_dict_recursive(plot_config_group, group_output_settings)
+    group_overrides = group_def.get('overrides', {})
+    if group_overrides and not isinstance(group_overrides, dict):
+        raise ValueError(f"[{group_name}] Group overrides must be a mapping.")
+    if isinstance(group_overrides, dict) and group_overrides:
+        unknown_group_override_keys = set(group_overrides.keys()) - VALID_OVERRIDE_KEYS
+        if unknown_group_override_keys:
+            raise ValueError(
+                f"[{group_name}] Unknown group override keys (possible typos): {sorted(unknown_group_override_keys)}. "
+                f"Valid keys: {sorted(VALID_OVERRIDE_KEYS)}"
+            )
+        group_cbo_errors = validate_cbo_config_blocks(group_overrides, label=f"group_overrides[{group_name}]")
+        if group_cbo_errors:
+            raise ValueError(f"[{group_name}] Group CBO override validation failed: {'; '.join(group_cbo_errors)}")
     for scen_index, scenario_def in enumerate(group_scenarios):
         if not isinstance(scenario_def, dict):
             print(f'Warning [Group {group_name}]: Scenario definition {scen_index} is not a valid dictionary. Skipping.')
@@ -142,10 +192,13 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
                 f"[{scenario_name}] Unknown override keys (possible typos): {sorted(unknown_override_keys)}. "
                 f"Valid keys: {sorted(VALID_OVERRIDE_KEYS)}"
             )
+        cbo_override_errors = validate_cbo_config_blocks(overrides, label=f"scenario_overrides[{scenario_name}]")
+        if cbo_override_errors:
+            raise ValueError(f"[{scenario_name}] CBO override validation failed: {'; '.join(cbo_override_errors)}")
         scenario_params = copy.deepcopy(base_config_subset)
         scenario_params = update_dict_recursive(scenario_params, overrides)
-        if 'overrides' in group_def and isinstance(group_def['overrides'], dict):
-            group_adjusted_params = update_dict_recursive(copy.deepcopy(base_config_subset), group_def['overrides'])
+        if group_overrides:
+            group_adjusted_params = update_dict_recursive(copy.deepcopy(base_config_subset), group_overrides)
             scenario_params = update_dict_recursive(group_adjusted_params, overrides)
         scenario_params['initial_bonds_df'] = initial_bonds_df_global.copy(deep=True) if initial_bonds_df_global is not None else pd.DataFrame(columns=BOND_PORTFOLIO_COLS)
         scenario_configs_to_run_group.append({'name': scenario_name, 'params': scenario_params})

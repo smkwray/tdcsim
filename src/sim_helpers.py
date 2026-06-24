@@ -9,6 +9,7 @@ import pandas as pd
 from tdc_validation import (
     VALID_OVERRIDE_KEYS,
     validate_events,
+    validate_cbo_config_blocks,
     validate_financing_cost_options,
     validate_issuance_profile,
     validate_rate_sensitive_demand,
@@ -94,6 +95,7 @@ def validate_run_params(params, scenario_name='Scenario'):
     errors.extend(validate_sector_preferences(secondary_prefs, issuance_profile=params.get('treasury_issuance_profile', {}), label='secondary_target_preferences'))
     errors.extend(validate_rate_sensitive_demand(params.get('rate_sensitive_demand', {}), label='rate_sensitive_demand'))
     errors.extend(validate_financing_cost_options(params.get('financing_cost_options', {}), label='financing_cost_options'))
+    errors.extend(validate_cbo_config_blocks(params))
     errors.extend(validate_events(params.get('events', []), label='events'))
     if errors:
         msg = '\n - '.join(errors[:20])
@@ -107,5 +109,6 @@ __all__ = [
     '_set_nested_value',
     'update_dict_recursive',
     'apply_event_actions',
+    'validate_cbo_config_blocks',
     'validate_run_params',
 ]

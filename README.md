@@ -234,7 +234,7 @@ Scenarios are defined as overrides on the base config. Each scenario in a group 
 - `financing_cost_options.include_tips_inflation_accretion: true` adds TIPS principal accretion to `FinancingCost_Period` and exposes `TIPSInflationAccretion_Period` / `TIPSInflationAccretion_Cumulative`.
 - The engine now exposes lightweight diagnostics for the new demand system via `AuctionDemandShift_AvgAbs`, `AuctionDemandShift_MaxAbs`, `SecondaryDemandShift_AvgAbs`, and `SecondaryDemandShift_MaxAbs`.
 
-Mergeable examples live in [examples/optional_feature_scenarios.yaml](/Users/shanewray/malus/proj/tdcsim/examples/optional_feature_scenarios.yaml). A ready-to-run alternate config is available at [tdc_config_optional.yaml](/Users/shanewray/malus/proj/tdcsim/tdc_config_optional.yaml), and the chosen auction-demand coefficients are summarized in [examples/calibration_notes.md](/Users/shanewray/malus/proj/tdcsim/examples/calibration_notes.md).
+Mergeable examples live in [examples/optional_feature_scenarios.yaml](examples/optional_feature_scenarios.yaml). A ready-to-run alternate config is available at [tdc_config_optional.yaml](tdc_config_optional.yaml), and the chosen auction-demand coefficients are summarized in [examples/calibration_notes.md](examples/calibration_notes.md).
 
 ---
 

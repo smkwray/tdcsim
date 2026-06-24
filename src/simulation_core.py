@@ -102,16 +102,17 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
                 'AccruedInterest',
                 'DirtyValue',
                 'DirtyPriceRatio',
+                'InterestPaymentFrequency',
             ]:
                 initial_bonds_df_global[col] = 0.0
-            elif col in ['IssueDate', 'MaturityDate', 'LastAccrualDate']:
+            elif col in ['IssueDate', 'MaturityDate', 'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'LastAccrualDate']:
                 initial_bonds_df_global[col] = pd.NaT
             elif col == 'BondID':
                 initial_bonds_df_global[col] = pd.NA
             else:
                 initial_bonds_df_global[col] = None
 
-    for col in ['IssueDate', 'MaturityDate', 'LastAccrualDate']:
+    for col in ['IssueDate', 'MaturityDate', 'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'LastAccrualDate']:
         initial_bonds_df_global[col] = pd.to_datetime(initial_bonds_df_global[col], errors='coerce')
 
     num_cols = [
@@ -128,6 +129,7 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
         'IssuePriceRatio',
         'IssueProceeds',
         'IssueYieldAtIssue',
+        'InterestPaymentFrequency',
     ]
     for col in num_cols:
         initial_bonds_df_global[col] = pd.to_numeric(initial_bonds_df_global[col], errors='coerce').fillna(0.0)
