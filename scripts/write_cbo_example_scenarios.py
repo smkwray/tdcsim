@@ -105,10 +105,15 @@ def example_scenarios(
         "03_sector_holders.json": _scenario(
             baseline,
             scenario_id="cbo_sector_holders_v1",
-            label="Sector holder preference stress",
+            label="Dated sector holder preference stress",
             simulation=simulation,
             coupling=_baseline_coupling(),
-            overrides={"holder_preferences": {"mode": "static_shares", "rows": _holder_rows()}},
+            overrides={
+                "holder_preferences": {
+                    "mode": "dated_static_shares",
+                    "rows": _holder_rows(effective_date=_holder_effective_date(simulation)),
+                }
+            },
         ),
         "04_fiscal_fed_cash.json": _scenario(
             baseline,
@@ -170,7 +175,7 @@ def _baseline_coupling() -> dict[str, str]:
     }
 
 
-def _holder_rows() -> list[dict[str, Any]]:
+def _holder_rows(*, effective_date: str | None = None) -> list[dict[str, Any]]:
     shares = {
         "Banks": 0.10,
         "CB": 0.0,
@@ -179,7 +184,17 @@ def _holder_rows() -> list[dict[str, Any]]:
         "TrustFunds": 0.0,
         "FedInternal": 0.0,
     }
-    return [{"security_type": security_type, "shares": shares} for security_type in ("bills", "notes", "bonds", "tips", "frn")]
+    rows = [{"security_type": security_type, "shares": shares} for security_type in ("bills", "notes", "bonds", "tips", "frn")]
+    if effective_date:
+        for row in rows:
+            row["effective_date"] = effective_date
+    return rows
+
+
+def _holder_effective_date(simulation: dict[str, str] | None) -> str:
+    if simulation:
+        return simulation["start_date"]
+    return "2030-01-01"
 
 
 def _simulation(start_date: str | None, end_date: str | None) -> dict[str, str] | None:

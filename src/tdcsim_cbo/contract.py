@@ -136,7 +136,8 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
         elif name in {"primary_deficit", "debt_target"}:
             _validate_by_mode(name, override, mode, _fiscal_path_fields())
         elif name == "holder_preferences":
-            _validate_by_mode(name, override, mode, {"static_shares": (("rows",), ())})
+            _validate_by_mode(name, override, mode, {"static_shares": (("rows",), ()), "dated_static_shares": (("rows",), ())})
+            _validate_holder_preference_rows(name, override, mode)
         elif name == "net_interest_comparator":
             _validate_by_mode(name, override, mode, {"official_cbo_baseline": (("role",), ())})
 
@@ -226,6 +227,26 @@ def _validate_by_mode(
     inapplicable = sorted(str(key) for key in override if key not in allowed)
     if inapplicable:
         raise ValueError(f"scenario.overrides.{name}.{mode}: mode-inapplicable fields {inapplicable}")
+
+
+def _validate_holder_preference_rows(name: str, override: Mapping[str, Any], mode: str) -> None:
+    rows = override.get("rows")
+    if mode not in {"static_shares", "dated_static_shares"} or not isinstance(rows, list):
+        return
+    required = {"security_type", "shares"}
+    allowed = set(required)
+    if mode == "dated_static_shares":
+        required.add("effective_date")
+        allowed.add("effective_date")
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            continue
+        missing = sorted(required - set(row))
+        if missing:
+            raise ValueError(f"scenario.overrides.{name}.{mode}.rows[{index}]: missing required fields {missing}")
+        inapplicable = sorted(str(key) for key in row if key not in allowed)
+        if inapplicable:
+            raise ValueError(f"scenario.overrides.{name}.{mode}.rows[{index}]: mode-inapplicable fields {inapplicable}")
 
 
 __all__ = [

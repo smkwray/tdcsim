@@ -18,11 +18,12 @@ import pandas as pd
 from forecast_paths import compiled_forecast_input_paths
 from sim_engine import run_simulation
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
+from tdc_validation import validate_events
 
 from ._json import read_json, sha256_file, write_json
 from ._schema import validate_schema
 from .baseline import CboBaselinePackage
-from .compiler import CboCompiledScenario, CboScenarioCompiler
+from .compiler import CboCompiledScenario, CboScenarioCompiler, HOLDER_PREFERENCE_EVENTS_FILE
 from .contract import CboScenarioSpec
 from .manifest import build_run_manifest
 from .output import hash_output_tree, write_scenario_outputs
@@ -131,6 +132,7 @@ def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
     operating_cash = pd.read_csv(inputs / "tdcsim_operating_cash_path.csv")
     base_tga = float(operating_cash.iloc[0].get("operating_cash_target_bil", 0.0))
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
+    holder_events = _holder_preference_events(inputs / HOLDER_PREFERENCE_EVENTS_FILE)
     if _fed_target_active(inputs / "tdcsim_fed_holdings_path.csv"):
         _assert_no_cb_auction_preferences(holder_preferences)
     return {
@@ -163,7 +165,7 @@ def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
         "financing_cost_options": {"include_tips_inflation_accretion": True},
         "simulation_period": {"enable_preference_trading": False},
         "initial_bonds_df": initial_portfolio,
-        "events": [],
+        "events": holder_events,
         "funding_rule": {
             "mode": "cbo_public_debt_target",
             "target_enforcement": "every_period",
@@ -263,6 +265,21 @@ def _holder_preferences(path: Path) -> dict[str, dict[str, float]]:
     for holder in ("Banks", "CB", "Foreign", "Private", "FedInternal", "TrustFunds"):
         prefs.setdefault(holder, {"bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0})
     return prefs
+
+
+def _holder_preference_events(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    payload = read_json(path)
+    if not isinstance(payload, Mapping):
+        raise RunnerError("compiled holder preference events must be a JSON object")
+    events = payload.get("events", [])
+    if not isinstance(events, list):
+        raise RunnerError("compiled holder preference events must contain an events list")
+    errors = validate_events(events, label="compiled holder preference events")
+    if errors:
+        raise RunnerError("; ".join(errors))
+    return events
 
 
 def _issuance_profile(inputs: Path) -> dict[str, Any]:

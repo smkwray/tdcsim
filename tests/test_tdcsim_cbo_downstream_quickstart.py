@@ -42,6 +42,9 @@ def test_downstream_quickstart_generates_and_runs_public_examples(tmp_path: Path
         "04_fiscal_fed_cash.json",
     ]
     assert completed.stdout.count(".json") == len(scenario_paths)
+    holder_example = json.loads((scenarios_dir / "03_sector_holders.json").read_text(encoding="utf-8"))
+    assert holder_example["overrides"]["holder_preferences"]["mode"] == "dated_static_shares"
+    assert {row["effective_date"] for row in holder_example["overrides"]["holder_preferences"]["rows"]} == {"2026-09-20"}
 
     noop = scenario_paths[0]
     noop_spec = CboScenarioSpec.from_file(noop)
