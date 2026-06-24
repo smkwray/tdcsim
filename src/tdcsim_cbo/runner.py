@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -255,16 +256,36 @@ def _holder_preferences(path: Path) -> dict[str, dict[str, float]]:
         holder = str(row.get("holder_type") or row.get("HolderType") or "")
         if not holder:
             continue
+        holder_subbucket = row.get("holder_subbucket", "")
+        if pd.notna(holder_subbucket) and str(holder_subbucket).strip():
+            continue
         prefs[holder] = {
-            "bills_pct": float(row.get("bills_pct", 0.0) or 0.0),
-            "notes_pct": float(row.get("notes_pct", 0.0) or 0.0),
-            "bonds_pct": float(row.get("bonds_pct", 0.0) or 0.0),
-            "tips_pct": float(row.get("tips_pct", 0.0) or 0.0),
-            "frn_pct": float(row.get("frn_pct", 0.0) or 0.0),
+            "bills_pct": _finite_share(row.get("bills_pct"), label=f"{holder}.bills_pct"),
+            "notes_pct": _finite_share(row.get("notes_pct"), label=f"{holder}.notes_pct"),
+            "bonds_pct": _finite_share(row.get("bonds_pct"), label=f"{holder}.bonds_pct"),
+            "tips_pct": _finite_share(row.get("tips_pct"), label=f"{holder}.tips_pct"),
+            "frn_pct": _finite_share(row.get("frn_pct"), label=f"{holder}.frn_pct"),
         }
     for holder in ("Banks", "CB", "Foreign", "Private", "FedInternal", "TrustFunds"):
         prefs.setdefault(holder, {"bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0})
+    _assert_holder_preference_sums(prefs)
     return prefs
+
+
+def _finite_share(value: Any, *, label: str) -> float:
+    if pd.isna(value):
+        raise RunnerError(f"holder preference {label} is missing")
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise RunnerError(f"holder preference {label} must be a finite nonnegative number")
+    return number
+
+
+def _assert_holder_preference_sums(prefs: Mapping[str, Mapping[str, float]]) -> None:
+    for pref_key in ("bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"):
+        total = sum(float(holder_prefs.get(pref_key, 0.0)) for holder_prefs in prefs.values())
+        if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
+            raise RunnerError(f"holder preference {pref_key} must sum to 1.0 across aggregate holders, got {total}")
 
 
 def _holder_preference_events(path: Path) -> list[dict[str, Any]]:

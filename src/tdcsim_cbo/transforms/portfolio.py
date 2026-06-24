@@ -260,8 +260,25 @@ def _maturity_distributions(raw: Any) -> Mapping[str, tuple[Mapping[str, float],
                 raise PortfolioTransformError("maturity_years must be positive")
             normalized.append({"maturity_years": maturity, "share": share})
         _assert_unit_sum((item["share"] for item in normalized), label=f"{security_type} maturity distribution")
+        _assert_supported_maturities(security_type, normalized)
         out[security_type] = tuple(normalized)
     return out
+
+
+def _assert_supported_maturities(security_type: str, distribution: Iterable[Mapping[str, float]]) -> None:
+    rows = tuple(distribution)
+    if security_type == "frn":
+        if len(rows) != 1 or abs(float(rows[0]["maturity_years"]) - 2.0) > 1e-9 or abs(float(rows[0]["share"]) - 1.0) > 1e-9:
+            raise PortfolioTransformError("frn maturity distribution must be exactly 2.0 years with share 1.0")
+        return
+    for item in rows:
+        maturity = float(item["maturity_years"])
+        if security_type == "bills" and maturity > 1.0 + 1e-9:
+            raise PortfolioTransformError("bills maturity_years must be at most 1.0")
+        if security_type == "notes" and (maturity <= 1.0 + 1e-9 or maturity > 10.0 + 1e-9):
+            raise PortfolioTransformError("notes maturity_years must be greater than 1.0 and at most 10.0")
+        if security_type == "bonds" and maturity <= 10.0 + 1e-9:
+            raise PortfolioTransformError("bonds maturity_years must be greater than 10.0")
 
 
 def _marketable_debt_by_date(rows: Iterable[Mapping[str, Any]] | None) -> dict[str, float]:

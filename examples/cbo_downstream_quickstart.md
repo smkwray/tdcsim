@@ -103,8 +103,8 @@ The CBO scenario interface supports the main downstream controls:
 
 - Yield curve shocks, including key-rate shocks on generated curve tenors.
 - Inflation, FRN benchmark, and TIPS real-yield assumptions.
-- Issuance shares and maturity mix, including weighted-average-maturity changes through the maturity distributions.
-- Future-dated holder preference changes for newly issued marketable debt.
+- Issuance shares and maturity mix, including weighted-average-maturity changes through the maturity distributions. FRNs remain two-year securities in this lane.
+- Future-dated holder preference changes for newly issued marketable debt, by security category: bills, notes, bonds, TIPS, and FRNs.
 - Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
 
 ## Boundaries
@@ -118,6 +118,7 @@ Keep these boundaries:
 - Operating cash and cash residual assumptions are not issuance plugs.
 - Fed holdings are stock-target holder allocation mechanics, not Fed auction purchases.
 - Fed remittances and deferred assets are not modeled in this lane.
+- Holder-preference changes affect new issuance from their effective date forward; they do not force secondary-market rebalancing of the existing stock.
 
 Those boundaries are why downstream projects can safely change scenario
 assumptions without accidentally changing what the CBO lane claims to prove.

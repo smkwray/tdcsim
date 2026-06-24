@@ -459,6 +459,92 @@ def test_dated_holder_preferences_change_future_auction_allocation(tmp_path: Pat
     assert set(post_event_bills["HolderType"]) == {"Banks"}
 
 
+def test_dated_holder_preferences_before_run_start_apply_at_first_issuance(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    scenario = _write_scenario(
+        tmp_path / "prestart-dated-holders.json",
+        baseline,
+        overrides={
+            "issuance_mix": _bill_only_issuance_mix_override(),
+            "holder_preferences": {
+                "mode": "dated_static_shares",
+                "rows": [
+                    {
+                        "effective_date": "2026-09-18",
+                        "security_type": "bills",
+                        "shares": {
+                            "Banks": 0.0,
+                            "CB": 0.0,
+                            "Foreign": 0.0,
+                            "Private": 1.0,
+                            "TrustFunds": 0.0,
+                            "FedInternal": 0.0,
+                        },
+                    },
+                    {
+                        "effective_date": "2026-09-19",
+                        "security_type": "bills",
+                        "shares": {
+                            "Banks": 1.0,
+                            "CB": 0.0,
+                            "Foreign": 0.0,
+                            "Private": 0.0,
+                            "TrustFunds": 0.0,
+                            "FedInternal": 0.0,
+                        },
+                    },
+                ],
+            },
+        },
+    )
+
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-prestart-dated-holders")
+
+    portfolio = pd.read_csv(run.output_dir / "outputs" / "final_portfolio_compact.csv")
+    bill_holders = set(portfolio.loc[portfolio["MaturityCategory"] == "bills", "HolderType"])
+    assert "Banks" in bill_holders
+    assert "Private" not in bill_holders
+
+
+def test_runtime_params_ignore_private_route_rows_for_auction_preferences(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    materialized = baseline.materialize(tmp_path / "materialized")
+    _write_csv(
+        materialized / "forecast_inputs" / "tdcsim_holder_profile_assumptions.csv",
+        [
+            {"holder_type": "Banks", "holder_subbucket": "", "bills_pct": 0.2, "notes_pct": 0.2, "bonds_pct": 0.1, "tips_pct": 0.1, "frn_pct": 0.3},
+            {"holder_type": "CB", "holder_subbucket": "", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
+            {"holder_type": "Foreign", "holder_subbucket": "", "bills_pct": 0.3, "notes_pct": 0.3, "bonds_pct": 0.3, "tips_pct": 0.5, "frn_pct": 0.2},
+            {"holder_type": "FedInternal", "holder_subbucket": "", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
+            {"holder_type": "TrustFunds", "holder_subbucket": "", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
+            {"holder_type": "Private", "holder_subbucket": "", "bills_pct": 0.5, "notes_pct": 0.5, "bonds_pct": 0.6, "tips_pct": 0.4, "frn_pct": 0.5},
+            {"holder_type": "Private", "holder_subbucket": "domestic_nonbank_deposit_funded", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": ""},
+            {"holder_type": "Private", "holder_subbucket": "mmf_cash_fund_route", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": ""},
+        ],
+    )
+
+    params = build_runtime_params(materialized / "forecast_inputs")
+
+    assert params["sector_preferences"]["Private"]["bills_pct"] == pytest.approx(0.5)
+    assert params["sector_preferences"]["Private"]["frn_pct"] == pytest.approx(0.5)
+    for pref_key in ("bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"):
+        assert sum(holder[pref_key] for holder in params["sector_preferences"].values()) == pytest.approx(1.0)
+
+
+def test_runtime_params_reject_nonfinite_holder_preferences(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    materialized = baseline.materialize(tmp_path / "materialized")
+    _write_csv(
+        materialized / "forecast_inputs" / "tdcsim_holder_profile_assumptions.csv",
+        [
+            {"holder_type": "Private", "holder_subbucket": "", "bills_pct": "", "notes_pct": 1.0, "bonds_pct": 1.0, "tips_pct": 1.0, "frn_pct": 1.0},
+        ],
+    )
+
+    with pytest.raises(RunnerError, match="Private.bills_pct"):
+        build_runtime_params(materialized / "forecast_inputs")
+
+
 def test_runtime_params_reject_malformed_compiled_holder_events(tmp_path: Path) -> None:
     baseline, _ = _runner_baseline_and_scenarios(tmp_path)
     materialized = baseline.materialize(tmp_path / "materialized")
