@@ -223,44 +223,6 @@
           "default": false
         }
       }
-    },
-    "assertions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "metric",
-          "operator",
-          "value"
-        ],
-        "properties": {
-          "metric": {
-            "type": "string",
-            "minLength": 1
-          },
-          "operator": {
-            "enum": [
-              "lt",
-              "lte",
-              "eq",
-              "gte",
-              "gt"
-            ]
-          },
-          "value": {
-            "type": [
-              "number",
-              "string",
-              "boolean"
-            ]
-          },
-          "tolerance": {
-            "type": "number",
-            "minimum": 0
-          }
-        }
-      }
     }
   },
   "$defs": {
@@ -370,12 +332,6 @@
         },
         "file": {
           "$ref": "#/$defs/fileRef"
-        },
-        "rate_unit": {
-          "enum": [
-            "decimal",
-            "percent_point"
-          ]
         }
       }
     },
@@ -438,14 +394,8 @@
         "terminal_rule": {
           "enum": [
             "baseline_terminal_growth",
-            "carry_last_scenario_growth",
-            "explicit_terminal_rate"
+            "carry_last_scenario_growth"
           ]
-        },
-        "terminal_annual_rate_decimal": {
-          "type": "number",
-          "minimum": -0.5,
-          "maximum": 2.0
         }
       }
     },
@@ -483,12 +433,6 @@
         },
         "file": {
           "$ref": "#/$defs/fileRef"
-        },
-        "rate_unit": {
-          "enum": [
-            "decimal",
-            "percent_point"
-          ]
         }
       }
     },
@@ -762,10 +706,6 @@
         "shares"
       ],
       "properties": {
-        "effective_quarter": {
-          "type": "string",
-          "pattern": "^[0-9]{4}Q[1-4]$"
-        },
         "security_type": {
           "enum": [
             "bills",
@@ -799,13 +739,6 @@
           "items": {
             "$ref": "#/$defs/holderPreferenceRow"
           }
-        },
-        "file": {
-          "$ref": "#/$defs/fileRef"
-        },
-        "allow_single_public_holder_stress": {
-          "type": "boolean",
-          "default": false
         }
       }
     },
@@ -912,12 +845,8 @@
       "properties": {
         "mode": {
           "enum": [
-            "official_cbo_baseline",
-            "comparison_path_file"
+            "official_cbo_baseline"
           ]
-        },
-        "file": {
-          "$ref": "#/$defs/fileRef"
         },
         "role": {
           "const": "diagnostic_nonbinding"

@@ -23,6 +23,20 @@ class VerificationError(ValueError):
     """Raised when a compiled or run package fails verification."""
 
 
+REQUIRED_RESULT_COLUMNS = (
+    "CBOControlledDebtTargetError",
+    "CBOFedAuctionShare",
+    "CBOFedAuctionRolloverAddons",
+    "CBORemittanceCashEffect",
+    "NetInterestDiagnosticStatus",
+)
+REQUIRED_SUMMARY_KEYS = (
+    "CBOControlledDebtTargetError_max_abs",
+    "CBOFedAuctionShare_max_abs",
+    "CBOFedAuctionRolloverAddons_max_abs",
+)
+
+
 def verify_compiled_scenario(compiled_dir: str | Path) -> dict[str, Any]:
     root = Path(compiled_dir).expanduser().resolve()
     manifest_path = root / "tdcsim_cbo_compiled_manifest.json"
@@ -55,6 +69,8 @@ def verify_scenario_run(
         raise VerificationError("run manifest compiled_manifest must be package-relative")
     compiled_manifest_path = root / compiled_rel
     compiled = verify_compiled_scenario(compiled_manifest_path.parent)
+    if compiled["compiled_inputs_digest"] != manifest.get("compiled_inputs_digest"):
+        raise VerificationError("run manifest compiled input digest does not match actual compiled tree")
     outputs = root / "outputs"
     if not outputs.exists():
         raise VerificationError("run outputs directory is missing")
@@ -151,11 +167,50 @@ def _verify_scenario_copy(root: Path, manifest: dict[str, Any]) -> None:
     spec = CboScenarioSpec.from_file(path)
     if spec.canonical_sha256() != scenario.get("canonical_sha256"):
         raise VerificationError("run scenario canonical hash mismatch")
+    _verify_manifest_artifacts(root, scenario.get("referenced_files", []), base=root)
+    declared = _scenario_file_refs(spec.data)
+    artifacts = {
+        str(item.get("relative_path")): str(item.get("sha256"))
+        for item in scenario.get("referenced_files", [])
+        if isinstance(item, dict)
+    }
+    if declared != artifacts:
+        raise VerificationError("run scenario referenced-file artifacts do not match scenario declarations")
+
+
+def _scenario_file_refs(value: Any) -> dict[str, str]:
+    refs: dict[str, str] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if "relative_path" in node and "sha256" in node:
+                rel = str(node["relative_path"])
+                sha = str(node["sha256"])
+                if rel in refs and refs[rel] != sha:
+                    raise VerificationError(f"scenario referenced file has conflicting hashes: {rel}")
+                refs[rel] = sha
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return refs
 
 
 def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: str | Path, attestation: str | Path) -> None:
     scenario_rel = Path(str(manifest["scenario"]["relative_path"]))
     baseline = CboBaselinePackage.open(baseline_package, attestation_path=attestation)
+    baseline_manifest = manifest.get("baseline")
+    if not isinstance(baseline_manifest, dict):
+        raise VerificationError("run manifest baseline must be an object")
+    if baseline.package_sha256 != baseline_manifest.get("package_sha256"):
+        raise VerificationError("verification baseline package hash does not match run manifest")
+    if baseline.manifest_sha256 != baseline_manifest.get("manifest_sha256"):
+        raise VerificationError("verification baseline manifest hash does not match run manifest")
+    if baseline.attestation.sha256 != baseline_manifest.get("release_attestation_sha256"):
+        raise VerificationError("verification attestation hash does not match run manifest")
     spec = CboScenarioSpec.from_file(root / scenario_rel)
     with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-recompile-") as tmp:
         compiled = CboScenarioCompiler().compile(baseline, spec, Path(tmp) / "work")
@@ -166,6 +221,7 @@ def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: st
 def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str, float]:
     results_path = _result_artifact_path(root, manifest)
     results = _read_results(results_path)
+    _require_columns(results, REQUIRED_RESULT_COLUMNS, label="results")
     target_error = _max_abs(results, "CBOControlledDebtTargetError")
     fed_share = _max_abs(results, "CBOFedAuctionShare")
     fed_face = _max_abs(results, "CBOFedAuctionRolloverAddons")
@@ -176,16 +232,19 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         raise VerificationError(f"Fed auction boundary failed: share={fed_share}, face={fed_face}")
     if remittance_cash > 1e-12:
         raise VerificationError(f"remittance cash effect must remain zero: {remittance_cash}")
-    if "NetInterestDiagnosticStatus" in results.columns:
-        statuses = set(str(value) for value in results["NetInterestDiagnosticStatus"].dropna().unique())
-        if statuses - {"cbo_reported_check_only", "not_loaded_check_only"}:
-            raise VerificationError(f"unexpected net-interest diagnostic statuses: {sorted(statuses)}")
+    statuses = set(str(value) for value in results["NetInterestDiagnosticStatus"].dropna().unique())
+    if not statuses:
+        raise VerificationError("NetInterestDiagnosticStatus must contain evidence")
+    if statuses - {"cbo_reported_check_only", "not_loaded_check_only"}:
+        raise VerificationError(f"unexpected net-interest diagnostic statuses: {sorted(statuses)}")
     summary_path = root / "outputs" / "summary.json"
-    if summary_path.exists():
-        summary = read_json(summary_path)
-        _compare_summary(summary, "CBOControlledDebtTargetError_max_abs", target_error)
-        _compare_summary(summary, "CBOFedAuctionShare_max_abs", fed_share)
-        _compare_summary(summary, "CBOFedAuctionRolloverAddons_max_abs", fed_face)
+    if not summary_path.exists():
+        raise VerificationError("summary.json is required")
+    summary = read_json(summary_path)
+    _require_summary_keys(summary, REQUIRED_SUMMARY_KEYS)
+    _compare_summary(summary, "CBOControlledDebtTargetError_max_abs", target_error)
+    _compare_summary(summary, "CBOFedAuctionShare_max_abs", fed_share)
+    _compare_summary(summary, "CBOFedAuctionRolloverAddons_max_abs", fed_face)
     return {
         "max_abs_target_error": target_error,
         "max_abs_fed_auction_share": fed_share,
@@ -210,13 +269,28 @@ def _read_results(path: Path) -> pd.DataFrame:
 
 def _max_abs(frame: pd.DataFrame, column: str) -> float:
     if column not in frame.columns:
-        return 0.0
-    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().max())
+        raise VerificationError(f"required result column is missing: {column}")
+    values = pd.to_numeric(frame[column], errors="coerce")
+    if values.notna().sum() == 0:
+        raise VerificationError(f"required result column has no numeric evidence: {column}")
+    return float(values.fillna(0.0).abs().max())
+
+
+def _require_columns(frame: pd.DataFrame, columns: tuple[str, ...], *, label: str) -> None:
+    missing = [column for column in columns if column not in frame.columns]
+    if missing:
+        raise VerificationError(f"{label} missing required columns: {missing}")
+
+
+def _require_summary_keys(summary: Any, keys: tuple[str, ...]) -> None:
+    if not isinstance(summary, dict):
+        raise VerificationError("summary.json must be an object")
+    missing = [key for key in keys if key not in summary]
+    if missing:
+        raise VerificationError(f"summary missing required keys: {missing}")
 
 
 def _compare_summary(summary: Any, key: str, expected: float) -> None:
-    if not isinstance(summary, dict) or key not in summary:
-        return
     if abs(float(summary[key]) - expected) > 1e-9:
         raise VerificationError(f"summary value mismatch for {key}")
 
