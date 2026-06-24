@@ -10,6 +10,21 @@ from .compiler import CboCompiledScenario
 from .contract import CboScenarioSpec
 
 
+RUN_CLAIM_BOUNDARY = {
+    "cash_residual_role": "reconciliation_only_not_issuance_sizing",
+    "net_interest_role": "diagnostic_nonbinding",
+    "fed_holdings_role": "holder_stock_target_not_fed_auction_purchase",
+    "fed_remittance_deferred_asset": "unsupported_in_cbo_scenario_lane",
+    "complete_budgetary_net_interest_mapping": "unsupported_partial_diagnostic_only",
+}
+
+RUN_UNSUPPORTED_COMPONENTS = [
+    "fed_remittances",
+    "fed_deferred_asset",
+    "complete_budgetary_net_interest_mapping",
+]
+
+
 def build_run_manifest(
     *,
     scenario_id: str,
@@ -53,13 +68,7 @@ def build_run_manifest(
             "referenced_files": scenario_referenced_files,
         },
         "code_environment": dict(code_environment),
-        "claim_boundary": {
-            "cash_residual_role": "reconciliation_only_not_issuance_sizing",
-            "net_interest_role": "diagnostic_nonbinding",
-            "fed_holdings_role": "holder_stock_target_not_fed_auction_purchase",
-            "fed_remittance_deferred_asset": "unsupported_in_cbo_scenario_lane",
-            "complete_budgetary_net_interest_mapping": "unsupported_partial_diagnostic_only",
-        },
+        "claim_boundary": dict(RUN_CLAIM_BOUNDARY),
         "coupling_decisions": dict(scenario.data.get("coupling", {})),
         "compiled_manifest": compiled_manifest_relpath,
         "compiled_inputs_digest": compiled.compiled_inputs_digest,
@@ -88,11 +97,7 @@ def build_run_manifest(
         "output_hashes": output_hashes,
         "boundary_checks": dict(boundary_checks),
         "validation": validation,
-        "unsupported_components": [
-            "fed_remittances",
-            "fed_deferred_asset",
-            "complete_budgetary_net_interest_mapping",
-        ],
+        "unsupported_components": list(RUN_UNSUPPORTED_COMPONENTS),
     }
 
 
@@ -187,4 +192,4 @@ def _media_type(path: str) -> str:
     return "application/octet-stream"
 
 
-__all__ = ["build_run_manifest"]
+__all__ = ["RUN_CLAIM_BOUNDARY", "RUN_UNSUPPORTED_COMPONENTS", "build_run_manifest"]

@@ -134,8 +134,9 @@
         "sim_engine_source_sha256",
         "package_name",
         "package_version",
-        "distribution_record_digest",
+        "distribution_file_digest",
         "wheel_sha256",
+        "wheel_artifact",
         "runtime_identity_source"
       ],
       "properties": {
@@ -173,12 +174,47 @@
         "package_version": {
           "type": "string"
         },
-        "distribution_record_digest": {
+        "distribution_file_digest": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
         },
         "wheel_sha256": {
           "type": "string"
+        },
+        "wheel_artifact": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "logical_name",
+            "relative_path",
+            "sha256",
+            "bytes"
+          ],
+          "properties": {
+            "logical_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "relative_path": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "media_type": {
+              "type": "string"
+            }
+          }
         },
         "runtime_identity_source": {
           "type": "string"
@@ -187,11 +223,30 @@
     },
     "claim_boundary": {
       "type": "object",
-      "additionalProperties": {
-        "type": [
-          "string",
-          "array"
-        ]
+      "additionalProperties": false,
+      "required": [
+        "cash_residual_role",
+        "net_interest_role",
+        "fed_holdings_role",
+        "fed_remittance_deferred_asset",
+        "complete_budgetary_net_interest_mapping"
+      ],
+      "properties": {
+        "cash_residual_role": {
+          "const": "reconciliation_only_not_issuance_sizing"
+        },
+        "net_interest_role": {
+          "const": "diagnostic_nonbinding"
+        },
+        "fed_holdings_role": {
+          "const": "holder_stock_target_not_fed_auction_purchase"
+        },
+        "fed_remittance_deferred_asset": {
+          "const": "unsupported_in_cbo_scenario_lane"
+        },
+        "complete_budgetary_net_interest_mapping": {
+          "const": "unsupported_partial_diagnostic_only"
+        }
       }
     },
     "coupling_decisions": {
@@ -286,8 +341,14 @@
     "unsupported_components": {
       "type": "array",
       "items": {
-        "type": "string"
+        "enum": [
+          "fed_remittances",
+          "fed_deferred_asset",
+          "complete_budgetary_net_interest_mapping"
+        ]
       },
+      "minItems": 3,
+      "maxItems": 3,
       "uniqueItems": true
     }
   },

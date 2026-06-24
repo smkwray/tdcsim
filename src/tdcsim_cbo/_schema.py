@@ -121,6 +121,16 @@ def _validate_array(value: list[Any], schema: Mapping[str, Any], *, root: Mappin
     min_items = schema.get("minItems")
     if min_items is not None and len(value) < int(min_items):
         raise SchemaValidationError(f"{path}: expected at least {min_items} items")
+    max_items = schema.get("maxItems")
+    if max_items is not None and len(value) > int(max_items):
+        raise SchemaValidationError(f"{path}: expected at most {max_items} items")
+    if schema.get("uniqueItems") is True:
+        seen = set()
+        for item in value:
+            marker = repr(item)
+            if marker in seen:
+                raise SchemaValidationError(f"{path}: expected unique items")
+            seen.add(marker)
     items_schema = schema.get("items")
     if isinstance(items_schema, Mapping):
         for index, item in enumerate(value):
