@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -132,39 +137,48 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline", type=Path, default=Path("output/cbo_forecast_release_bound_package.zip"))
     parser.add_argument("--attestation", type=Path, default=Path("output/cbo_forecast_release_bound_attestation.json"))
     parser.add_argument("--compile-only", action="store_true", help="skip run/verify execution after validating and compiling scenarios")
+    parser.add_argument("--evidence-dir", type=Path, help="persist installed-wheel qualification evidence instead of using a temporary directory")
     args = parser.parse_args(argv)
     wheel = args.wheel.resolve()
     if not wheel.exists():
         raise FileNotFoundError(wheel)
+    wheel_sha256 = _sha256(wheel)
     baseline = args.baseline.resolve()
     attestation = args.attestation.resolve()
-    with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-qualify-") as tmp:
-        tmp_path = Path(tmp)
+    with _qualification_root(args.evidence_dir) as tmp_path:
         env = tmp_path / "venv"
         subprocess.run([sys.executable, "-m", "venv", str(env)], check=True)
         pip = env / "bin" / "pip"
         python = env / "bin" / "python"
         cli = env / "bin" / "tdcsim-cbo"
-        subprocess.run([str(pip), "install", "-q", str(wheel)], check=True)
-        subprocess.run(
+        run_env = os.environ.copy()
+        run_env["TDCSIM_CBO_WHEEL_SHA256"] = wheel_sha256
+        commands = []
+        _run(commands, [str(pip), "install", "-q", str(wheel)], env=run_env)
+        _run(
+            commands,
             [
                 str(python),
                 "-c",
                 "import ratewall_paths; from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, CboScenarioCompiler, run_cbo_scenario",
             ],
-            check=True,
+            env=run_env,
         )
-        subprocess.run([str(cli), "--help"], check=True, stdout=subprocess.DEVNULL)
+        _run(commands, [str(cli), "--help"], env=run_env, stdout=subprocess.DEVNULL)
+        freeze = subprocess.run([str(pip), "freeze"], check=True, capture_output=True, text=True, env=run_env).stdout
+        (tmp_path / "pip-freeze.txt").write_text(freeze, encoding="utf-8")
+        shutil.copyfile(wheel, tmp_path / wheel.name)
         if not baseline.exists():
             raise FileNotFoundError(baseline)
         if not attestation.exists():
             raise FileNotFoundError(attestation)
         scenarios = tmp_path / "scenarios"
-        subprocess.run([str(python), "-c", SCENARIO_SNIPPET, str(baseline), str(attestation), str(scenarios)], check=True)
+        _run(commands, [str(python), "-c", SCENARIO_SNIPPET, str(baseline), str(attestation), str(scenarios)], env=run_env)
         for name in ("noop", "compound"):
             scenario = scenarios / f"{name}.json"
             compiled_root = tmp_path / f"compiled-{name}"
-            subprocess.run(
+            _run(
+                commands,
                 [
                     str(cli),
                     "validate",
@@ -175,10 +189,11 @@ def main(argv: list[str] | None = None) -> int:
                     "--scenario",
                     str(scenario),
                 ],
-                check=True,
+                env=run_env,
                 stdout=subprocess.DEVNULL,
             )
-            subprocess.run(
+            _run(
+                commands,
                 [
                     str(cli),
                     "compile",
@@ -191,17 +206,19 @@ def main(argv: list[str] | None = None) -> int:
                     "--output-dir",
                     str(compiled_root),
                 ],
-                check=True,
+                env=run_env,
                 stdout=subprocess.DEVNULL,
             )
-            subprocess.run(
+            _run(
+                commands,
                 [str(cli), "verify", "--compiled-dir", str(compiled_root / "compiled")],
-                check=True,
+                env=run_env,
                 stdout=subprocess.DEVNULL,
             )
             if not args.compile_only:
                 run_dir = tmp_path / f"run-{name}"
-                subprocess.run(
+                _run(
+                    commands,
                     [
                         str(cli),
                         "run",
@@ -214,10 +231,11 @@ def main(argv: list[str] | None = None) -> int:
                         "--output-dir",
                         str(run_dir),
                     ],
-                    check=True,
+                    env=run_env,
                     stdout=subprocess.DEVNULL,
                 )
-                subprocess.run(
+                _run(
+                    commands,
                     [
                         str(cli),
                         "verify",
@@ -228,11 +246,47 @@ def main(argv: list[str] | None = None) -> int:
                         "--attestation",
                         str(attestation),
                     ],
-                    check=True,
+                    env=run_env,
                     stdout=subprocess.DEVNULL,
                 )
+        manifest = {
+            "schema_version": "tdcsim_cbo_dependency_qualification_v1",
+            "wheel": {"path": wheel.name, "sha256": wheel_sha256, "bytes": wheel.stat().st_size},
+            "baseline_package_sha256": _sha256(baseline),
+            "attestation_sha256": _sha256(attestation),
+            "compile_only": bool(args.compile_only),
+            "commands": commands,
+        }
+        (tmp_path / "qualification_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print("pass")
     return 0
+
+
+@contextmanager
+def _qualification_root(evidence_dir: Path | None):
+    if evidence_dir is None:
+        with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-qualify-") as tmp:
+            yield Path(tmp)
+        return
+    root = evidence_dir.expanduser().resolve()
+    if root.exists() and any(root.iterdir()):
+        raise FileExistsError(f"evidence directory must be empty: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    yield root
+
+
+def _run(commands: list[dict], args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    completed = subprocess.run(args, check=True, **kwargs)
+    commands.append({"command": args, "exit_code": completed.returncode})
+    return completed
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ import pytest
 
 from forecast_paths import compiled_forecast_input_paths
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
-from tdcsim_cbo._json import sha256_file, write_json
+from tdcsim_cbo._json import read_json, sha256_file, write_json
+from tdcsim_cbo.compiler import digest_input_tree, input_tree_hashes
 from tdcsim_cbo.output import write_scenario_outputs
 from tdcsim_cbo.runner import build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
@@ -65,6 +66,25 @@ def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(tmp_path: Path) -> 
     assert cash_results["CBOCashReconciliationResidual"].sum() != pytest.approx(
         noop_results["CBOCashReconciliationResidual"].sum()
     )
+
+
+def test_file_backed_run_package_is_self_contained_for_baseline_recompile(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+
+    cash = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run-cash")
+    source_scenario = scenarios["cash"]
+    source_override = tmp_path / "cash_residual_override.csv"
+    source_scenario.unlink()
+    source_override.unlink()
+
+    scenario_block = cash.run_manifest["scenario"]
+    assert scenario_block["referenced_files"][0]["relative_path"] == "cash_residual_override.csv"
+    assert (cash.output_dir / "cash_residual_override.csv").exists()
+    assert verify_scenario_run(
+        cash.output_dir,
+        baseline_package=baseline.package_path,
+        attestation=baseline.attestation.path,
+    )["status"] == "pass"
 
 
 def test_run_cbo_scenario_net_interest_is_diagnostic_only(tmp_path: Path) -> None:
@@ -137,6 +157,52 @@ def test_verifier_rejects_coordinated_manifest_and_output_tamper(tmp_path: Path)
 
     with pytest.raises(VerificationError, match="CBO target error"):
         verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_missing_required_output_column_even_with_fresh_hashes(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    results = pd.read_csv(run.results_path).drop(columns=["CBOFedAuctionShare"])
+    results.to_csv(run.results_path, index=False)
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    _refresh_result_hashes(run.output_dir, manifest)
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="missing required columns"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_compiled_digest_split_even_with_updated_compiled_manifest(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    compiled_inputs = run.output_dir / "compile" / "compiled" / "forecast_inputs"
+    target = compiled_inputs / "tdcsim_fiscal_incidence_policy.csv"
+    rows = pd.read_csv(target)
+    rows.loc[0, "du_share"] = 0.5
+    rows.loc[0, "ru_share"] = 0.5
+    rows.to_csv(target, index=False)
+    compiled_manifest_path = run.output_dir / "compile" / "compiled" / "tdcsim_cbo_compiled_manifest.json"
+    compiled_manifest = read_json(compiled_manifest_path)
+    compiled_manifest["compiled_inputs_digest"] = digest_input_tree(compiled_inputs)
+    compiled_manifest["input_hashes"] = input_tree_hashes(compiled_inputs)
+    write_json(compiled_manifest_path, compiled_manifest)
+    run_manifest = read_json(run.manifest_path)
+    _refresh_compiled_input_hashes(run.output_dir, run_manifest)
+    write_json(run.manifest_path, run_manifest)
+
+    with pytest.raises(VerificationError, match="compiled input digest"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_wrong_baseline_identity(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["baseline"]["package_sha256"] = "0" * 64
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="baseline package hash"):
+        verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
 
 
 def test_runtime_params_use_compiled_fiscal_incidence_policy(tmp_path: Path) -> None:
@@ -467,6 +533,18 @@ def _refresh_result_hashes(run_dir: Path, manifest: dict) -> None:
                 "bytes": result_path.stat().st_size,
                 "sha256": sha256_file(result_path),
             }
+
+
+def _refresh_compiled_input_hashes(run_dir: Path, manifest: dict) -> None:
+    compiled_inputs = run_dir / "compile" / "compiled" / "forecast_inputs"
+    by_path = {
+        f"compile/compiled/forecast_inputs/{item['path']}": item
+        for item in input_tree_hashes(compiled_inputs)
+    }
+    for item in manifest["compiled_inputs"]:
+        updated = by_path[item["relative_path"]]
+        item["sha256"] = updated["sha256"]
+        item["bytes"] = updated["bytes"]
 
 
 def _holder_preference_rows(*, cb_share: float = 0.0) -> list[dict]:

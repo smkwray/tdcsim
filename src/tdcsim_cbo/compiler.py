@@ -484,7 +484,7 @@ def _fed_stock_target_present(path: Path) -> bool:
         rows, _ = _read_csv(path)
     except CompilerError:
         return False
-    return any(float(row.get("cbo_fed_holdings_target_bil", 0.0) or 0.0) > 1e-12 for row in rows)
+    return any("cbo_fed_holdings_target_bil" in row for row in rows)
 
 
 def _write_issuance_mix(path: Path, issuance_mix: Any) -> None:
@@ -560,11 +560,19 @@ def _compile_holder_preferences(
         if holder in share_by_holder:
             new.update(share_by_holder[holder])
             seen_holders.add(holder)
+        new["source_role"] = "scenario_assumption"
+        new["runtime_role"] = "memo_only"
+        new["claim_boundary"] = "holder preference profile not exact holder ownership"
+        new["scenario_transform"] = "static_shares"
         output.append(new)
     for holder in sorted(set(share_by_holder) - seen_holders):
         new = {field: "" for field in header}
         new["holder_type"] = holder
         new.update(share_by_holder[holder])
+        new["source_role"] = "scenario_assumption"
+        new["runtime_role"] = "memo_only"
+        new["claim_boundary"] = "holder preference profile not exact holder ownership"
+        new["scenario_transform"] = "static_shares"
         output.append(new)
     return output
 

@@ -20,6 +20,7 @@ def build_run_manifest(
     scenario: CboScenarioSpec,
     scenario_relpath: str,
     scenario_file_sha256: str,
+    scenario_referenced_files: list[dict[str, Any]],
     start_date: str,
     end_date: str,
     outputs: Mapping[str, Any],
@@ -49,6 +50,7 @@ def build_run_manifest(
             "source_file_sha256": scenario_file_sha256,
             "relative_path": scenario_relpath,
             "referenced_file_hashes": _referenced_file_hashes(scenario),
+            "referenced_files": scenario_referenced_files,
         },
         "code_environment": dict(code_environment),
         "claim_boundary": {

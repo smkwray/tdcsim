@@ -437,8 +437,7 @@ def _mark(
 ) -> Row:
     row["source_role"] = SCENARIO_SOURCE_ROLE
     row["scenario_transform"] = mode
-    if runtime_role is not None:
-        row["runtime_role"] = runtime_role
+    row["runtime_role"] = runtime_role or "hard_target"
     if claim_boundary is not None:
         row["claim_boundary"] = claim_boundary
     return row

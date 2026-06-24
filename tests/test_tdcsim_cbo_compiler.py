@@ -153,10 +153,25 @@ def test_primary_deficit_fy_anchors_write_period_flows_not_annual_value_per_row(
 
 def test_compiler_rejects_frn_file_mode_with_linked_coupling(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
+    replacement = tmp_path / "frn.csv"
+    _write_csv(
+        replacement,
+        [
+            {"period_start": "2027-01-01", "period_end": "2027-01-02", "benchmark_rate_decimal": 0.05},
+            {"period_start": "2027-01-02", "period_end": "2027-01-03", "benchmark_rate_decimal": 0.06},
+        ],
+    )
     scenario = _scenario_mapping(baseline)
     scenario["coupling"]["frn_benchmark"] = "derive_from_scenario_nominal_curve"
-    scenario["overrides"] = {"frn_benchmark": {"mode": "absolute_path_file"}}
-    spec = CboScenarioSpec.from_mapping(scenario)
+    scenario["overrides"] = {
+        "frn_benchmark": {
+            "mode": "absolute_path_file",
+            "file": {"relative_path": "frn.csv", "sha256": sha256_file(replacement), "media_type": "text/csv"},
+        }
+    }
+    scenario_path = tmp_path / "scenario.json"
+    write_json(scenario_path, scenario)
+    spec = CboScenarioSpec.from_file(scenario_path)
 
     with pytest.raises(CompilerError, match="independent FRN"):
         CboScenarioCompiler().compile(baseline, spec, tmp_path / "work")
@@ -164,9 +179,24 @@ def test_compiler_rejects_frn_file_mode_with_linked_coupling(tmp_path: Path) -> 
 
 def test_compiler_rejects_tips_file_mode_with_recompute_coupling(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
+    replacement = tmp_path / "tips.csv"
+    _write_csv(
+        replacement,
+        [
+            {"curve_date": "2027-01-01", "tenor_years": 0.25, "real_yield_decimal": 0.01},
+            {"curve_date": "2027-01-02", "tenor_years": 0.25, "real_yield_decimal": 0.02},
+        ],
+    )
     scenario = _scenario_mapping(baseline)
-    scenario["overrides"] = {"tips_real_yield": {"mode": "absolute_path_file"}}
-    spec = CboScenarioSpec.from_mapping(scenario)
+    scenario["overrides"] = {
+        "tips_real_yield": {
+            "mode": "absolute_path_file",
+            "file": {"relative_path": "tips.csv", "sha256": sha256_file(replacement), "media_type": "text/csv"},
+        }
+    }
+    scenario_path = tmp_path / "scenario.json"
+    write_json(scenario_path, scenario)
+    spec = CboScenarioSpec.from_file(scenario_path)
 
     with pytest.raises(CompilerError, match="independent TIPS"):
         CboScenarioCompiler().compile(baseline, spec, tmp_path / "work")
@@ -248,6 +278,74 @@ def test_file_backed_override_duplicate_keys_rejected_even_when_row_count_matche
         CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_file(scenario_path), tmp_path / "work")
 
 
+def test_file_backed_fiscal_replacements_overwrite_claim_labels(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    replacement = tmp_path / "primary.csv"
+    _write_csv(
+        replacement,
+        [
+            {
+                "source_fiscal_year": 2027,
+                "primary_deficit_bil": 12.0,
+                "source_role": "official_cbo_source",
+                "runtime_role": "cash_plug",
+                "claim_boundary": "bad",
+            },
+            {
+                "source_fiscal_year": 2028,
+                "primary_deficit_bil": 24.0,
+                "source_role": "official_cbo_source",
+                "runtime_role": "cash_plug",
+                "claim_boundary": "bad",
+            },
+        ],
+    )
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "primary_deficit": {
+            "mode": "absolute_path_file",
+            "file": {"relative_path": "primary.csv", "sha256": sha256_file(replacement), "media_type": "text/csv"},
+        }
+    }
+    scenario_path = tmp_path / "scenario.json"
+    write_json(scenario_path, scenario)
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_file(scenario_path), tmp_path / "work")
+
+    rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_primary_deficit_path.csv")
+    assert {row["source_role"] for row in rows} == {"scenario_assumption"}
+    assert {row["runtime_role"] for row in rows} == {"hard_target"}
+    assert {row["claim_boundary"] for row in rows} == {"primary_deficit_scenario_transform_no_plug"}
+
+
+def test_file_backed_operating_cash_replacements_overwrite_runtime_role(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    replacement = tmp_path / "cash.csv"
+    _write_csv(
+        replacement,
+        [
+            {"period_end": "2027-01-01", "operating_cash_target_bil": 80.0, "source_role": "source", "runtime_role": "plug", "claim_boundary": "bad"},
+            {"period_end": "2027-01-02", "operating_cash_target_bil": 90.0, "source_role": "source", "runtime_role": "plug", "claim_boundary": "bad"},
+        ],
+    )
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "operating_cash": {
+            "mode": "aggregate_path_file",
+            "file": {"relative_path": "cash.csv", "sha256": sha256_file(replacement), "media_type": "text/csv"},
+        }
+    }
+    scenario_path = tmp_path / "scenario.json"
+    write_json(scenario_path, scenario)
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_file(scenario_path), tmp_path / "work")
+
+    rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_operating_cash_path.csv")
+    assert {row["source_role"] for row in rows} == {"scenario_assumption"}
+    assert {row["runtime_role"] for row in rows} == {"hard_target"}
+    assert {row["claim_boundary"] for row in rows} == {"operating_cash_proxy_not_debt_target_or_issuance_supply"}
+
+
 def test_holder_preferences_reject_cb_auction_share_when_baseline_fed_target_active(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
     scenario = _scenario_mapping(baseline)
@@ -255,6 +353,20 @@ def test_holder_preferences_reject_cb_auction_share_when_baseline_fed_target_act
 
     with pytest.raises(ValueError, match="CB auction share"):
         CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+
+def test_holder_preferences_overwrite_baseline_claim_labels(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {"holder_preferences": {"mode": "static_shares", "rows": _holder_preference_rows(cb_share=0.0)}}
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv")
+    assert {row["source_role"] for row in rows} == {"scenario_assumption"}
+    assert {row["runtime_role"] for row in rows} == {"memo_only"}
+    assert {row["claim_boundary"] for row in rows} == {"holder preference profile not exact holder ownership"}
+    assert {row["scenario_transform"] for row in rows} == {"static_shares"}
 
 
 def test_issuance_mix_override_materializes_hashed_compiled_artifact(tmp_path: Path) -> None:

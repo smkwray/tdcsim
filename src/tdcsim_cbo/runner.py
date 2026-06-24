@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
+import shutil
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,7 @@ def run_cbo_scenario(
     compiled = CboScenarioCompiler().compile(baseline, spec, out / "compile")
     scenario_path = out / "scenario.json"
     write_json(scenario_path, spec.data)
+    scenario_referenced_files = _copy_scenario_referenced_files(spec, out)
     inputs = compiled.forecast_inputs_dir
     start, end = _simulation_dates(spec, inputs)
     params = build_runtime_params(inputs)
@@ -92,12 +96,13 @@ def run_cbo_scenario(
         scenario=spec,
         scenario_relpath=scenario_path.relative_to(out).as_posix(),
         scenario_file_sha256=sha256_file(scenario_path),
+        scenario_referenced_files=scenario_referenced_files,
         start_date=start,
         end_date=end,
         outputs=outputs,
         output_hashes=hash_output_tree(out / "outputs"),
         boundary_checks=boundaries,
-        code_environment=_code_environment(),
+        code_environment=_code_environment(baseline),
         generated_at_utc=datetime.now(timezone.utc).isoformat(),
     )
     manifest_path = out / "tdcsim_cbo_run_manifest.json"
@@ -348,8 +353,7 @@ def _fed_target_active(path: Path) -> bool:
     frame = pd.read_csv(path)
     if frame.empty or "cbo_fed_holdings_target_bil" not in frame.columns:
         return False
-    values = pd.to_numeric(frame["cbo_fed_holdings_target_bil"], errors="coerce").fillna(0.0)
-    return bool((values.abs() > 1e-12).any())
+    return True
 
 
 def _assert_no_cb_auction_preferences(prefs: Mapping[str, Mapping[str, float]]) -> None:
@@ -379,23 +383,115 @@ def _sum_abs(frame: pd.DataFrame, column: str) -> float:
     return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().sum())
 
 
-def _code_environment() -> dict[str, Any]:
+def _copy_scenario_referenced_files(spec: CboScenarioSpec, run_root: Path) -> list[dict[str, Any]]:
+    refs = _scenario_file_refs(spec.data)
+    if not refs:
+        return []
+    if spec.path is None:
+        raise RunnerError("file-backed scenario runs require a scenario file path")
+    source_root = spec.path.parent.resolve()
+    records: list[dict[str, Any]] = []
+    seen: dict[str, str] = {}
+    for rel, expected_sha in sorted(refs.items()):
+        if _is_reserved_run_path(rel):
+            raise RunnerError(f"scenario referenced file uses a reserved run-package path: {rel}")
+        source = (source_root / rel).resolve()
+        if source_root not in source.parents and source != source_root:
+            raise RunnerError(f"scenario referenced file escapes scenario directory: {rel}")
+        if not source.exists():
+            raise RunnerError(f"scenario referenced file is missing: {rel}")
+        actual_sha = sha256_file(source)
+        if actual_sha != expected_sha:
+            raise RunnerError(f"scenario referenced file SHA-256 mismatch: {rel}")
+        prior = seen.get(rel)
+        if prior is not None and prior != expected_sha:
+            raise RunnerError(f"scenario referenced file has conflicting hashes: {rel}")
+        seen[rel] = expected_sha
+        dest = run_root / rel
+        if dest == run_root / "scenario.json":
+            raise RunnerError("scenario referenced file conflicts with packaged scenario.json")
+        if dest.resolve() == spec.path:
+            raise RunnerError(f"scenario referenced file conflicts with scenario file: {rel}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        records.append(_artifact_record(run_root, dest, logical_name=rel))
+    return records
+
+
+def _is_reserved_run_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    return rel in {"scenario.json", "tdcsim_cbo_run_manifest.json"} or (bool(parts) and parts[0] in {"compile", "outputs"})
+
+
+def _scenario_file_refs(value: Any) -> dict[str, str]:
+    refs: dict[str, str] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            if "relative_path" in node and "sha256" in node:
+                rel = str(node["relative_path"])
+                sha = str(node["sha256"])
+                if rel in refs and refs[rel] != sha:
+                    raise RunnerError(f"scenario file reference has conflicting hashes: {rel}")
+                refs[rel] = sha
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return refs
+
+
+def _artifact_record(root: Path, path: Path, *, logical_name: str | None = None) -> dict[str, Any]:
+    rel = path.relative_to(root).as_posix()
     return {
-        "code_commit_sha": _git_value(["rev-parse", "HEAD"], default="0" * 40),
-        "dirty_state": bool(_git_value(["status", "--short"], default="")),
-        "requirements_lock_sha256": _requirements_lock_sha(),
+        "logical_name": logical_name or rel,
+        "relative_path": rel,
+        "sha256": sha256_file(path),
+        "bytes": path.stat().st_size,
+        "media_type": _media_type(rel),
+    }
+
+
+def _media_type(path: str) -> str:
+    if path.endswith(".json"):
+        return "application/json"
+    if path.endswith(".csv") or path.endswith(".csv.gz"):
+        return "text/csv"
+    if path.endswith(".sqlite"):
+        return "application/vnd.sqlite3"
+    return "application/octet-stream"
+
+
+def _code_environment(baseline: CboBaselinePackage) -> dict[str, Any]:
+    dist = _distribution_identity()
+    return {
+        "code_commit_sha": _module_git_value(["rev-parse", "HEAD"], default="0" * 40),
+        "dirty_state": bool(_module_git_value(["status", "--short"], default="")),
+        "requirements_lock_sha256": str(baseline.attestation.data.get("requirements_lock_sha256") or "0" * 64),
         "python_version": platform.python_version(),
         "runner_version": "tdcsim_cbo_runner_v1",
         "verifier_version": "tdcsim_cbo_verifier_v1",
         "runner_source_sha256": sha256_file(Path(__file__)),
+        "sim_engine_source_sha256": sha256_file(Path(run_simulation.__code__.co_filename)),
+        "package_name": dist["name"],
+        "package_version": dist["version"],
+        "distribution_record_digest": dist["record_digest"],
+        "wheel_sha256": os.environ.get("TDCSIM_CBO_WHEEL_SHA256", ""),
+        "runtime_identity_source": dist["identity_source"],
     }
 
 
-def _git_value(args: list[str], *, default: str) -> str:
+def _module_git_value(args: list[str], *, default: str) -> str:
+    git_root = _module_git_root()
+    if git_root is None:
+        return default
     try:
         return subprocess.run(
             ["git", *args],
-            cwd=Path.cwd(),
+            cwd=git_root,
             check=True,
             capture_output=True,
             text=True,
@@ -404,11 +500,54 @@ def _git_value(args: list[str], *, default: str) -> str:
         return default
 
 
-def _requirements_lock_sha() -> str:
-    for path in (Path("requirements.lock.txt"), Path("output/cbo_forecast_release_bound/requirements.lock.txt")):
-        if path.exists():
-            return sha256_file(path)
-    return "0" * 64
+def _module_git_root() -> Path | None:
+    try:
+        root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return None
+    return Path(root) if root else None
+
+
+def _distribution_identity() -> dict[str, str]:
+    try:
+        dist = metadata.distribution("tdcsim")
+        files_list = sorted(str(item) for item in (dist.files or []))
+        record_path = _distribution_record_path(dist)
+        return {
+            "name": dist.metadata.get("Name", "tdcsim"),
+            "version": dist.version,
+            "record_digest": sha256_file(record_path) if record_path is not None else _record_digest(files_list),
+            "identity_source": "installed_distribution_record" if record_path is not None else "installed_distribution_metadata",
+        }
+    except metadata.PackageNotFoundError:
+        return {
+            "name": "tdcsim",
+            "version": "source-tree",
+            "record_digest": "0" * 64,
+            "identity_source": "source_tree_no_installed_distribution",
+        }
+
+
+def _distribution_record_path(dist: metadata.Distribution) -> Path | None:
+    for item in dist.files or []:
+        if str(item).endswith(".dist-info/RECORD"):
+            path = Path(dist.locate_file(item))
+            if path.exists():
+                return path
+    return None
+
+
+def _record_digest(records: list[str]) -> str:
+    import hashlib
+
+    payload = "\n".join(records).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 __all__ = ["CboScenarioRun", "RunnerError", "build_runtime_params", "run_cbo_scenario", "validate_run_boundaries"]

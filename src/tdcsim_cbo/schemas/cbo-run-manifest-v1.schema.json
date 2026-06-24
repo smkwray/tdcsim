@@ -87,7 +87,8 @@
         "canonical_sha256",
         "source_file_sha256",
         "relative_path",
-        "referenced_file_hashes"
+        "referenced_file_hashes",
+        "referenced_files"
       ],
       "properties": {
         "scenario_id": {
@@ -110,6 +111,12 @@
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
           }
+        },
+        "referenced_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
         }
       }
     },
@@ -123,7 +130,13 @@
         "python_version",
         "runner_version",
         "verifier_version",
-        "runner_source_sha256"
+        "runner_source_sha256",
+        "sim_engine_source_sha256",
+        "package_name",
+        "package_version",
+        "distribution_record_digest",
+        "wheel_sha256",
+        "runtime_identity_source"
       ],
       "properties": {
         "code_commit_sha": {
@@ -149,6 +162,26 @@
         "runner_source_sha256": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "sim_engine_source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "package_name": {
+          "type": "string"
+        },
+        "package_version": {
+          "type": "string"
+        },
+        "distribution_record_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "wheel_sha256": {
+          "type": "string"
+        },
+        "runtime_identity_source": {
+          "type": "string"
         }
       }
     },

@@ -37,6 +37,60 @@ def test_scenario_spec_rejects_unknown_fields(tmp_path: Path) -> None:
         CboScenarioSpec.from_mapping(scenario)
 
 
+def test_scenario_spec_rejects_advertised_but_unsupported_fields(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"]["nominal_yield_curve"] = {
+        "mode": "parallel_bp",
+        "shock_bp": 10,
+        "rate_unit": "decimal",
+    }
+
+    with pytest.raises(ValueError, match="unknown fields"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_mode_missing_required_control(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"]["nominal_yield_curve"] = {"mode": "parallel_bp"}
+
+    with pytest.raises(ValueError, match="missing required fields"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_holder_temporal_or_file_surface(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"]["holder_preferences"] = {
+        "mode": "static_shares",
+        "rows": [
+            {
+                "effective_quarter": "2027Q1",
+                "security_type": "bills",
+                "shares": {"Banks": 0.0, "CB": 0.0, "Foreign": 0.0, "Private": 1.0, "TrustFunds": 0.0, "FedInternal": 0.0},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="unknown fields"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_comparator_file_and_assertions_surface(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["assertions"] = [{"metric": "x", "operator": "eq", "value": 1}]
+    scenario["overrides"]["net_interest_comparator"] = {
+        "mode": "comparison_path_file",
+        "role": "diagnostic_nonbinding",
+        "file": {"relative_path": "comparison.csv", "sha256": "0" * 64, "media_type": "text/csv"},
+    }
+
+    with pytest.raises(ValueError, match="unknown fields|not in enum"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
 def test_scenario_spec_rejects_compatible_baseline_mode(tmp_path: Path) -> None:
     baseline = _baseline(tmp_path)
     scenario = _scenario_mapping(baseline)
