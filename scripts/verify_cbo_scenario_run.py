@@ -20,10 +20,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiled-dir")
     parser.add_argument("--run-dir")
+    parser.add_argument("--baseline")
+    parser.add_argument("--attestation")
     args = parser.parse_args(argv)
     if bool(args.compiled_dir) == bool(args.run_dir):
         parser.error("provide exactly one of --compiled-dir or --run-dir")
-    result = verify_compiled_scenario(args.compiled_dir) if args.compiled_dir else verify_scenario_run(args.run_dir)
+    result = (
+        verify_compiled_scenario(args.compiled_dir)
+        if args.compiled_dir
+        else verify_scenario_run(
+            args.run_dir,
+            baseline_package=args.baseline,
+            attestation=args.attestation,
+        )
+    )
     print(json.dumps(result, sort_keys=True))
     return 0
 

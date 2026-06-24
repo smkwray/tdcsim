@@ -7,7 +7,7 @@ import pytest
 
 from tdcsim_cbo import CboBaselinePackage, CboScenarioCompiler, CboScenarioSpec
 from tdcsim_cbo._json import sha256_file, write_json
-from tdcsim_cbo.compiler import CompilerError, digest_input_tree
+from tdcsim_cbo.compiler import CompilerError, ISSUANCE_MIX_FILE, digest_input_tree
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
 
 
@@ -82,6 +82,38 @@ def test_frn_linked_mode_uses_compiled_nominal_curve_not_baseline(tmp_path: Path
     assert float(rows[0]["benchmark_rate_decimal"]) == pytest.approx(0.041)
 
 
+def test_scenario_cpi_recomputes_tips_real_yield_without_explicit_tips_override(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "inflation_cpi": {"mode": "annualized_inflation_shift_bp", "shock_bp": 100, "terminal_rule": "carry_last_scenario_growth"},
+    }
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_tips_real_yield_path.csv")
+    assert "tdcsim_tips_real_yield_path.csv" in compiled.changed_inputs
+    assert float(rows[0]["expected_inflation_decimal"]) == pytest.approx(0.03)
+    assert float(rows[0]["real_yield_decimal"]) == pytest.approx(0.0)
+
+
+def test_operating_cash_constant_real_uses_compiled_scenario_cpi(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["coupling"]["operating_cash_inflation"] = "scenario_cpi"
+    scenario["overrides"] = {
+        "inflation_cpi": {"mode": "cpi_level_scale", "scale": 1.12},
+        "operating_cash": {"mode": "constant_real"},
+    }
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_operating_cash_path.csv")
+    assert float(rows[1]["inflation_index_level"]) == pytest.approx(113.12)
+    assert float(rows[1]["operating_cash_target_bil"]) == pytest.approx(100.0)
+    assert rows[1]["construction_mode"] == "scenario_constant_real"
+
+
 def test_cash_residual_tracking_uses_compiled_operating_cash(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
     scenario = _scenario_mapping(baseline)
@@ -96,6 +128,27 @@ def test_cash_residual_tracking_uses_compiled_operating_cash(tmp_path: Path) -> 
     assert float(rows[0]["cash_reconciliation_residual_bil"]) == pytest.approx(0.0)
     assert float(rows[1]["cash_reconciliation_residual_bil"]) == pytest.approx(20.0)
     assert rows[1]["affects_issuance_size"] == "False"
+
+
+def test_primary_deficit_fy_anchors_write_period_flows_not_annual_value_per_row(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "primary_deficit": {
+            "mode": "fy_endpoint_anchors",
+            "anchors": [{"fiscal_year": 2027, "value_bil": 1000.0}, {"fiscal_year": 2028, "value_bil": 2000.0}],
+        }
+    }
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_primary_deficit_path.csv")
+    by_year: dict[int, float] = {}
+    for row in rows:
+        by_year[int(row["source_fiscal_year"])] = by_year.get(int(row["source_fiscal_year"]), 0.0) + float(row["primary_deficit_bil"])
+    assert by_year[2027] == pytest.approx(1000.0)
+    assert by_year[2028] == pytest.approx(2000.0)
+    assert float(rows[0]["annual_or_remaining_primary_deficit_bil"]) == pytest.approx(1000.0)
 
 
 def test_compiler_rejects_frn_file_mode_with_linked_coupling(tmp_path: Path) -> None:
@@ -171,6 +224,55 @@ def test_file_backed_override_missing_horizon_coverage_rejected(tmp_path: Path) 
         CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_file(scenario_path), tmp_path / "work")
 
 
+def test_file_backed_override_duplicate_keys_rejected_even_when_row_count_matches(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    replacement = tmp_path / "curve.csv"
+    _write_csv(
+        replacement,
+        [
+            {"curve_date": "2027-01-01", "tenor_years": 0.25, "nominal_rate_decimal": 0.05},
+            {"curve_date": "2027-01-01", "tenor_years": 0.25, "nominal_rate_decimal": 0.06},
+        ],
+    )
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "nominal_yield_curve": {
+            "mode": "full_surface_file",
+            "file": {"relative_path": "curve.csv", "sha256": sha256_file(replacement), "media_type": "text/csv"},
+        }
+    }
+    scenario_path = tmp_path / "scenario.json"
+    write_json(scenario_path, scenario)
+
+    with pytest.raises(CompilerError, match="duplicate keys"):
+        CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_file(scenario_path), tmp_path / "work")
+
+
+def test_holder_preferences_reject_cb_auction_share_when_baseline_fed_target_active(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {"holder_preferences": {"mode": "static_shares", "rows": _holder_preference_rows(cb_share=0.10)}}
+
+    with pytest.raises(ValueError, match="CB auction share"):
+        CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+
+def test_issuance_mix_override_materializes_hashed_compiled_artifact(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {"issuance_mix": _issuance_mix_override()}
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    artifact = compiled.forecast_inputs_dir / ISSUANCE_MIX_FILE
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert artifact.exists()
+    assert ISSUANCE_MIX_FILE in compiled.changed_inputs
+    assert any(item["path"] == ISSUANCE_MIX_FILE for item in compiled.manifest["input_hashes"])
+    assert payload["mode"] == "replace_shares"
+    assert payload["security_shares"]["tips"] == pytest.approx(0.08)
+
+
 def test_compiler_rejects_directory_baseline_without_package_digest(tmp_path: Path) -> None:
     package, attestation = _write_compiler_package(tmp_path)
     baseline_zip = CboBaselinePackage.open(package, attestation_path=attestation)
@@ -207,6 +309,41 @@ def _scenario_mapping(baseline: CboBaselinePackage) -> dict:
         },
         "overrides": {},
         "output": {"profile": "compact", "compression": "gzip"},
+    }
+
+
+def _holder_preference_rows(*, cb_share: float = 0.0) -> list[dict]:
+    private_share = 1.0 - cb_share
+    return [
+        {
+            "security_type": security_type,
+            "shares": {
+                "Banks": 0.0,
+                "CB": cb_share,
+                "Foreign": 0.0,
+                "Private": private_share,
+                "TrustFunds": 0.0,
+                "FedInternal": 0.0,
+            },
+        }
+        for security_type in ("bills", "notes", "bonds", "tips", "frn")
+    ]
+
+
+def _issuance_mix_override() -> dict:
+    return {
+        "mode": "replace_shares",
+        "tips_share": 0.08,
+        "frn_share": 0.04,
+        "fixed_remainder_shares": {"bills": 0.30, "notes": 0.50, "bonds": 0.20},
+        "maturity_distributions": {
+            "bills": [{"maturity_years": 0.5, "share": 1.0}],
+            "notes": [{"maturity_years": 5.0, "share": 1.0}],
+            "bonds": [{"maturity_years": 20.0, "share": 1.0}],
+            "tips": [{"maturity_years": 10.0, "share": 1.0}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        },
+        "negative_issuance_action": "retire_shortest_public_marketable",
     }
 
 

@@ -7,7 +7,7 @@ or write files; the compiler is responsible for file resolution and hashing.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import date
+from datetime import date, timedelta
 from math import log
 from typing import Any
 
@@ -134,6 +134,7 @@ def apply_tips_real_yield_override(
     override: Mapping[str, Any],
     *,
     nominal_curve_rows: Iterable[Mapping[str, Any]] | None = None,
+    cpi_rows: Iterable[Mapping[str, Any]] | None = None,
     replacement_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> list[Row]:
     """Apply TIPS real-yield overrides to derived real-yield assumptions."""
@@ -159,15 +160,21 @@ def apply_tips_real_yield_override(
         ]
     if mode == "linked_recompute":
         nominal_map = _curve_rate_map(nominal_curve_rows) if nominal_curve_rows is not None else {}
+        expected_inflation_map = _expected_inflation_by_curve_date(cpi_rows)
         add = _bp_to_decimal(float(override.get("additional_parallel_bp", 0.0)))
         out: list[Row] = []
         for row in rows:
             new = dict(row)
             key = (str(new["curve_date"]), float(new["tenor_years"]))
             nominal = nominal_map.get(key, float(new.get("nominal_rate_decimal", 0.0)))
-            expected_inflation = float(new.get("expected_inflation_decimal", 0.0))
+            curve_date = str(new["curve_date"])
+            expected_inflation = _nearest_date_rate(
+                expected_inflation_map,
+                curve_date,
+            ) if expected_inflation_map else float(new.get("expected_inflation_decimal", 0.0))
             real_yield = nominal - expected_inflation + add
             new["nominal_rate_decimal"] = nominal
+            new["expected_inflation_decimal"] = expected_inflation
             new["real_yield_decimal"] = real_yield
             if "real_coupon_decimal" in new:
                 new["real_coupon_decimal"] = real_yield
@@ -220,6 +227,8 @@ def _scale_cpi_row(row: Mapping[str, Any], scale: float) -> Row:
 
 def _mark(row: Row, mode: str) -> Row:
     row["source_role"] = SCENARIO_SOURCE_ROLE
+    row["runtime_role"] = "hard_target"
+    row["claim_boundary"] = "scenario_assumption_not_official_cbo_source"
     row["scenario_transform"] = mode
     return row
 
@@ -298,6 +307,60 @@ def _curve_rate_map(rows: Iterable[Mapping[str, Any]] | None) -> dict[tuple[str,
     if rows is None:
         return {}
     return {(str(row["curve_date"]), float(row["tenor_years"])): float(row["nominal_rate_decimal"]) for row in rows}
+
+
+def _expected_inflation_by_curve_date(rows: Iterable[Mapping[str, Any]] | None) -> dict[str, float]:
+    if rows is None:
+        return {}
+    points: list[tuple[date, float, float | None]] = []
+    for row in rows:
+        month = row.get("month")
+        if month in ("", None):
+            continue
+        value = row.get("tips_cpi_u_index", row.get("cbo_cpi_u_index"))
+        if value in ("", None):
+            continue
+        terminal = row.get("terminal_annualized_cpi_growth_decimal")
+        points.append(
+            (
+                _parse_date(str(month)),
+                float(value),
+                None if terminal in ("", None) else float(terminal),
+            )
+        )
+    if not points:
+        return {}
+    points.sort(key=lambda item: item[0])
+    out: dict[str, float] = {}
+    for point_date, _, _ in points:
+        out[point_date.isoformat()] = _annualized_forward_cpi_growth(points, point_date)
+    return out
+
+
+def _annualized_forward_cpi_growth(points: Sequence[tuple[date, float, float | None]], start: date) -> float:
+    start_date, start_value, start_terminal = _nearest_point(points, start)
+    target = start + timedelta(days=365)
+    future_candidates = [point for point in points if point[0] >= target]
+    if future_candidates and start_value > 0:
+        end_date, end_value, _ = future_candidates[0]
+        years = max((end_date - start_date).days / 365.25, 1e-9)
+        return (end_value / start_value) ** (1.0 / years) - 1.0
+    terminal_candidates = [terminal for _, _, terminal in points if terminal is not None]
+    if terminal_candidates:
+        return terminal_candidates[-1]
+    first_date, first_value, _ = points[0]
+    last_date, last_value, _ = points[-1]
+    if first_value <= 0 or last_date <= first_date:
+        return 0.0
+    years = max((last_date - first_date).days / 365.25, 1e-9)
+    return (last_value / first_value) ** (1.0 / years) - 1.0
+
+
+def _nearest_point(points: Sequence[tuple[date, float, float | None]], target: date) -> tuple[date, float, float | None]:
+    before = [point for point in points if point[0] <= target]
+    if before:
+        return before[-1]
+    return points[0]
 
 
 def _row_date_key(row: Mapping[str, Any], *columns: str) -> str:

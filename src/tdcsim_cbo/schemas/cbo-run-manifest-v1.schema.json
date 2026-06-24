@@ -9,13 +9,22 @@
     "run_id",
     "status",
     "verification_grade",
+    "generated_at_utc",
     "baseline",
     "scenario",
     "code_environment",
     "claim_boundary",
+    "coupling_decisions",
+    "compiled_manifest",
+    "compiled_inputs_digest",
     "compiled_inputs",
+    "simulation",
     "outputs",
-    "validation"
+    "output_manifest",
+    "output_hashes",
+    "boundary_checks",
+    "validation",
+    "unsupported_components"
   ],
   "properties": {
     "schema_version": {
@@ -76,7 +85,9 @@
       "required": [
         "scenario_id",
         "canonical_sha256",
-        "source_file_sha256"
+        "source_file_sha256",
+        "relative_path",
+        "referenced_file_hashes"
       ],
       "properties": {
         "scenario_id": {
@@ -89,6 +100,9 @@
         "source_file_sha256": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "relative_path": {
+          "type": "string"
         },
         "referenced_file_hashes": {
           "type": "object",
@@ -108,12 +122,13 @@
         "requirements_lock_sha256",
         "python_version",
         "runner_version",
-        "verifier_version"
+        "verifier_version",
+        "runner_source_sha256"
       ],
       "properties": {
         "code_commit_sha": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{40}$"
         },
         "dirty_state": {
           "type": "boolean"
@@ -130,6 +145,10 @@
         },
         "verifier_version": {
           "type": "string"
+        },
+        "runner_source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         }
       }
     },
@@ -155,11 +174,52 @@
       },
       "minItems": 1
     },
+    "compiled_manifest": {
+      "type": "string"
+    },
+    "compiled_inputs_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "simulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_date",
+        "end_date",
+        "frequency"
+      ],
+      "properties": {
+        "start_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "end_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "frequency": {
+          "const": "daily"
+        }
+      }
+    },
     "outputs": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/artifact"
       }
+    },
+    "output_manifest": {
+      "type": "object"
+    },
+    "output_hashes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "boundary_checks": {
+      "type": "object"
     },
     "validation": {
       "type": "object",

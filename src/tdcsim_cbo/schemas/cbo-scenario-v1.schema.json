@@ -218,12 +218,6 @@
             "none"
           ]
         },
-        "include_final_portfolio": {
-          "type": "boolean"
-        },
-        "include_maturity_ledger": {
-          "type": "boolean"
-        },
         "catalog_sqlite": {
           "type": "boolean",
           "default": false
@@ -290,8 +284,7 @@
         "media_type": {
           "type": "string",
           "enum": [
-            "text/csv",
-            "application/json"
+            "text/csv"
           ]
         }
       }
@@ -354,7 +347,6 @@
           "enum": [
             "parallel_bp",
             "key_rate_bp",
-            "anchor_path_file",
             "full_surface_file"
           ]
         },
@@ -798,8 +790,7 @@
       "properties": {
         "mode": {
           "enum": [
-            "static_shares",
-            "quarterly_path_file"
+            "static_shares"
           ]
         },
         "rows": {

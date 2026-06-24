@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import gzip
+import json
+import tempfile
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from ._json import read_json, sha256_file
-from .compiler import digest_input_tree
+from .baseline import CboBaselinePackage
+from .compiler import CboScenarioCompiler, digest_input_tree
+from .contract import CboScenarioSpec
 from .output import hash_output_tree
+from ._schema import validate_schema
 
 
 class VerificationError(ValueError):
@@ -32,9 +41,15 @@ def verify_compiled_scenario(compiled_dir: str | Path) -> dict[str, Any]:
     return {"status": "pass", "compiled_inputs_digest": actual_digest, "input_count": len(expected_hashes or [])}
 
 
-def verify_scenario_run(run_dir: str | Path) -> dict[str, Any]:
+def verify_scenario_run(
+    run_dir: str | Path,
+    *,
+    baseline_package: str | Path | None = None,
+    attestation: str | Path | None = None,
+) -> dict[str, Any]:
     root = Path(run_dir).expanduser().resolve()
     manifest = _manifest(root / "tdcsim_cbo_run_manifest.json")
+    _validate_run_manifest_schema(manifest)
     compiled_rel = Path(str(manifest.get("compiled_manifest") or ""))
     if compiled_rel.is_absolute() or ".." in compiled_rel.parts:
         raise VerificationError("run manifest compiled_manifest must be package-relative")
@@ -45,6 +60,13 @@ def verify_scenario_run(run_dir: str | Path) -> dict[str, Any]:
         raise VerificationError("run outputs directory is missing")
     if manifest.get("output_hashes") != hash_output_tree(outputs):
         raise VerificationError("run output hash list mismatch")
+    _verify_manifest_artifacts(root, manifest.get("outputs"), base=root)
+    _verify_manifest_artifacts(root, manifest.get("compiled_inputs"), base=root)
+    _verify_scenario_copy(root, manifest)
+    if baseline_package is not None or attestation is not None:
+        if baseline_package is None or attestation is None:
+            raise VerificationError("baseline_package and attestation must be supplied together")
+        _verify_recompile(root, manifest, baseline_package, attestation)
     boundaries = manifest.get("boundary_checks")
     if not isinstance(boundaries, dict):
         raise VerificationError("run manifest boundary_checks must be an object")
@@ -54,7 +76,13 @@ def verify_scenario_run(run_dir: str | Path) -> dict[str, Any]:
         raise VerificationError("remittance/deferred-asset status must remain unsupported")
     if boundaries.get("fed_target_holder_allocation_only") is not True:
         raise VerificationError("Fed target holder-allocation boundary failed")
-    return {"status": "pass", "compiled": compiled, "output_count": len(manifest.get("output_hashes") or [])}
+    recomputed = _verify_output_invariants(root, manifest)
+    return {
+        "status": "pass",
+        "compiled": compiled,
+        "output_count": len(manifest.get("output_hashes") or []),
+        "recomputed": recomputed,
+    }
 
 
 def _manifest(path: Path) -> dict[str, Any]:
@@ -79,6 +107,118 @@ def _verify_claim_boundary(manifest: dict[str, Any]) -> None:
         raise VerificationError("compiled manifest Fed holdings role is invalid")
     if claim.get("operating_cash_role") != "cash_path_not_issuance_plug":
         raise VerificationError("compiled manifest operating cash role is invalid")
+
+
+def _validate_run_manifest_schema(manifest: dict[str, Any]) -> None:
+    with files("tdcsim_cbo").joinpath("schemas/cbo-run-manifest-v1.schema.json").open("r", encoding="utf-8") as handle:
+        schema = json.load(handle)
+    try:
+        validate_schema(manifest, schema, label="run_manifest")
+    except Exception as exc:
+        raise VerificationError(f"run manifest schema validation failed: {exc}") from exc
+
+
+def _verify_manifest_artifacts(root: Path, artifacts: Any, *, base: Path) -> None:
+    if not isinstance(artifacts, list):
+        raise VerificationError("manifest artifact list must be an array")
+    for item in artifacts:
+        if not isinstance(item, dict):
+            raise VerificationError("manifest artifact item must be an object")
+        rel = Path(str(item.get("relative_path") or ""))
+        if rel.is_absolute() or ".." in rel.parts:
+            raise VerificationError("manifest artifact path must be package-relative")
+        path = base / rel
+        if not path.exists():
+            raise VerificationError(f"manifest artifact is missing: {rel}")
+        if sha256_file(path) != item.get("sha256"):
+            raise VerificationError(f"manifest artifact SHA mismatch: {rel}")
+        if path.stat().st_size != int(item.get("bytes", -1)):
+            raise VerificationError(f"manifest artifact byte count mismatch: {rel}")
+
+
+def _verify_scenario_copy(root: Path, manifest: dict[str, Any]) -> None:
+    scenario = manifest.get("scenario")
+    if not isinstance(scenario, dict):
+        raise VerificationError("run manifest scenario must be an object")
+    rel = Path(str(scenario.get("relative_path") or ""))
+    if rel.is_absolute() or ".." in rel.parts:
+        raise VerificationError("scenario relative_path must be package-relative")
+    path = root / rel
+    if not path.exists():
+        raise VerificationError("run scenario copy is missing")
+    if sha256_file(path) != scenario.get("source_file_sha256"):
+        raise VerificationError("run scenario copy hash mismatch")
+    spec = CboScenarioSpec.from_file(path)
+    if spec.canonical_sha256() != scenario.get("canonical_sha256"):
+        raise VerificationError("run scenario canonical hash mismatch")
+
+
+def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: str | Path, attestation: str | Path) -> None:
+    scenario_rel = Path(str(manifest["scenario"]["relative_path"]))
+    baseline = CboBaselinePackage.open(baseline_package, attestation_path=attestation)
+    spec = CboScenarioSpec.from_file(root / scenario_rel)
+    with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-recompile-") as tmp:
+        compiled = CboScenarioCompiler().compile(baseline, spec, Path(tmp) / "work")
+    if compiled.compiled_inputs_digest != manifest.get("compiled_inputs_digest"):
+        raise VerificationError("recompiled input digest mismatch")
+
+
+def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str, float]:
+    results_path = _result_artifact_path(root, manifest)
+    results = _read_results(results_path)
+    target_error = _max_abs(results, "CBOControlledDebtTargetError")
+    fed_share = _max_abs(results, "CBOFedAuctionShare")
+    fed_face = _max_abs(results, "CBOFedAuctionRolloverAddons")
+    remittance_cash = _max_abs(results, "CBORemittanceCashEffect")
+    if target_error > 1e-5:
+        raise VerificationError(f"CBO target error exceeds tolerance: {target_error}")
+    if fed_share > 1e-12 or fed_face > 1e-12:
+        raise VerificationError(f"Fed auction boundary failed: share={fed_share}, face={fed_face}")
+    if remittance_cash > 1e-12:
+        raise VerificationError(f"remittance cash effect must remain zero: {remittance_cash}")
+    if "NetInterestDiagnosticStatus" in results.columns:
+        statuses = set(str(value) for value in results["NetInterestDiagnosticStatus"].dropna().unique())
+        if statuses - {"cbo_reported_check_only", "not_loaded_check_only"}:
+            raise VerificationError(f"unexpected net-interest diagnostic statuses: {sorted(statuses)}")
+    summary_path = root / "outputs" / "summary.json"
+    if summary_path.exists():
+        summary = read_json(summary_path)
+        _compare_summary(summary, "CBOControlledDebtTargetError_max_abs", target_error)
+        _compare_summary(summary, "CBOFedAuctionShare_max_abs", fed_share)
+        _compare_summary(summary, "CBOFedAuctionRolloverAddons_max_abs", fed_face)
+    return {
+        "max_abs_target_error": target_error,
+        "max_abs_fed_auction_share": fed_share,
+        "max_abs_fed_auction_face": fed_face,
+        "max_abs_remittance_cash_effect": remittance_cash,
+    }
+
+
+def _result_artifact_path(root: Path, manifest: dict[str, Any]) -> Path:
+    for item in manifest.get("outputs", []):
+        if isinstance(item, dict) and str(item.get("logical_name", "")).startswith("results_"):
+            return root / str(item["relative_path"])
+    raise VerificationError("run manifest does not list a results output")
+
+
+def _read_results(path: Path) -> pd.DataFrame:
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            return pd.read_csv(handle)
+    return pd.read_csv(path)
+
+
+def _max_abs(frame: pd.DataFrame, column: str) -> float:
+    if column not in frame.columns:
+        return 0.0
+    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().max())
+
+
+def _compare_summary(summary: Any, key: str, expected: float) -> None:
+    if not isinstance(summary, dict) or key not in summary:
+        return
+    if abs(float(summary[key]) - expected) > 1e-9:
+        raise VerificationError(f"summary value mismatch for {key}")
 
 
 def _reject_absolute_paths(value: Any, *, path: str = "manifest") -> None:

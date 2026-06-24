@@ -47,6 +47,19 @@ def test_operating_cash_constant_real_uses_inflation_index() -> None:
     assert transformed[1]["tga_target_bil"] == pytest.approx(99.0)
 
 
+def test_operating_cash_constant_real_uses_scenario_cpi_when_supplied() -> None:
+    cpi_rows = [
+        {"month": "2027-01-01", "tips_cpi_u_index": 300.0},
+        {"month": "2028-01-01", "tips_cpi_u_index": 330.0},
+    ]
+
+    transformed = apply_operating_cash_override(_cash_rows(), {"mode": "constant_real"}, inflation_rows=cpi_rows)
+
+    assert transformed[1]["inflation_index_level"] == pytest.approx(330.0)
+    assert transformed[1]["operating_cash_target_bil"] == pytest.approx(110.0)
+    assert transformed[1]["tga_target_bil"] == pytest.approx(99.0)
+
+
 def test_operating_cash_scale_baseline_scales_all_components() -> None:
     transformed = apply_operating_cash_override(_cash_rows(), {"mode": "scale_baseline", "scale": 1.25})
 
@@ -111,6 +124,26 @@ def test_primary_deficit_scale_and_additive_transforms() -> None:
     assert scaled[0]["primary_deficit_bil"] == pytest.approx(11.0)
     assert scaled[0]["annual_or_remaining_primary_deficit_bil"] == pytest.approx(1100.0)
     assert added[0]["primary_deficit_bil"] == pytest.approx(15.0)
+
+
+def test_primary_deficit_fy_endpoint_anchor_preserves_annual_sum() -> None:
+    rows = [
+        {"source_fiscal_year": 2027, "primary_deficit_bil": 10.0, "annual_or_remaining_primary_deficit_bil": 30.0},
+        {"source_fiscal_year": 2027, "primary_deficit_bil": 20.0, "annual_or_remaining_primary_deficit_bil": 30.0},
+        {"source_fiscal_year": 2028, "primary_deficit_bil": 40.0, "annual_or_remaining_primary_deficit_bil": 40.0},
+    ]
+    override = {
+        "mode": "fy_endpoint_anchors",
+        "anchors": [{"fiscal_year": 2027, "value_bil": 300.0}, {"fiscal_year": 2028, "value_bil": 400.0}],
+    }
+
+    transformed = apply_primary_deficit_override(rows, override)
+
+    fy2027 = [row for row in transformed if int(row["source_fiscal_year"]) == 2027]
+    assert sum(float(row["primary_deficit_bil"]) for row in fy2027) == pytest.approx(300.0)
+    assert fy2027[0]["primary_deficit_bil"] == pytest.approx(100.0)
+    assert fy2027[1]["primary_deficit_bil"] == pytest.approx(200.0)
+    assert fy2027[0]["annual_or_remaining_primary_deficit_bil"] == pytest.approx(300.0)
 
 
 def test_debt_target_fy_endpoint_anchor_interpolates_and_scales_related_column() -> None:

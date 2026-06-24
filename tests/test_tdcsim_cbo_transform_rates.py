@@ -53,7 +53,15 @@ def test_nominal_full_surface_replacement_requires_columns() -> None:
 
     transformed = apply_nominal_yield_curve_override([], {"mode": "full_surface_file"}, replacement_rows=replacement)
 
-    assert transformed == [{**replacement[0], "source_role": "scenario_assumption", "scenario_transform": "full_surface_file"}]
+    assert transformed == [
+        {
+            **replacement[0],
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_target",
+            "claim_boundary": "scenario_assumption_not_official_cbo_source",
+            "scenario_transform": "full_surface_file",
+        }
+    ]
 
 
 def test_frn_linked_to_nominal_curve_uses_three_month_rate_plus_spread() -> None:
@@ -119,6 +127,31 @@ def test_tips_linked_recompute_uses_nominal_curve_and_expected_inflation() -> No
     assert transformed[0]["nominal_rate_decimal"] == pytest.approx(0.055)
     assert transformed[0]["real_yield_decimal"] == pytest.approx(0.0375)
     assert transformed[0]["real_coupon_decimal"] == pytest.approx(0.0375)
+
+
+def test_tips_linked_recompute_uses_scenario_cpi_when_supplied() -> None:
+    rows = [
+        {
+            "curve_date": "2027-01-01",
+            "tenor_years": 10.0,
+            "nominal_rate_decimal": 0.04,
+            "expected_inflation_decimal": 0.02,
+            "real_yield_decimal": 0.02,
+        }
+    ]
+    cpi = [
+        {"month": "2027-01-01", "tips_cpi_u_index": 100.0, "terminal_annualized_cpi_growth_decimal": 0.05},
+        {"month": "2027-02-01", "tips_cpi_u_index": 100.5, "terminal_annualized_cpi_growth_decimal": 0.05},
+    ]
+
+    transformed = apply_tips_real_yield_override(
+        rows,
+        {"mode": "linked_recompute"},
+        cpi_rows=cpi,
+    )
+
+    assert transformed[0]["expected_inflation_decimal"] == pytest.approx(0.05)
+    assert transformed[0]["real_yield_decimal"] == pytest.approx(-0.01)
 
 
 def test_tips_absolute_path_file_requires_replacement_rows() -> None:

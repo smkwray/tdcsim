@@ -39,6 +39,7 @@ from .transforms.rates import (
 
 FORECAST_INPUTS = "forecast_inputs"
 COMPILED_MANIFEST = "tdcsim_cbo_compiled_manifest.json"
+ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
 
 INPUT_FILES = {
     "nominal_yield_curve": "tdcsim_yield_curve_surface.csv",
@@ -209,7 +210,7 @@ def _apply_overrides(
     cpi_rows: list[dict[str, Any]] | None = None
     operating_cash_rows: list[dict[str, Any]] | None = None
     debt_rows: list[dict[str, Any]] | None = None
-    fed_active = "fed_holdings" in overrides
+    fed_active = _fed_stock_target_present(forecast_inputs_dir / INPUT_FILES["fed_holdings"])
 
     if "nominal_yield_curve" in overrides:
         override = _override_mapping(overrides["nominal_yield_curve"])
@@ -243,7 +244,25 @@ def _apply_overrides(
         override = _override_mapping(overrides["tips_real_yield"])
         rows, header = _read_csv(forecast_inputs_dir / INPUT_FILES["tips_real_yield"])
         replacement = _csv_file_override_rows(spec, override, baseline_rows=rows)
-        output = apply_tips_real_yield_override(rows, override, nominal_curve_rows=nominal_rows, replacement_rows=replacement)
+        output = apply_tips_real_yield_override(
+            rows,
+            override,
+            nominal_curve_rows=nominal_rows,
+            cpi_rows=cpi_rows,
+            replacement_rows=replacement,
+        )
+        _write_csv(forecast_inputs_dir / INPUT_FILES["tips_real_yield"], output, preferred_header=header)
+        changed.add(INPUT_FILES["tips_real_yield"])
+    elif coupling.get("tips_real_yield") == "recompute_from_nominal_and_scenario_inflation" and (
+        "inflation_cpi" in overrides or "nominal_yield_curve" in overrides
+    ):
+        rows, header = _read_csv(forecast_inputs_dir / INPUT_FILES["tips_real_yield"])
+        output = apply_tips_real_yield_override(
+            rows,
+            {"mode": "linked_recompute"},
+            nominal_curve_rows=nominal_rows,
+            cpi_rows=cpi_rows,
+        )
         _write_csv(forecast_inputs_dir / INPUT_FILES["tips_real_yield"], output, preferred_header=header)
         changed.add(INPUT_FILES["tips_real_yield"])
 
@@ -251,7 +270,12 @@ def _apply_overrides(
         override = _override_mapping(overrides["operating_cash"])
         rows, header = _read_csv(forecast_inputs_dir / INPUT_FILES["operating_cash"])
         replacement = _csv_file_override_rows(spec, override, baseline_rows=rows)
-        operating_cash_rows = apply_operating_cash_override(rows, override, replacement_rows=replacement)
+        operating_cash_rows = apply_operating_cash_override(
+            rows,
+            override,
+            inflation_rows=cpi_rows if coupling.get("operating_cash_inflation") == "scenario_cpi" else None,
+            replacement_rows=replacement,
+        )
         _write_csv(forecast_inputs_dir / INPUT_FILES["operating_cash"], operating_cash_rows, preferred_header=header)
         changed.add(INPUT_FILES["operating_cash"])
 
@@ -299,7 +323,9 @@ def _apply_overrides(
         changed.add("tdcsim_holder_profile_assumptions.csv")
 
     if "issuance_mix" in overrides:
-        compile_issuance_mix_override(_override_mapping(overrides["issuance_mix"]))
+        issuance_mix = compile_issuance_mix_override(_override_mapping(overrides["issuance_mix"]))
+        _write_issuance_mix(forecast_inputs_dir / ISSUANCE_MIX_FILE, issuance_mix)
+        changed.add(ISSUANCE_MIX_FILE)
 
     if "net_interest_comparator" in overrides:
         net_interest = _override_mapping(overrides["net_interest_comparator"])
@@ -338,13 +364,11 @@ def _validate_override_coupling(overrides: Mapping[str, Any], coupling: Mapping[
 def _is_file_mode(mode: str) -> bool:
     return mode in {
         "full_surface_file",
-        "anchor_path_file",
         "absolute_path_file",
         "monthly_path_file",
         "aggregate_path_file",
         "component_path_file",
         "explicit_path_file",
-        "quarterly_path_file",
         "comparison_path_file",
     }
 
@@ -410,6 +434,84 @@ def _assert_replacement_coverage(
             f"{mode} replacement row count must match baseline coverage: "
             f"{len(replacement_rows)} != {len(baseline_rows)}"
         )
+    key_cols = _replacement_key_columns(baseline_rows, replacement_rows)
+    if key_cols:
+        baseline_keys = _unique_keys(baseline_rows, key_cols, label="baseline")
+        replacement_keys = _unique_keys(replacement_rows, key_cols, label="replacement")
+        if baseline_keys != replacement_keys:
+            missing = sorted(baseline_keys - replacement_keys)[:5]
+            extra = sorted(replacement_keys - baseline_keys)[:5]
+            raise CompilerError(
+                f"{mode} replacement key coverage mismatch for {key_cols}: "
+                f"missing={missing}, extra={extra}"
+            )
+
+
+def _replacement_key_columns(
+    baseline_rows: list[dict[str, str]],
+    replacement_rows: list[dict[str, str]],
+) -> tuple[str, ...]:
+    if not baseline_rows or not replacement_rows:
+        return ()
+    baseline_cols = set(baseline_rows[0])
+    replacement_cols = set(replacement_rows[0])
+    for cols in (
+        ("curve_date", "tenor_years"),
+        ("period_start", "period_end"),
+        ("period_end", "holder_type"),
+        ("period_end",),
+        ("month",),
+        ("source_fiscal_year",),
+        ("fiscal_year",),
+    ):
+        if set(cols) <= baseline_cols and set(cols) <= replacement_cols:
+            return cols
+    return ()
+
+
+def _unique_keys(rows: list[dict[str, str]], cols: tuple[str, ...], *, label: str) -> set[tuple[str, ...]]:
+    keys = [tuple(str(row.get(col) or "") for col in cols) for row in rows]
+    if any(any(value == "" for value in key) for key in keys):
+        raise CompilerError(f"{label} replacement coverage key has blank values for {cols}")
+    out = set(keys)
+    if len(out) != len(keys):
+        raise CompilerError(f"{label} replacement coverage has duplicate keys for {cols}")
+    return out
+
+
+def _fed_stock_target_present(path: Path) -> bool:
+    try:
+        rows, _ = _read_csv(path)
+    except CompilerError:
+        return False
+    return any(float(row.get("cbo_fed_holdings_target_bil", 0.0) or 0.0) > 1e-12 for row in rows)
+
+
+def _write_issuance_mix(path: Path, issuance_mix: Any) -> None:
+    if issuance_mix is None:
+        payload = {
+            "schema_version": "tdcsim_cbo_issuance_mix_assumptions_v1",
+            "mode": "default_tdcsim_cbo_runner_profile",
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_target",
+            "claim_boundary": "issuance_mix_is_tdcsim_scenario_assumption_not_cbo_prescription",
+        }
+    else:
+        payload = {
+            "schema_version": "tdcsim_cbo_issuance_mix_assumptions_v1",
+            "mode": "replace_shares",
+            "security_shares": dict(issuance_mix.security_shares),
+            "maturity_distributions": {
+                key: [dict(item) for item in value]
+                for key, value in issuance_mix.maturity_distributions.items()
+            },
+            "weighted_average_maturity_years": issuance_mix.weighted_average_maturity_years,
+            "negative_issuance_action": issuance_mix.negative_issuance_action,
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_target",
+            "claim_boundary": "issuance_mix_is_tdcsim_scenario_assumption_not_cbo_prescription",
+        }
+    write_json(path, payload)
 
 
 def _read_csv(path: Path) -> tuple[list[dict[str, str]], list[str]]:
