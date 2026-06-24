@@ -17,6 +17,17 @@ python run.py tdc_config_optional.yaml  # run the optional-feature example confi
 
 By default, the project uses the shipped `tdc_config.yaml` and generates a synthetic starting portfolio. Generated CSVs and plots are written to `output/`.
 
+## CBO baseline scenario runner
+
+The release-bound CBO lane has a simple downstream workflow:
+
+1. Use the single CBO baseline package in `output/cbo_forecast_release_bound_package.zip`.
+2. Generate example scenario files with `scripts/write_cbo_example_scenarios.py`.
+3. Run a scenario with `tdcsim-cbo run` or the `tdcsim_cbo` Python API.
+4. Read `outputs/results_compact.csv.gz`, `outputs/final_portfolio_compact.csv.gz`, and `outputs/summary.json`.
+
+See [examples/cbo_downstream_quickstart.md](examples/cbo_downstream_quickstart.md) for the exact commands and supported knobs.
+
 ## What the simulator does
 
 TDCsim models a Treasury liability portfolio at the tranche level and steps it forward through time. In each period the engine:
