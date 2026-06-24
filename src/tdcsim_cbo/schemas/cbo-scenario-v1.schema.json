@@ -1,0 +1,937 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tdcsim.local/schemas/cbo-scenario-v1.schema.json",
+  "title": "TDCSIM CBO scenario overlay v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scenario_id",
+    "baseline",
+    "provenance",
+    "coupling",
+    "overrides",
+    "output"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "tdcsim_cbo_scenario_v1"
+    },
+    "scenario_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$"
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 256
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_id",
+        "package_sha256",
+        "manifest_sha256",
+        "release_attestation_sha256"
+      ],
+      "properties": {
+        "package_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "package_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "release_attestation_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "allow_compatible_baseline": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "label"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "tdcsim_transform_of_cbo_baseline",
+            "external_source_assumption",
+            "user_stress_assumption"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "prepared_by": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "as_of_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "external_sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/externalSource"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      }
+    },
+    "simulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "frequency": {
+          "const": "daily"
+        },
+        "start_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "end_date": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "coupling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frn_benchmark",
+        "tips_real_yield",
+        "operating_cash_inflation",
+        "primary_deficit_to_debt_target"
+      ],
+      "properties": {
+        "frn_benchmark": {
+          "enum": [
+            "derive_from_scenario_nominal_curve",
+            "independent_explicit_path"
+          ]
+        },
+        "tips_real_yield": {
+          "enum": [
+            "recompute_from_nominal_and_scenario_inflation",
+            "independent_explicit_path"
+          ]
+        },
+        "operating_cash_inflation": {
+          "enum": [
+            "scenario_cpi",
+            "baseline_cpi",
+            "independent_explicit_path"
+          ]
+        },
+        "primary_deficit_to_debt_target": {
+          "const": "independent_no_plug"
+        }
+      }
+    },
+    "overrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nominal_yield_curve": {
+          "$ref": "#/$defs/nominalCurveOverride"
+        },
+        "frn_benchmark": {
+          "$ref": "#/$defs/frnOverride"
+        },
+        "inflation_cpi": {
+          "$ref": "#/$defs/cpiOverride"
+        },
+        "tips_real_yield": {
+          "$ref": "#/$defs/tipsRealYieldOverride"
+        },
+        "operating_cash": {
+          "$ref": "#/$defs/operatingCashOverride"
+        },
+        "cash_reconciliation": {
+          "$ref": "#/$defs/cashResidualOverride"
+        },
+        "issuance_mix": {
+          "$ref": "#/$defs/issuanceMixOverride"
+        },
+        "fed_holdings": {
+          "$ref": "#/$defs/stockPathOverride"
+        },
+        "holder_preferences": {
+          "$ref": "#/$defs/holderPreferenceOverride"
+        },
+        "primary_deficit": {
+          "$ref": "#/$defs/fiscalPathOverride"
+        },
+        "debt_target": {
+          "$ref": "#/$defs/fiscalPathOverride"
+        },
+        "fiscal_incidence": {
+          "$ref": "#/$defs/fiscalIncidenceOverride"
+        },
+        "net_interest_comparator": {
+          "$ref": "#/$defs/netInterestComparator"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "compression"
+      ],
+      "properties": {
+        "profile": {
+          "enum": [
+            "summary",
+            "compact",
+            "audit"
+          ]
+        },
+        "compression": {
+          "enum": [
+            "gzip",
+            "none"
+          ]
+        },
+        "include_final_portfolio": {
+          "type": "boolean"
+        },
+        "include_maturity_ledger": {
+          "type": "boolean"
+        },
+        "catalog_sqlite": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "metric",
+          "operator",
+          "value"
+        ],
+        "properties": {
+          "metric": {
+            "type": "string",
+            "minLength": 1
+          },
+          "operator": {
+            "enum": [
+              "lt",
+              "lte",
+              "eq",
+              "gte",
+              "gt"
+            ]
+          },
+          "value": {
+            "type": [
+              "number",
+              "string",
+              "boolean"
+            ]
+          },
+          "tolerance": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "fileRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "media_type": {
+          "type": "string",
+          "enum": [
+            "text/csv",
+            "application/json"
+          ]
+        }
+      }
+    },
+    "externalSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "locator",
+        "retrieved_at",
+        "sha256"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retrieved_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "keyRateShock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tenor_years",
+        "shock_bp"
+      ],
+      "properties": {
+        "tenor_years": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "shock_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        }
+      }
+    },
+    "nominalCurveOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "parallel_bp",
+            "key_rate_bp",
+            "anchor_path_file",
+            "full_surface_file"
+          ]
+        },
+        "shock_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        },
+        "shocks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/keyRateShock"
+          }
+        },
+        "interpolation": {
+          "enum": [
+            "log_tenor_linear",
+            "pchip_log_tenor"
+          ]
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "rate_unit": {
+          "enum": [
+            "decimal",
+            "percent_point"
+          ]
+        }
+      }
+    },
+    "frnOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "linked_to_nominal_curve",
+            "parallel_bp",
+            "absolute_path_file"
+          ]
+        },
+        "spread_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        },
+        "shock_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        }
+      }
+    },
+    "cpiOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "annualized_inflation_shift_bp",
+            "cpi_level_scale",
+            "monthly_path_file"
+          ]
+        },
+        "shock_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        },
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "terminal_rule": {
+          "enum": [
+            "baseline_terminal_growth",
+            "carry_last_scenario_growth",
+            "explicit_terminal_rate"
+          ]
+        },
+        "terminal_annual_rate_decimal": {
+          "type": "number",
+          "minimum": -0.5,
+          "maximum": 2.0
+        }
+      }
+    },
+    "tipsRealYieldOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "linked_recompute",
+            "parallel_bp",
+            "key_rate_bp",
+            "absolute_path_file"
+          ]
+        },
+        "additional_parallel_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        },
+        "shock_bp": {
+          "type": "number",
+          "minimum": -5000,
+          "maximum": 5000
+        },
+        "shocks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/keyRateShock"
+          }
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "rate_unit": {
+          "enum": [
+            "decimal",
+            "percent_point"
+          ]
+        }
+      }
+    },
+    "operatingCashOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "constant_real",
+            "constant_nominal",
+            "scale_baseline",
+            "aggregate_path_file",
+            "component_path_file"
+          ]
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "tga_settlement_component": {
+          "type": "boolean",
+          "const": true
+        },
+        "toc_components_are_exogenous_diagnostics": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "cashResidualOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "zero",
+            "track_operating_cash_target",
+            "explicit_path_file"
+          ]
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "funding_effect": {
+          "const": "none"
+        }
+      }
+    },
+    "maturityWeight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maturity_years",
+        "share"
+      ],
+      "properties": {
+        "maturity_years": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "issuanceMixOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "tips_share",
+        "frn_share",
+        "fixed_remainder_shares",
+        "maturity_distributions",
+        "negative_issuance_action"
+      ],
+      "properties": {
+        "mode": {
+          "const": "replace_shares"
+        },
+        "tips_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "frn_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "fixed_remainder_shares": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "bills",
+            "notes",
+            "bonds"
+          ],
+          "properties": {
+            "bills": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "notes": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "bonds": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "maturity_distributions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "bills",
+            "notes",
+            "bonds",
+            "tips",
+            "frn"
+          ],
+          "properties": {
+            "bills": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/maturityWeight"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/maturityWeight"
+              }
+            },
+            "bonds": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/maturityWeight"
+              }
+            },
+            "tips": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/maturityWeight"
+              }
+            },
+            "frn": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/maturityWeight"
+              }
+            }
+          }
+        },
+        "negative_issuance_action": {
+          "enum": [
+            "error",
+            "retire_shortest_public_marketable"
+          ]
+        }
+      }
+    },
+    "stockPathOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "scale_path",
+            "additive_bil",
+            "fy_endpoint_anchors",
+            "absolute_path_file"
+          ]
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "additive_bil": {
+          "type": "number"
+        },
+        "anchors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fyAnchor"
+          },
+          "minItems": 1
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        }
+      }
+    },
+    "holderShares": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Banks",
+        "CB",
+        "Foreign",
+        "Private",
+        "TrustFunds",
+        "FedInternal"
+      ],
+      "properties": {
+        "Banks": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "CB": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "Foreign": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "Private": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "TrustFunds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "FedInternal": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "holderPreferenceRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "security_type",
+        "shares"
+      ],
+      "properties": {
+        "effective_quarter": {
+          "type": "string",
+          "pattern": "^[0-9]{4}Q[1-4]$"
+        },
+        "security_type": {
+          "enum": [
+            "bills",
+            "notes",
+            "bonds",
+            "tips",
+            "frn",
+            "nonmarketable"
+          ]
+        },
+        "shares": {
+          "$ref": "#/$defs/holderShares"
+        }
+      }
+    },
+    "holderPreferenceOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "static_shares",
+            "quarterly_path_file"
+          ]
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/holderPreferenceRow"
+          }
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "allow_single_public_holder_stress": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "fyAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fiscal_year",
+        "value_bil"
+      ],
+      "properties": {
+        "fiscal_year": {
+          "type": "integer",
+          "minimum": 1900,
+          "maximum": 2200
+        },
+        "value_bil": {
+          "type": "number"
+        }
+      }
+    },
+    "fiscalPathOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "scale_path",
+            "additive_bil",
+            "fy_endpoint_anchors",
+            "absolute_path_file"
+          ]
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "additive_bil": {
+          "type": "number"
+        },
+        "anchors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/fyAnchor"
+          }
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "freeze_pre_start_actuals": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "fiscalIncidenceOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "domestic_ultimate_share",
+        "rest_of_world_share",
+        "foreign_official_share",
+        "other_share"
+      ],
+      "properties": {
+        "mode": {
+          "const": "static_shares"
+        },
+        "domestic_ultimate_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "rest_of_world_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "foreign_official_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "other_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "netInterestComparator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "role"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "official_cbo_baseline",
+            "comparison_path_file"
+          ]
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
+        },
+        "role": {
+          "const": "diagnostic_nonbinding"
+        }
+      }
+    }
+  }
+}

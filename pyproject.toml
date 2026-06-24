@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tdcsim"
+version = "0.1.0"
+description = "Treasury debt composition simulator with CBO baseline forecast inputs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "matplotlib",
+  "numpy",
+  "pandas",
+  "python-dateutil",
+  "PyYAML",
+  "scipy",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["tdcsim_cbo", "tdcsim_cbo.schemas"]
+py-modules = [
+  "budget_interest",
+  "cbo_policy_bundle",
+  "cbo_portfolio_builder",
+  "cbo_yield_curve_surface",
+  "contract_validation",
+  "csv_gen",
+  "debt_targeting",
+  "forecast_bundle_builders",
+  "forecast_input_builder",
+  "forecast_paths",
+  "frn_indexation",
+  "funding_plan",
+  "historical_replay",
+  "historical_replay_auction",
+  "historical_replay_contract",
+  "historical_replay_event_ledger",
+  "historical_replay_interest",
+  "historical_replay_loader",
+  "historical_replay_materializer",
+  "historical_replay_observations",
+  "historical_replay_pricing",
+  "historical_replay_solver",
+  "historical_replay_soma",
+  "historical_replay_tdc",
+  "historical_replay_tdc_inputs",
+  "historical_replay_tdcest",
+  "holder_mapping",
+  "quarterly_aggregation",
+  "ratewall_assumption_mode_schema",
+  "ratewall_contract",
+  "ratewall_input_builder",
+  "ratewall_paths",
+  "route_component_support_registry",
+  "sim_engine",
+  "sim_groups",
+  "sim_helpers",
+  "sim_plotting",
+  "sim_pricing",
+  "sim_trading",
+  "simulation_calendar",
+  "simulation_core",
+  "tdc_shared",
+  "tdc_validation",
+  "tips_indexation",
+  "yield_curve_path",
+]
+
+[tool.setuptools.package-data]
+tdcsim_cbo = ["schemas/*.json"]
