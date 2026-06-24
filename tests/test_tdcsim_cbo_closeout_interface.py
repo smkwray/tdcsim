@@ -13,7 +13,7 @@ from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
 from tdcsim_cbo._json import read_json, sha256_file, write_json
 from tdcsim_cbo.compiler import digest_input_tree, input_tree_hashes
 from tdcsim_cbo.output import hash_output_tree, write_scenario_outputs
-from tdcsim_cbo.runner import build_runtime_params
+from tdcsim_cbo.runner import RunnerError, build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
 from simulation_calendar import build_simulation_calendar
 from test_cbo_engine_integration import (
@@ -411,6 +411,66 @@ def test_runtime_params_use_compiled_issuance_mix_artifact(tmp_path: Path) -> No
     assert params["funding_rule"]["negative_required_issuance_action"] == "retire_shortest_public_marketable"
 
 
+def test_dated_holder_preferences_change_future_auction_allocation(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    scenario = _write_scenario(
+        tmp_path / "dated-holders.json",
+        baseline,
+        overrides={
+            "issuance_mix": _bill_only_issuance_mix_override(),
+            "holder_preferences": {
+                "mode": "dated_static_shares",
+                "rows": [
+                    {
+                        "effective_date": "2026-09-25",
+                        "security_type": "bills",
+                        "shares": {
+                            "Banks": 1.0,
+                            "CB": 0.0,
+                            "Foreign": 0.0,
+                            "Private": 0.0,
+                            "TrustFunds": 0.0,
+                            "FedInternal": 0.0,
+                        },
+                    }
+                ],
+            },
+        },
+    )
+    baseline_run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
+    dated_run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-dated-holders")
+
+    params = build_runtime_params(dated_run.compiled.forecast_inputs_dir)
+    baseline_results = pd.read_csv(baseline_run.results_path)
+    dated_results = pd.read_csv(dated_run.results_path)
+    dated_portfolio = pd.read_csv(dated_run.output_dir / "outputs" / "final_portfolio_compact.csv")
+    dated_bills = dated_portfolio[dated_portfolio["MaturityCategory"] == "bills"]
+    pre_event_bills = dated_bills[dated_bills["IssueDate"] < "2026-09-25"]
+    post_event_bills = dated_bills[dated_bills["IssueDate"] >= "2026-09-25"]
+
+    assert (dated_run.compiled.forecast_inputs_dir / "tdcsim_holder_preference_events.json").exists()
+    assert params["events"][0]["date"] == "2026-09-25"
+    assert params["events"][0]["actions"][0]["parameter_path"] == "sector_preferences.Banks.bills_pct"
+    assert dated_results["DebtHeld_Banks"].iloc[-1] > baseline_results["DebtHeld_Banks"].iloc[-1]
+    assert not pre_event_bills.empty
+    assert not post_event_bills.empty
+    assert "Banks" not in set(pre_event_bills["HolderType"])
+    assert "Private" in set(pre_event_bills["HolderType"])
+    assert set(post_event_bills["HolderType"]) == {"Banks"}
+
+
+def test_runtime_params_reject_malformed_compiled_holder_events(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    materialized = baseline.materialize(tmp_path / "materialized")
+    write_json(
+        materialized / "forecast_inputs" / "tdcsim_holder_preference_events.json",
+        {"schema_version": "tdcsim_holder_preference_events_v1", "events": [{"date": "2026-09-25", "actions": []}]},
+    )
+
+    with pytest.raises(RunnerError, match="actions"):
+        build_runtime_params(materialized / "forecast_inputs")
+
+
 def test_cb_auction_preferences_rejected_with_baseline_fed_target(tmp_path: Path) -> None:
     baseline, _ = _runner_baseline_and_scenarios(tmp_path)
     scenario = _write_scenario(
@@ -762,6 +822,23 @@ def _issuance_mix_override() -> dict:
         "tips_share": 0.08,
         "frn_share": 0.04,
         "fixed_remainder_shares": {"bills": 0.30, "notes": 0.50, "bonds": 0.20},
+        "maturity_distributions": {
+            "bills": [{"maturity_years": 0.5, "share": 1.0}],
+            "notes": [{"maturity_years": 5.0, "share": 1.0}],
+            "bonds": [{"maturity_years": 20.0, "share": 1.0}],
+            "tips": [{"maturity_years": 10.0, "share": 1.0}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        },
+        "negative_issuance_action": "retire_shortest_public_marketable",
+    }
+
+
+def _bill_only_issuance_mix_override() -> dict:
+    return {
+        "mode": "replace_shares",
+        "tips_share": 0.0,
+        "frn_share": 0.0,
+        "fixed_remainder_shares": {"bills": 1.0, "notes": 0.0, "bonds": 0.0},
         "maturity_distributions": {
             "bills": [{"maturity_years": 0.5, "share": 1.0}],
             "notes": [{"maturity_years": 5.0, "share": 1.0}],

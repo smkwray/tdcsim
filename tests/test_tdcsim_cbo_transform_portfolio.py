@@ -3,6 +3,7 @@ import pytest
 from tdcsim_cbo.transforms.portfolio import (
     PortfolioTransformError,
     apply_fed_holdings_override,
+    compile_holder_preference_events,
     compile_issuance_mix_override,
     reject_non_fed_stock_targets,
     validate_holder_preferences,
@@ -133,6 +134,98 @@ def test_holder_preferences_reject_cb_auction_share_when_fed_stock_target_active
 
     with pytest.raises(PortfolioTransformError, match="CB auction share"):
         validate_holder_preferences(override, fed_stock_target_active=True)
+
+
+def test_dated_holder_preferences_compile_to_sector_preference_events() -> None:
+    override = {
+        "mode": "dated_static_shares",
+        "rows": [
+            {
+                "effective_date": "2030-01-15",
+                "security_type": "notes",
+                "shares": {
+                    "Banks": 0.4,
+                    "CB": 0.0,
+                    "Foreign": 0.2,
+                    "Private": 0.4,
+                    "TrustFunds": 0.0,
+                    "FedInternal": 0.0,
+                },
+            }
+        ],
+    }
+
+    rows = validate_holder_preferences(override, fed_stock_target_active=True)
+    events = compile_holder_preference_events(override, fed_stock_target_active=True)
+
+    assert rows[0]["effective_date"] == "2030-01-15"
+    assert rows[0]["runtime_role"] == "runtime_event"
+    assert events == [
+        {
+            "id": "cbo_holder_preferences_2030-01-15",
+            "date": "2030-01-15",
+            "actions": [
+                {
+                    "parameter_path": "sector_preferences.Banks.notes_pct",
+                    "new_value": 0.4,
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                },
+                {
+                    "parameter_path": "sector_preferences.CB.notes_pct",
+                    "new_value": 0.0,
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                },
+                {
+                    "parameter_path": "sector_preferences.Foreign.notes_pct",
+                    "new_value": 0.2,
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                },
+                {
+                    "parameter_path": "sector_preferences.Private.notes_pct",
+                    "new_value": 0.4,
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                },
+                {
+                    "parameter_path": "sector_preferences.TrustFunds.notes_pct",
+                    "new_value": 0.0,
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                },
+                {
+                    "parameter_path": "sector_preferences.FedInternal.notes_pct",
+                    "new_value": 0.0,
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                },
+            ],
+        }
+    ]
+
+
+def test_dated_holder_preferences_reject_nonmarketable_rows() -> None:
+    override = {
+        "mode": "dated_static_shares",
+        "rows": [
+            {
+                "effective_date": "2030-01-15",
+                "security_type": "nonmarketable",
+                "shares": {"Banks": 0.0, "CB": 0.0, "Foreign": 0.0, "Private": 0.0, "TrustFunds": 0.0, "FedInternal": 0.0},
+            }
+        ],
+    }
+
+    with pytest.raises(PortfolioTransformError, match="marketable security types only"):
+        validate_holder_preferences(override)
 
 
 def test_non_fed_stock_targets_are_rejected() -> None:

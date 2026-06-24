@@ -27,6 +27,7 @@ from .transforms.fiscal import (
 )
 from .transforms.portfolio import (
     apply_fed_holdings_override,
+    compile_holder_preference_events,
     compile_issuance_mix_override,
     validate_holder_preferences,
 )
@@ -41,6 +42,7 @@ from .transforms.rates import (
 FORECAST_INPUTS = "forecast_inputs"
 COMPILED_MANIFEST = "tdcsim_cbo_compiled_manifest.json"
 ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
+HOLDER_PREFERENCE_EVENTS_FILE = "tdcsim_holder_preference_events.json"
 
 INPUT_FILES = {
     "nominal_yield_curve": "tdcsim_yield_curve_surface.csv",
@@ -318,10 +320,26 @@ def _apply_overrides(
         apply_csv("fiscal_incidence", apply_fiscal_incidence_override)
 
     if "holder_preferences" in overrides:
-        rows, header = _read_csv(forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv")
-        output = _compile_holder_preferences(rows, header, _override_mapping(overrides["holder_preferences"]), fed_stock_target_active=fed_active)
-        _write_csv(forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv", output, preferred_header=header)
-        changed.add("tdcsim_holder_profile_assumptions.csv")
+        override = _override_mapping(overrides["holder_preferences"])
+        if override.get("mode") == "dated_static_shares":
+            events = compile_holder_preference_events(override, fed_stock_target_active=fed_active)
+            write_json(
+                forecast_inputs_dir / HOLDER_PREFERENCE_EVENTS_FILE,
+                {
+                    "schema_version": "tdcsim_holder_preference_events_v1",
+                    "scenario_transform": "dated_static_shares",
+                    "source_role": "scenario_assumption",
+                    "runtime_role": "runtime_event",
+                    "claim_boundary": "holder preference profile not exact holder ownership",
+                    "events": events,
+                },
+            )
+            changed.add(HOLDER_PREFERENCE_EVENTS_FILE)
+        else:
+            rows, header = _read_csv(forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv")
+            output = _compile_holder_preferences(rows, header, override, fed_stock_target_active=fed_active)
+            _write_csv(forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv", output, preferred_header=header)
+            changed.add("tdcsim_holder_profile_assumptions.csv")
 
     if "issuance_mix" in overrides:
         issuance_mix = compile_issuance_mix_override(_override_mapping(overrides["issuance_mix"]))

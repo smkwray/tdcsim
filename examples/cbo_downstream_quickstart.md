@@ -29,7 +29,7 @@ This writes five ready-to-run examples:
 - `00_baseline_noop.json`: run the baseline without scenario changes.
 - `01_rates_inflation_frn_tips.json`: change the nominal curve, inflation, FRN benchmark, TIPS real yield, and real operating cash.
 - `02_issuance_maturity_mix.json`: change issuance shares and maturity mix.
-- `03_sector_holders.json`: change sector holder preferences.
+- `03_sector_holders.json`: change sector holder preferences from a future date forward.
 - `04_fiscal_fed_cash.json`: change primary deficit scale, Fed stock target handling, cash residual, operating cash, and fiscal incidence.
 
 For a short smoke run, add:
@@ -96,6 +96,16 @@ Useful result columns include:
 - `DebtHeldByType_FRN`
 - `CBONetInterestDiagnostic`
 - `NetInterestDiagnosticStatus`
+
+## Scenario Knobs
+
+The CBO scenario interface supports the main downstream controls:
+
+- Yield curve shocks, including key-rate shocks on generated curve tenors.
+- Inflation, FRN benchmark, and TIPS real-yield assumptions.
+- Issuance shares and maturity mix, including weighted-average-maturity changes through the maturity distributions.
+- Future-dated holder preference changes for newly issued marketable debt.
+- Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
 
 ## Boundaries
 

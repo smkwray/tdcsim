@@ -9,6 +9,7 @@ from .fiscal import (
 )
 from .portfolio import (
     apply_fed_holdings_override,
+    compile_holder_preference_events,
     compile_issuance_mix_override,
     validate_holder_preferences,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "apply_operating_cash_override",
     "apply_primary_deficit_override",
     "apply_tips_real_yield_override",
+    "compile_holder_preference_events",
     "compile_issuance_mix_override",
     "validate_holder_preferences",
 ]

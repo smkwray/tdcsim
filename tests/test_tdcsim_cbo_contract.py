@@ -133,6 +133,41 @@ def test_scenario_spec_rejects_holder_temporal_or_file_surface(tmp_path: Path) -
         CboScenarioSpec.from_mapping(scenario)
 
 
+def test_scenario_spec_allows_dated_holder_preference_rows(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"]["holder_preferences"] = {
+        "mode": "dated_static_shares",
+        "rows": [
+            {
+                "effective_date": "2030-01-15",
+                "security_type": "bills",
+                "shares": {"Banks": 0.1, "CB": 0.0, "Foreign": 0.2, "Private": 0.7, "TrustFunds": 0.0, "FedInternal": 0.0},
+            }
+        ],
+    }
+
+    CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_effective_date_on_static_holder_rows(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"]["holder_preferences"] = {
+        "mode": "static_shares",
+        "rows": [
+            {
+                "effective_date": "2030-01-15",
+                "security_type": "bills",
+                "shares": {"Banks": 0.1, "CB": 0.0, "Foreign": 0.2, "Private": 0.7, "TrustFunds": 0.0, "FedInternal": 0.0},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="mode-inapplicable fields.*effective_date"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
 def test_scenario_spec_rejects_comparator_file_and_assertions_surface(tmp_path: Path) -> None:
     baseline = _baseline(tmp_path)
     scenario = _scenario_mapping(baseline)

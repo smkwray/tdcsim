@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 
@@ -145,22 +146,30 @@ def validate_holder_preferences(
     *,
     fed_stock_target_active: bool = False,
 ) -> list[dict[str, Any]]:
-    """Validate static holder shares and return normalized row dictionaries."""
+    """Validate holder shares and return normalized row dictionaries."""
 
     mode = str(override.get("mode") or "")
     if mode == "quarterly_path_file":
         raise PortfolioTransformError("quarterly_path_file requires compiler-resolved replacement rows")
-    if mode != "static_shares":
+    if mode not in {"static_shares", "dated_static_shares"}:
         raise PortfolioTransformError(f"unsupported holder_preferences mode: {mode}")
     rows = override.get("rows")
     if not isinstance(rows, list) or not rows:
-        raise PortfolioTransformError("static_shares requires rows")
+        raise PortfolioTransformError(f"{mode} requires rows")
     out = []
     seen: set[tuple[str, str]] = set()
     for row in rows:
         security_type = str(row["security_type"])
+        if mode == "dated_static_shares":
+            if security_type not in MARKETABLE_SECURITY_TYPES:
+                raise PortfolioTransformError("dated_static_shares supports marketable security types only")
+            effective_date = _iso_date(row.get("effective_date"), label="holder preference effective_date")
+        else:
+            if row.get("effective_date"):
+                raise PortfolioTransformError("static_shares does not accept effective_date")
+            effective_date = ""
         effective_quarter = str(row.get("effective_quarter") or "")
-        key = (effective_quarter, security_type)
+        key = (effective_date or effective_quarter, security_type)
         if key in seen:
             raise PortfolioTransformError(f"duplicate holder preference row: {key}")
         seen.add(key)
@@ -178,15 +187,53 @@ def validate_holder_preferences(
             raise PortfolioTransformError("CB auction share must be zero when Fed stock target is active")
         out.append(
             {
+                "mode": mode,
+                "effective_date": effective_date or None,
                 "effective_quarter": effective_quarter or None,
                 "security_type": security_type,
                 "shares": normalized,
                 "source_role": SCENARIO_SOURCE_ROLE,
-                "runtime_role": "memo_only",
+                "runtime_role": "runtime_event" if mode == "dated_static_shares" else "memo_only",
                 "claim_boundary": "holder preference profile not exact holder ownership",
             }
         )
     return out
+
+
+def compile_holder_preference_events(
+    override: Mapping[str, Any],
+    *,
+    fed_stock_target_active: bool = False,
+) -> list[dict[str, Any]]:
+    """Compile dated holder share rows into engine-native sector preference events."""
+
+    if str(override.get("mode") or "") != "dated_static_shares":
+        raise PortfolioTransformError("holder preference events require dated_static_shares mode")
+    rows = validate_holder_preferences(override, fed_stock_target_active=fed_stock_target_active)
+    actions_by_date: dict[str, list[dict[str, Any]]] = {}
+    order = {security_type: idx for idx, security_type in enumerate(MARKETABLE_SECURITY_TYPES)}
+    for row in sorted(rows, key=lambda item: (str(item["effective_date"]), order[str(item["security_type"])])):
+        event_date = str(row["effective_date"])
+        pref_key = f"{row['security_type']}_pct"
+        actions = actions_by_date.setdefault(event_date, [])
+        for holder in HOLDER_TYPES:
+            actions.append(
+                {
+                    "parameter_path": f"sector_preferences.{holder}.{pref_key}",
+                    "new_value": float(row["shares"][holder]),
+                    "source_role": row["source_role"],
+                    "runtime_role": row["runtime_role"],
+                    "claim_boundary": row["claim_boundary"],
+                }
+            )
+    return [
+        {
+            "id": f"cbo_holder_preferences_{event_date}",
+            "date": event_date,
+            "actions": actions,
+        }
+        for event_date, actions in sorted(actions_by_date.items())
+    ]
 
 
 def reject_non_fed_stock_targets(targets: Mapping[str, Any]) -> None:
@@ -259,10 +306,20 @@ def _assert_unit_sum(values: Iterable[float], *, label: str) -> None:
         raise PortfolioTransformError(f"{label} must sum to 1.0, got {total}")
 
 
+def _iso_date(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise PortfolioTransformError(f"{label} is required")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise PortfolioTransformError(f"{label} must be YYYY-MM-DD") from exc
+
+
 __all__ = [
     "IssuanceMix",
     "PortfolioTransformError",
     "apply_fed_holdings_override",
+    "compile_holder_preference_events",
     "compile_issuance_mix_override",
     "reject_non_fed_stock_targets",
     "validate_holder_preferences",

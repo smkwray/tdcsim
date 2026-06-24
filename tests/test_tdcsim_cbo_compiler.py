@@ -7,7 +7,7 @@ import pytest
 
 from tdcsim_cbo import CboBaselinePackage, CboScenarioCompiler, CboScenarioSpec
 from tdcsim_cbo._json import sha256_file, write_json
-from tdcsim_cbo.compiler import CompilerError, ISSUANCE_MIX_FILE, digest_input_tree
+from tdcsim_cbo.compiler import CompilerError, HOLDER_PREFERENCE_EVENTS_FILE, ISSUANCE_MIX_FILE, digest_input_tree
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
 
 
@@ -381,6 +381,33 @@ def test_holder_preferences_overwrite_baseline_claim_labels(tmp_path: Path) -> N
     assert {row["runtime_role"] for row in rows} == {"memo_only"}
     assert {row["claim_boundary"] for row in rows} == {"holder preference profile not exact holder ownership"}
     assert {row["scenario_transform"] for row in rows} == {"static_shares"}
+
+
+def test_dated_holder_preferences_materialize_engine_event_artifact(tmp_path: Path) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "holder_preferences": {
+            "mode": "dated_static_shares",
+            "rows": [
+                {
+                    "effective_date": "2030-01-15",
+                    "security_type": "bills",
+                    "shares": {"Banks": 1.0, "CB": 0.0, "Foreign": 0.0, "Private": 0.0, "TrustFunds": 0.0, "FedInternal": 0.0},
+                }
+            ],
+        }
+    }
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    artifact = compiled.forecast_inputs_dir / HOLDER_PREFERENCE_EVENTS_FILE
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert artifact.exists()
+    assert HOLDER_PREFERENCE_EVENTS_FILE in compiled.changed_inputs
+    assert any(item["path"] == HOLDER_PREFERENCE_EVENTS_FILE for item in compiled.manifest["input_hashes"])
+    assert payload["scenario_transform"] == "dated_static_shares"
+    assert payload["events"][0]["actions"][0]["parameter_path"] == "sector_preferences.Banks.bills_pct"
 
 
 def test_issuance_mix_override_materializes_hashed_compiled_artifact(tmp_path: Path) -> None:
