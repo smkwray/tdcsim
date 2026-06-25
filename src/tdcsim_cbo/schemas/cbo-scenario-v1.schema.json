@@ -194,6 +194,9 @@
         },
         "net_interest_comparator": {
           "$ref": "#/$defs/netInterestComparator"
+        },
+        "mmf_deposit_pass_through": {
+          "$ref": "#/$defs/mmfDepositPassThroughOverride"
         }
       }
     },
@@ -839,6 +842,7 @@
           "enum": [
             "constant_real",
             "constant_nominal",
+            "inflation_beta",
             "scale_baseline",
             "aggregate_path_file",
             "component_path_file"
@@ -848,6 +852,11 @@
           "type": "number",
           "minimum": 0,
           "maximum": 100
+        },
+        "beta": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
         },
         "file": {
           "$ref": "#/$defs/fileRef"
@@ -904,6 +913,41 @@
           },
           "required": [
             "mode"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "scale"
+                ]
+              },
+              {
+                "required": [
+                  "tga_settlement_component"
+                ]
+              },
+              {
+                "required": [
+                  "toc_components_are_exogenous_diagnostics"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "inflation_beta"
+            }
+          },
+          "required": [
+            "mode",
+            "beta"
           ],
           "not": {
             "anyOf": [
@@ -1113,8 +1157,7 @@
         "tips_share",
         "frn_share",
         "fixed_remainder_shares",
-        "maturity_distributions",
-        "negative_issuance_action"
+        "maturity_distributions"
       ],
       "properties": {
         "mode": {
@@ -1707,6 +1750,24 @@
         },
         "role": {
           "const": "diagnostic_nonbinding"
+        }
+      }
+    },
+    "mmfDepositPassThroughOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "value"
+      ],
+      "properties": {
+        "mode": {
+          "const": "fixed_fraction"
+        },
+        "value": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
         }
       }
     }

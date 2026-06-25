@@ -32,10 +32,11 @@ This writes five ready-to-run examples:
 - `03_sector_holders.json`: change sector holder preferences from a future date forward.
 - `04_fiscal_fed_cash.json`: change primary deficit scale, Fed stock target handling, cash residual, operating cash, and fiscal incidence.
 
-For a short smoke run, add:
+The simulation start date must match the package opening-state date. For the
+current release-bound package that is `2026-06-21`. For a short smoke run, add:
 
 ```bash
---start-date 2026-10-01 --end-date 2026-10-10
+--start-date 2026-06-21 --end-date 2026-06-30
 ```
 
 ## Run A Scenario
@@ -73,8 +74,20 @@ Each run writes:
 - `compile/compiled/forecast_inputs/`: TDCSIM-compatible forecast input CSV/JSON files.
 - `outputs/results_compact.csv.gz`: daily scenario results.
 - `outputs/final_portfolio_compact.csv.gz`: final active security portfolio.
+- `outputs/tdcsim_period_issuance_flows.csv.gz`: period issuance by instrument, maturity bucket, holder, and private route.
+- `outputs/tdcsim_period_principal_flows.csv.gz`: period redemptions/principal by holder and instrument.
+- `outputs/tdcsim_period_payment_flows.csv.gz`: period interest/payment components with accounting-basis labels.
+- `outputs/tdcsim_holder_stocks.csv.gz`: holder stocks by date, sector, instrument, and maturity bucket.
+- `outputs/tdcsim_debt_target_bridge.csv.gz`: CBO public-debt target to controlled TDCSIM debt bridge.
+- `outputs/tdcsim_scenario_metrics.csv.gz`: derived WAM, bill-share, and short-maturity-share metrics.
 - `outputs/summary.json`: small run summary.
 - `outputs/catalog.sqlite`: optional artifact catalog when requested by the scenario.
+
+The issuance, principal, and payment tables are event/security-grain tables.
+Use `flow_id` for idempotent row ingestion and `security_id` when you need to
+join flow rows back to simulated securities. Payment rows also carry
+`accounting_basis` and `is_additive_to_cash_total` so bills and TIPS memo
+decompositions are not double-counted as cash.
 
 Useful result columns include:
 
@@ -105,7 +118,9 @@ The CBO scenario interface supports the main downstream controls:
 - Inflation, FRN benchmark, and TIPS real-yield assumptions.
 - Issuance shares and maturity mix, including weighted-average-maturity changes through the maturity distributions. FRNs remain two-year securities in this lane.
 - Future-dated holder preference changes for newly issued marketable debt, by security category: bills, notes, bonds, TIPS, and FRNs.
+- MMF deposit pass-through, defaulting to `0.97`.
 - Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
+- Operating cash can be constant nominal, constant real, explicit path-based, or `inflation_beta` where `0.0` means constant nominal and `1.0` means fully inflation-scaled.
 
 ## Boundaries
 
@@ -119,6 +134,7 @@ Keep these boundaries:
 - Fed holdings are stock-target holder allocation mechanics, not Fed auction purchases.
 - Fed remittances and deferred assets are not modeled in this lane.
 - Holder-preference changes affect new issuance from their effective date forward; they do not force secondary-market rebalancing of the existing stock.
+- Negative required issuance fails closed unless a scenario explicitly opts into the simplified at-par shortest-public-marketable retirement path.
 
 Those boundaries are why downstream projects can safely change scenario
 assumptions without accidentally changing what the CBO lane claims to prove.

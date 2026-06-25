@@ -395,12 +395,18 @@ def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path
         raise VerificationError("run manifest simulation must be an object")
     start = str(simulation.get("start_date") or "")
     end = str(simulation.get("end_date") or "")
-    params = runner_module.build_runtime_params(inputs_dir)
-    engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
-    results, final_portfolio = run_simulation(params, start, end, freq="D", scenario_name=engine_scenario_id)
     output_manifest = manifest.get("output_manifest")
     if not isinstance(output_manifest, dict):
         raise VerificationError("run manifest output_manifest must be an object")
+    row_metadata = output_manifest.get("row_metadata", {})
+    if not isinstance(row_metadata, dict):
+        row_metadata = {}
+    params = runner_module.build_runtime_params(
+        inputs_dir,
+        actuals_available_as_of=str(row_metadata.get("actuals_available_as_of") or ""),
+    )
+    engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
+    results, final_portfolio = run_simulation(params, start, end, freq="D", scenario_name=engine_scenario_id)
     profile = str(output_manifest.get("profile") or "compact")
     compression = str(output_manifest.get("compression") or "gzip")
     with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-output-") as tmp:
@@ -412,6 +418,7 @@ def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path
             profile=profile,
             compression=compression,
             catalog_sqlite="catalog_sqlite" in output_manifest,
+            metadata=row_metadata,
         )
         if hash_output_tree(replay_outputs) != manifest.get("output_hashes"):
             raise VerificationError("engine replay output hash mismatch")

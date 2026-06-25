@@ -413,6 +413,8 @@ def validate_sector_preferences(
         return [f"{label} must be a mapping."]
 
     for holder, holder_cfg in sector_preferences.items():
+        if holder == "__private_subbucket_shares__":
+            continue
         if holder not in HOLDER_TYPES:
             errors.append(f"{label} contains unknown holder '{holder}'.")
             continue

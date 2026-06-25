@@ -53,7 +53,7 @@ def compile_issuance_mix_override(override: Mapping[str, Any]) -> IssuanceMix:
     wam = 0.0
     for security_type, share in security_shares.items():
         wam += share * sum(float(item["maturity_years"]) * float(item["share"]) for item in distributions[security_type])
-    action = str(override["negative_issuance_action"])
+    action = str(override.get("negative_issuance_action") or "error")
     if action not in {"error", "retire_shortest_public_marketable"}:
         raise PortfolioTransformError(f"unsupported negative_issuance_action: {action}")
     return IssuanceMix(

@@ -140,6 +140,8 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
             _validate_holder_preference_rows(name, override, mode)
         elif name == "net_interest_comparator":
             _validate_by_mode(name, override, mode, {"official_cbo_baseline": (("role",), ())})
+        elif name == "mmf_deposit_pass_through":
+            _validate_by_mode(name, override, mode, {"fixed_fraction": (("value",), ())})
 
 
 def _nominal_curve_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
@@ -179,6 +181,7 @@ def _operating_cash_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]
     return {
         "constant_real": ((), ()),
         "constant_nominal": ((), ()),
+        "inflation_beta": (("beta",), ()),
         "scale_baseline": (("scale",), ()),
         "aggregate_path_file": (("file",), ()),
         "component_path_file": (("file",), ("tga_settlement_component", "toc_components_are_exogenous_diagnostics")),

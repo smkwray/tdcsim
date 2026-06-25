@@ -82,6 +82,22 @@ def curve_for_date(
 
     if surface is None or surface.empty:
         return ([], [], "static_curve_no_surface")
+    surface = surface.copy()
+    surface["curve_date"] = pd.to_datetime(surface["curve_date"])
+    surface["tenor_years"] = pd.to_numeric(surface["tenor_years"], errors="raise")
+    if "nominal_rate_decimal" in surface.columns:
+        surface["nominal_rate_decimal"] = pd.to_numeric(surface["nominal_rate_decimal"], errors="raise")
+    else:
+        surface["nominal_rate"] = pd.to_numeric(surface["nominal_rate"], errors="raise")
+        rate_unit = _single_rate_unit(surface)
+        if rate_unit == RATE_UNIT_PERCENT_POINTS:
+            surface["nominal_rate_decimal"] = surface["nominal_rate"] / 100.0
+        elif rate_unit == RATE_UNIT_DECIMAL:
+            surface["nominal_rate_decimal"] = surface["nominal_rate"]
+        elif not rate_unit:
+            surface["nominal_rate_decimal"] = _infer_legacy_decimal_rates(surface["nominal_rate"])
+        else:
+            raise ValueError("yield curve surface must use rate_unit percent_points/decimal")
     current_date = pd.to_datetime(date)
     candidates = surface[surface["curve_date"] <= current_date].copy()
     if scenario_id and "scenario_id" in candidates.columns:

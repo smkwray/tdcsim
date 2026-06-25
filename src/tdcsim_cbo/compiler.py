@@ -43,6 +43,7 @@ FORECAST_INPUTS = "forecast_inputs"
 COMPILED_MANIFEST = "tdcsim_cbo_compiled_manifest.json"
 ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
 HOLDER_PREFERENCE_EVENTS_FILE = "tdcsim_holder_preference_events.json"
+RUNTIME_ASSUMPTIONS_FILE = "tdcsim_runtime_assumptions.json"
 
 INPUT_FILES = {
     "nominal_yield_curve": "tdcsim_yield_curve_surface.csv",
@@ -346,12 +347,46 @@ def _apply_overrides(
         _write_issuance_mix(forecast_inputs_dir / ISSUANCE_MIX_FILE, issuance_mix)
         changed.add(ISSUANCE_MIX_FILE)
 
+    if "mmf_deposit_pass_through" in overrides:
+        _write_runtime_assumptions(
+            forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE,
+            mmf_deposit_pass_through=_mmf_deposit_pass_through_override(
+                _override_mapping(overrides["mmf_deposit_pass_through"])
+            ),
+        )
+        changed.add(RUNTIME_ASSUMPTIONS_FILE)
+
     if "net_interest_comparator" in overrides:
         net_interest = _override_mapping(overrides["net_interest_comparator"])
         if net_interest.get("role") != "diagnostic_nonbinding":
             raise CompilerError("net_interest_comparator role must remain diagnostic_nonbinding")
 
     return changed
+
+
+def _mmf_deposit_pass_through_override(override: Mapping[str, Any]) -> float:
+    if override.get("mode") != "fixed_fraction":
+        raise CompilerError("mmf_deposit_pass_through mode must be fixed_fraction")
+    try:
+        value = float(override["value"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CompilerError("mmf_deposit_pass_through value must be numeric") from exc
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise CompilerError("mmf_deposit_pass_through value must be between 0.0 and 1.0")
+    return value
+
+
+def _write_runtime_assumptions(path: Path, *, mmf_deposit_pass_through: float) -> None:
+    write_json(
+        path,
+        {
+            "schema_version": "tdcsim_cbo_runtime_assumptions_v1",
+            "source_role": "scenario_assumption",
+            "runtime_role": "deposit_channel_parameter",
+            "claim_boundary": "mmf_pass_through_changes_deposit_plumbing_not_debt_or_issuance",
+            "mmf_deposit_pass_through": mmf_deposit_pass_through,
+        },
+    )
 
 
 def _validate_override_coupling(overrides: Mapping[str, Any], coupling: Mapping[str, Any]) -> None:

@@ -62,6 +62,8 @@ def apply_operating_cash_override(
         first_period,
         float(baseline[0].get("inflation_index_level", 0.0) or 0.0),
     )
+    if base_index <= 0 and not inflation_index:
+        base_index = 1.0
     for row in baseline:
         new = dict(row)
         if mode == "constant_nominal":
@@ -82,6 +84,25 @@ def apply_operating_cash_override(
                 new[col] = value * scalar
             new["inflation_index_level"] = row_index
             new["construction_mode"] = "scenario_constant_real"
+        elif mode == "inflation_beta":
+            beta = _number(override, "beta")
+            if beta < 0.0 or beta > 1.0:
+                raise FiscalTransformError("inflation_beta beta must be between 0.0 and 1.0")
+            if base_index <= 0:
+                raise FiscalTransformError("inflation_beta requires positive inflation_index_level in first row")
+            key = str(new.get("period_end") or "")
+            row_index = _nearest_inflation_index(
+                inflation_index,
+                key,
+                float(new.get("inflation_index_level", base_index) or base_index),
+            )
+            scalar = (row_index / base_index) ** beta
+            for col, value in base_values.items():
+                new[col] = value * scalar
+            new["inflation_index_level"] = row_index
+            new["inflation_beta"] = beta
+            new["inflation_scalar"] = scalar
+            new["construction_mode"] = "scenario_inflation_beta"
         elif mode == "scale_baseline":
             scale = _number(override, "scale")
             for col in _cash_columns(new):
