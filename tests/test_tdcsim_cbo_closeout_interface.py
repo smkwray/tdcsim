@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -63,6 +64,8 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         "tdcsim_period_principal_flows.csv",
         "tdcsim_period_payment_flows.csv",
         "tdcsim_holder_stocks.csv",
+        "tdcsim_tdc_principal_route_stocks.csv",
+        "tdcsim_tdc_principal_route_stock_closure.csv",
         "tdcsim_debt_target_bridge.csv",
         "tdcsim_scenario_metrics.csv",
         "tdcsim_period_tdc_summary.csv",
@@ -76,6 +79,8 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     payments = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_payment_flows.csv")
     bridge = pd.read_csv(run.output_dir / "outputs" / "tdcsim_debt_target_bridge.csv")
     stocks = pd.read_csv(run.output_dir / "outputs" / "tdcsim_holder_stocks.csv")
+    route_stocks = pd.read_csv(run.output_dir / "outputs" / "tdcsim_tdc_principal_route_stocks.csv")
+    route_closure = pd.read_csv(run.output_dir / "outputs" / "tdcsim_tdc_principal_route_stock_closure.csv")
     metrics = pd.read_csv(run.output_dir / "outputs" / "tdcsim_scenario_metrics.csv")
     tdc_summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
     tdc_components = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_components.csv")
@@ -92,7 +97,7 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         "fiscal_incidence_basis",
         "fiscal_incidence_du_share",
     }
-    for frame in (issuance, bridge, stocks, metrics, tdc_summary, tdc_components):
+    for frame in (issuance, bridge, stocks, route_stocks, route_closure, metrics, tdc_summary, tdc_components):
         assert common_keys <= set(frame.columns)
         assert set(frame["scenario_id"]) == {run.run_manifest["scenario"]["scenario_id"]}
         assert set(frame["actuals_available_as_of"]) == {"2026-09-20"}
@@ -194,6 +199,16 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     assert controlled_stocks.loc[controlled_stocks["date"] == final_stock_date, "debt_held_bil"].sum() == pytest.approx(
         results["CBOControlledDebtPostIssuance"].iloc[-1]
     )
+    controlled_route_stocks = route_stocks[route_stocks["debt_scope"] == "controlled_public_marketable"]
+    assert set(controlled_route_stocks["route_stock_basis"]) == {"tdc_principal_settlement_route"}
+    assert controlled_route_stocks.loc[
+        controlled_route_stocks["date"] == final_stock_date,
+        "route_debt_held_bil",
+    ].sum() == pytest.approx(results["CBOControlledDebtPostIssuance"].iloc[-1])
+    assert set(route_closure["route_stock_basis"]) == {"tdc_principal_settlement_route"}
+    assert route_closure["closure_identity_error_bil"].abs().max() <= 1e-9
+    closure_private = route_closure[route_closure["route_holder_sector"] == "Private"]
+    assert not closure_private.empty
 
 
 def test_run_cbo_scenario_rejects_opening_date_mismatch(tmp_path: Path) -> None:
@@ -864,6 +879,8 @@ def test_cb_auction_preferences_rejected_with_baseline_fed_target(tmp_path: Path
 def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     compile_dir = tmp_path / "cli-compile"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
     validate_cmd = [
         sys.executable,
         "-m",
@@ -876,7 +893,13 @@ def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
         "--scenario",
         str(scenarios["noop"]),
     ]
-    assert subprocess.run(validate_cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True).stdout.strip() == b"pass"
+    assert subprocess.run(
+        validate_cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+    ).stdout.strip() == b"pass"
     compile_cmd = [
         sys.executable,
         "-m",
@@ -891,7 +914,13 @@ def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
         "--output-dir",
         str(compile_dir),
     ]
-    subprocess.run(compile_cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True)
+    subprocess.run(
+        compile_cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
     verify_cmd = [
         sys.executable,
         "-m",
@@ -900,7 +929,13 @@ def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
         "--compiled-dir",
         str(compile_dir / "compiled"),
     ]
-    assert subprocess.run(verify_cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True).stdout.strip() == b"pass"
+    assert subprocess.run(
+        verify_cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+    ).stdout.strip() == b"pass"
 
 
 def _runner_baseline_and_scenarios(tmp_path: Path) -> tuple[CboBaselinePackage, dict[str, Path]]:

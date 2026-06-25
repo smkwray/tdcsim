@@ -833,6 +833,7 @@ def _handoff_append_holder_stocks(handoff_tables, active_bonds, current_date):
     if active_bonds is None or active_bonds.empty:
         return
     frame = active_bonds.copy()
+    frame = _ensure_tdc_principal_route_columns(frame)
     frame['DebtBase'] = np.where(
         frame['SecurityType'].astype(str).eq('TIPS'),
         pd.to_numeric(frame['AdjustedPrincipal'], errors='coerce').fillna(pd.to_numeric(frame['FaceValue'], errors='coerce')),
@@ -879,6 +880,28 @@ def _handoff_append_holder_stocks(handoff_tables, active_bonds, current_date):
                     'valuation_basis': 'tips_adjusted_principal' if str(security_type) == 'TIPS' else 'face',
                     'debt_scope': debt_scope,
                     'allocation_method': 'end_of_period_stock_snapshot',
+                }
+            )
+        route_grouped = rows.groupby(
+            ['TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket', 'SecurityType', 'maturity_bucket'],
+            dropna=False,
+        )['DebtBase'].sum()
+        for keys, amount in route_grouped.items():
+            route_holder, route_subbucket, security_type, maturity_bucket = keys
+            if abs(float(amount)) <= TGA_FLOOR_TOLERANCE:
+                continue
+            handoff_tables['tdcsim_tdc_principal_route_stocks'].append(
+                {
+                    'date': str(pd.Timestamp(current_date).date()),
+                    'route_holder_sector': '' if pd.isna(route_holder) else str(route_holder),
+                    'route_holder_subsector': '' if pd.isna(route_subbucket) else str(route_subbucket),
+                    'instrument_type': '' if pd.isna(security_type) else str(security_type),
+                    'maturity_bucket': '' if pd.isna(maturity_bucket) else str(maturity_bucket),
+                    'route_debt_held_bil': float(amount),
+                    'valuation_basis': 'tips_adjusted_principal' if str(security_type) == 'TIPS' else 'face',
+                    'debt_scope': debt_scope,
+                    'allocation_method': 'end_of_period_tdc_principal_route_stock_snapshot',
+                    'route_stock_basis': 'tdc_principal_settlement_route',
                 }
             )
 
@@ -1623,6 +1646,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         'tdcsim_period_principal_flows': [],
         'tdcsim_period_payment_flows': [],
         'tdcsim_holder_stocks': [],
+        'tdcsim_tdc_principal_route_stocks': [],
         'tdcsim_debt_target_bridge': [],
         'tdcsim_scenario_metrics': [],
     }
@@ -2817,19 +2841,6 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 cbo_fed_allocation_override_active = True
                 cbo_fed_holdings_target = float(cbo_fed_row['cbo_fed_holdings_target_bil'])
                 results.loc[current_date, 'CBOFedHoldingsTargetApplicable'] = 1.0
-                active_for_cb_target = bond_portfolio[bond_portfolio['Status'] == 'Active'].copy()
-                if not active_for_cb_target.empty:
-                    active_for_cb_target['DebtBase'] = np.where(
-                        active_for_cb_target['SecurityType'] == 'TIPS',
-                        active_for_cb_target['AdjustedPrincipal'].fillna(active_for_cb_target['FaceValue']),
-                        active_for_cb_target['FaceValue'],
-                    )
-                    current_cb_holdings = active_for_cb_target.loc[
-                        active_for_cb_target['HolderType'] == 'CB',
-                        'DebtBase',
-                    ].sum()
-                else:
-                    current_cb_holdings = 0.0
             results.loc[current_date, 'CBORequiredFaceIssuance'] = total_issuance_target_period
             results.loc[current_date, 'CBOBuybackFaceRetired'] = cbo_buyback_face_retired
             results.loc[current_date, 'CBOBuybackCashPaid'] = cbo_buyback_cash_paid
@@ -3196,9 +3207,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         f"CBO Fed holdings target cannot be met by secondary purchases at {current_date.date()}: "
                         f"target={cbo_fed_holdings_target:.12f}, current={current_cb_after_issuance:.12f}, "
                         f"purchased={fed_secondary_purchase_face:.12f}"
-                    )
+                )
                 fed_secondary_purchase_cash = 0.0
-                fed_secondary_private_deposit = 0.0
                 results.loc[current_date, 'CBOFedSecondaryPurchaseReserveEffect'] = 0.0
                 results.loc[current_date, 'CBOFedSecondaryPurchaseDepositEffect'] = 0.0
                 results.loc[current_date, 'CBOFedSecondaryPurchaseFace'] = fed_secondary_purchase_face

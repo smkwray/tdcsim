@@ -151,6 +151,35 @@ HANDOFF_TABLE_COLUMNS = {
         "debt_scope",
         "allocation_method",
     ],
+    "tdcsim_tdc_principal_route_stocks": [
+        "date",
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "route_debt_held_bil",
+        "valuation_basis",
+        "debt_scope",
+        "allocation_method",
+        "route_stock_basis",
+    ],
+    "tdcsim_tdc_principal_route_stock_closure": [
+        "period_start",
+        "period_end",
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "debt_scope",
+        "opening_route_stock_bil",
+        "route_face_issued_bil",
+        "route_face_redeemed_bil",
+        "route_stock_residual_or_indexation_bil",
+        "closing_route_stock_bil",
+        "closure_identity_error_bil",
+        "route_stock_basis",
+        "residual_basis",
+    ],
     "tdcsim_debt_target_bridge": [
         "date",
         "cbo_public_debt_target_bil",
@@ -576,6 +605,7 @@ def _handoff_tables(results: pd.DataFrame, metadata: Mapping[str, Any]) -> dict[
     if not isinstance(raw, Mapping):
         raw = {}
     derived = _tdc_handoff_tables(results)
+    derived.update(_route_stock_closure_handoff_tables(raw))
     tables: dict[str, pd.DataFrame] = {}
     for name, columns in HANDOFF_TABLE_COLUMNS.items():
         rows = derived.get(name, raw.get(name, []))
@@ -593,7 +623,8 @@ def _handoff_tables(results: pd.DataFrame, metadata: Mapping[str, Any]) -> dict[
 
 
 def _tdc_handoff_tables(results: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
-    frame = _ensure_date_column(results)
+    frame = _ensure_date_column(results).copy()
+    frame.attrs = {}
     required = {"Date", "TDC_Change", *TDC_IDENTITY_COLUMNS}
     if frame.empty or not required <= set(frame.columns):
         return {}
@@ -685,6 +716,163 @@ def _tdc_handoff_tables(results: pd.DataFrame) -> dict[str, list[dict[str, Any]]
         "tdcsim_period_tdc_summary": summary_rows,
         "tdcsim_period_tdc_components": component_rows,
     }
+
+
+def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    stocks = pd.DataFrame(raw.get("tdcsim_tdc_principal_route_stocks", []))
+    if stocks.empty:
+        return {"tdcsim_tdc_principal_route_stock_closure": []}
+    issuance = pd.DataFrame(raw.get("tdcsim_period_issuance_flows", []))
+    principal = pd.DataFrame(raw.get("tdcsim_period_principal_flows", []))
+    rows: list[dict[str, Any]] = []
+    stocks = stocks.copy()
+    stocks["date"] = pd.to_datetime(stocks["date"], errors="coerce")
+    stocks = stocks[stocks["date"].notna()]
+    if stocks.empty:
+        return {"tdcsim_tdc_principal_route_stock_closure": []}
+    dates = sorted(stocks["date"].unique())
+    for start, end in zip(dates, dates[1:]):
+        period_start = str(pd.Timestamp(start).date())
+        period_end = str(pd.Timestamp(end).date())
+        opening = _route_stock_map(stocks[stocks["date"].eq(start)])
+        closing = _route_stock_map(stocks[stocks["date"].eq(end)])
+        issued = _route_issuance_map(issuance, period_start=period_start, period_end=period_end)
+        redeemed = _route_redemption_map(principal, period_start=period_start, period_end=period_end)
+        for key in sorted(set(opening) | set(closing) | set(issued) | set(redeemed)):
+            open_value = opening.get(key, 0.0)
+            issued_value = issued.get(key, 0.0)
+            redeemed_value = redeemed.get(key, 0.0)
+            close_value = closing.get(key, 0.0)
+            residual = close_value - open_value - issued_value + redeemed_value
+            route_holder, route_subbucket, instrument_type, maturity_bucket, debt_scope = key
+            rows.append(
+                {
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "route_holder_sector": route_holder,
+                    "route_holder_subsector": route_subbucket,
+                    "instrument_type": instrument_type,
+                    "maturity_bucket": maturity_bucket,
+                    "debt_scope": debt_scope,
+                    "opening_route_stock_bil": open_value,
+                    "route_face_issued_bil": issued_value,
+                    "route_face_redeemed_bil": redeemed_value,
+                    "route_stock_residual_or_indexation_bil": residual,
+                    "closing_route_stock_bil": close_value,
+                    "closure_identity_error_bil": (
+                        close_value - open_value - issued_value + redeemed_value - residual
+                    ),
+                    "route_stock_basis": "tdc_principal_settlement_route",
+                    "residual_basis": (
+                        "closing_minus_opening_less_issuance_plus_redemption;"
+                        "captures_stock_only_reallocation_rounding_and_tips_indexation"
+                    ),
+                }
+            )
+    return {"tdcsim_tdc_principal_route_stock_closure": rows}
+
+
+def _route_stock_map(frame: pd.DataFrame) -> dict[tuple[str, str, str, str, str], float]:
+    if frame.empty:
+        return {}
+    work = frame.copy()
+    for column in (
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "debt_scope",
+    ):
+        if column not in work.columns:
+            work[column] = ""
+        work[column] = work[column].fillna("").astype(str)
+    work["amount"] = pd.to_numeric(work.get("route_debt_held_bil", 0.0), errors="coerce").fillna(0.0)
+    grouped = work.groupby(
+        [
+            "route_holder_sector",
+            "route_holder_subsector",
+            "instrument_type",
+            "maturity_bucket",
+            "debt_scope",
+        ],
+        dropna=False,
+    )["amount"].sum()
+    return {tuple(key): float(value) for key, value in grouped.items()}
+
+
+def _route_issuance_map(
+    frame: pd.DataFrame,
+    *,
+    period_start: str,
+    period_end: str,
+) -> dict[tuple[str, str, str, str, str], float]:
+    if frame.empty:
+        return {}
+    work = frame[
+        frame.get("period_start", pd.Series("", index=frame.index)).astype(str).eq(period_start)
+        & frame.get("period_end", pd.Series("", index=frame.index)).astype(str).eq(period_end)
+    ].copy()
+    if work.empty:
+        return {}
+    rename = {
+        "holder_sector": "route_holder_sector",
+        "holder_subsector": "route_holder_subsector",
+    }
+    work = work.rename(columns=rename)
+    work["debt_scope"] = "controlled_public_marketable"
+    return _flow_amount_map(work, "face_issued_bil")
+
+
+def _route_redemption_map(
+    frame: pd.DataFrame,
+    *,
+    period_start: str,
+    period_end: str,
+) -> dict[tuple[str, str, str, str, str], float]:
+    if frame.empty:
+        return {}
+    work = frame[
+        frame.get("period_start", pd.Series("", index=frame.index)).astype(str).eq(period_start)
+        & frame.get("period_end", pd.Series("", index=frame.index)).astype(str).eq(period_end)
+    ].copy()
+    if work.empty:
+        return {}
+    rename = {
+        "tdc_principal_recipient_sector": "route_holder_sector",
+        "tdc_principal_recipient_subsector": "route_holder_subsector",
+    }
+    work = work.rename(columns=rename)
+    work["debt_scope"] = "controlled_public_marketable"
+    return _flow_amount_map(work, "face_redeemed_bil")
+
+
+def _flow_amount_map(frame: pd.DataFrame, amount_column: str) -> dict[tuple[str, str, str, str, str], float]:
+    for column in (
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "debt_scope",
+    ):
+        if column not in frame.columns:
+            frame[column] = ""
+        frame[column] = frame[column].fillna("").astype(str)
+    if amount_column in frame.columns:
+        amount_values = frame[amount_column]
+    else:
+        amount_values = pd.Series(0.0, index=frame.index)
+    frame["amount"] = pd.to_numeric(amount_values, errors="coerce").fillna(0.0)
+    grouped = frame.groupby(
+        [
+            "route_holder_sector",
+            "route_holder_subsector",
+            "instrument_type",
+            "maturity_bucket",
+            "debt_scope",
+        ],
+        dropna=False,
+    )["amount"].sum()
+    return {tuple(key): float(value) for key, value in grouped.items()}
 
 
 def _number(row: pd.Series, column: str) -> float:
