@@ -26,14 +26,44 @@ from historical_replay_event_ledger import (
 )
 from historical_replay_interest import (
     aggregate_stock_only_interest,
+    build_bill_interest_flow_detail,
+    build_bill_lot_conservation,
+    build_fixed_coupon_interest_flow_detail,
+    build_fixed_coupon_interest_reconciliation,
+    build_fixed_coupon_principal_adjustments,
+    build_frn_cusip_coverage,
+    build_frn_daily_index_backcast_validation,
+    build_frn_daily_index_path,
+    build_frn_interest_flow_detail,
+    build_frn_interest_reconciliation,
+    build_frn_principal_reconciliation,
+    build_interest_component_reconciliation,
+    build_interest_component_certification,
+    build_interest_scope_certification,
+    build_nonbill_discount_premium_flow_detail,
+    build_official_interest_scope_bridge,
     build_quarterly_interest_detail,
+    build_tips_inflation_compensation_flow_detail,
+    build_tips_inflation_compensation_reconciliation,
+    build_tips_coupon_accrual_flow_detail,
     build_treasury_interest_expense_diagnostic,
 )
 from historical_replay_loader import (
     enrich_mspd_cohorts_with_security_sources,
+    load_fixed_coupon_auction_events,
+    load_fixed_coupon_monthly_stocks,
+    load_frn_auction_lots,
+    load_frn_benchmark_auctions,
+    load_frn_daily_index_validation,
+    load_frn_mspd_principal_controls,
+    load_interest_auction_lots,
     load_mspd_cohorts,
+    load_nonbill_discount_premium_auction_lots,
     load_quarterly_cash,
     load_sector_positions,
+    load_tips_auction_events,
+    load_tips_cpi_reference_path,
+    load_tips_inflation_adjustment_stocks,
 )
 from historical_replay_materializer import materialize_portfolio
 from historical_replay_observations import (
@@ -154,6 +184,125 @@ def run_historical_replay(params: dict, start_date, end_date, scenario_name: str
         auction_path=paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
         frn_daily_indexes_path=paths.get("frn_daily_indexes", "data/historical_replay/raw/fiscaldata/frn_daily_indexes.csv"),
         tips_cpi_path=paths.get("tips_cpi", "data/historical_replay/raw/fiscaldata/tips_cpi_data_detail.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    bill_interest_auction_lots = load_interest_auction_lots(
+        paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    bill_interest_flow_detail = build_bill_interest_flow_detail(
+        bill_interest_auction_lots,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    bill_lot_conservation = build_bill_lot_conservation(
+        bill_interest_flow_detail,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    fixed_coupon_monthly_stocks = load_fixed_coupon_monthly_stocks(
+        paths["cohorts"],
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    fixed_coupon_auction_events = load_fixed_coupon_auction_events(
+        paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    fixed_coupon_interest_flow_detail = build_fixed_coupon_interest_flow_detail(
+        fixed_coupon_monthly_stocks,
+        fixed_coupon_auction_events,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    fixed_coupon_principal_adjustments = build_fixed_coupon_principal_adjustments(
+        fixed_coupon_interest_flow_detail,
+    )
+    frn_benchmark_auctions = load_frn_benchmark_auctions(
+        paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    frn_auction_lots = load_frn_auction_lots(
+        paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    frn_daily_index_observed = load_frn_daily_index_validation(
+        paths.get("frn_daily_indexes", "data/historical_replay/raw/fiscaldata/frn_daily_indexes.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    frn_mspd_principal_controls = load_frn_mspd_principal_controls(
+        paths["cohorts"],
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    frn_daily_index_path = build_frn_daily_index_path(
+        frn_benchmark_auctions,
+        frn_auction_lots,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    frn_daily_index_validation = build_frn_daily_index_backcast_validation(
+        frn_daily_index_path,
+        frn_daily_index_observed,
+    )
+    frn_interest_flow_detail = build_frn_interest_flow_detail(
+        frn_auction_lots,
+        frn_daily_index_path,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    frn_principal_reconciliation = build_frn_principal_reconciliation(
+        frn_mspd_principal_controls,
+        frn_auction_lots,
+    )
+    frn_cusip_coverage = build_frn_cusip_coverage(
+        frn_auction_lots,
+        frn_daily_index_path,
+        frn_daily_index_observed,
+        frn_mspd_principal_controls,
+    )
+    tips_inflation_adjustment_stocks = load_tips_inflation_adjustment_stocks(
+        paths["cohorts"],
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    tips_auction_events = load_tips_auction_events(
+        paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    tips_cpi_reference_path = load_tips_cpi_reference_path(
+        paths.get("tips_cpi", "data/historical_replay/raw/fiscaldata/tips_cpi_data_detail.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    tips_inflation_flow_detail = build_tips_inflation_compensation_flow_detail(
+        tips_inflation_adjustment_stocks,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+        tips_auction_events=tips_auction_events,
+        tips_cpi_reference_path=tips_cpi_reference_path,
+    )
+    tips_coupon_flow_detail = build_tips_coupon_accrual_flow_detail(
+        tips_inflation_adjustment_stocks,
+        tips_auction_events,
+        tips_cpi_reference_path,
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    nonbill_discount_premium_auction_lots = load_nonbill_discount_premium_auction_lots(
+        paths.get("auctions", "data/historical_replay/raw/fiscaldata/auctions_query.csv"),
+        start_quarter=start_quarter,
+        end_quarter=end_quarter,
+    )
+    nonbill_discount_premium_detail = build_nonbill_discount_premium_flow_detail(
+        nonbill_discount_premium_auction_lots,
         start_quarter=start_quarter,
         end_quarter=end_quarter,
     )
@@ -312,6 +461,50 @@ def run_historical_replay(params: dict, start_date, end_date, scenario_name: str
     treasury_interest_expense_diagnostic = _build_treasury_interest_expense_diagnostic_from_manifest(
         tdc_source_manifest,
         interest_component_detail,
+        bill_interest_flow_detail=bill_interest_flow_detail,
+        fixed_coupon_flow_detail=fixed_coupon_interest_flow_detail,
+        frn_interest_flow_detail=frn_interest_flow_detail,
+        tips_inflation_flow_detail=tips_inflation_flow_detail,
+        tips_coupon_flow_detail=tips_coupon_flow_detail,
+        nonbill_discount_premium_detail=nonbill_discount_premium_detail,
+    )
+    official_interest_scope_bridge = _build_official_interest_scope_bridge_from_manifest(
+        tdc_source_manifest,
+    )
+    interest_component_reconciliation = _build_interest_component_reconciliation_from_manifest(
+        tdc_source_manifest,
+        interest_component_detail,
+        bill_interest_flow_detail=bill_interest_flow_detail,
+        fixed_coupon_flow_detail=fixed_coupon_interest_flow_detail,
+        frn_interest_flow_detail=frn_interest_flow_detail,
+        tips_inflation_flow_detail=tips_inflation_flow_detail,
+        tips_coupon_flow_detail=tips_coupon_flow_detail,
+        nonbill_discount_premium_detail=nonbill_discount_premium_detail,
+    )
+    treasury_interest_for_certification = (
+        _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
+        if tdc_source_manifest is not None and not tdc_source_manifest.empty
+        else pd.DataFrame()
+    )
+    interest_component_certification = build_interest_component_certification(
+        treasury_interest_for_certification,
+        interest_component_reconciliation,
+        nonbill_discount_premium_detail,
+    )
+    interest_scope_certification = build_interest_scope_certification(
+        interest_component_certification,
+    )
+    fixed_coupon_interest_reconciliation = _build_fixed_coupon_interest_reconciliation_from_manifest(
+        tdc_source_manifest,
+        fixed_coupon_interest_flow_detail,
+    )
+    frn_interest_reconciliation = _build_frn_interest_reconciliation_from_manifest(
+        tdc_source_manifest,
+        frn_interest_flow_detail,
+    )
+    tips_inflation_reconciliation = _build_tips_inflation_compensation_reconciliation_from_manifest(
+        tdc_source_manifest,
+        tips_inflation_flow_detail,
     )
     final_quarter = _last_quarter(period_end_portfolios.keys()) or end_quarter
     final_portfolio = period_end_portfolios.get(final_quarter)
@@ -360,6 +553,34 @@ def run_historical_replay(params: dict, start_date, end_date, scenario_name: str
     results.attrs["auction_use_reconciliation"] = auction_use_reconciliation.copy()
     results.attrs["holder_mix_differentiation"] = holder_mix_differentiation.copy()
     results.attrs["interest_component_detail"] = interest_component_detail.copy()
+    results.attrs["historical_replay_interest_flow_detail"] = bill_interest_flow_detail.copy()
+    results.attrs["historical_replay_bill_lot_conservation"] = bill_lot_conservation.copy()
+    results.attrs["historical_replay_fixed_coupon_monthly_detail"] = (
+        fixed_coupon_interest_flow_detail.copy()
+    )
+    results.attrs["fixed_coupon_principal_adjustments"] = fixed_coupon_principal_adjustments.copy()
+    results.attrs["fixed_coupon_interest_reconciliation"] = fixed_coupon_interest_reconciliation.copy()
+    results.attrs["frn_daily_index_backcast_validation"] = frn_daily_index_validation.copy()
+    results.attrs["frn_cusip_coverage"] = frn_cusip_coverage.copy()
+    results.attrs["historical_replay_frn_interest_daily_detail"] = frn_interest_flow_detail.copy()
+    results.attrs["frn_principal_reconciliation"] = frn_principal_reconciliation.copy()
+    results.attrs["frn_interest_reconciliation"] = frn_interest_reconciliation.copy()
+    results.attrs["historical_replay_tips_inflation_monthly_detail"] = (
+        tips_inflation_flow_detail.copy()
+    )
+    results.attrs["historical_replay_tips_coupon_accrual_detail"] = tips_coupon_flow_detail.copy()
+    results.attrs["historical_replay_nonbill_discount_premium_lot_detail"] = (
+        nonbill_discount_premium_detail.copy()
+    )
+    results.attrs["tips_inflation_compensation_reconciliation"] = tips_inflation_reconciliation.copy()
+    results.attrs["official_interest_scope_bridge"] = official_interest_scope_bridge.copy()
+    results.attrs["historical_replay_interest_component_reconciliation"] = (
+        interest_component_reconciliation.copy()
+    )
+    results.attrs["historical_replay_interest_component_certification"] = (
+        interest_component_certification.copy()
+    )
+    results.attrs["historical_replay_interest_scope_certification"] = interest_scope_certification.copy()
     results.attrs["interest_proxy_alignment"] = interest_proxy_alignment.copy()
     results.attrs["treasury_interest_expense_diagnostic"] = treasury_interest_expense_diagnostic.copy()
     results.attrs["auction_allotment_proxy"] = auction_allotment_proxy.copy()
@@ -407,6 +628,24 @@ def run_historical_replay(params: dict, start_date, end_date, scenario_name: str
         auction_use_reconciliation=auction_use_reconciliation,
         holder_mix_differentiation=holder_mix_differentiation,
         interest_component_detail=interest_component_detail,
+        interest_flow_detail=bill_interest_flow_detail,
+        bill_lot_conservation=bill_lot_conservation,
+        fixed_coupon_monthly_detail=fixed_coupon_interest_flow_detail,
+        fixed_coupon_principal_adjustments=fixed_coupon_principal_adjustments,
+        fixed_coupon_interest_reconciliation=fixed_coupon_interest_reconciliation,
+        frn_daily_index_validation=frn_daily_index_validation,
+        frn_cusip_coverage=frn_cusip_coverage,
+        frn_interest_flow_detail=frn_interest_flow_detail,
+        frn_principal_reconciliation=frn_principal_reconciliation,
+        frn_interest_reconciliation=frn_interest_reconciliation,
+        tips_inflation_monthly_detail=tips_inflation_flow_detail,
+        tips_coupon_detail=tips_coupon_flow_detail,
+        nonbill_discount_premium_detail=nonbill_discount_premium_detail,
+        tips_inflation_reconciliation=tips_inflation_reconciliation,
+        official_interest_scope_bridge=official_interest_scope_bridge,
+        interest_component_reconciliation=interest_component_reconciliation,
+        interest_component_certification=interest_component_certification,
+        interest_scope_certification=interest_scope_certification,
         interest_proxy_alignment=interest_proxy_alignment,
         treasury_interest_expense_diagnostic=treasury_interest_expense_diagnostic,
         auction_allotment_proxy=auction_allotment_proxy,
@@ -1947,13 +2186,21 @@ def _build_interest_proxy_alignment(
         "tdcest_high",
         "feasible_min",
         "feasible_max",
+        "stock_only_marginal_min",
+        "stock_only_marginal_max",
         "stock_only_gap",
         "constrained_gap",
         "adjustment_from_stock_only",
+        "tdcest_point_clipped_to_stock_envelope",
         "within_feasible_bounds",
+        "tdcest_reference_intersects_stock_envelope",
         "stock_only_within_tolerance",
         "constrained_within_tolerance",
         "within_tolerance",
+        "bounds_scope_status",
+        "binding_downstream_bound",
+        "aggregate_reconciled_interest_bound",
+        "interest_proxy_claim_boundary",
         "method_tier",
     ]
     if interest_detail.empty:
@@ -2004,17 +2251,27 @@ def _build_interest_proxy_alignment(
                 "tdcest_high": high,
                 "feasible_min": feasible_min,
                 "feasible_max": feasible_max,
+                "stock_only_marginal_min": feasible_min,
+                "stock_only_marginal_max": feasible_max,
                 "stock_only_gap": gap,
                 "constrained_gap": constrained_gap,
                 "adjustment_from_stock_only": (
                     constrained - stock_only if pd.notna(constrained) else pd.NA
                 ),
+                "tdcest_point_clipped_to_stock_envelope": constrained,
                 "within_feasible_bounds": within_feasible,
+                "tdcest_reference_intersects_stock_envelope": within_feasible,
                 "stock_only_within_tolerance": stock_only_within_tolerance,
                 "constrained_within_tolerance": constrained_within_tolerance,
                 "within_tolerance": constrained_within_tolerance,
+                "bounds_scope_status": "deprecated_non_joint_diagnostic_only_not_aggregate_reconciled_not_binding",
+                "binding_downstream_bound": False,
+                "aggregate_reconciled_interest_bound": False,
+                "interest_proxy_claim_boundary": (
+                    "quarter_end_stock_only_marginal_holder_envelope_not_event_ledger_or_joint_bound"
+                ),
                 "method_tier": (
-                    "single_holder_stock_bound_projection"
+                    "single_holder_stock_envelope_diagnostic_projection"
                     if pd.notna(constrained)
                     else "stock_only_unconstrained"
                 ),
@@ -2401,6 +2658,24 @@ def _export_replay_outputs(
     auction_use_reconciliation: pd.DataFrame,
     holder_mix_differentiation: pd.DataFrame,
     interest_component_detail: pd.DataFrame,
+    interest_flow_detail: pd.DataFrame,
+    bill_lot_conservation: pd.DataFrame,
+    fixed_coupon_monthly_detail: pd.DataFrame,
+    fixed_coupon_principal_adjustments: pd.DataFrame,
+    fixed_coupon_interest_reconciliation: pd.DataFrame,
+    frn_daily_index_validation: pd.DataFrame,
+    frn_cusip_coverage: pd.DataFrame,
+    frn_interest_flow_detail: pd.DataFrame,
+    frn_principal_reconciliation: pd.DataFrame,
+    frn_interest_reconciliation: pd.DataFrame,
+    tips_inflation_monthly_detail: pd.DataFrame,
+    tips_coupon_detail: pd.DataFrame,
+    nonbill_discount_premium_detail: pd.DataFrame,
+    tips_inflation_reconciliation: pd.DataFrame,
+    official_interest_scope_bridge: pd.DataFrame,
+    interest_component_reconciliation: pd.DataFrame,
+    interest_component_certification: pd.DataFrame,
+    interest_scope_certification: pd.DataFrame,
     interest_proxy_alignment: pd.DataFrame,
     treasury_interest_expense_diagnostic: pd.DataFrame,
     auction_allotment_proxy: pd.DataFrame,
@@ -2450,6 +2725,24 @@ def _export_replay_outputs(
         "security_term_invariants": output_dir / "security_term_invariants.csv",
         "tips_principal_identity": output_dir / "tips_principal_identity.csv",
         "interest_component_detail": output_dir / "interest_component_detail.csv",
+        "interest_flow_detail": output_dir / "historical_replay_interest_flow_detail.csv",
+        "bill_lot_conservation": output_dir / "historical_replay_bill_lot_conservation.csv",
+        "fixed_coupon_monthly_detail": output_dir / "historical_replay_fixed_coupon_monthly_detail.csv",
+        "fixed_coupon_principal_adjustments": output_dir / "fixed_coupon_principal_adjustments.csv",
+        "fixed_coupon_interest_reconciliation": output_dir / "fixed_coupon_interest_reconciliation.csv",
+        "frn_daily_index_validation": output_dir / "frn_daily_index_backcast_validation.csv",
+        "frn_cusip_coverage": output_dir / "frn_cusip_coverage.csv",
+        "frn_interest_flow_detail": output_dir / "historical_replay_frn_interest_daily_detail.csv",
+        "frn_principal_reconciliation": output_dir / "frn_principal_reconciliation.csv",
+        "frn_interest_reconciliation": output_dir / "frn_interest_reconciliation.csv",
+        "tips_inflation_monthly_detail": output_dir / "historical_replay_tips_inflation_monthly_detail.csv",
+        "tips_coupon_detail": output_dir / "historical_replay_tips_coupon_accrual_detail.csv",
+        "nonbill_discount_premium_detail": output_dir / "historical_replay_nonbill_discount_premium_lot_detail.csv",
+        "tips_inflation_reconciliation": output_dir / "tips_inflation_compensation_reconciliation.csv",
+        "official_interest_scope_bridge": output_dir / "official_interest_scope_bridge.csv",
+        "interest_component_reconciliation": output_dir / "historical_replay_interest_component_reconciliation.csv",
+        "interest_component_certification": output_dir / "historical_replay_interest_component_certification.csv",
+        "interest_scope_certification": output_dir / "historical_replay_interest_scope_certification.csv",
         "interest_proxy_alignment": output_dir / "interest_proxy_alignment.csv",
         "interest_proxy_alignment_summary": output_dir / "interest_proxy_alignment_summary.md",
         "treasury_interest_expense_diagnostic": output_dir / "treasury_interest_expense_diagnostic.csv",
@@ -2493,6 +2786,24 @@ def _export_replay_outputs(
     auction_use_reconciliation.to_csv(paths["auction_use_reconciliation"], index=False)
     holder_mix_differentiation.to_csv(paths["holder_mix_differentiation"], index=False)
     interest_component_detail.to_csv(paths["interest_component_detail"], index=False)
+    interest_flow_detail.to_csv(paths["interest_flow_detail"], index=False)
+    bill_lot_conservation.to_csv(paths["bill_lot_conservation"], index=False)
+    fixed_coupon_monthly_detail.to_csv(paths["fixed_coupon_monthly_detail"], index=False)
+    fixed_coupon_principal_adjustments.to_csv(paths["fixed_coupon_principal_adjustments"], index=False)
+    fixed_coupon_interest_reconciliation.to_csv(paths["fixed_coupon_interest_reconciliation"], index=False)
+    frn_daily_index_validation.to_csv(paths["frn_daily_index_validation"], index=False)
+    frn_cusip_coverage.to_csv(paths["frn_cusip_coverage"], index=False)
+    frn_interest_flow_detail.to_csv(paths["frn_interest_flow_detail"], index=False)
+    frn_principal_reconciliation.to_csv(paths["frn_principal_reconciliation"], index=False)
+    frn_interest_reconciliation.to_csv(paths["frn_interest_reconciliation"], index=False)
+    tips_inflation_monthly_detail.to_csv(paths["tips_inflation_monthly_detail"], index=False)
+    tips_coupon_detail.to_csv(paths["tips_coupon_detail"], index=False)
+    nonbill_discount_premium_detail.to_csv(paths["nonbill_discount_premium_detail"], index=False)
+    tips_inflation_reconciliation.to_csv(paths["tips_inflation_reconciliation"], index=False)
+    official_interest_scope_bridge.to_csv(paths["official_interest_scope_bridge"], index=False)
+    interest_component_reconciliation.to_csv(paths["interest_component_reconciliation"], index=False)
+    interest_component_certification.to_csv(paths["interest_component_certification"], index=False)
+    interest_scope_certification.to_csv(paths["interest_scope_certification"], index=False)
     interest_proxy_alignment.to_csv(paths["interest_proxy_alignment"], index=False)
     treasury_interest_expense_diagnostic.to_csv(paths["treasury_interest_expense_diagnostic"], index=False)
     paths["interest_proxy_alignment_summary"].write_text(
@@ -3209,16 +3520,118 @@ def _build_valuation_scope_diagnostics(
 def _build_treasury_interest_expense_diagnostic_from_manifest(
     tdc_source_manifest: pd.DataFrame | None,
     interest_component_detail: pd.DataFrame,
+    *,
+    bill_interest_flow_detail: pd.DataFrame | None = None,
+    fixed_coupon_flow_detail: pd.DataFrame | None = None,
+    frn_interest_flow_detail: pd.DataFrame | None = None,
+    tips_inflation_flow_detail: pd.DataFrame | None = None,
+    tips_coupon_flow_detail: pd.DataFrame | None = None,
+    nonbill_discount_premium_detail: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if tdc_source_manifest is None or tdc_source_manifest.empty:
-        return build_treasury_interest_expense_diagnostic(pd.DataFrame(), interest_component_detail)
+        return build_treasury_interest_expense_diagnostic(
+            pd.DataFrame(),
+            interest_component_detail,
+            bill_interest_flow_detail=bill_interest_flow_detail,
+            fixed_coupon_flow_detail=fixed_coupon_flow_detail,
+            frn_interest_flow_detail=frn_interest_flow_detail,
+            tips_inflation_flow_detail=tips_inflation_flow_detail,
+            tips_coupon_flow_detail=tips_coupon_flow_detail,
+            nonbill_discount_premium_detail=nonbill_discount_premium_detail,
+        )
     treasury_interest = _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
     tier2_candidate = _read_manifest_csv(tdc_source_manifest, "tier2_interest_component_candidate")
     return build_treasury_interest_expense_diagnostic(
         treasury_interest,
         interest_component_detail,
         tier2_interest_candidate=tier2_candidate,
+        bill_interest_flow_detail=bill_interest_flow_detail,
+        fixed_coupon_flow_detail=fixed_coupon_flow_detail,
+        frn_interest_flow_detail=frn_interest_flow_detail,
+        tips_inflation_flow_detail=tips_inflation_flow_detail,
+        tips_coupon_flow_detail=tips_coupon_flow_detail,
+        nonbill_discount_premium_detail=nonbill_discount_premium_detail,
     )
+
+
+def _build_interest_component_reconciliation_from_manifest(
+    tdc_source_manifest: pd.DataFrame | None,
+    interest_component_detail: pd.DataFrame,
+    *,
+    bill_interest_flow_detail: pd.DataFrame | None = None,
+    fixed_coupon_flow_detail: pd.DataFrame | None = None,
+    frn_interest_flow_detail: pd.DataFrame | None = None,
+    tips_inflation_flow_detail: pd.DataFrame | None = None,
+    tips_coupon_flow_detail: pd.DataFrame | None = None,
+    nonbill_discount_premium_detail: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if tdc_source_manifest is None or tdc_source_manifest.empty:
+        return build_interest_component_reconciliation(
+            pd.DataFrame(),
+            interest_component_detail,
+            bill_interest_flow_detail=bill_interest_flow_detail,
+            fixed_coupon_flow_detail=fixed_coupon_flow_detail,
+            frn_interest_flow_detail=frn_interest_flow_detail,
+            tips_inflation_flow_detail=tips_inflation_flow_detail,
+            tips_coupon_flow_detail=tips_coupon_flow_detail,
+            nonbill_discount_premium_detail=nonbill_discount_premium_detail,
+        )
+    treasury_interest = _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
+    return build_interest_component_reconciliation(
+        treasury_interest,
+        interest_component_detail,
+        bill_interest_flow_detail=bill_interest_flow_detail,
+        fixed_coupon_flow_detail=fixed_coupon_flow_detail,
+        frn_interest_flow_detail=frn_interest_flow_detail,
+        tips_inflation_flow_detail=tips_inflation_flow_detail,
+        tips_coupon_flow_detail=tips_coupon_flow_detail,
+        nonbill_discount_premium_detail=nonbill_discount_premium_detail,
+    )
+
+
+def _build_fixed_coupon_interest_reconciliation_from_manifest(
+    tdc_source_manifest: pd.DataFrame | None,
+    fixed_coupon_flow_detail: pd.DataFrame,
+) -> pd.DataFrame:
+    if tdc_source_manifest is None or tdc_source_manifest.empty:
+        return build_fixed_coupon_interest_reconciliation(pd.DataFrame(), fixed_coupon_flow_detail)
+    treasury_interest = _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
+    return build_fixed_coupon_interest_reconciliation(treasury_interest, fixed_coupon_flow_detail)
+
+
+def _build_frn_interest_reconciliation_from_manifest(
+    tdc_source_manifest: pd.DataFrame | None,
+    frn_interest_flow_detail: pd.DataFrame,
+) -> pd.DataFrame:
+    if tdc_source_manifest is None or tdc_source_manifest.empty:
+        return build_frn_interest_reconciliation(pd.DataFrame(), frn_interest_flow_detail)
+    treasury_interest = _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
+    return build_frn_interest_reconciliation(treasury_interest, frn_interest_flow_detail)
+
+
+def _build_tips_inflation_compensation_reconciliation_from_manifest(
+    tdc_source_manifest: pd.DataFrame | None,
+    tips_inflation_flow_detail: pd.DataFrame,
+) -> pd.DataFrame:
+    if tdc_source_manifest is None or tdc_source_manifest.empty:
+        return build_tips_inflation_compensation_reconciliation(
+            pd.DataFrame(),
+            tips_inflation_flow_detail,
+        )
+    treasury_interest = _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
+    return build_tips_inflation_compensation_reconciliation(
+        treasury_interest,
+        tips_inflation_flow_detail,
+    )
+
+
+def _build_official_interest_scope_bridge_from_manifest(
+    tdc_source_manifest: pd.DataFrame | None,
+) -> pd.DataFrame:
+    if tdc_source_manifest is None or tdc_source_manifest.empty:
+        return build_official_interest_scope_bridge(pd.DataFrame())
+    treasury_interest = _read_manifest_csv(tdc_source_manifest, "treasury_interest_expense")
+    return build_official_interest_scope_bridge(treasury_interest)
 
 
 def _read_manifest_csv(manifest: pd.DataFrame, source_key: str) -> pd.DataFrame:
@@ -3699,13 +4112,17 @@ def _build_interest_proxy_alignment_summary(alignment: pd.DataFrame) -> str:
     lines = [
         "# Interest Proxy Alignment Summary",
         "",
+        "Scope status: deprecated_non_joint_diagnostic_only_not_aggregate_reconciled_not_binding.",
+        "",
+        "These rows are quarter-end stock-only marginal holder envelopes. They are not event-ledger interest bounds, not aggregate-reconciled Treasury expense bounds, and not joint multi-holder feasibility intervals for downstream clipping.",
+        "",
         f"- Rows: {rows}",
         f"- Rows with TDC-EST reference point: {referenced}",
-        f"- Rows within single-holder stock bounds: {int(feasible.sum())}",
+        f"- Rows where TDC-EST reference intersects stock envelope: {int(feasible.sum())}",
         f"- Stock-only rows within exact tolerance: {int(stock_tolerance.sum())}",
-        f"- Constrained/projection rows within exact tolerance: {int(constrained_tolerance.sum())}",
+        f"- TDC-EST point clipped to stock envelope rows within exact tolerance: {int(constrained_tolerance.sum())}",
         f"- Max absolute stock-only gap (mil): {stock_gap.max() if not stock_gap.empty else 'NA'}",
-        f"- Max absolute constrained/projection gap (mil): {constrained_gap.max() if not constrained_gap.empty else 'NA'}",
+        f"- Max absolute clipped-envelope gap (mil): {constrained_gap.max() if not constrained_gap.empty else 'NA'}",
         "",
         "Method counts:",
     ]
@@ -3714,7 +4131,7 @@ def _build_interest_proxy_alignment_summary(alignment: pd.DataFrame) -> str:
     lines.extend(
         [
             "",
-            "The constrained proxy is a single-holder stock-bound projection. It is a feasibility diagnostic, not a final event-ledger interest solution.",
+        "The clipped-envelope proxy is a deprecated, non-joint diagnostic projection of TDC-EST reference points onto marginal stock-only envelopes. It must not be used as a binding TDC-EST bound unless a separate aggregate-reconciled joint event-ledger interest layer certifies that stronger claim.",
             "",
         ]
     )

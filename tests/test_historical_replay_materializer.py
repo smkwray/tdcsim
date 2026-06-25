@@ -235,3 +235,38 @@ def test_materializer_does_not_use_tips_inflation_adjustment_as_principal():
     assert tips_rows["OriginalPrincipal"].sum() == pytest.approx(100.0 / 1.2)
     assert note_row["AdjustedPrincipal"] == pytest.approx(20.0)
     assert note_row["OriginalPrincipal"] == pytest.approx(0.0)
+
+
+def test_materializer_first_interest_schedule_handles_missing_maturity():
+    cohorts = pd.DataFrame(
+        [
+            {
+                "quarter": "2025Q1",
+                "cohort_id": "console_like",
+                "cusip": "912345AA1",
+                "outstanding": 100.0,
+                "security_type": "note",
+                "issue_date": "2025-01-15",
+                "maturity_date": pd.NaT,
+                "original_maturity_years": 10.0,
+                "coupon_rate": 0.04,
+                "interest_pay_date_1": "2025-07-15",
+                "interest_pay_date_2": "2026-01-15",
+            }
+        ]
+    )
+    allocations = pd.DataFrame(
+        [
+            {
+                "quarter": "2025Q1",
+                "sector": "Banks",
+                "cohort_id": "console_like",
+                "allocated_outstanding": 25.0,
+            }
+        ]
+    )
+
+    portfolio = materialize_portfolio(allocations, cohorts)
+
+    assert portfolio.loc[0, "FirstInterestPaymentDate"] == pd.Timestamp("2025-07-15")
+    assert portfolio.loc[0, "InterestPaymentFrequency"] == pytest.approx(2.0)
