@@ -215,6 +215,34 @@ def _price_ratio_series(frame: pd.DataFrame, *, default: float = 1.0) -> pd.Seri
     return ratio.where(ratio.notna(), per100 / 100.0).fillna(default)
 
 
+def _date_from_columns(frame: pd.DataFrame, *columns: str) -> pd.Series:
+    return pd.to_datetime(_value_from_columns(frame, *columns), errors="coerce")
+
+
+def _first_interest_from_pay_dates(
+    frame: pd.DataFrame,
+    issue_dates: pd.Series,
+    maturity_dates: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    pay_date_columns = [f"interest_pay_date_{idx}" for idx in range(1, 5)]
+    pay_dates = pd.DataFrame(
+        {
+            column: pd.to_datetime(_value_from_columns(frame, column), errors="coerce")
+            for column in pay_date_columns
+        },
+        index=frame.index,
+    )
+    maturity_missing = pd.DataFrame(
+        np.repeat(maturity_dates.isna().to_numpy()[:, None], len(pay_date_columns), axis=1),
+        index=frame.index,
+        columns=pay_date_columns,
+    )
+    valid_pay_dates = pay_dates.where(
+        pay_dates.gt(issue_dates, axis=0) & (maturity_missing | pay_dates.le(maturity_dates, axis=0))
+    )
+    return valid_pay_dates.min(axis=1), valid_pay_dates.notna().sum(axis=1).astype(float)
+
+
 def _security_type_from_label(value) -> str:
     text = str(value).strip()
     key = _normalize_label(text)
@@ -488,12 +516,50 @@ def materialize_portfolio(
     source_status = _first_nonblank_text(merged, "source_status", "source_status_y", "source_status_x").replace("", pd.NA)
     quarter_values = _first_nonblank_text(merged, _QUARTER_COL, f"{_QUARTER_COL}_x", f"{_QUARTER_COL}_y").replace("", pd.NA)
 
+    issue_dates = _date_from_columns(merged, "IssueDate", "issue_date")
+    maturity_dates = _date_from_columns(merged, "MaturityDate", "maturity_date")
+    dated_dates = _date_from_columns(merged, "DatedDate", "dated_date").fillna(issue_dates)
+    original_dated_dates = _date_from_columns(
+        merged,
+        "OriginalDatedDate",
+        "original_dated_date",
+    ).fillna(dated_dates)
+    first_interest_from_schedule, schedule_frequency = _first_interest_from_pay_dates(
+        merged,
+        issue_dates,
+        maturity_dates,
+    )
+    first_interest_payment_dates = _date_from_columns(
+        merged,
+        "FirstInterestPaymentDate",
+        "first_interest_payment_date",
+    ).fillna(first_interest_from_schedule)
+    explicit_payment_frequency = _numeric_from_columns(
+        merged,
+        "InterestPaymentFrequency",
+        "interest_payment_frequency",
+        default=np.nan,
+    )
+    interest_payment_frequency = explicit_payment_frequency.where(
+        explicit_payment_frequency.notna(),
+        schedule_frequency.where(schedule_frequency > 0.0),
+    )
+    fixed_coupon_mask = security_type.isin(["Fixed", "TIPS"]) & (coupon_rate > 1e-12)
+    interest_payment_frequency = interest_payment_frequency.where(
+        interest_payment_frequency.notna(),
+        np.where(security_type.eq("FRN"), 4.0, np.where(fixed_coupon_mask, 2.0, np.nan)),
+    )
+
     materialized = pd.DataFrame(
         {
             "BondID": range(int(start_bond_id), int(start_bond_id) + len(merged.index)),
             "SecurityType": security_type,
-            "IssueDate": pd.to_datetime(_value_from_columns(merged, "IssueDate", "issue_date"), errors="coerce"),
-            "MaturityDate": pd.to_datetime(_value_from_columns(merged, "MaturityDate", "maturity_date"), errors="coerce"),
+            "IssueDate": issue_dates,
+            "MaturityDate": maturity_dates,
+            "DatedDate": dated_dates,
+            "OriginalDatedDate": original_dated_dates,
+            "FirstInterestPaymentDate": first_interest_payment_dates,
+            "InterestPaymentFrequency": interest_payment_frequency,
             "OriginalMaturityYears": original_maturity_years,
             "FaceValue": allocation,
             "CouponRate": coupon_rate,

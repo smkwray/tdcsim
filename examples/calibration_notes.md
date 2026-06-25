@@ -1,6 +1,6 @@
 # Optional Demand Calibration Notes
 
-The alternate config in [tdc_config_optional.yaml](/Users/shanewray/malus/proj/tdcsim/tdc_config_optional.yaml) uses a deliberately modest auction-only demand calibration:
+The alternate config in [tdc_config_optional.yaml](../tdc_config_optional.yaml) uses a deliberately modest auction-only demand calibration:
 
 - `Banks.bills.yield_beta = 30.0`
 - `Banks.bills.spread_beta = 15.0`
