@@ -662,6 +662,7 @@ def _handoff_append_principal(
     face_redeemed,
     principal_redeemed,
     cash_paid,
+    mmf_deposit_pass_through=1.0,
 ):
     face_redeemed = float(face_redeemed or 0.0)
     principal_redeemed = float(principal_redeemed or 0.0)
@@ -670,6 +671,27 @@ def _handoff_append_principal(
         return
     security_type = _handoff_instrument_type(row)
     security_id = _handoff_security_id(row)
+    tdc_recipient = _tdc_principal_holder(row)
+    tdc_cash_to_du = 0.0
+    tdc_principal_to_du = 0.0
+    tdc_cash_to_du_domestic_nonbank = 0.0
+    tdc_principal_to_du_domestic_nonbank = 0.0
+    tdc_cash_to_du_mmf = 0.0
+    tdc_principal_to_du_mmf = 0.0
+    tdc_cash_to_du_mmf_plumbing = 0.0
+    tdc_principal_to_du_mmf_plumbing = 0.0
+    if tdc_recipient["holder_sector"] == "Private":
+        route = tdc_recipient["holder_subsector"]
+        if route == PRIVATE_SUBBUCKET_MMF:
+            tdc_cash_to_du_mmf = mmf_deposit_pass_through * cash_paid
+            tdc_principal_to_du_mmf = mmf_deposit_pass_through * principal_redeemed
+            tdc_cash_to_du_mmf_plumbing = (1.0 - mmf_deposit_pass_through) * cash_paid
+            tdc_principal_to_du_mmf_plumbing = (1.0 - mmf_deposit_pass_through) * principal_redeemed
+        else:
+            tdc_cash_to_du_domestic_nonbank = cash_paid
+            tdc_principal_to_du_domestic_nonbank = principal_redeemed
+        tdc_cash_to_du = tdc_cash_to_du_domestic_nonbank + tdc_cash_to_du_mmf
+        tdc_principal_to_du = tdc_principal_to_du_domestic_nonbank + tdc_principal_to_du_mmf
     handoff_tables['tdcsim_period_principal_flows'].append(
         {
             **_handoff_period(prev_date, current_date),
@@ -693,6 +715,17 @@ def _handoff_append_principal(
             'face_redeemed_bil': face_redeemed,
             'principal_redeemed_bil': principal_redeemed,
             'cash_paid_bil': cash_paid,
+            'tdc_principal_recipient_sector': tdc_recipient["holder_sector"],
+            'tdc_principal_recipient_subsector': tdc_recipient["holder_subsector"],
+            'tdc_principal_cash_paid_to_du_bil': tdc_cash_to_du,
+            'tdc_principal_redeemed_to_du_bil': tdc_principal_to_du,
+            'tdc_principal_cash_paid_to_du_domestic_nonbank_bil': tdc_cash_to_du_domestic_nonbank,
+            'tdc_principal_redeemed_to_du_domestic_nonbank_bil': tdc_principal_to_du_domestic_nonbank,
+            'tdc_principal_cash_paid_to_du_mmf_bil': tdc_cash_to_du_mmf,
+            'tdc_principal_redeemed_to_du_mmf_bil': tdc_principal_to_du_mmf,
+            'tdc_principal_cash_paid_to_du_mmf_plumbing_bil': tdc_cash_to_du_mmf_plumbing,
+            'tdc_principal_redeemed_to_du_mmf_plumbing_bil': tdc_principal_to_du_mmf_plumbing,
+            'tdc_principal_recipient_basis': 'tdc_principal_settlement_route_preserved_through_stock_only_reallocation',
         }
     )
 
@@ -1239,6 +1272,46 @@ def _private_subbucket(row_or_value) -> str:
     return value if value in PRIVATE_SUBBUCKETS else PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
 
 
+def _normalize_holder_value(value) -> str:
+    return '' if pd.isna(value) else str(value)
+
+
+def _ensure_tdc_principal_route_columns(bond_portfolio: pd.DataFrame) -> pd.DataFrame:
+    if bond_portfolio is None or bond_portfolio.empty:
+        return bond_portfolio
+    if 'TDCPrincipalHolderType' not in bond_portfolio.columns:
+        bond_portfolio['TDCPrincipalHolderType'] = bond_portfolio['HolderType']
+    if 'TDCPrincipalHolderSubBucket' not in bond_portfolio.columns:
+        bond_portfolio['TDCPrincipalHolderSubBucket'] = bond_portfolio['HolderSubBucket']
+    route_holder = bond_portfolio['TDCPrincipalHolderType'].fillna('').astype(str).replace({'<NA>': '', 'nan': '', 'None': ''})
+    route_subbucket = bond_portfolio['TDCPrincipalHolderSubBucket'].fillna('').astype(str).replace({'<NA>': '', 'nan': '', 'None': ''})
+    missing_route = route_holder.eq('')
+    route_holder = route_holder.mask(missing_route, bond_portfolio['HolderType'].fillna('').astype(str))
+    holder_subbucket = bond_portfolio['HolderSubBucket'].fillna('').astype(str).replace({'<NA>': '', 'nan': '', 'None': ''})
+    route_subbucket = route_subbucket.mask(missing_route | route_subbucket.eq(''), holder_subbucket)
+    private_route = route_holder.eq('Private')
+    valid_route_subbucket = route_subbucket.isin(PRIVATE_SUBBUCKETS)
+    route_subbucket = route_subbucket.mask(private_route & ~valid_route_subbucket, PRIVATE_SUBBUCKET_DOMESTIC_NONBANK)
+    route_subbucket = route_subbucket.mask(~private_route, '')
+    bond_portfolio['TDCPrincipalHolderType'] = route_holder
+    bond_portfolio['TDCPrincipalHolderSubBucket'] = route_subbucket
+    return bond_portfolio
+
+
+def _tdc_principal_holder(row_or_mapping) -> dict[str, str]:
+    if not hasattr(row_or_mapping, 'get'):
+        return {'holder_sector': '', 'holder_subsector': ''}
+    holder = _normalize_holder_value(row_or_mapping.get('TDCPrincipalHolderType', row_or_mapping.get('HolderType', '')))
+    subbucket = _normalize_holder_value(
+        row_or_mapping.get('TDCPrincipalHolderSubBucket', row_or_mapping.get('HolderSubBucket', ''))
+    )
+    if holder == 'Private':
+        subbucket = subbucket if subbucket in PRIVATE_SUBBUCKETS else PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+    else:
+        subbucket = ''
+    return {'holder_sector': holder, 'holder_subsector': subbucket}
+
+
 def _private_subbucket_split(preferences: dict, category: str) -> dict[str, float]:
     subbucket_map = preferences.get('__private_subbucket_shares__', {}) if isinstance(preferences, dict) else {}
     category_map = subbucket_map.get(category, {}) if isinstance(subbucket_map, dict) else {}
@@ -1537,7 +1610,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         empty_results = pd.DataFrame(index=dates, columns=results_cols_on_skip, dtype=float).fillna(0.0)
         return (empty_results, pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
     print(f'--- Starting Simulation: {scenario_name} ---')
-    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
+    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
     handoff_tables = {
         'tdcsim_period_issuance_flows': [],
@@ -1800,6 +1873,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
             )
             bond_portfolio.loc[~private_mask, 'HolderSubBucket'] = ''
+            bond_portfolio = _ensure_tdc_principal_route_columns(bond_portfolio)
             issue_price_missing = bond_portfolio['IssuePriceRatio'].isna() | (bond_portfolio['IssuePriceRatio'] <= TGA_FLOOR_TOLERANCE)
             bond_portfolio.loc[issue_price_missing, 'IssuePriceRatio'] = 1.0
             non_bill_mask = ~((bond_portfolio['SecurityType'] == 'Fixed') & (bond_portfolio['CouponRate'].fillna(0.0) <= TGA_FLOOR_TOLERANCE) & (bond_portfolio['OriginalMaturityYears'].fillna(np.inf) <= 1.0 + TGA_FLOOR_TOLERANCE))
@@ -2240,6 +2314,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 bill_discount_interest_payment = 0.0
                 tips_inflation_compensation_payment = 0.0
                 holder = bond['HolderType']
+                tdc_principal_recipient = _tdc_principal_holder(bond)
                 face_value = bond['FaceValue']
                 coupon_rate = bond['CouponRate']
                 maturity_date = bond['MaturityDate']
@@ -2288,6 +2363,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     face_redeemed=face_value,
                     principal_redeemed=principal_component_payment,
                     cash_paid=principal_payment,
+                    mmf_deposit_pass_through=mmf_deposit_pass_through,
                 )
                 if bill_discount_interest_payment > TGA_FLOOR_TOLERANCE:
                     _handoff_append_payment(
@@ -2333,14 +2409,16 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 tips_inflation_compensation_paid_by_holder[holder] += (
                     tips_inflation_compensation_payment
                 )
-                if holder == 'Private':
-                    private_route = _private_subbucket(bond)
-                    principal_paid_by_private_route[private_route] += principal_payment
-                    interest_paid_by_private_route[private_route] += interest_payment
-                    principal_component_paid_by_private_route[private_route] += max(
+                if tdc_principal_recipient['holder_sector'] == 'Private':
+                    principal_route = tdc_principal_recipient['holder_subsector']
+                    principal_paid_by_private_route[principal_route] += principal_payment
+                    principal_component_paid_by_private_route[principal_route] += max(
                         0.0, principal_payment - bill_discount_interest_payment
                     )
-                    bill_discount_interest_paid_by_private_route[private_route] += bill_discount_interest_payment
+                    bill_discount_interest_paid_by_private_route[principal_route] += bill_discount_interest_payment
+                if holder == 'Private':
+                    private_route = _private_subbucket(bond)
+                    interest_paid_by_private_route[private_route] += interest_payment
                     if security_type == 'FRN':
                         frn_interest_paid_by_private_route[private_route] += interest_payment
                     elif security_type == 'TIPS' and coupon_rate > TGA_FLOOR_TOLERANCE:
@@ -2668,6 +2746,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         face_redeemed=amount,
                         principal_redeemed=amount,
                         cash_paid=amount,
+                        mmf_deposit_pass_through=mmf_deposit_pass_through,
                     )
                 for holder, amount in retired_by_holder.items():
                     if holder == 'Private' or amount <= TGA_FLOOR_TOLERANCE:
@@ -2687,6 +2766,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         face_redeemed=amount,
                         principal_redeemed=amount,
                         cash_paid=amount,
+                        mmf_deposit_pass_through=mmf_deposit_pass_through,
                     )
                 total_principal_paid_period += retired_amount
                 reserve_change_period += sum(retired_by_holder.get(h, 0.0) for h in ['Banks', 'Private', 'Foreign'])
@@ -3025,7 +3105,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         maturity_category_val = None
                         if sec_type == 'Fixed':
                             maturity_category_val = get_maturity_category(mat_yrs, issuance_profile)
-                        new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': current_date, 'OriginalDatedDate': current_date, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': original_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': 0.0, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
+                        new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'TDCPrincipalHolderType': holder, 'TDCPrincipalHolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': current_date, 'OriginalDatedDate': current_date, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': original_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': 0.0, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
                         new_bonds_added_list.append(new_tranche)
                         total_issued_face_by_holder[holder] += route_face_value
                         total_issued_proceeds_by_holder[holder] += issue_proceeds_val
@@ -3459,6 +3539,22 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             results.loc[current_date, 'TDC_PrincipalToDU_DomesticNonbank']
             + results.loc[current_date, 'TDC_PrincipalToDU_MMF']
         )
+        results.loc[current_date, 'TDC_PrincipalCashToDU_DomesticNonbank'] = _private_route_value(
+            principal_paid_by_private_route,
+            PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+        )
+        results.loc[current_date, 'TDC_PrincipalCashToDU_MMF'] = mmf_deposit_pass_through * _private_route_value(
+            principal_paid_by_private_route,
+            PRIVATE_SUBBUCKET_MMF,
+        )
+        results.loc[current_date, 'TDC_PrincipalCashToDU_MMFPlumbing'] = (
+            (1.0 - mmf_deposit_pass_through)
+            * _private_route_value(principal_paid_by_private_route, PRIVATE_SUBBUCKET_MMF)
+        )
+        results.loc[current_date, 'TDC_PrincipalCashToDU'] = (
+            results.loc[current_date, 'TDC_PrincipalCashToDU_DomesticNonbank']
+            + results.loc[current_date, 'TDC_PrincipalCashToDU_MMF']
+        )
         results.loc[current_date, 'TDC_BillDiscountInterestToDU'] = (
             results.loc[current_date, 'TDC_BillDiscountInterestToDU_DomesticNonbank']
             + results.loc[current_date, 'TDC_BillDiscountInterestToDU_MMF']
@@ -3508,6 +3604,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         results.loc[current_date, 'TDC_GrossIssuanceProceedsAbsorbedByDU'] = (
             results.loc[current_date, 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank']
             + results.loc[current_date, 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF']
+        )
+        results.loc[current_date, 'TDC_NetPrincipalIssuanceCashflowToDU'] = (
+            results.loc[current_date, 'TDC_PrincipalCashToDU']
+            - results.loc[current_date, 'TDC_GrossIssuanceProceedsAbsorbedByDU']
         )
         results.loc[current_date, 'TDC_SecondaryTrades_DomesticNonbank'] = pref_trade_monetary_impact.get(
             'deposit_change_private_deposit_funded',

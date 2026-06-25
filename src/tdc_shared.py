@@ -5,7 +5,8 @@
 BOND_PORTFOLIO_COLS = [
     'BondID', 'SecurityType', 'IssueDate', 'MaturityDate',
     'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'InterestPaymentFrequency',
-    'OriginalMaturityYears', 'FaceValue', 'CouponRate', 'HolderType', 'HolderSubBucket', 'Status',
+    'OriginalMaturityYears', 'FaceValue', 'CouponRate', 'HolderType', 'HolderSubBucket',
+    'TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket', 'Status',
     'MaturityCategory',
     'OriginalPrincipal', 'AdjustedPrincipal', 'ReferenceCPI_Issue', 'IndexRatio',
     'FixedSpread', 'AccruedInterest_FRN', 'BenchmarkRate_FRN', 'LastAccrualDate',
@@ -54,6 +55,8 @@ PORTFOLIO_DTYPES = {
     'CouponRate': 'float64',
     'HolderType': 'string',
     'HolderSubBucket': 'string',
+    'TDCPrincipalHolderType': 'string',
+    'TDCPrincipalHolderSubBucket': 'string',
     'Status': 'string',
     'MaturityCategory': 'string',
     'OriginalPrincipal': 'float64',

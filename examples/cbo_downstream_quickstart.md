@@ -75,7 +75,7 @@ Each run writes:
 - `outputs/results_compact.csv.gz`: daily scenario results.
 - `outputs/final_portfolio_compact.csv.gz`: final active security portfolio.
 - `outputs/tdcsim_period_issuance_flows.csv.gz`: period issuance by instrument, maturity bucket, holder, and private route.
-- `outputs/tdcsim_period_principal_flows.csv.gz`: period redemptions/principal by holder and instrument.
+- `outputs/tdcsim_period_principal_flows.csv.gz`: period redemptions/principal by actual holder and instrument, with separate TDC principal-recipient fields on the domestic-ultimate/MMF route.
 - `outputs/tdcsim_period_payment_flows.csv.gz`: period interest/payment components with accounting-basis labels.
 - `outputs/tdcsim_holder_stocks.csv.gz`: holder stocks by date, sector, instrument, and maturity bucket.
 - `outputs/tdcsim_debt_target_bridge.csv.gz`: CBO public-debt target to controlled TDCSIM debt bridge.
@@ -87,7 +87,15 @@ Each run writes:
 
 The issuance, principal, and payment tables are event/security-grain tables.
 Use `flow_id` for idempotent row ingestion and `security_id` when you need to
-join flow rows back to simulated securities. Payment rows also carry
+join flow rows back to simulated securities. Principal rows expose the actual
+redeeming holder in `holder_sector` / `holder_subsector` and the TDC settlement
+route in `tdc_principal_recipient_sector` / `tdc_principal_recipient_subsector`.
+For RateWall-style net Treasury cashflow work, pair
+`tdc_principal_cash_paid_to_du_bil` with issuance
+`cash_proceeds_absorbed_by_du_bil`, or use the summary table's
+`gross_principal_cash_paid_to_du_bil`,
+`gross_issuance_proceeds_absorbed_by_du_bil`, and
+`net_du_principal_issuance_cashflow_bil`. Payment rows also carry
 `accounting_basis` and `is_additive_to_cash_total` so bills and TIPS memo
 decompositions are not double-counted as cash.
 

@@ -477,6 +477,7 @@ def _output_artifact_path(root: Path, manifest: dict[str, Any], logical_name_ste
 def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     summary = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_summary"))
     components = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_components"))
+    principal = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_principal_flows"))
     _require_columns(
         summary,
         (
@@ -485,6 +486,11 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
             "tdc_change_bil",
             "tdc_fiscal_flow_bil",
             "tdc_debt_service_bil",
+            "tdc_debt_service_principal_to_du_bil",
+            "gross_principal_cash_paid_to_du_bil",
+            "gross_principal_cash_paid_to_du_domestic_nonbank_bil",
+            "gross_principal_cash_paid_to_du_mmf_bil",
+            "gross_principal_cash_paid_to_du_mmf_plumbing_bil",
             "tdc_auction_absorption_du_bil",
             "tdc_secondary_trades_bil",
             "tdc_other_bil",
@@ -492,6 +498,8 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
             "tdc_change_ex_overlap_bil",
             "component_sum_bil",
             "component_sum_error_bil",
+            "gross_issuance_proceeds_absorbed_by_du_bil",
+            "net_du_principal_issuance_cashflow_bil",
             "tdc_amount_basis",
             "holder_allocation_scope",
         ),
@@ -511,6 +519,24 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
             "tdc_amount_basis",
         ),
         label="tdcsim_period_tdc_components",
+    )
+    _require_columns(
+        principal,
+        (
+            "period_start",
+            "period_end",
+            "tdc_principal_recipient_sector",
+            "tdc_principal_recipient_subsector",
+            "tdc_principal_cash_paid_to_du_bil",
+            "tdc_principal_redeemed_to_du_bil",
+            "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
+            "tdc_principal_redeemed_to_du_domestic_nonbank_bil",
+            "tdc_principal_cash_paid_to_du_mmf_bil",
+            "tdc_principal_redeemed_to_du_mmf_bil",
+            "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+            "tdc_principal_recipient_basis",
+        ),
+        label="tdcsim_period_principal_flows",
     )
     if summary.empty:
         raise VerificationError("tdcsim_period_tdc_summary must contain period rows")
@@ -534,6 +560,13 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     )
     if overlap_identity.abs().max() > 1e-7:
         raise VerificationError("TDC summary ex-overlap identity failed")
+    net_principal_issuance = (
+        _numeric(summary, "gross_principal_cash_paid_to_du_bil")
+        - _numeric(summary, "gross_issuance_proceeds_absorbed_by_du_bil")
+        - _numeric(summary, "net_du_principal_issuance_cashflow_bil")
+    )
+    if net_principal_issuance.abs().max() > 1e-7:
+        raise VerificationError("TDC summary net principal/issuance cashflow identity failed")
     direct = _bool_series(components, "enters_direct_interest_support")
     default_tdc = _bool_series(components, "enters_tdc_deposit_support_default")
     if (direct & default_tdc).any():
@@ -563,6 +596,44 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     )
     if tdc_delta.abs().max() > 1e-7:
         raise VerificationError("TDC default-support components do not match summary ex-overlap")
+    if not principal.empty:
+        principal_grouped = (
+            principal.assign(
+                tdc_principal_cash_paid_to_du_bil=_numeric(principal, "tdc_principal_cash_paid_to_du_bil"),
+                tdc_principal_redeemed_to_du_bil=_numeric(principal, "tdc_principal_redeemed_to_du_bil"),
+                tdc_principal_cash_paid_to_du_domestic_nonbank_bil=_numeric(
+                    principal, "tdc_principal_cash_paid_to_du_domestic_nonbank_bil"
+                ),
+                tdc_principal_cash_paid_to_du_mmf_bil=_numeric(principal, "tdc_principal_cash_paid_to_du_mmf_bil"),
+                tdc_principal_cash_paid_to_du_mmf_plumbing_bil=_numeric(
+                    principal, "tdc_principal_cash_paid_to_du_mmf_plumbing_bil"
+                ),
+            )
+            .groupby(["period_start", "period_end"], dropna=False)[
+                [
+                    "tdc_principal_cash_paid_to_du_bil",
+                    "tdc_principal_redeemed_to_du_bil",
+                    "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
+                    "tdc_principal_cash_paid_to_du_mmf_bil",
+                    "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+                ]
+            ]
+            .sum()
+        )
+        summary_indexed = summary.set_index(["period_start", "period_end"], drop=False)
+        checks = {
+            "gross_principal_cash_paid_to_du_bil": "tdc_principal_cash_paid_to_du_bil",
+            "tdc_debt_service_principal_to_du_bil": "tdc_principal_redeemed_to_du_bil",
+            "gross_principal_cash_paid_to_du_domestic_nonbank_bil": "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
+            "gross_principal_cash_paid_to_du_mmf_bil": "tdc_principal_cash_paid_to_du_mmf_bil",
+            "gross_principal_cash_paid_to_du_mmf_plumbing_bil": "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+        }
+        for summary_col, principal_col in checks.items():
+            delta = principal_grouped[principal_col].reindex(summary_indexed.index, fill_value=0.0) - _numeric(
+                summary_indexed, summary_col
+            )
+            if delta.abs().max() > 1e-7:
+                raise VerificationError(f"TDC principal bridge does not match summary field: {summary_col}")
 
 
 def _read_results(path: Path) -> pd.DataFrame:
