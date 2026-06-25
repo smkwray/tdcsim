@@ -91,8 +91,8 @@ join flow rows back to simulated securities. Principal rows expose the actual
 redeeming holder in `holder_sector` / `holder_subsector` and the TDC settlement
 route in `tdc_principal_recipient_sector` / `tdc_principal_recipient_subsector`.
 For RateWall-style net Treasury cashflow work, pair
-`tdc_principal_cash_paid_to_du_bil` with issuance
-`cash_proceeds_absorbed_by_du_bil`, or use the summary table's
+`tdc_principal_cash_paid_to_du_bil` with DU issuance derived from private
+issuance rows, or use the summary table's
 `gross_principal_cash_paid_to_du_bil`,
 `gross_issuance_proceeds_absorbed_by_du_bil`, and
 `net_du_principal_issuance_cashflow_bil`. Payment rows also carry

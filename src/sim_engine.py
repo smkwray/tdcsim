@@ -886,17 +886,18 @@ def _handoff_append_holder_stocks(handoff_tables, active_bonds, current_date):
 def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, current_date):
     """Retire active public marketable debt at par, shortest maturities first."""
     if bond_portfolio is None or bond_portfolio.empty:
-        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes()
+        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), []
     remaining = max(0.0, float(amount_to_retire))
     paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
-    paid_by_private_route = _zero_private_routes()
+    paid_by_tdc_private_route = _zero_private_routes()
+    retirement_events = []
     active = bond_portfolio[
         (bond_portfolio['Status'] == 'Active')
         & (bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS', 'FRN']))
         & (~bond_portfolio['HolderType'].isin(INTRAGOV_HOLDERS))
     ].copy()
     if active.empty:
-        return bond_portfolio, 0.0, paid_by_holder, paid_by_private_route
+        return bond_portfolio, 0.0, paid_by_holder, paid_by_tdc_private_route, retirement_events
     active['DebtBaseForRetirement'] = np.where(
         active['SecurityType'] == 'TIPS',
         active['AdjustedPrincipal'].fillna(active['FaceValue']),
@@ -914,9 +915,14 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
         retire_amount = min(remaining, debt_base)
         holder = row['HolderType']
         paid_by_holder[holder] = paid_by_holder.get(holder, 0.0) + retire_amount
-        if holder == 'Private':
-            route = _private_subbucket(row)
-            paid_by_private_route[route] += retire_amount
+        tdc_recipient = _tdc_principal_holder(row)
+        if tdc_recipient['holder_sector'] == 'Private':
+            paid_by_tdc_private_route[tdc_recipient['holder_subsector']] += retire_amount
+        event_row = row.copy()
+        event_row['FaceValue'] = retire_amount
+        if event_row.get('SecurityType') == 'TIPS':
+            event_row['AdjustedPrincipal'] = retire_amount
+        retirement_events.append(event_row)
         if retire_amount >= debt_base - TGA_FLOOR_TOLERANCE:
             bond_portfolio.loc[idx, 'Status'] = 'Matured'
             bond_portfolio.loc[idx, 'MaturityDate'] = current_date
@@ -938,7 +944,7 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
             f"CBO buyback policy could not retire enough debt at {pd.Timestamp(current_date).date()}: "
             f"remaining={remaining:.12f}"
         )
-    return bond_portfolio, retired_total, paid_by_holder, paid_by_private_route
+    return bond_portfolio, retired_total, paid_by_holder, paid_by_tdc_private_route, retirement_events
 
 
 def _transfer_public_marketable_debt_to_cb(bond_portfolio, amount_to_purchase):
@@ -2716,7 +2722,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 'buyback_shortest_public_marketable',
             }:
                 amount_to_retire = abs(raw_required_issuance)
-                bond_portfolio, retired_amount, retired_by_holder, retired_by_private_route = (
+                bond_portfolio, retired_amount, retired_by_holder, retired_by_private_route, retirement_events = (
                     _retire_public_marketable_debt_to_target(
                         bond_portfolio,
                         amount_to_retire,
@@ -2731,50 +2737,30 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 for route, amount in retired_by_private_route.items():
                     principal_paid_by_private_route[route] += amount
                     principal_component_paid_by_private_route[route] += amount
-                    _handoff_append_principal(
-                        handoff_tables,
-                        prev_date,
-                        current_date,
-                        {
-                            'HolderType': 'Private',
-                            'HolderSubBucket': route,
-                            'SecurityType': 'mixed_public_marketable',
-                            'OriginalMaturityYears': np.nan,
-                            'MaturityCategory': 'shortest_first',
-                        },
-                        redemption_type='explicit_retirement_at_par',
-                        face_redeemed=amount,
-                        principal_redeemed=amount,
-                        cash_paid=amount,
-                        mmf_deposit_pass_through=mmf_deposit_pass_through,
-                    )
-                for holder, amount in retired_by_holder.items():
-                    if holder == 'Private' or amount <= TGA_FLOOR_TOLERANCE:
+                for event_row in retirement_events:
+                    retire_amount = float(event_row.get('FaceValue', 0.0) or 0.0)
+                    if retire_amount <= TGA_FLOOR_TOLERANCE:
                         continue
                     _handoff_append_principal(
                         handoff_tables,
                         prev_date,
                         current_date,
-                        {
-                            'HolderType': holder,
-                            'HolderSubBucket': '',
-                            'SecurityType': 'mixed_public_marketable',
-                            'OriginalMaturityYears': np.nan,
-                            'MaturityCategory': 'shortest_first',
-                        },
+                        event_row,
                         redemption_type='explicit_retirement_at_par',
-                        face_redeemed=amount,
-                        principal_redeemed=amount,
-                        cash_paid=amount,
+                        face_redeemed=retire_amount,
+                        principal_redeemed=retire_amount,
+                        cash_paid=retire_amount,
                         mmf_deposit_pass_through=mmf_deposit_pass_through,
                     )
                 total_principal_paid_period += retired_amount
                 reserve_change_period += sum(retired_by_holder.get(h, 0.0) for h in ['Banks', 'Private', 'Foreign'])
-                deposit_change_period += _effective_private_amount(
+                buyback_deposit_change = _effective_private_amount(
                     retired_by_private_route,
                     mmf_deposit_pass_through,
                     legacy_total=retired_by_holder.get('Private', 0.0),
                 )
+                debt_service_deposit_change += buyback_deposit_change
+                deposit_change_period += buyback_deposit_change
                 tga_change_period -= retired_amount
                 projected_tga_pre_issuance -= retired_amount
                 cbo_pre_issuance_controlled_debt = _controlled_public_marketable_debt_from_portfolio(bond_portfolio)

@@ -534,6 +534,7 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
             "tdc_principal_cash_paid_to_du_mmf_bil",
             "tdc_principal_redeemed_to_du_mmf_bil",
             "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+            "tdc_principal_redeemed_to_du_mmf_plumbing_bil",
             "tdc_principal_recipient_basis",
         ),
         label="tdcsim_period_principal_flows",
@@ -567,6 +568,8 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     )
     if net_principal_issuance.abs().max() > 1e-7:
         raise VerificationError("TDC summary net principal/issuance cashflow identity failed")
+    if principal.empty and _numeric(summary, "gross_principal_cash_paid_to_du_bil").abs().max() > 1e-7:
+        raise VerificationError("TDC summary reports DU principal cash but principal flow table is empty")
     direct = _bool_series(components, "enters_direct_interest_support")
     default_tdc = _bool_series(components, "enters_tdc_deposit_support_default")
     if (direct & default_tdc).any():
@@ -597,6 +600,20 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     if tdc_delta.abs().max() > 1e-7:
         raise VerificationError("TDC default-support components do not match summary ex-overlap")
     if not principal.empty:
+        principal_cash_identity = (
+            _numeric(principal, "tdc_principal_cash_paid_to_du_bil")
+            - _numeric(principal, "tdc_principal_cash_paid_to_du_domestic_nonbank_bil")
+            - _numeric(principal, "tdc_principal_cash_paid_to_du_mmf_bil")
+        )
+        if principal_cash_identity.abs().max() > 1e-7:
+            raise VerificationError("TDC principal row cash-to-DU identity failed")
+        principal_redeemed_identity = (
+            _numeric(principal, "tdc_principal_redeemed_to_du_bil")
+            - _numeric(principal, "tdc_principal_redeemed_to_du_domestic_nonbank_bil")
+            - _numeric(principal, "tdc_principal_redeemed_to_du_mmf_bil")
+        )
+        if principal_redeemed_identity.abs().max() > 1e-7:
+            raise VerificationError("TDC principal row redeemed-to-DU identity failed")
         principal_grouped = (
             principal.assign(
                 tdc_principal_cash_paid_to_du_bil=_numeric(principal, "tdc_principal_cash_paid_to_du_bil"),

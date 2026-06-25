@@ -15,6 +15,7 @@ from tdcsim_cbo.compiler import digest_input_tree, input_tree_hashes
 from tdcsim_cbo.output import hash_output_tree, write_scenario_outputs
 from tdcsim_cbo.runner import RunnerError, build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
+from tdc_shared import PORTFOLIO_DTYPES
 from simulation_calendar import build_simulation_calendar
 from test_cbo_engine_integration import (
     _build_temp_forecast_inputs,
@@ -337,6 +338,57 @@ def test_stock_only_fed_reallocation_preserves_tdc_principal_settlement_route(tm
         - summary["gross_issuance_proceeds_absorbed_by_du_bil"]
         - summary["net_du_principal_issuance_cashflow_bil"]
     ).abs().max() <= 1e-9
+    assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)[
+        "status"
+    ] == "pass"
+
+
+def test_explicit_retirement_preserves_tdc_principal_settlement_route(tmp_path: Path) -> None:
+    opening = _opening_retirement_route_portfolio()
+    package, attestation = _write_runner_package(
+        tmp_path,
+        opening_portfolio=opening,
+        cbo_public_debt_target_bil=925.0,
+        fed_holdings_target_bil=0.0,
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    scenario = _write_scenario(
+        tmp_path / "explicit-retirement-route.json",
+        baseline,
+        overrides={"issuance_mix": _bill_only_issuance_mix_override()},
+    )
+
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-retirement-route")
+    principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
+    summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
+    retirements = principal[principal["redemption_type"] == "explicit_retirement_at_par"]
+    actual_cb_tdc_private = retirements[
+        (retirements["holder_sector"] == "CB")
+        & (retirements["tdc_principal_recipient_sector"] == "Private")
+        & (retirements["tdc_principal_cash_paid_to_du_bil"] > 0.0)
+    ]
+    actual_private_tdc_cb = retirements[
+        (retirements["holder_sector"] == "Private")
+        & (retirements["tdc_principal_recipient_sector"] == "CB")
+    ]
+
+    assert not retirements.empty
+    assert not actual_cb_tdc_private.empty
+    assert not actual_private_tdc_cb.empty
+    assert actual_cb_tdc_private["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(
+        actual_cb_tdc_private["cash_paid_bil"].sum()
+    )
+    assert actual_cb_tdc_private["tdc_principal_cash_paid_to_du_bil"].sum() > 0.0
+    assert actual_private_tdc_cb["cash_paid_bil"].sum() > 0.0
+    assert actual_private_tdc_cb["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(0.0)
+    assert retirements["tdc_principal_cash_paid_to_du_bil"].sum() < retirements["cash_paid_bil"].sum()
+    assert summary["gross_principal_cash_paid_to_du_bil"].sum() == pytest.approx(
+        retirements["tdc_principal_cash_paid_to_du_bil"].sum()
+    )
+    assert summary["tdc_debt_service_principal_to_du_bil"].sum() == pytest.approx(
+        retirements["tdc_principal_redeemed_to_du_bil"].sum()
+    )
+    assert summary["gross_issuance_proceeds_absorbed_by_du_bil"].abs().max() <= 1e-9
     assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)[
         "status"
     ] == "pass"
@@ -941,7 +993,13 @@ def _write_scenario(path: Path, baseline: CboBaselinePackage, *, overrides: dict
     return path
 
 
-def _write_runner_package(tmp_path: Path, *, opening_portfolio: pd.DataFrame | None = None) -> tuple[Path, Path]:
+def _write_runner_package(
+    tmp_path: Path,
+    *,
+    opening_portfolio: pd.DataFrame | None = None,
+    cbo_public_debt_target_bil: float = 1_250.0,
+    fed_holdings_target_bil: float = 100.0,
+) -> tuple[Path, Path]:
     package_dir = tmp_path / "runner_pkg"
     inputs = package_dir / "forecast_inputs"
     inputs.mkdir(parents=True)
@@ -953,6 +1011,7 @@ def _write_runner_package(tmp_path: Path, *, opening_portfolio: pd.DataFrame | N
         periods=periods,
         period_start="2026-09-20",
         period_end="2026-09-30",
+        cbo_public_debt_target_bil=cbo_public_debt_target_bil,
     )
     extra_paths = {
         "tdcsim_yield_curve_surface.csv": _dynamic_surface_path(tmp_path / "raw_inputs"),
@@ -984,7 +1043,7 @@ def _write_runner_package(tmp_path: Path, *, opening_portfolio: pd.DataFrame | N
                 "scenario_id": "baseline",
                 "period_end": period.period_end.isoformat(),
                 "holder_type": "CB",
-                "cbo_fed_holdings_target_bil": 100.0,
+                "cbo_fed_holdings_target_bil": fed_holdings_target_bil,
                 "interpolation_method": "fixture",
                 "source_fiscal_year": 2026,
                 "source_role": "scenario_assumption",
@@ -1069,6 +1128,32 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _opening_retirement_route_portfolio() -> pd.DataFrame:
+    base = _opening_controlled_portfolio(800.0).iloc[0].copy()
+    rows = []
+    for bond_id, face, maturity, holder, subbucket, tdc_holder, tdc_subbucket in (
+        (1, 100.0, "2027-01-01", "CB", "", "Private", "domestic_nonbank_deposit_funded"),
+        (2, 100.0, "2027-01-02", "Private", "domestic_nonbank_deposit_funded", "CB", ""),
+        (3, 800.0, "2027-09-30", "Private", "domestic_nonbank_deposit_funded", "Private", "domestic_nonbank_deposit_funded"),
+    ):
+        row = base.copy()
+        row["BondID"] = bond_id
+        row["FaceValue"] = face
+        row["OriginalPrincipal"] = face
+        row["AdjustedPrincipal"] = face
+        row["IssueProceeds"] = face
+        row["MaturityDate"] = pd.Timestamp(maturity)
+        row["HolderType"] = holder
+        row["HolderSubBucket"] = subbucket
+        row["TDCPrincipalHolderType"] = tdc_holder
+        row["TDCPrincipalHolderSubBucket"] = tdc_subbucket
+        row["MaturityCategory"] = "bills" if face == 100.0 else "notes"
+        row["OriginalMaturityYears"] = 0.25 if face == 100.0 else 2.0
+        row["CouponRate"] = 0.0
+        rows.append(row)
+    return pd.DataFrame(rows, columns=base.index).astype(PORTFOLIO_DTYPES, errors="ignore")
 
 
 def _refresh_result_hashes(run_dir: Path, manifest: dict) -> None:
