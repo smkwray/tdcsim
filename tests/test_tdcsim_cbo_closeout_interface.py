@@ -101,6 +101,30 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         assert {"flow_id", "security_id"} <= set(frame.columns)
         assert frame["flow_id"].notna().all()
         assert frame["flow_id"].is_unique
+    principal_bridge_columns = {
+        "tdc_principal_recipient_sector",
+        "tdc_principal_recipient_subsector",
+        "tdc_principal_cash_paid_to_du_bil",
+        "tdc_principal_redeemed_to_du_bil",
+        "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
+        "tdc_principal_redeemed_to_du_domestic_nonbank_bil",
+        "tdc_principal_cash_paid_to_du_mmf_bil",
+        "tdc_principal_redeemed_to_du_mmf_bil",
+        "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+        "tdc_principal_redeemed_to_du_mmf_plumbing_bil",
+        "tdc_principal_recipient_basis",
+    }
+    assert principal_bridge_columns <= set(principal.columns)
+    summary_principal_columns = {
+        "gross_principal_cash_paid_to_du_bil",
+        "principal_redeemed_to_du_domestic_nonbank_bil",
+        "principal_redeemed_to_du_mmf_bil",
+        "gross_principal_cash_paid_to_du_domestic_nonbank_bil",
+        "gross_principal_cash_paid_to_du_mmf_bil",
+        "gross_principal_cash_paid_to_du_mmf_plumbing_bil",
+        "net_du_principal_issuance_cashflow_bil",
+    }
+    assert summary_principal_columns <= set(tdc_summary.columns)
     assert not tdc_summary.empty
     assert not tdc_components.empty
     identity = (
@@ -117,6 +141,28 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         - tdc_summary["overlap_cashflow_bil"]
         - tdc_summary["tdc_change_ex_overlap_bil"]
     ).abs().max() <= 1e-9
+    assert (
+        tdc_summary["gross_principal_cash_paid_to_du_bil"]
+        - tdc_summary["gross_issuance_proceeds_absorbed_by_du_bil"]
+        - tdc_summary["net_du_principal_issuance_cashflow_bil"]
+    ).abs().max() <= 1e-9
+    if not principal.empty:
+        principal_grouped = principal.groupby(["period_start", "period_end"], dropna=False)[
+            [
+                "tdc_principal_cash_paid_to_du_bil",
+                "tdc_principal_redeemed_to_du_bil",
+                "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
+                "tdc_principal_cash_paid_to_du_mmf_bil",
+                "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+            ]
+        ].sum()
+        tdc_summary_indexed = tdc_summary.set_index(["period_start", "period_end"], drop=False)
+        assert principal_grouped["tdc_principal_cash_paid_to_du_bil"].reindex(
+            tdc_summary_indexed.index, fill_value=0.0
+        ).tolist() == pytest.approx(tdc_summary_indexed["gross_principal_cash_paid_to_du_bil"].tolist())
+        assert principal_grouped["tdc_principal_redeemed_to_du_bil"].reindex(
+            tdc_summary_indexed.index, fill_value=0.0
+        ).tolist() == pytest.approx(tdc_summary_indexed["tdc_debt_service_principal_to_du_bil"].tolist())
     assert not (
         tdc_components["enters_direct_interest_support"].astype(bool)
         & tdc_components["enters_tdc_deposit_support_default"].astype(bool)
@@ -256,6 +302,46 @@ def test_run_cbo_scenario_fed_target_reallocates_only_and_remittance_unsupported
     )
 
 
+def test_stock_only_fed_reallocation_preserves_tdc_principal_settlement_route(tmp_path: Path) -> None:
+    opening = _opening_controlled_portfolio(1_000.0)
+    opening.loc[:, "SecurityType"] = "Fixed"
+    opening.loc[:, "MaturityDate"] = pd.Timestamp("2026-09-25")
+    opening.loc[:, "OriginalMaturityYears"] = 0.25
+    opening.loc[:, "CouponRate"] = 0.0
+    opening.loc[:, "MaturityCategory"] = "bills"
+    package, attestation = _write_runner_package(tmp_path, opening_portfolio=opening)
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    scenario = _write_scenario(tmp_path / "fed-principal-route.json", baseline, overrides={})
+
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-fed-principal-route")
+    principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
+    summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
+    cb_actual = principal[
+        (principal["holder_sector"] == "CB")
+        & (principal["tdc_principal_recipient_sector"] == "Private")
+        & (principal["tdc_principal_cash_paid_to_du_bil"] > 0.0)
+    ]
+
+    assert not cb_actual.empty
+    assert cb_actual["tdc_principal_recipient_basis"].eq(
+        "tdc_principal_settlement_route_preserved_through_stock_only_reallocation"
+    ).all()
+    assert principal["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(1_000.0)
+    assert summary["gross_principal_cash_paid_to_du_bil"].sum() == pytest.approx(1_000.0)
+    assert summary["tdc_debt_service_principal_to_du_bil"].sum() == pytest.approx(
+        principal["tdc_principal_redeemed_to_du_bil"].sum()
+    )
+    assert summary["tdc_debt_service_principal_to_du_bil"].sum() > 990.0
+    assert (
+        summary["gross_principal_cash_paid_to_du_bil"]
+        - summary["gross_issuance_proceeds_absorbed_by_du_bil"]
+        - summary["net_du_principal_issuance_cashflow_bil"]
+    ).abs().max() <= 1e-9
+    assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)[
+        "status"
+    ] == "pass"
+
+
 def test_output_gzip_bytes_are_deterministic(tmp_path: Path) -> None:
     results = pd.DataFrame({"Date": ["2027-01-01"], "CBORequiredFaceIssuance": [1.0]})
     portfolio = pd.DataFrame({"Status": ["Active"], "FaceValue": [1.0]})
@@ -301,6 +387,21 @@ def test_verifier_rejects_missing_required_output_column_even_with_fresh_hashes(
     write_json(run.manifest_path, manifest)
 
     with pytest.raises(VerificationError, match="missing required columns"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_missing_principal_bridge_even_with_fresh_hashes(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    principal_path = run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv"
+    principal = pd.read_csv(principal_path).drop(columns=["tdc_principal_cash_paid_to_du_bil"])
+    principal.to_csv(principal_path, index=False)
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    _refresh_manifest_artifact(run.output_dir, manifest, "outputs/tdcsim_period_principal_flows.csv")
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="tdcsim_period_principal_flows missing required columns"):
         verify_scenario_run(run.output_dir)
 
 
@@ -840,7 +941,7 @@ def _write_scenario(path: Path, baseline: CboBaselinePackage, *, overrides: dict
     return path
 
 
-def _write_runner_package(tmp_path: Path) -> tuple[Path, Path]:
+def _write_runner_package(tmp_path: Path, *, opening_portfolio: pd.DataFrame | None = None) -> tuple[Path, Path]:
     package_dir = tmp_path / "runner_pkg"
     inputs = package_dir / "forecast_inputs"
     inputs.mkdir(parents=True)
@@ -896,7 +997,9 @@ def _write_runner_package(tmp_path: Path) -> tuple[Path, Path]:
             for period in periods
         ],
     )
-    _opening_controlled_portfolio(1_000.0).to_csv(inputs / "tdcsim_opening_portfolio.csv", index=False)
+    if opening_portfolio is None:
+        opening_portfolio = _opening_controlled_portfolio(1_000.0)
+    opening_portfolio.to_csv(inputs / "tdcsim_opening_portfolio.csv", index=False)
     write_json(inputs / "tdcsim_opening_portfolio_metadata.json", {"schema_version": "fixture"})
     _write_csv(inputs / "tdcsim_opening_frn_indexation_diagnostics.csv", [{"schema_version": "fixture"}])
     _write_csv(inputs / "tdcsim_opening_rollforward_diagnostics.csv", [{"schema_version": "fixture"}])

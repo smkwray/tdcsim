@@ -114,6 +114,17 @@ HANDOFF_TABLE_COLUMNS = {
         "face_redeemed_bil",
         "principal_redeemed_bil",
         "cash_paid_bil",
+        "tdc_principal_recipient_sector",
+        "tdc_principal_recipient_subsector",
+        "tdc_principal_cash_paid_to_du_bil",
+        "tdc_principal_redeemed_to_du_bil",
+        "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
+        "tdc_principal_redeemed_to_du_domestic_nonbank_bil",
+        "tdc_principal_cash_paid_to_du_mmf_bil",
+        "tdc_principal_redeemed_to_du_mmf_bil",
+        "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
+        "tdc_principal_redeemed_to_du_mmf_plumbing_bil",
+        "tdc_principal_recipient_basis",
     ],
     "tdcsim_period_payment_flows": [
         "period_start",
@@ -177,6 +188,12 @@ HANDOFF_TABLE_COLUMNS = {
         "tdc_debt_service_bil",
         "tdc_debt_service_principal_to_du_bil",
         "tdc_debt_service_interest_to_du_bil",
+        "gross_principal_cash_paid_to_du_bil",
+        "principal_redeemed_to_du_domestic_nonbank_bil",
+        "principal_redeemed_to_du_mmf_bil",
+        "gross_principal_cash_paid_to_du_domestic_nonbank_bil",
+        "gross_principal_cash_paid_to_du_mmf_bil",
+        "gross_principal_cash_paid_to_du_mmf_plumbing_bil",
         "tdc_auction_absorption_du_bil",
         "tdc_secondary_trades_bil",
         "tdc_other_bil",
@@ -186,6 +203,7 @@ HANDOFF_TABLE_COLUMNS = {
         "component_sum_error_bil",
         "gross_issuance_cash_proceeds_bil",
         "gross_issuance_proceeds_absorbed_by_du_bil",
+        "net_du_principal_issuance_cashflow_bil",
         "tdc_amount_basis",
         "holder_allocation_scope",
         "overlap_policy",
@@ -608,6 +626,18 @@ def _tdc_handoff_tables(results: pd.DataFrame) -> dict[str, list[dict[str, Any]]
                 "tdc_debt_service_bil": _number(row, "TDC_DebtService"),
                 "tdc_debt_service_principal_to_du_bil": _number(row, "TDC_PrincipalToDU"),
                 "tdc_debt_service_interest_to_du_bil": _number(row, "TDC_InterestToDU"),
+                "gross_principal_cash_paid_to_du_bil": _number(row, "TDC_PrincipalCashToDU"),
+                "principal_redeemed_to_du_domestic_nonbank_bil": _number(
+                    row, "TDC_PrincipalToDU_DomesticNonbank"
+                ),
+                "principal_redeemed_to_du_mmf_bil": _number(row, "TDC_PrincipalToDU_MMF"),
+                "gross_principal_cash_paid_to_du_domestic_nonbank_bil": _number(
+                    row, "TDC_PrincipalCashToDU_DomesticNonbank"
+                ),
+                "gross_principal_cash_paid_to_du_mmf_bil": _number(row, "TDC_PrincipalCashToDU_MMF"),
+                "gross_principal_cash_paid_to_du_mmf_plumbing_bil": _number(
+                    row, "TDC_PrincipalCashToDU_MMFPlumbing"
+                ),
                 "tdc_auction_absorption_du_bil": _number(row, "TDC_AuctionAbsorption"),
                 "tdc_secondary_trades_bil": _number(row, "TDC_SecondaryTrades"),
                 "tdc_other_bil": _number(row, "TDC_Other"),
@@ -618,6 +648,9 @@ def _tdc_handoff_tables(results: pd.DataFrame) -> dict[str, list[dict[str, Any]]
                 "gross_issuance_cash_proceeds_bil": _number(row, "AuctionProceeds"),
                 "gross_issuance_proceeds_absorbed_by_du_bil": _number(
                     row, "TDC_GrossIssuanceProceedsAbsorbedByDU"
+                ),
+                "net_du_principal_issuance_cashflow_bil": _number(
+                    row, "TDC_NetPrincipalIssuanceCashflowToDU"
                 ),
                 "tdc_amount_basis": TDC_AMOUNT_BASIS,
                 "holder_allocation_scope": TDC_HOLDER_SCOPE,
