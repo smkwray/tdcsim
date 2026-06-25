@@ -40,11 +40,21 @@ def test_downstream_quickstart_generates_and_runs_public_examples(tmp_path: Path
         "02_issuance_maturity_mix.json",
         "03_sector_holders.json",
         "04_fiscal_fed_cash.json",
+        "05_rate_down_25bp.json",
+        "06_rate_up_25bp.json",
+        "07_issuance_shorter.json",
+        "08_issuance_longer.json",
+        "09_private_holder_high.json",
+        "10_private_holder_low.json",
+        "11_primary_deficit_plus_1pct.json",
+        "12_operating_cash_inflation_beta_50.json",
+        "13_fed_holdings_scale_1.json",
     ]
     assert completed.stdout.count(".json") == len(scenario_paths)
     holder_example = json.loads((scenarios_dir / "03_sector_holders.json").read_text(encoding="utf-8"))
     assert holder_example["overrides"]["holder_preferences"]["mode"] == "dated_static_shares"
     assert {row["effective_date"] for row in holder_example["overrides"]["holder_preferences"]["rows"]} == {"2026-09-20"}
+    _assert_matched_scenario_boundaries(scenarios_dir)
 
     noop = scenario_paths[0]
     noop_spec = CboScenarioSpec.from_file(noop)
@@ -134,3 +144,50 @@ def _output_csv(run_dir: Path, stem: str) -> Path:
 
 def _last_nonempty_line(text: str) -> str:
     return next(line for line in reversed(text.splitlines()) if line.strip())
+
+
+def _assert_matched_scenario_boundaries(scenarios_dir: Path) -> None:
+    scenarios = {
+        path.name: json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(scenarios_dir.glob("*.json"))
+    }
+    assert scenarios["05_rate_down_25bp.json"]["scenario_id"] == "tdcsim_rate_down_25bp_v1"
+    assert scenarios["06_rate_up_25bp.json"]["scenario_id"] == "tdcsim_rate_up_25bp_v1"
+    assert set(scenarios["05_rate_down_25bp.json"]["overrides"]) == {
+        "frn_benchmark",
+        "nominal_yield_curve",
+    }
+    assert set(scenarios["06_rate_up_25bp.json"]["overrides"]) == {
+        "frn_benchmark",
+        "nominal_yield_curve",
+    }
+    assert scenarios["05_rate_down_25bp.json"]["overrides"]["nominal_yield_curve"]["shock_bp"] == -25
+    assert scenarios["06_rate_up_25bp.json"]["overrides"]["nominal_yield_curve"]["shock_bp"] == 25
+
+    shorter = scenarios["07_issuance_shorter.json"]["overrides"]
+    longer = scenarios["08_issuance_longer.json"]["overrides"]
+    assert set(shorter) == {"issuance_mix"}
+    assert set(longer) == {"issuance_mix"}
+    assert shorter["issuance_mix"]["tips_share"] == longer["issuance_mix"]["tips_share"]
+    assert shorter["issuance_mix"]["frn_share"] == longer["issuance_mix"]["frn_share"]
+    assert (
+        shorter["issuance_mix"]["fixed_remainder_shares"]["bills"]
+        > longer["issuance_mix"]["fixed_remainder_shares"]["bills"]
+    )
+    assert (
+        shorter["issuance_mix"]["fixed_remainder_shares"]["bonds"]
+        < longer["issuance_mix"]["fixed_remainder_shares"]["bonds"]
+    )
+
+    high_private = scenarios["09_private_holder_high.json"]["overrides"]
+    low_private = scenarios["10_private_holder_low.json"]["overrides"]
+    assert set(high_private) == {"holder_preferences"}
+    assert set(low_private) == {"holder_preferences"}
+    high_share = high_private["holder_preferences"]["rows"][0]["shares"]["Private"]
+    low_share = low_private["holder_preferences"]["rows"][0]["shares"]["Private"]
+    assert high_share == 0.70
+    assert low_share == 0.30
+
+    assert set(scenarios["11_primary_deficit_plus_1pct.json"]["overrides"]) == {"primary_deficit"}
+    assert set(scenarios["12_operating_cash_inflation_beta_50.json"]["overrides"]) == {"operating_cash"}
+    assert set(scenarios["13_fed_holdings_scale_1.json"]["overrides"]) == {"fed_holdings"}

@@ -13,8 +13,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec
-from tdcsim_cbo._json import write_json
+from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
+from tdcsim_cbo._json import write_json  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,6 +135,96 @@ def example_scenarios(
                 },
             },
         ),
+        "05_rate_down_25bp.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_rate_down_25bp_v1",
+            label="Nominal rate down 25bp",
+            simulation=simulation,
+            coupling={
+                "frn_benchmark": "derive_from_scenario_nominal_curve",
+                "tips_real_yield": "independent_explicit_path",
+                "operating_cash_inflation": "baseline_cpi",
+            },
+            overrides=_rate_parallel_override(-25),
+        ),
+        "06_rate_up_25bp.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_rate_up_25bp_v1",
+            label="Nominal rate up 25bp",
+            simulation=simulation,
+            coupling={
+                "frn_benchmark": "derive_from_scenario_nominal_curve",
+                "tips_real_yield": "independent_explicit_path",
+                "operating_cash_inflation": "baseline_cpi",
+            },
+            overrides=_rate_parallel_override(25),
+        ),
+        "07_issuance_shorter.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_shorter_v1",
+            label="Shorter issuance maturity mix",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={"issuance_mix": _matched_issuance_mix("shorter")},
+        ),
+        "08_issuance_longer.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_longer_v1",
+            label="Longer issuance maturity mix",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={"issuance_mix": _matched_issuance_mix("longer")},
+        ),
+        "09_private_holder_high.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_private_holder_high_v1",
+            label="Higher private new-issuance holder share",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={
+                "holder_preferences": {
+                    "mode": "dated_static_shares",
+                    "rows": _matched_holder_rows(private_share=0.70, effective_date=_holder_effective_date(simulation)),
+                }
+            },
+        ),
+        "10_private_holder_low.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_private_holder_low_v1",
+            label="Lower private new-issuance holder share",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={
+                "holder_preferences": {
+                    "mode": "dated_static_shares",
+                    "rows": _matched_holder_rows(private_share=0.30, effective_date=_holder_effective_date(simulation)),
+                }
+            },
+        ),
+        "11_primary_deficit_plus_1pct.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_primary_deficit_plus_1pct_v1",
+            label="Primary deficit plus 1 percent",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={"primary_deficit": {"mode": "scale_path", "scale": 1.01}},
+        ),
+        "12_operating_cash_inflation_beta_50.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_operating_cash_inflation_beta_50_v1",
+            label="Operating cash inflation beta 0.5",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={"operating_cash": {"mode": "inflation_beta", "beta": 0.5}},
+        ),
+        "13_fed_holdings_scale_1.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_fed_holdings_scale_1_v1",
+            label="Fed holdings unchanged stock path",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={"fed_holdings": {"mode": "scale_path", "scale": 1.0}},
+        ),
     }
 
 
@@ -173,6 +263,63 @@ def _baseline_coupling() -> dict[str, str]:
         "tips_real_yield": "independent_explicit_path",
         "operating_cash_inflation": "baseline_cpi",
     }
+
+
+def _rate_parallel_override(shock_bp: int) -> dict[str, Any]:
+    return {
+        "nominal_yield_curve": {"mode": "parallel_bp", "shock_bp": shock_bp},
+        "frn_benchmark": {"mode": "linked_to_nominal_curve", "spread_bp": 0},
+    }
+
+
+def _matched_issuance_mix(kind: str) -> dict[str, Any]:
+    if kind == "shorter":
+        fixed_remainder_shares = {"bills": 0.55, "notes": 0.40, "bonds": 0.05}
+        maturity_distributions = {
+            "bills": [{"maturity_years": 0.25, "share": 0.50}, {"maturity_years": 0.5, "share": 0.50}],
+            "notes": [{"maturity_years": 2.0, "share": 0.70}, {"maturity_years": 5.0, "share": 0.30}],
+            "bonds": [{"maturity_years": 20.0, "share": 0.50}, {"maturity_years": 30.0, "share": 0.50}],
+            "tips": [{"maturity_years": 5.0, "share": 0.60}, {"maturity_years": 10.0, "share": 0.40}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        }
+    elif kind == "longer":
+        fixed_remainder_shares = {"bills": 0.10, "notes": 0.45, "bonds": 0.45}
+        maturity_distributions = {
+            "bills": [{"maturity_years": 0.5, "share": 1.0}],
+            "notes": [{"maturity_years": 7.0, "share": 0.45}, {"maturity_years": 10.0, "share": 0.55}],
+            "bonds": [{"maturity_years": 20.0, "share": 0.35}, {"maturity_years": 30.0, "share": 0.65}],
+            "tips": [{"maturity_years": 10.0, "share": 0.45}, {"maturity_years": 30.0, "share": 0.55}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        }
+    else:
+        raise ValueError(f"unknown issuance mix kind: {kind}")
+    return {
+        "mode": "replace_shares",
+        "tips_share": 0.06,
+        "frn_share": 0.06,
+        "fixed_remainder_shares": fixed_remainder_shares,
+        "maturity_distributions": maturity_distributions,
+    }
+
+
+def _matched_holder_rows(*, private_share: float, effective_date: str | None = None) -> list[dict[str, Any]]:
+    bank_share = 0.20
+    foreign_share = 1.0 - bank_share - private_share
+    if foreign_share < -1e-12:
+        raise ValueError("private_share is too high for matched holder rows")
+    shares = {
+        "Banks": bank_share,
+        "CB": 0.0,
+        "Foreign": max(0.0, foreign_share),
+        "Private": private_share,
+        "TrustFunds": 0.0,
+        "FedInternal": 0.0,
+    }
+    rows = [{"security_type": security_type, "shares": shares} for security_type in ("bills", "notes", "bonds", "tips", "frn")]
+    if effective_date:
+        for row in rows:
+            row["effective_date"] = effective_date
+    return rows
 
 
 def _holder_rows(*, effective_date: str | None = None) -> list[dict[str, Any]]:

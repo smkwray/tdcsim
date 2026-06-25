@@ -478,6 +478,8 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     summary = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_summary"))
     components = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_components"))
     principal = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_principal_flows"))
+    route_stocks = _read_results(_output_artifact_path(root, manifest, "tdcsim_tdc_principal_route_stocks"))
+    route_closure = _read_results(_output_artifact_path(root, manifest, "tdcsim_tdc_principal_route_stock_closure"))
     _require_columns(
         summary,
         (
@@ -539,10 +541,54 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
         ),
         label="tdcsim_period_principal_flows",
     )
+    _require_columns(
+        route_stocks,
+        (
+            "date",
+            "route_holder_sector",
+            "route_holder_subsector",
+            "instrument_type",
+            "maturity_bucket",
+            "route_debt_held_bil",
+            "debt_scope",
+            "route_stock_basis",
+        ),
+        label="tdcsim_tdc_principal_route_stocks",
+    )
+    _require_columns(
+        route_closure,
+        (
+            "period_start",
+            "period_end",
+            "route_holder_sector",
+            "route_holder_subsector",
+            "instrument_type",
+            "maturity_bucket",
+            "debt_scope",
+            "opening_route_stock_bil",
+            "route_face_issued_bil",
+            "route_face_redeemed_bil",
+            "route_stock_residual_or_indexation_bil",
+            "closing_route_stock_bil",
+            "closure_identity_error_bil",
+            "route_stock_basis",
+        ),
+        label="tdcsim_tdc_principal_route_stock_closure",
+    )
     if summary.empty:
         raise VerificationError("tdcsim_period_tdc_summary must contain period rows")
     if components.empty:
         raise VerificationError("tdcsim_period_tdc_components must contain component rows")
+    if route_stocks.empty:
+        raise VerificationError("tdcsim_tdc_principal_route_stocks must contain route stock rows")
+    if route_closure.empty:
+        raise VerificationError("tdcsim_tdc_principal_route_stock_closure must contain period rows")
+    if set(route_stocks["route_stock_basis"].astype(str).unique()) != {"tdc_principal_settlement_route"}:
+        raise VerificationError("route stocks have unexpected route_stock_basis")
+    if set(route_closure["route_stock_basis"].astype(str).unique()) != {"tdc_principal_settlement_route"}:
+        raise VerificationError("route closure has unexpected route_stock_basis")
+    if _numeric(route_closure, "closure_identity_error_bil").abs().max() > 1e-7:
+        raise VerificationError("route stock closure identity failed")
     identity = (
         _numeric(summary, "tdc_fiscal_flow_bil")
         + _numeric(summary, "tdc_debt_service_bil")

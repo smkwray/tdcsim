@@ -24,13 +24,22 @@ python scripts/write_cbo_example_scenarios.py \
   --output-dir /tmp/tdcsim-cbo-scenarios
 ```
 
-This writes five ready-to-run examples:
+This writes fourteen ready-to-run examples:
 
 - `00_baseline_noop.json`: run the baseline without scenario changes.
 - `01_rates_inflation_frn_tips.json`: change the nominal curve, inflation, FRN benchmark, TIPS real yield, and real operating cash.
 - `02_issuance_maturity_mix.json`: change issuance shares and maturity mix.
 - `03_sector_holders.json`: change sector holder preferences from a future date forward.
 - `04_fiscal_fed_cash.json`: change primary deficit scale, Fed stock target handling, cash residual, operating cash, and fiscal incidence.
+- `05_rate_down_25bp.json`: matched nominal-rate down case with linked FRN benchmark.
+- `06_rate_up_25bp.json`: matched nominal-rate up case with linked FRN benchmark.
+- `07_issuance_shorter.json`: matched shorter issuance mix, holding TIPS/FRN shares fixed against the longer case.
+- `08_issuance_longer.json`: matched longer issuance mix, holding TIPS/FRN shares fixed against the shorter case.
+- `09_private_holder_high.json`: high private new-issuance holder share.
+- `10_private_holder_low.json`: low private new-issuance holder share.
+- `11_primary_deficit_plus_1pct.json`: primary-deficit-only scale scenario.
+- `12_operating_cash_inflation_beta_50.json`: operating-cash-only inflation-beta scenario.
+- `13_fed_holdings_scale_1.json`: Fed-holdings-only passthrough scenario.
 
 The simulation start date must match the package opening-state date. For the
 current release-bound package that is `2026-06-21`. For a short smoke run, add:
@@ -78,6 +87,8 @@ Each run writes:
 - `outputs/tdcsim_period_principal_flows.csv.gz`: period redemptions/principal by actual holder and instrument, with separate TDC principal-recipient fields on the domestic-ultimate/MMF route.
 - `outputs/tdcsim_period_payment_flows.csv.gz`: period interest/payment components with accounting-basis labels.
 - `outputs/tdcsim_holder_stocks.csv.gz`: holder stocks by date, sector, instrument, and maturity bucket.
+- `outputs/tdcsim_tdc_principal_route_stocks.csv.gz`: security stock by TDC principal-settlement route.
+- `outputs/tdcsim_tdc_principal_route_stock_closure.csv.gz`: opening route stock plus issuance less redemption to closing route stock.
 - `outputs/tdcsim_debt_target_bridge.csv.gz`: CBO public-debt target to controlled TDCSIM debt bridge.
 - `outputs/tdcsim_scenario_metrics.csv.gz`: derived WAM, bill-share, and short-maturity-share metrics.
 - `outputs/tdcsim_period_tdc_summary.csv.gz`: period TDC accounting totals, overlap, and ex-overlap TDC.
