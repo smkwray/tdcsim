@@ -98,7 +98,6 @@ def example_scenarios(
                         "tips": [{"maturity_years": 10.0, "share": 0.70}, {"maturity_years": 30.0, "share": 0.30}],
                         "frn": [{"maturity_years": 2.0, "share": 1.0}],
                     },
-                    "negative_issuance_action": "retire_shortest_public_marketable",
                 }
             },
         ),
@@ -124,8 +123,9 @@ def example_scenarios(
             overrides={
                 "primary_deficit": {"mode": "scale_path", "scale": 1.01},
                 "fed_holdings": {"mode": "scale_path", "scale": 1.0},
-                "operating_cash": {"mode": "constant_nominal"},
+                "operating_cash": {"mode": "inflation_beta", "beta": 0.5},
                 "cash_reconciliation": {"mode": "zero", "funding_effect": "none"},
+                "mmf_deposit_pass_through": {"mode": "fixed_fraction", "value": 0.97},
                 "fiscal_incidence": {
                     "mode": "static_shares",
                     "domestic_ultimate_share": 0.50,
@@ -160,7 +160,7 @@ def _scenario(
         "provenance": {"kind": "user_stress_assumption", "label": label},
         "coupling": {**coupling, "primary_deficit_to_debt_target": "independent_no_plug"},
         "overrides": overrides,
-        "output": {"profile": "compact", "compression": "none", "catalog_sqlite": True},
+        "output": {"profile": "compact", "compression": "gzip", "catalog_sqlite": True},
     }
     if simulation:
         scenario["simulation"] = simulation

@@ -18,13 +18,18 @@ import pandas as pd
 
 from forecast_paths import compiled_forecast_input_paths
 from sim_engine import run_simulation
-from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
+from tdc_shared import (
+    BOND_PORTFOLIO_COLS,
+    HOLDER_TYPES,
+    PORTFOLIO_DTYPES,
+    PRIVATE_SUBBUCKETS,
+)
 from tdc_validation import validate_events
 
 from ._json import read_json, sha256_file, write_json
 from ._schema import validate_schema
 from .baseline import CboBaselinePackage
-from .compiler import CboCompiledScenario, CboScenarioCompiler, HOLDER_PREFERENCE_EVENTS_FILE
+from .compiler import CboCompiledScenario, CboScenarioCompiler, HOLDER_PREFERENCE_EVENTS_FILE, RUNTIME_ASSUMPTIONS_FILE
 from .contract import CboScenarioSpec
 from .manifest import build_run_manifest
 from .output import hash_output_tree, write_scenario_outputs
@@ -65,7 +70,9 @@ def run_cbo_scenario(
     scenario_referenced_files = _copy_scenario_referenced_files(spec, out)
     inputs = compiled.forecast_inputs_dir
     start, end = _simulation_dates(spec, inputs)
-    params = build_runtime_params(inputs)
+    source_metadata = _source_metadata(baseline, inputs)
+    _validate_opening_alignment(start, source_metadata, inputs)
+    params = build_runtime_params(inputs, actuals_available_as_of=source_metadata["actuals_available_as_of"])
     engine_scenario_id = _compiled_scenario_id(inputs)
     results, final_portfolio = run_simulation(
         params,
@@ -79,6 +86,16 @@ def run_cbo_scenario(
         output_cfg = {}
     profile = output_profile or str(output_cfg.get("profile") or "compact")
     compression = str(output_cfg.get("compression") or "gzip")
+    output_metadata = {
+        "schema_version": "tdcsim_cbo_handoff_v1",
+        "scenario_id": spec.scenario_id,
+        "run_id": f"{spec.scenario_id}-{spec.canonical_sha256()[:12]}",
+        "package_id": baseline.package_id,
+        "source_vintage": source_metadata["source_vintage"],
+        "actuals_available_as_of": source_metadata["actuals_available_as_of"],
+        "scenario_config_sha256": spec.canonical_sha256(),
+        "compiled_inputs_digest": compiled.compiled_inputs_digest,
+    }
     outputs = write_scenario_outputs(
         results,
         final_portfolio,
@@ -86,6 +103,7 @@ def run_cbo_scenario(
         profile=profile,
         compression=compression,
         catalog_sqlite=bool(output_cfg.get("catalog_sqlite", False)),
+        metadata=output_metadata,
     )
     boundaries = validate_run_boundaries(results, inputs)
     run_manifest = build_run_manifest(
@@ -125,7 +143,7 @@ def run_cbo_scenario(
     )
 
 
-def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
+def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str | None = None) -> dict[str, Any]:
     """Build simulator params from compiled forecast inputs and scenario config."""
 
     inputs = Path(inputs_dir)
@@ -154,7 +172,14 @@ def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
         },
         "yield_curve_surface": {"file": str(inputs / "tdcsim_yield_curve_surface.csv"), "interpolation_method": "pchip", "floor_zero": False},
         "sector_preferences": holder_preferences,
-        "private_mmf_split": {"bills": 0.25, "notes": 0.10, "bonds": 0.05, "tips": 0.05, "frn": 0.20},
+        "private_mmf_split": {
+            "bills": 0.25,
+            "notes": 0.10,
+            "bonds": 0.05,
+            "tips": 0.05,
+            "frn": 0.20,
+            "mmf_deposit_pass_through": _mmf_deposit_pass_through(inputs),
+        },
         "tips_params": {
             "cpi_start_level": 100.0,
             "cpi_annual_inflation": 0.0,
@@ -174,7 +199,10 @@ def build_runtime_params(inputs_dir: str | Path) -> dict[str, Any]:
             "target_tolerance_bil": 0.000001,
         },
         "baseline_input_paths": compiled_forecast_input_paths(inputs),
-        "data_vintage": {"actuals_available_as_of": "2200-12-31", "allow_lookahead": False},
+        "data_vintage": {
+            "actuals_available_as_of": actuals_available_as_of or _max_available_date(inputs) or "1900-01-01",
+            "allow_lookahead": False,
+        },
         "fiscal_incidence_policy": _fiscal_incidence_policy(inputs / "tdcsim_fiscal_incidence_policy.csv"),
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
     }
@@ -230,6 +258,84 @@ def _simulation_dates(spec: CboScenarioSpec, inputs_dir: Path) -> tuple[str, str
     raise RunnerError("could not infer simulation start/end dates from scenario or compiled inputs")
 
 
+def _source_metadata(baseline: CboBaselinePackage, inputs_dir: Path) -> dict[str, str]:
+    date_range = baseline.manifest.get("date_range", {}) if isinstance(baseline.manifest, Mapping) else {}
+    if not isinstance(date_range, Mapping):
+        date_range = {}
+    actuals = str(date_range.get("actuals_available_as_of") or _max_available_date(inputs_dir) or "")
+    opening = str(date_range.get("opening_state_date") or _opening_state_date(inputs_dir) or "")
+    if not actuals:
+        raise RunnerError("could not determine actuals_available_as_of from baseline package or compiled inputs")
+    if not opening:
+        raise RunnerError("could not determine opening_state_date from baseline package or compiled inputs")
+    return {
+        "actuals_available_as_of": actuals,
+        "opening_state_date": opening,
+        "source_vintage": str(baseline.manifest.get("forecast_publication_date") or baseline.package_id),
+    }
+
+
+def _validate_opening_alignment(start_date: str, source_metadata: Mapping[str, str], inputs_dir: Path) -> None:
+    opening = str(source_metadata["opening_state_date"])
+    if start_date != opening:
+        raise RunnerError(
+            f"simulation.start_date must equal opening_state_date for CBO runs; "
+            f"got start_date={start_date}, opening_state_date={opening}"
+        )
+    actuals = str(source_metadata["actuals_available_as_of"])
+    if actuals > start_date:
+        raise RunnerError(
+            f"actuals_available_as_of must not be after simulation.start_date; "
+            f"got actuals_available_as_of={actuals}, start_date={start_date}"
+        )
+    portfolio = _load_opening_portfolio(inputs_dir / "tdcsim_opening_portfolio.csv")
+    if "Status" not in portfolio.columns or "MaturityDate" not in portfolio.columns:
+        return
+    active = portfolio[portfolio["Status"].astype(str).eq("Active")].copy()
+    if active.empty:
+        return
+    maturity = pd.to_datetime(active["MaturityDate"], errors="coerce")
+    stale = active[maturity <= pd.Timestamp(start_date)]
+    if not stale.empty:
+        face = pd.to_numeric(stale.get("FaceValue", 0.0), errors="coerce").fillna(0.0).sum()
+        raise RunnerError(
+            f"opening portfolio has {len(stale)} active securities maturing on/before simulation.start_date "
+            f"{start_date}; stale face={float(face):.6f} billion"
+        )
+
+
+def _opening_state_date(inputs_dir: Path) -> str | None:
+    metadata_path = inputs_dir / "tdcsim_opening_portfolio_metadata.json"
+    if metadata_path.exists():
+        payload = read_json(metadata_path)
+        if isinstance(payload, Mapping):
+            for key in ("opening_state_date", "simulation_start_date", "opening_date"):
+                if payload.get(key):
+                    return str(payload[key])
+    primary_path = inputs_dir / "tdcsim_primary_deficit_path.csv"
+    if primary_path.exists():
+        primary = pd.read_csv(primary_path)
+        if "period_start" in primary.columns and not primary.empty:
+            dates = sorted(str(value) for value in primary["period_start"].dropna())
+            if dates:
+                return dates[0]
+    return None
+
+
+def _max_available_date(inputs_dir: Path) -> str | None:
+    dates: list[str] = []
+    for path in sorted(inputs_dir.glob("*.csv")):
+        try:
+            frame = pd.read_csv(path, usecols=lambda col: col == "available_date")
+        except ValueError:
+            continue
+        except pd.errors.EmptyDataError:
+            continue
+        if "available_date" in frame.columns:
+            dates.extend(str(value) for value in frame["available_date"].dropna() if str(value).strip())
+    return max(dates) if dates else None
+
+
 def _load_opening_portfolio(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
     for col in BOND_PORTFOLIO_COLS:
@@ -266,10 +372,51 @@ def _holder_preferences(path: Path) -> dict[str, dict[str, float]]:
             "tips_pct": _finite_share(row.get("tips_pct"), label=f"{holder}.tips_pct"),
             "frn_pct": _finite_share(row.get("frn_pct"), label=f"{holder}.frn_pct"),
         }
-    for holder in ("Banks", "CB", "Foreign", "Private", "FedInternal", "TrustFunds"):
+    for holder in HOLDER_TYPES:
         prefs.setdefault(holder, {"bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0})
     _assert_holder_preference_sums(prefs)
+    private_subbucket_shares = _private_subbucket_shares(frame)
+    if private_subbucket_shares:
+        prefs["__private_subbucket_shares__"] = private_subbucket_shares
     return prefs
+
+
+def _private_subbucket_shares(frame: pd.DataFrame) -> dict[str, dict[str, float]]:
+    categories = ("bills", "notes", "bonds", "tips", "frn")
+    shares: dict[str, dict[str, float]] = {}
+    if "holder_subbucket" not in frame.columns:
+        return shares
+    holder = frame.get("holder_type", frame.get("HolderType", pd.Series("", index=frame.index))).fillna("").astype(str)
+    subbucket = frame["holder_subbucket"].fillna("").astype(str)
+    private_rows = frame.loc[(holder == "Private") & subbucket.isin(PRIVATE_SUBBUCKETS)].copy()
+    if private_rows.empty:
+        return shares
+    for category in categories:
+        col = f"{category}_route_share"
+        if col not in private_rows.columns:
+            continue
+        category_values: dict[str, float] = {}
+        has_value = False
+        for _, row in private_rows.iterrows():
+            route = str(row["holder_subbucket"])
+            value = row.get(col)
+            if pd.isna(value) or str(value).strip() == "":
+                continue
+            has_value = True
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise RunnerError(f"private route share {route}.{col} must be numeric") from exc
+            if not math.isfinite(number) or number < 0.0:
+                raise RunnerError(f"private route share {route}.{col} must be finite and nonnegative")
+            category_values[route] = number
+        if not has_value:
+            continue
+        total = sum(category_values.values())
+        if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
+            raise RunnerError(f"private route shares for {category} must sum to 1.0, got {total}")
+        shares[category] = {route: category_values.get(route, 0.0) for route in PRIVATE_SUBBUCKETS}
+    return shares
 
 
 def _finite_share(value: Any, *, label: str) -> float:
@@ -283,7 +430,7 @@ def _finite_share(value: Any, *, label: str) -> float:
 
 def _assert_holder_preference_sums(prefs: Mapping[str, Mapping[str, float]]) -> None:
     for pref_key in ("bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"):
-        total = sum(float(holder_prefs.get(pref_key, 0.0)) for holder_prefs in prefs.values())
+        total = sum(float(prefs.get(holder, {}).get(pref_key, 0.0)) for holder in HOLDER_TYPES)
         if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
             raise RunnerError(f"holder preference {pref_key} must sum to 1.0 across aggregate holders, got {total}")
 
@@ -366,7 +513,23 @@ def _negative_issuance_action(inputs: Path) -> str:
         payload = read_json(path)
         if isinstance(payload, Mapping) and payload.get("negative_issuance_action"):
             return str(payload["negative_issuance_action"])
-    return "retire_shortest_public_marketable"
+    return "error"
+
+
+def _mmf_deposit_pass_through(inputs: Path) -> float:
+    path = inputs / RUNTIME_ASSUMPTIONS_FILE
+    if not path.exists():
+        return 0.97
+    payload = read_json(path)
+    if not isinstance(payload, Mapping):
+        raise RunnerError("compiled runtime assumptions must be a JSON object")
+    try:
+        value = float(payload.get("mmf_deposit_pass_through", 0.97))
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("mmf_deposit_pass_through must be numeric") from exc
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise RunnerError("mmf_deposit_pass_through must be between 0.0 and 1.0")
+    return value
 
 
 def _fiscal_incidence_policy(path: Path) -> dict[str, Any]:

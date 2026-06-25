@@ -51,6 +51,102 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     assert verify_compiled_scenario(run.compiled.compiled_dir)["status"] == "pass"
     assert verify_scenario_run(run.output_dir)["status"] == "pass"
     assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)["status"] == "pass"
+    params = build_runtime_params(
+        run.compiled.forecast_inputs_dir,
+        actuals_available_as_of=run.run_manifest["output_manifest"]["row_metadata"]["actuals_available_as_of"],
+    )
+    assert params["funding_rule"]["negative_required_issuance_action"] == "error"
+
+    required_tables = [
+        "tdcsim_period_issuance_flows.csv",
+        "tdcsim_period_principal_flows.csv",
+        "tdcsim_period_payment_flows.csv",
+        "tdcsim_holder_stocks.csv",
+        "tdcsim_debt_target_bridge.csv",
+        "tdcsim_scenario_metrics.csv",
+    ]
+    for filename in required_tables:
+        assert (run.output_dir / "outputs" / filename).exists()
+
+    issuance = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_issuance_flows.csv")
+    principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
+    payments = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_payment_flows.csv")
+    bridge = pd.read_csv(run.output_dir / "outputs" / "tdcsim_debt_target_bridge.csv")
+    stocks = pd.read_csv(run.output_dir / "outputs" / "tdcsim_holder_stocks.csv")
+    metrics = pd.read_csv(run.output_dir / "outputs" / "tdcsim_scenario_metrics.csv")
+    common_keys = {
+        "schema_version",
+        "scenario_id",
+        "run_id",
+        "package_id",
+        "source_vintage",
+        "actuals_available_as_of",
+        "scenario_config_sha256",
+        "compiled_inputs_digest",
+    }
+    for frame in (issuance, bridge, stocks, metrics):
+        assert common_keys <= set(frame.columns)
+        assert set(frame["scenario_id"]) == {run.run_manifest["scenario"]["scenario_id"]}
+        assert set(frame["actuals_available_as_of"]) == {"2026-09-20"}
+    for frame in (issuance, principal, payments):
+        assert {"flow_id", "security_id"} <= set(frame.columns)
+        assert frame["flow_id"].notna().all()
+        assert frame["flow_id"].is_unique
+    private_issuance = issuance[issuance["holder_sector"] == "Private"]
+    assert {"domestic_nonbank_deposit_funded", "mmf_cash_fund_route"} <= set(private_issuance["holder_subsector"])
+    frn_issuance = issuance[issuance["instrument_type"] == "FRN"]
+    assert not frn_issuance.empty
+    assert (frn_issuance["reference_rate_decimal"] > 0.0).all()
+    assert (frn_issuance["reference_rate_decimal"] < 0.25).all()
+    assert not (frn_issuance["reference_rate_decimal"] == 0.25).any()
+    non_tips_stocks = stocks[stocks["instrument_type"].isin(["Fixed", "FRN"])]
+    assert set(non_tips_stocks["valuation_basis"]) == {"face"}
+    tips_stocks = stocks[stocks["instrument_type"] == "TIPS"]
+    assert set(tips_stocks["valuation_basis"]) == {"tips_adjusted_principal"}
+    results = pd.read_csv(run.results_path)
+    assert bridge["face_issued_bil"].sum() == pytest.approx(results["NewDebtIssued"].sum())
+    assert bridge["target_error_bil"].abs().max() <= 1e-6
+    controlled_stocks = stocks[stocks["debt_scope"] == "controlled_public_marketable"]
+    final_stock_date = controlled_stocks["date"].max()
+    assert controlled_stocks.loc[controlled_stocks["date"] == final_stock_date, "debt_held_bil"].sum() == pytest.approx(
+        results["CBOControlledDebtPostIssuance"].iloc[-1]
+    )
+
+
+def test_run_cbo_scenario_rejects_opening_date_mismatch(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    payload = read_json(scenarios["noop"])
+    payload["simulation"]["start_date"] = "2026-09-21"
+    bad = tmp_path / "bad-start.json"
+    write_json(bad, payload)
+
+    with pytest.raises(RunnerError, match="opening_state_date"):
+        run_cbo_scenario(baseline, CboScenarioSpec.from_file(bad), tmp_path / "run-bad-start")
+
+
+def test_run_cbo_scenario_supports_mmf_and_operating_cash_beta_knobs(tmp_path: Path) -> None:
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    scenario = _write_scenario(
+        tmp_path / "mmf-cash-beta.json",
+        baseline,
+        overrides={
+            "mmf_deposit_pass_through": {"mode": "fixed_fraction", "value": 0.82},
+            "operating_cash": {"mode": "inflation_beta", "beta": 0.5},
+        },
+    )
+
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-mmf-cash-beta")
+    runtime = read_json(run.compiled.forecast_inputs_dir / "tdcsim_runtime_assumptions.json")
+    cash = pd.read_csv(run.compiled.forecast_inputs_dir / "tdcsim_operating_cash_path.csv")
+    params = build_runtime_params(
+        run.compiled.forecast_inputs_dir,
+        actuals_available_as_of=run.run_manifest["output_manifest"]["row_metadata"]["actuals_available_as_of"],
+    )
+
+    assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.82)
+    assert params["private_mmf_split"]["mmf_deposit_pass_through"] == pytest.approx(0.82)
+    assert set(cash["construction_mode"]) == {"scenario_inflation_beta"}
+    assert set(cash["inflation_beta"]) == {0.5}
 
 
 def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(tmp_path: Path) -> None:
@@ -518,8 +614,8 @@ def test_runtime_params_ignore_private_route_rows_for_auction_preferences(tmp_pa
             {"holder_type": "FedInternal", "holder_subbucket": "", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
             {"holder_type": "TrustFunds", "holder_subbucket": "", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
             {"holder_type": "Private", "holder_subbucket": "", "bills_pct": 0.5, "notes_pct": 0.5, "bonds_pct": 0.6, "tips_pct": 0.4, "frn_pct": 0.5},
-            {"holder_type": "Private", "holder_subbucket": "domestic_nonbank_deposit_funded", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": ""},
-            {"holder_type": "Private", "holder_subbucket": "mmf_cash_fund_route", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": ""},
+            {"holder_type": "Private", "holder_subbucket": "domestic_nonbank_deposit_funded", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": "", "bills_route_share": 0.75, "notes_route_share": 0.9, "bonds_route_share": 0.95, "tips_route_share": 0.95, "frn_route_share": 0.8},
+            {"holder_type": "Private", "holder_subbucket": "mmf_cash_fund_route", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": "", "bills_route_share": 0.25, "notes_route_share": 0.1, "bonds_route_share": 0.05, "tips_route_share": 0.05, "frn_route_share": 0.2},
         ],
     )
 
@@ -527,8 +623,15 @@ def test_runtime_params_ignore_private_route_rows_for_auction_preferences(tmp_pa
 
     assert params["sector_preferences"]["Private"]["bills_pct"] == pytest.approx(0.5)
     assert params["sector_preferences"]["Private"]["frn_pct"] == pytest.approx(0.5)
+    route_shares = params["sector_preferences"]["__private_subbucket_shares__"]
+    assert route_shares["bills"]["domestic_nonbank_deposit_funded"] == pytest.approx(0.75)
+    assert route_shares["bills"]["mmf_cash_fund_route"] == pytest.approx(0.25)
+    assert route_shares["frn"]["mmf_cash_fund_route"] == pytest.approx(0.2)
     for pref_key in ("bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"):
-        assert sum(holder[pref_key] for holder in params["sector_preferences"].values()) == pytest.approx(1.0)
+        assert sum(
+            params["sector_preferences"][holder][pref_key]
+            for holder in ("Banks", "CB", "Foreign", "FedInternal", "TrustFunds", "Private")
+        ) == pytest.approx(1.0)
 
 
 def test_runtime_params_reject_nonfinite_holder_preferences(tmp_path: Path) -> None:
@@ -732,6 +835,8 @@ def _write_runner_package(tmp_path: Path) -> tuple[Path, Path]:
         [
             {"schema_version": "fixture", "scenario_id": "baseline", "holder_type": "Private", "holder_subbucket": "", "source_role": "scenario_assumption", "runtime_role": "memo_only", "claim_boundary": "fixture", "bills_pct": 1.0, "notes_pct": 1.0, "bonds_pct": 1.0, "tips_pct": 1.0, "frn_pct": 1.0},
             {"schema_version": "fixture", "scenario_id": "baseline", "holder_type": "CB", "holder_subbucket": "", "source_role": "scenario_assumption", "runtime_role": "memo_only", "claim_boundary": "fixture", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
+            {"schema_version": "fixture", "scenario_id": "baseline", "holder_type": "Private", "holder_subbucket": "domestic_nonbank_deposit_funded", "source_role": "scenario_assumption", "runtime_role": "memo_only", "claim_boundary": "fixture", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": "", "bills_route_share": 0.75, "notes_route_share": 0.9, "bonds_route_share": 0.95, "tips_route_share": 0.95, "frn_route_share": 0.8},
+            {"schema_version": "fixture", "scenario_id": "baseline", "holder_type": "Private", "holder_subbucket": "mmf_cash_fund_route", "source_role": "scenario_assumption", "runtime_role": "memo_only", "claim_boundary": "fixture", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": "", "bills_route_share": 0.25, "notes_route_share": 0.1, "bonds_route_share": 0.05, "tips_route_share": 0.05, "frn_route_share": 0.2},
         ],
     )
     _write_csv(
@@ -816,7 +921,11 @@ def _write_runner_package(tmp_path: Path) -> tuple[Path, Path]:
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0])
+    fieldnames = []
+    for row in rows:
+        for field in row:
+            if field not in fieldnames:
+                fieldnames.append(field)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

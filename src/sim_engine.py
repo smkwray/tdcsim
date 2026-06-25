@@ -51,6 +51,7 @@ from forecast_paths import (
     load_fiscal_incidence_policy,
     load_fed_holdings_path,
     load_frn_rate_path,
+    load_yield_curve_surface as load_forecast_yield_curve_surface,
     load_macro_forecast_path,
     load_net_interest_bridge,
     load_operating_cash_path,
@@ -278,7 +279,11 @@ def _load_cbo_engine_inputs(params, scenario_name):
         )
     yield_curve_surface = pd.DataFrame()
     if paths.yield_curve_surface_file is not None:
-        yield_curve_surface = load_yield_curve_surface(paths.yield_curve_surface_file)
+        yield_curve_surface = load_forecast_yield_curve_surface(
+            paths.yield_curve_surface_file,
+            actuals_available_as_of=actuals_available_as_of,
+            allow_lookahead=allow_lookahead,
+        )
     frn_rate_path = pd.DataFrame()
     if paths.frn_rate_path_file is not None:
         frn_rate_path = load_frn_rate_path(
@@ -543,6 +548,306 @@ def _bond_debt_base(row):
             return face
         return float(adjusted)
     return face
+
+
+def _handoff_period(prev_date, current_date):
+    return {
+        'period_start': str(pd.Timestamp(prev_date).date()),
+        'period_end': str(pd.Timestamp(current_date).date()),
+    }
+
+
+def _handoff_holder(row_or_mapping):
+    holder = row_or_mapping.get('HolderType', '') if hasattr(row_or_mapping, 'get') else ''
+    holder_subbucket = row_or_mapping.get('HolderSubBucket', '') if hasattr(row_or_mapping, 'get') else ''
+    return {
+        'holder_sector': '' if pd.isna(holder) else str(holder),
+        'holder_subsector': '' if pd.isna(holder_subbucket) else str(holder_subbucket),
+    }
+
+
+def _handoff_instrument_type(row_or_type):
+    if hasattr(row_or_type, 'get'):
+        value = row_or_type.get('SecurityType', '')
+    else:
+        value = row_or_type
+    return '' if pd.isna(value) else str(value)
+
+
+def _handoff_security_id(row_or_mapping):
+    value = row_or_mapping.get('BondID', '') if hasattr(row_or_mapping, 'get') else ''
+    if pd.isna(value) or value == '':
+        return ''
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _handoff_flow_id(*parts):
+    cleaned = []
+    for part in parts:
+        if pd.isna(part):
+            cleaned.append('')
+        else:
+            cleaned.append(str(part).replace('|', '_'))
+    return '|'.join(cleaned)
+
+
+def _handoff_maturity_bucket(security_type, maturity_years=None, maturity_category=None):
+    if str(security_type) == 'Fixed' and maturity_category and not pd.isna(maturity_category):
+        return str(maturity_category)
+    try:
+        years = float(maturity_years)
+    except (TypeError, ValueError):
+        return 'unknown'
+    if not np.isfinite(years):
+        return 'unknown'
+    if years <= 1.0 + TGA_FLOOR_TOLERANCE:
+        return 'bills'
+    if years <= 10.0 + TGA_FLOOR_TOLERANCE:
+        return 'notes'
+    return 'bonds'
+
+
+def _handoff_append_payment(
+    handoff_tables,
+    prev_date,
+    current_date,
+    row,
+    payment_type,
+    accounting_basis,
+    amount,
+    *,
+    is_additive_to_cash_total,
+):
+    amount = float(amount or 0.0)
+    if abs(amount) <= TGA_FLOOR_TOLERANCE:
+        return
+    security_type = _handoff_instrument_type(row)
+    security_id = _handoff_security_id(row)
+    handoff_tables['tdcsim_period_payment_flows'].append(
+        {
+            **_handoff_period(prev_date, current_date),
+            'flow_id': _handoff_flow_id(
+                'payment',
+                pd.Timestamp(current_date).date(),
+                security_id,
+                payment_type,
+                accounting_basis,
+            ),
+            'security_id': security_id,
+            **_handoff_holder(row),
+            'instrument_type': security_type,
+            'maturity_bucket': _handoff_maturity_bucket(
+                security_type,
+                row.get('OriginalMaturityYears', np.nan) if hasattr(row, 'get') else np.nan,
+                row.get('MaturityCategory', '') if hasattr(row, 'get') else '',
+            ),
+            'payment_type': payment_type,
+            'accounting_basis': accounting_basis,
+            'amount_bil': amount,
+            'is_additive_to_cash_total': bool(is_additive_to_cash_total),
+        }
+    )
+
+
+def _handoff_append_principal(
+    handoff_tables,
+    prev_date,
+    current_date,
+    row,
+    *,
+    redemption_type,
+    face_redeemed,
+    principal_redeemed,
+    cash_paid,
+):
+    face_redeemed = float(face_redeemed or 0.0)
+    principal_redeemed = float(principal_redeemed or 0.0)
+    cash_paid = float(cash_paid or 0.0)
+    if max(abs(face_redeemed), abs(principal_redeemed), abs(cash_paid)) <= TGA_FLOOR_TOLERANCE:
+        return
+    security_type = _handoff_instrument_type(row)
+    security_id = _handoff_security_id(row)
+    handoff_tables['tdcsim_period_principal_flows'].append(
+        {
+            **_handoff_period(prev_date, current_date),
+            'flow_id': _handoff_flow_id(
+                'principal',
+                pd.Timestamp(current_date).date(),
+                security_id,
+                redemption_type,
+                row.get('HolderType', '') if hasattr(row, 'get') else '',
+                row.get('HolderSubBucket', '') if hasattr(row, 'get') else '',
+            ),
+            'security_id': security_id,
+            **_handoff_holder(row),
+            'instrument_type': security_type,
+            'maturity_bucket': _handoff_maturity_bucket(
+                security_type,
+                row.get('OriginalMaturityYears', np.nan) if hasattr(row, 'get') else np.nan,
+                row.get('MaturityCategory', '') if hasattr(row, 'get') else '',
+            ),
+            'redemption_type': redemption_type,
+            'face_redeemed_bil': face_redeemed,
+            'principal_redeemed_bil': principal_redeemed,
+            'cash_paid_bil': cash_paid,
+        }
+    )
+
+
+def _handoff_append_issuance(
+    handoff_tables,
+    prev_date,
+    current_date,
+    *,
+    security_type,
+    maturity_years,
+    face_issued,
+    cash_proceeds,
+    coupon_rate,
+    reference_rate,
+    spread_bps,
+    issue_yield,
+    security_id='',
+    holder_sector='',
+    holder_subsector='',
+):
+    face_issued = float(face_issued or 0.0)
+    cash_proceeds = float(cash_proceeds or 0.0)
+    if max(abs(face_issued), abs(cash_proceeds)) <= TGA_FLOOR_TOLERANCE:
+        return
+    handoff_tables['tdcsim_period_issuance_flows'].append(
+        {
+            **_handoff_period(prev_date, current_date),
+            'flow_id': _handoff_flow_id('issuance', pd.Timestamp(current_date).date(), security_id),
+            'security_id': _handoff_security_id({'BondID': security_id}),
+            'holder_sector': '' if pd.isna(holder_sector) else str(holder_sector),
+            'holder_subsector': '' if pd.isna(holder_subsector) else str(holder_subsector),
+            'instrument_type': str(security_type),
+            'maturity_bucket': _handoff_maturity_bucket(security_type, maturity_years),
+            'weighted_original_term_years': float(maturity_years) if not pd.isna(maturity_years) else np.nan,
+            'face_issued_bil': face_issued,
+            'cash_proceeds_bil': cash_proceeds,
+            'discount_or_premium_bil': face_issued - cash_proceeds,
+            'coupon_rate_decimal': float(coupon_rate) if not pd.isna(coupon_rate) else np.nan,
+            'reference_rate_decimal': float(reference_rate) if not pd.isna(reference_rate) else np.nan,
+            'spread_bps': float(spread_bps) if not pd.isna(spread_bps) else np.nan,
+            'issue_yield_decimal': float(issue_yield) if not pd.isna(issue_yield) else np.nan,
+        }
+    )
+
+
+def _handoff_weighted_metrics(rows, *, short_cutoff_years=1.0):
+    if rows is None or len(rows) == 0:
+        return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
+    frame = pd.DataFrame(rows) if not isinstance(rows, pd.DataFrame) else rows.copy()
+    if frame.empty or 'FaceValue' not in frame.columns:
+        return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
+    weights = pd.to_numeric(frame['FaceValue'], errors='coerce').fillna(0.0)
+    years = pd.to_numeric(frame.get('OriginalMaturityYears', np.nan), errors='coerce').fillna(0.0)
+    denom = float(weights.sum())
+    if denom <= TGA_FLOOR_TOLERANCE:
+        return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
+    security_type = frame.get('SecurityType', pd.Series('', index=frame.index)).astype(str)
+    bills = (security_type.eq('Fixed') & (years <= 1.0 + TGA_FLOOR_TOLERANCE))
+    short = years <= short_cutoff_years + TGA_FLOOR_TOLERANCE
+    return {
+        'wam_years': float((weights * years).sum() / denom),
+        'bill_share': float(weights.loc[bills].sum() / denom),
+        'short_maturity_share': float(weights.loc[short].sum() / denom),
+    }
+
+
+def _handoff_outstanding_metrics(active_bonds, current_date, *, short_cutoff_years=1.0):
+    if active_bonds is None or active_bonds.empty:
+        return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
+    frame = active_bonds.copy()
+    controlled = (
+        frame['Status'].astype(str).eq('Active')
+        & frame['SecurityType'].astype(str).isin(['Fixed', 'TIPS', 'FRN'])
+        & ~frame['HolderType'].astype(str).isin(INTRAGOV_HOLDERS)
+    )
+    frame = frame.loc[controlled].copy()
+    if frame.empty:
+        return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
+    debt_base = np.where(
+        frame['SecurityType'].astype(str).eq('TIPS'),
+        pd.to_numeric(frame['AdjustedPrincipal'], errors='coerce').fillna(pd.to_numeric(frame['FaceValue'], errors='coerce')),
+        pd.to_numeric(frame['FaceValue'], errors='coerce').fillna(0.0),
+    )
+    weights = pd.Series(debt_base, index=frame.index).fillna(0.0)
+    years = (pd.to_datetime(frame['MaturityDate'], errors='coerce') - pd.Timestamp(current_date)).dt.total_seconds() / (
+        DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60
+    )
+    years = years.clip(lower=0.0).fillna(0.0)
+    denom = float(weights.sum())
+    if denom <= TGA_FLOOR_TOLERANCE:
+        return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
+    original_years = pd.to_numeric(frame.get('OriginalMaturityYears', np.nan), errors='coerce').fillna(0.0)
+    security_type = frame['SecurityType'].astype(str)
+    bills = security_type.eq('Fixed') & (original_years <= 1.0 + TGA_FLOOR_TOLERANCE)
+    short = years <= short_cutoff_years + TGA_FLOOR_TOLERANCE
+    return {
+        'wam_years': float((weights * years).sum() / denom),
+        'bill_share': float(weights.loc[bills].sum() / denom),
+        'short_maturity_share': float(weights.loc[short].sum() / denom),
+    }
+
+
+def _handoff_append_holder_stocks(handoff_tables, active_bonds, current_date):
+    if active_bonds is None or active_bonds.empty:
+        return
+    frame = active_bonds.copy()
+    frame['DebtBase'] = np.where(
+        frame['SecurityType'].astype(str).eq('TIPS'),
+        pd.to_numeric(frame['AdjustedPrincipal'], errors='coerce').fillna(pd.to_numeric(frame['FaceValue'], errors='coerce')),
+        pd.to_numeric(frame['FaceValue'], errors='coerce').fillna(0.0),
+    )
+    security_type = frame['SecurityType'].astype(str)
+    maturity_years = pd.to_numeric(frame.get('OriginalMaturityYears', np.nan), errors='coerce')
+    maturity_category = frame.get('MaturityCategory', pd.Series('', index=frame.index)).fillna('').astype(str)
+    frame['maturity_bucket'] = np.select(
+        [
+            security_type.eq('Fixed') & maturity_category.ne(''),
+            maturity_years <= 1.0 + TGA_FLOOR_TOLERANCE,
+            maturity_years <= 10.0 + TGA_FLOOR_TOLERANCE,
+            maturity_years > 10.0 + TGA_FLOOR_TOLERANCE,
+        ],
+        [maturity_category, 'bills', 'notes', 'bonds'],
+        default='unknown',
+    )
+    for debt_scope, rows in (
+        ('all_active_treasury', frame),
+        (
+            'controlled_public_marketable',
+            frame[
+                frame['SecurityType'].astype(str).isin(['Fixed', 'TIPS', 'FRN'])
+                & ~frame['HolderType'].astype(str).isin(INTRAGOV_HOLDERS)
+            ],
+        ),
+    ):
+        if rows.empty:
+            continue
+        grouped = rows.groupby(['HolderType', 'HolderSubBucket', 'SecurityType', 'maturity_bucket'], dropna=False)['DebtBase'].sum()
+        for keys, amount in grouped.items():
+            holder, subbucket, security_type, maturity_bucket = keys
+            if abs(float(amount)) <= TGA_FLOOR_TOLERANCE:
+                continue
+            handoff_tables['tdcsim_holder_stocks'].append(
+                {
+                    'date': str(pd.Timestamp(current_date).date()),
+                    'holder_sector': '' if pd.isna(holder) else str(holder),
+                    'holder_subsector': '' if pd.isna(subbucket) else str(subbucket),
+                    'instrument_type': '' if pd.isna(security_type) else str(security_type),
+                    'maturity_bucket': '' if pd.isna(maturity_bucket) else str(maturity_bucket),
+                    'debt_held_bil': float(amount),
+                    'valuation_basis': 'tips_adjusted_principal' if str(security_type) == 'TIPS' else 'face',
+                    'debt_scope': debt_scope,
+                    'allocation_method': 'end_of_period_stock_snapshot',
+                }
+            )
 
 
 def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, current_date):
@@ -1112,6 +1417,46 @@ def _frn_rate_path_row_for_date(frame, scenario_id, date_value, lookup=None):
     return covering.sort_values(['_duration_days', '_period_end']).iloc[0]
 
 
+def _frn_reference_rate_for_date(
+    cbo_inputs,
+    scenario_id,
+    date_value,
+    *,
+    benchmark_maturity_years,
+    yield_curve_years,
+    yield_curve_rates,
+    interpolation_method,
+    floor_zero,
+):
+    frn_path_frame = (
+        cbo_inputs.get('frn_rate_path')
+        if isinstance(cbo_inputs, dict)
+        else pd.DataFrame()
+    )
+    frn_path_date_lookup = (
+        cbo_inputs.get('frn_rate_path_date_lookup', {})
+        if isinstance(cbo_inputs, dict)
+        else {}
+    )
+    if isinstance(frn_path_frame, pd.DataFrame) and not frn_path_frame.empty:
+        row = _frn_rate_path_row_for_date(
+            frn_path_frame,
+            scenario_id,
+            date_value,
+            lookup=frn_path_date_lookup,
+        )
+        if row is not None:
+            return float(row['benchmark_rate_decimal'])
+    rate = get_yield_for_maturity(
+        benchmark_maturity_years,
+        yield_curve_years,
+        yield_curve_rates,
+        method=interpolation_method,
+        floor_zero=floor_zero,
+    )
+    return np.nan if pd.isna(rate) else float(rate)
+
+
 def _first_interest_payment_date(issue_date, maturity_date, frequency):
     if pd.isna(issue_date) or pd.isna(maturity_date):
         return pd.NaT
@@ -1194,6 +1539,14 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     print(f'--- Starting Simulation: {scenario_name} ---')
     results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
+    handoff_tables = {
+        'tdcsim_period_issuance_flows': [],
+        'tdcsim_period_principal_flows': [],
+        'tdcsim_period_payment_flows': [],
+        'tdcsim_holder_stocks': [],
+        'tdcsim_debt_target_bridge': [],
+        'tdcsim_scenario_metrics': [],
+    }
     for status_col in ['FundingMode', 'FiscalIncidenceStatus', 'NetInterestDiagnosticStatus', 'CBOCashResidualStatus']:
         results[status_col] = ''
     for status_col in ['CBOFedStockMode', 'CBOFedSettlementScope', 'CBORemittanceStatus']:
@@ -1338,7 +1691,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             if isinstance(private_mmf_split, dict)
             else MMF_DEPOSIT_PASS_THROUGH_DEFAULT
         )
-        mmf_deposit_pass_through = min(1.0, max(0.0, mmf_deposit_pass_through))
+        if not np.isfinite(mmf_deposit_pass_through) or not (0.0 <= mmf_deposit_pass_through <= 1.0):
+            raise ValueError('private_mmf_split.mmf_deposit_pass_through must be between 0.0 and 1.0')
         dynamic_params_state = {'yield_curve': yield_p, 'fiscal_params': current_fiscal_params, 'tga_params': current_tga_params, 'other_flows': current_other_flows, 'sector_preferences': current_sector_prefs, 'auction_absorption_preferences': current_auction_prefs, 'secondary_target_preferences': current_secondary_prefs, 'treasury_issuance_profile': issuance_profile, 'tips_params': tips_p, 'frn_params': frn_p, 'nonmarketable_params': current_nonmkt_params, 'rate_sensitive_demand': rate_sensitive_p, 'financing_cost_options': financing_cost_options, 'simulation_period': {'enable_preference_trading': current_enable_trading}}
     except Exception as e:
         print(f'ERROR [{scenario_name}]: Failed during parameter extraction/initialization: {e}')
@@ -1473,6 +1827,11 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     )
     results.loc[t0, 'CBOFundingModeActive'] = 1.0 if cbo_funding_mode else 0.0
     results.loc[t0, ['CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOFiscalIncidencePolicyPresent', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBONetInterestBridgeRows']] = 0.0
+    _handoff_append_holder_stocks(
+        handoff_tables,
+        bond_portfolio[bond_portfolio['Status'] == 'Active'].copy() if not bond_portfolio.empty else bond_portfolio,
+        t0,
+    )
     if cbo_funding_mode:
         results.loc[t0, 'CBOFedStockMode'] = 'synthetic_cb_treasury_stock_target_par_reallocation'
         results.loc[t0, 'CBOFedSettlementScope'] = 'not_applicable_opening_row'
@@ -1919,6 +2278,52 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         tips_coupon_interest_paid_by_holder[holder] += interest_payment
                     else:
                         coupon_interest_paid_by_holder[holder] += interest_payment
+                principal_component_payment = max(0.0, principal_payment - bill_discount_interest_payment)
+                _handoff_append_principal(
+                    handoff_tables,
+                    prev_date,
+                    current_date,
+                    bond,
+                    redemption_type='scheduled_maturity',
+                    face_redeemed=face_value,
+                    principal_redeemed=principal_component_payment,
+                    cash_paid=principal_payment,
+                )
+                if bill_discount_interest_payment > TGA_FLOOR_TOLERANCE:
+                    _handoff_append_payment(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        bond,
+                        'bill_discount',
+                        'budget_accrual',
+                        bill_discount_interest_payment,
+                        is_additive_to_cash_total=False,
+                    )
+                if tips_inflation_compensation_payment > TGA_FLOOR_TOLERANCE:
+                    _handoff_append_payment(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        bond,
+                        'tips_indexation',
+                        'memo_decomposition',
+                        tips_inflation_compensation_payment,
+                        is_additive_to_cash_total=False,
+                    )
+                if interest_payment > TGA_FLOOR_TOLERANCE:
+                    _handoff_append_payment(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        bond,
+                        'frn_interest'
+                        if security_type == 'FRN'
+                        else ('tips_coupon' if security_type == 'TIPS' else 'fixed_coupon'),
+                        'cash',
+                        interest_payment,
+                        is_additive_to_cash_total=True,
+                    )
                 principal_paid_by_holder[holder] += principal_payment
                 interest_paid_by_holder[holder] += interest_payment
                 principal_component_paid_by_holder[holder] += max(
@@ -1969,6 +2374,17 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     },
                     dtype=float,
                 ).fillna(0.0)
+                for idx, amount in payment_amount.items():
+                    _handoff_append_payment(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        bond_portfolio.loc[idx],
+                        'frn_interest',
+                        'cash',
+                        amount,
+                        is_additive_to_cash_total=True,
+                    )
                 pmt_by_holder = payment_amount.groupby(bond_portfolio.loc[frn_paying_indices, 'HolderType']).sum().to_dict()
                 for h, pmt in pmt_by_holder.items():
                     interest_paid_by_holder[h] += pmt
@@ -2014,6 +2430,18 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 paying_tranches = bond_portfolio.loc[fixed_tips_paying_indices]
                 principal_base = np.where(paying_tranches['SecurityType'] == 'TIPS', paying_tranches['AdjustedPrincipal'].fillna(paying_tranches['FaceValue']), paying_tranches['FaceValue'])
                 payment_amount = (principal_base * paying_tranches['CouponRate'] / 2.0).clip(lower=0)
+                for idx, amount in payment_amount.items():
+                    row = paying_tranches.loc[idx]
+                    _handoff_append_payment(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        row,
+                        'tips_coupon' if row['SecurityType'] == 'TIPS' else 'fixed_coupon',
+                        'cash',
+                        amount,
+                        is_additive_to_cash_total=True,
+                    )
                 pmt_by_holder = payment_amount.groupby(paying_tranches['HolderType']).sum().to_dict()
                 for h, pmt in pmt_by_holder.items():
                     interest_paid_by_holder[h] += pmt
@@ -2225,6 +2653,41 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 for route, amount in retired_by_private_route.items():
                     principal_paid_by_private_route[route] += amount
                     principal_component_paid_by_private_route[route] += amount
+                    _handoff_append_principal(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        {
+                            'HolderType': 'Private',
+                            'HolderSubBucket': route,
+                            'SecurityType': 'mixed_public_marketable',
+                            'OriginalMaturityYears': np.nan,
+                            'MaturityCategory': 'shortest_first',
+                        },
+                        redemption_type='explicit_retirement_at_par',
+                        face_redeemed=amount,
+                        principal_redeemed=amount,
+                        cash_paid=amount,
+                    )
+                for holder, amount in retired_by_holder.items():
+                    if holder == 'Private' or amount <= TGA_FLOOR_TOLERANCE:
+                        continue
+                    _handoff_append_principal(
+                        handoff_tables,
+                        prev_date,
+                        current_date,
+                        {
+                            'HolderType': holder,
+                            'HolderSubBucket': '',
+                            'SecurityType': 'mixed_public_marketable',
+                            'OriginalMaturityYears': np.nan,
+                            'MaturityCategory': 'shortest_first',
+                        },
+                        redemption_type='explicit_retirement_at_par',
+                        face_redeemed=amount,
+                        principal_redeemed=amount,
+                        cash_paid=amount,
+                    )
                 total_principal_paid_period += retired_amount
                 reserve_change_period += sum(retired_by_holder.get(h, 0.0) for h in ['Banks', 'Private', 'Foreign'])
                 deposit_change_period += _effective_private_amount(
@@ -2529,6 +2992,20 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         issue_price_ratio_val = details.get('issue_price_ratio', 1.0)
                         issue_yield_val = details.get('issue_yield', np.nan)
                         issue_proceeds_val = route_face_value * issue_price_ratio_val
+                        frn_reference_rate_val = (
+                            _frn_reference_rate_for_date(
+                                cbo_inputs,
+                                cbo_scenario_id,
+                                current_date,
+                                benchmark_maturity_years=frn_benchmark_mat,
+                                yield_curve_years=current_yield_curve_years,
+                                yield_curve_rates=current_yield_curve_rates,
+                                interpolation_method=yield_interpolation_method,
+                                floor_zero=yield_floor_zero,
+                            )
+                            if sec_type == 'FRN'
+                            else np.nan
+                        )
                         interest_payment_frequency_val = 4.0 if sec_type == 'FRN' else (2.0 if sec_type in {'Fixed', 'TIPS'} and coupon_rate_val > TGA_FLOOR_TOLERANCE else np.nan)
                         first_interest_payment_date_val = _first_interest_payment_date(
                             current_date,
@@ -2557,6 +3034,22 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         actual_issued_amount += route_face_value
                         actual_auction_proceeds += issue_proceeds_val
                         issue_discount_cost_period += max(0.0, route_face_value - issue_proceeds_val)
+                        _handoff_append_issuance(
+                            handoff_tables,
+                            prev_date,
+                            current_date,
+                            security_type=sec_type,
+                            maturity_years=mat_yrs,
+                            face_issued=route_face_value,
+                            cash_proceeds=issue_proceeds_val,
+                            coupon_rate=coupon_rate_val,
+                            reference_rate=frn_reference_rate_val,
+                            spread_bps=fixed_spread_val * 10000.0 if sec_type == 'FRN' else np.nan,
+                            issue_yield=issue_yield_val,
+                            security_id=next_bond_id_to_assign,
+                            holder_sector=holder,
+                            holder_subsector=holder_subbucket if holder == 'Private' else '',
+                        )
                         next_bond_id_to_assign += 1
             bond_id_counter = next_bond_id_to_assign
             if new_bonds_added_list:
@@ -2744,6 +3237,51 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 if isinstance(cbo_inputs.get('net_interest_bridge'), pd.DataFrame)
                 else 0.0
             )
+            intragov_excluded = 0.0
+            fed_included = 0.0
+            if not active_bonds_final.empty:
+                intragov_excluded = float(
+                    active_bonds_final.loc[
+                        active_bonds_final['HolderType'].astype(str).isin(INTRAGOV_HOLDERS),
+                        'DebtBase',
+                    ].sum()
+                )
+                fed_included = float(
+                    active_bonds_final.loc[
+                        active_bonds_final['HolderType'].astype(str).eq('CB'),
+                        'DebtBase',
+                    ].sum()
+                )
+            handoff_tables['tdcsim_debt_target_bridge'].append(
+                {
+                    'date': str(pd.Timestamp(current_date).date()),
+                    'cbo_public_debt_target_bil': _cbo_value(
+                        cbo_debt_row,
+                        'cbo_federal_debt_held_public_target_bil',
+                    ),
+                    'public_nonmarketable_bridge_bil': _cbo_value(
+                        cbo_debt_row,
+                        'public_nonmarketable_treasury_bil',
+                    ),
+                    'non_treasury_and_definition_bridge_bil': _cbo_value(
+                        cbo_debt_row,
+                        'non_treasury_and_definition_residual_bil',
+                    ),
+                    'controlled_public_marketable_target_bil': cbo_controlled_debt_target,
+                    'controlled_debt_pre_issuance_bil': cbo_pre_issuance_controlled_debt,
+                    'face_issued_bil': actual_issued_amount,
+                    'face_retired_bil': cbo_buyback_face_retired,
+                    'tips_principal_indexation_bil': tips_inflation_accretion_period,
+                    'controlled_debt_post_issuance_bil': cbo_post_issuance_controlled_debt,
+                    'target_error_bil': cbo_target_error,
+                    'intragovernmental_excluded_bil': intragov_excluded,
+                    'fed_included_bil': fed_included,
+                    'funding_mode': CBO_FUNDING_MODE,
+                    'intragovernmental_treatment': 'excluded_from_public_debt',
+                    'fed_held_treasury_treatment': 'included_in_public_debt',
+                    'public_nonmarketable_treatment': 'explicit_bridge_not_marketable_issuance',
+                }
+            )
         for holder in HOLDER_TYPES:
             results.loc[current_date, f'DebtHeld_{holder}'] = active_bonds_final.loc[active_bonds_final['HolderType'] == holder, 'DebtBase'].sum() if not active_bonds_final.empty else 0.0
         if cbo_funding_mode and cbo_fed_allocation_override_active:
@@ -2787,6 +3325,27 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         else:
             current_wam = 0.0
         results.loc[current_date, 'WAM'] = current_wam
+        new_issuance_metrics = _handoff_weighted_metrics(new_bonds_added_list)
+        outstanding_metrics = _handoff_outstanding_metrics(active_bonds_final, current_date)
+        results.loc[current_date, 'NewIssuanceWAM'] = new_issuance_metrics['wam_years']
+        results.loc[current_date, 'NewIssuanceBillShare'] = new_issuance_metrics['bill_share']
+        results.loc[current_date, 'NewIssuanceShortMaturityShare'] = new_issuance_metrics['short_maturity_share']
+        results.loc[current_date, 'OutstandingControlledWAM'] = outstanding_metrics['wam_years']
+        results.loc[current_date, 'OutstandingControlledBillShare'] = outstanding_metrics['bill_share']
+        results.loc[current_date, 'OutstandingControlledShortMaturityShare'] = outstanding_metrics['short_maturity_share']
+        _handoff_append_holder_stocks(handoff_tables, active_bonds_final, current_date)
+        handoff_tables['tdcsim_scenario_metrics'].append(
+            {
+                'date': str(pd.Timestamp(current_date).date()),
+                'new_issuance_wam_years': new_issuance_metrics['wam_years'],
+                'outstanding_controlled_wam_years': outstanding_metrics['wam_years'],
+                'new_issuance_bill_share': new_issuance_metrics['bill_share'],
+                'outstanding_controlled_bill_share': outstanding_metrics['bill_share'],
+                'new_issuance_short_maturity_share': new_issuance_metrics['short_maturity_share'],
+                'outstanding_controlled_short_maturity_share': outstanding_metrics['short_maturity_share'],
+                'short_maturity_cutoff_years': 1.0,
+            }
+        )
         other_reserve_change = -reserve_transfer
         other_deposit_change = 0.0
         other_tga_change = reserve_transfer + money_minting_transfers
@@ -2978,6 +3537,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             final_portfolio_out = bond_portfolio[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES, errors='ignore')
         except Exception:
             final_portfolio_out = bond_portfolio
+    results.attrs['handoff_tables'] = handoff_tables
     results.attrs['run_metadata'] = {
         'scenario_name': scenario_name,
         'start_date': str(start_date),

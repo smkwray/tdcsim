@@ -112,8 +112,8 @@ def _run_cli(*args: str) -> str:
 
 def _assert_readable_outputs(run_dir: Path) -> None:
     summary_path = run_dir / "outputs" / "summary.json"
-    results_path = run_dir / "outputs" / "results_compact.csv"
-    portfolio_path = run_dir / "outputs" / "final_portfolio_compact.csv"
+    results_path = _output_csv(run_dir, "results_compact")
+    portfolio_path = _output_csv(run_dir, "final_portfolio_compact")
     catalog_path = run_dir / "outputs" / "catalog.sqlite"
 
     assert summary_path.exists()
@@ -124,6 +124,12 @@ def _assert_readable_outputs(run_dir: Path) -> None:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["rows"] > 0
     assert summary["final_portfolio_rows"] > 0
+
+
+def _output_csv(run_dir: Path, stem: str) -> Path:
+    plain = run_dir / "outputs" / f"{stem}.csv"
+    gzip = run_dir / "outputs" / f"{stem}.csv.gz"
+    return gzip if gzip.exists() else plain
 
 
 def _last_nonempty_line(text: str) -> str:

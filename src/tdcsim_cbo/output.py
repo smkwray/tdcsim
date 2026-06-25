@@ -55,7 +55,113 @@ SUMMARY_COLUMNS = [
     "DebtHeldByType_Fixed",
     "DebtHeldByType_TIPS",
     "DebtHeldByType_FRN",
+    "NewIssuanceWAM",
+    "NewIssuanceBillShare",
+    "NewIssuanceShortMaturityShare",
+    "OutstandingControlledWAM",
+    "OutstandingControlledBillShare",
+    "OutstandingControlledShortMaturityShare",
 ]
+
+COMMON_METADATA_COLUMNS = [
+    "schema_version",
+    "scenario_id",
+    "run_id",
+    "package_id",
+    "source_vintage",
+    "actuals_available_as_of",
+    "scenario_config_sha256",
+    "compiled_inputs_digest",
+]
+
+HANDOFF_TABLE_COLUMNS = {
+    "tdcsim_period_issuance_flows": [
+        "period_start",
+        "period_end",
+        "flow_id",
+        "security_id",
+        "holder_sector",
+        "holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "weighted_original_term_years",
+        "face_issued_bil",
+        "cash_proceeds_bil",
+        "discount_or_premium_bil",
+        "coupon_rate_decimal",
+        "reference_rate_decimal",
+        "spread_bps",
+        "issue_yield_decimal",
+    ],
+    "tdcsim_period_principal_flows": [
+        "period_start",
+        "period_end",
+        "flow_id",
+        "security_id",
+        "holder_sector",
+        "holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "redemption_type",
+        "face_redeemed_bil",
+        "principal_redeemed_bil",
+        "cash_paid_bil",
+    ],
+    "tdcsim_period_payment_flows": [
+        "period_start",
+        "period_end",
+        "flow_id",
+        "security_id",
+        "holder_sector",
+        "holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "payment_type",
+        "accounting_basis",
+        "amount_bil",
+        "is_additive_to_cash_total",
+    ],
+    "tdcsim_holder_stocks": [
+        "date",
+        "holder_sector",
+        "holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "debt_held_bil",
+        "valuation_basis",
+        "debt_scope",
+        "allocation_method",
+    ],
+    "tdcsim_debt_target_bridge": [
+        "date",
+        "cbo_public_debt_target_bil",
+        "public_nonmarketable_bridge_bil",
+        "non_treasury_and_definition_bridge_bil",
+        "controlled_public_marketable_target_bil",
+        "controlled_debt_pre_issuance_bil",
+        "face_issued_bil",
+        "face_retired_bil",
+        "tips_principal_indexation_bil",
+        "controlled_debt_post_issuance_bil",
+        "target_error_bil",
+        "intragovernmental_excluded_bil",
+        "fed_included_bil",
+        "funding_mode",
+        "intragovernmental_treatment",
+        "fed_held_treasury_treatment",
+        "public_nonmarketable_treatment",
+    ],
+    "tdcsim_scenario_metrics": [
+        "date",
+        "new_issuance_wam_years",
+        "outstanding_controlled_wam_years",
+        "new_issuance_bill_share",
+        "outstanding_controlled_bill_share",
+        "new_issuance_short_maturity_share",
+        "outstanding_controlled_short_maturity_share",
+        "short_maturity_cutoff_years",
+    ],
+}
 
 
 def write_scenario_outputs(
@@ -66,6 +172,7 @@ def write_scenario_outputs(
     profile: str = "compact",
     compression: str = "gzip",
     catalog_sqlite: bool = False,
+    metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write run outputs and return a hash-listed output manifest."""
 
@@ -102,12 +209,52 @@ def write_scenario_outputs(
     write_json(summary_path, summary)
     outputs["summary"] = _artifact_record(out, summary_path)
     outputs["summary_values"] = summary
+    if metadata:
+        outputs["row_metadata"] = dict(metadata)
+
+    handoff_tables = _handoff_tables(results, metadata or {})
+    for logical_name, frame in handoff_tables.items():
+        path = out / f"{logical_name}{suffix}"
+        _write_frame(frame, path, compression=compression)
+        outputs[logical_name] = _artifact_record(out, path)
+        outputs[logical_name]["row_count"] = int(len(frame))
 
     if catalog_sqlite:
         catalog_path = out / "catalog.sqlite"
         _write_catalog(catalog_path, outputs)
         outputs["catalog_sqlite"] = _artifact_record(out, catalog_path)
     return outputs
+
+
+def _handoff_tables(results: pd.DataFrame, metadata: Mapping[str, Any]) -> dict[str, pd.DataFrame]:
+    raw = results.attrs.get("handoff_tables", {})
+    if not isinstance(raw, Mapping):
+        return {}
+    tables: dict[str, pd.DataFrame] = {}
+    for name, columns in HANDOFF_TABLE_COLUMNS.items():
+        rows = raw.get(name, [])
+        if rows is None:
+            continue
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            frame = pd.DataFrame(columns=columns)
+        for column in columns:
+            if column not in frame.columns:
+                frame[column] = pd.NA
+        frame = frame[columns + [col for col in frame.columns if col not in columns]]
+        tables[name] = _with_metadata(frame, metadata)
+    return tables
+
+
+def _with_metadata(frame: pd.DataFrame, metadata: Mapping[str, Any]) -> pd.DataFrame:
+    out = frame.copy()
+    for key, value in metadata.items():
+        if key not in out.columns:
+            out[key] = value
+    metadata_cols = [key for key in COMMON_METADATA_COLUMNS if key in out.columns]
+    metadata_cols.extend(key for key in metadata if key in out.columns and key not in metadata_cols)
+    other_cols = [col for col in out.columns if col not in metadata_cols]
+    return out[metadata_cols + other_cols]
 
 
 def hash_output_tree(path: str | Path) -> list[dict[str, Any]]:
