@@ -80,6 +80,8 @@ Each run writes:
 - `outputs/tdcsim_holder_stocks.csv.gz`: holder stocks by date, sector, instrument, and maturity bucket.
 - `outputs/tdcsim_debt_target_bridge.csv.gz`: CBO public-debt target to controlled TDCSIM debt bridge.
 - `outputs/tdcsim_scenario_metrics.csv.gz`: derived WAM, bill-share, and short-maturity-share metrics.
+- `outputs/tdcsim_period_tdc_summary.csv.gz`: period TDC accounting totals, overlap, and ex-overlap TDC.
+- `outputs/tdcsim_period_tdc_components.csv.gz`: period TDC components with direct-interest and default TDC-support flags.
 - `outputs/summary.json`: small run summary.
 - `outputs/catalog.sqlite`: optional artifact catalog when requested by the scenario.
 
@@ -88,6 +90,15 @@ Use `flow_id` for idempotent row ingestion and `security_id` when you need to
 join flow rows back to simulated securities. Payment rows also carry
 `accounting_basis` and `is_additive_to_cash_total` so bills and TIPS memo
 decompositions are not double-counted as cash.
+
+The TDC summary and component tables are the safer handoff for downstream TDC
+accounting. The summary table exposes `tdc_change_bil`,
+`overlap_cashflow_bil`, and `tdc_change_ex_overlap_bil`. The component table
+marks each component with `enters_direct_interest_support` and
+`enters_tdc_deposit_support_default`; no component should enter both legs.
+Amounts use the basis
+`post_mmf_route_pass_through_pre_ratewall_beta_chi`, so downstream consumers
+should not apply the MMF pass-through again.
 
 Useful result columns include:
 

@@ -64,6 +64,8 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         "tdcsim_holder_stocks.csv",
         "tdcsim_debt_target_bridge.csv",
         "tdcsim_scenario_metrics.csv",
+        "tdcsim_period_tdc_summary.csv",
+        "tdcsim_period_tdc_components.csv",
     ]
     for filename in required_tables:
         assert (run.output_dir / "outputs" / filename).exists()
@@ -74,6 +76,8 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     bridge = pd.read_csv(run.output_dir / "outputs" / "tdcsim_debt_target_bridge.csv")
     stocks = pd.read_csv(run.output_dir / "outputs" / "tdcsim_holder_stocks.csv")
     metrics = pd.read_csv(run.output_dir / "outputs" / "tdcsim_scenario_metrics.csv")
+    tdc_summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
+    tdc_components = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_components.csv")
     common_keys = {
         "schema_version",
         "scenario_id",
@@ -83,15 +87,47 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         "actuals_available_as_of",
         "scenario_config_sha256",
         "compiled_inputs_digest",
+        "mmf_deposit_pass_through",
+        "fiscal_incidence_basis",
+        "fiscal_incidence_du_share",
     }
-    for frame in (issuance, bridge, stocks, metrics):
+    for frame in (issuance, bridge, stocks, metrics, tdc_summary, tdc_components):
         assert common_keys <= set(frame.columns)
         assert set(frame["scenario_id"]) == {run.run_manifest["scenario"]["scenario_id"]}
         assert set(frame["actuals_available_as_of"]) == {"2026-09-20"}
+        assert set(frame["mmf_deposit_pass_through"]) == {0.97}
+        assert set(frame["fiscal_incidence_basis"]) == {"signed_net_primary_proxy"}
     for frame in (issuance, principal, payments):
         assert {"flow_id", "security_id"} <= set(frame.columns)
         assert frame["flow_id"].notna().all()
         assert frame["flow_id"].is_unique
+    assert not tdc_summary.empty
+    assert not tdc_components.empty
+    identity = (
+        tdc_summary["tdc_fiscal_flow_bil"]
+        + tdc_summary["tdc_debt_service_bil"]
+        + tdc_summary["tdc_auction_absorption_du_bil"]
+        + tdc_summary["tdc_secondary_trades_bil"]
+        + tdc_summary["tdc_other_bil"]
+    )
+    assert identity.tolist() == pytest.approx(tdc_summary["tdc_change_bil"].tolist())
+    assert tdc_summary["component_sum_error_bil"].abs().max() <= 1e-9
+    assert (
+        tdc_summary["tdc_change_bil"]
+        - tdc_summary["overlap_cashflow_bil"]
+        - tdc_summary["tdc_change_ex_overlap_bil"]
+    ).abs().max() <= 1e-9
+    assert not (
+        tdc_components["enters_direct_interest_support"].astype(bool)
+        & tdc_components["enters_tdc_deposit_support_default"].astype(bool)
+    ).any()
+    direct_overlap = tdc_components[tdc_components["enters_direct_interest_support"].astype(bool)]
+    assert set(direct_overlap["holder_subsector"]) <= {"domestic_nonbank_deposit_funded"}
+    tips_indexation = tdc_components[tdc_components["payment_type"] == "tips_indexation"]
+    assert not tips_indexation["is_additive_to_tdc_change"].astype(bool).any()
+    assert not tips_indexation["enters_direct_interest_support"].astype(bool).any()
+    assert set(tdc_summary["tdc_amount_basis"]) == {"post_mmf_route_pass_through_pre_ratewall_beta_chi"}
+    assert set(tdc_components["tdc_amount_basis"]) == {"post_mmf_route_pass_through_pre_ratewall_beta_chi"}
     private_issuance = issuance[issuance["holder_sector"] == "Private"]
     assert {"domestic_nonbank_deposit_funded", "mmf_cash_fund_route"} <= set(private_issuance["holder_subsector"])
     frn_issuance = issuance[issuance["instrument_type"] == "FRN"]

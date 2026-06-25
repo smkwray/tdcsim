@@ -95,6 +95,14 @@ def run_cbo_scenario(
         "actuals_available_as_of": source_metadata["actuals_available_as_of"],
         "scenario_config_sha256": spec.canonical_sha256(),
         "compiled_inputs_digest": compiled.compiled_inputs_digest,
+        "mmf_deposit_pass_through": params["private_mmf_split"]["mmf_deposit_pass_through"],
+        "mmf_deposit_pass_through_status": "scenario_runtime_assumption",
+        "fiscal_incidence_policy_id": "compiled_policy",
+        "fiscal_incidence_basis": params["fiscal_incidence_policy"].get("incidence_basis", "signed_net_primary_proxy"),
+        "fiscal_incidence_du_share": params["fiscal_incidence_policy"].get("du_share", 0.0),
+        "fiscal_incidence_ru_share": params["fiscal_incidence_policy"].get("ru_share", 0.0),
+        "fiscal_incidence_foreign_share": params["fiscal_incidence_policy"].get("foreign_share", 0.0),
+        "fiscal_incidence_other_share": params["fiscal_incidence_policy"].get("other_share", 0.0),
     }
     outputs = write_scenario_outputs(
         results,

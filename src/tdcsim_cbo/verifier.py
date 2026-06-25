@@ -451,6 +451,7 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
     _compare_summary(summary, "CBOControlledDebtTargetError_max_abs", target_error)
     _compare_summary(summary, "CBOFedAuctionShare_max_abs", fed_share)
     _compare_summary(summary, "CBOFedAuctionRolloverAddons_max_abs", fed_face)
+    _verify_tdc_handoff_outputs(root, manifest)
     return {
         "max_abs_target_error": target_error,
         "max_abs_fed_auction_share": fed_share,
@@ -464,6 +465,104 @@ def _result_artifact_path(root: Path, manifest: dict[str, Any]) -> Path:
         if isinstance(item, dict) and str(item.get("logical_name", "")).startswith("results_"):
             return root / str(item["relative_path"])
     raise VerificationError("run manifest does not list a results output")
+
+
+def _output_artifact_path(root: Path, manifest: dict[str, Any], logical_name_stem: str) -> Path:
+    for item in manifest.get("outputs", []):
+        if isinstance(item, dict) and str(item.get("logical_name", "")).startswith(f"{logical_name_stem}.csv"):
+            return root / str(item["relative_path"])
+    raise VerificationError(f"run manifest does not list required output: {logical_name_stem}")
+
+
+def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
+    summary = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_summary"))
+    components = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_components"))
+    _require_columns(
+        summary,
+        (
+            "period_start",
+            "period_end",
+            "tdc_change_bil",
+            "tdc_fiscal_flow_bil",
+            "tdc_debt_service_bil",
+            "tdc_auction_absorption_du_bil",
+            "tdc_secondary_trades_bil",
+            "tdc_other_bil",
+            "overlap_cashflow_bil",
+            "tdc_change_ex_overlap_bil",
+            "component_sum_bil",
+            "component_sum_error_bil",
+            "tdc_amount_basis",
+            "holder_allocation_scope",
+        ),
+        label="tdcsim_period_tdc_summary",
+    )
+    _require_columns(
+        components,
+        (
+            "period_start",
+            "period_end",
+            "component_id",
+            "component_key",
+            "amount_bil",
+            "is_additive_to_tdc_change",
+            "enters_direct_interest_support",
+            "enters_tdc_deposit_support_default",
+            "tdc_amount_basis",
+        ),
+        label="tdcsim_period_tdc_components",
+    )
+    if summary.empty:
+        raise VerificationError("tdcsim_period_tdc_summary must contain period rows")
+    if components.empty:
+        raise VerificationError("tdcsim_period_tdc_components must contain component rows")
+    identity = (
+        _numeric(summary, "tdc_fiscal_flow_bil")
+        + _numeric(summary, "tdc_debt_service_bil")
+        + _numeric(summary, "tdc_auction_absorption_du_bil")
+        + _numeric(summary, "tdc_secondary_trades_bil")
+        + _numeric(summary, "tdc_other_bil")
+    )
+    if (_numeric(summary, "tdc_change_bil") - identity).abs().max() > 1e-7:
+        raise VerificationError("TDC summary component identity failed")
+    if _numeric(summary, "component_sum_error_bil").abs().max() > 1e-7:
+        raise VerificationError("TDC summary component_sum_error_bil exceeds tolerance")
+    overlap_identity = (
+        _numeric(summary, "tdc_change_bil")
+        - _numeric(summary, "overlap_cashflow_bil")
+        - _numeric(summary, "tdc_change_ex_overlap_bil")
+    )
+    if overlap_identity.abs().max() > 1e-7:
+        raise VerificationError("TDC summary ex-overlap identity failed")
+    direct = _bool_series(components, "enters_direct_interest_support")
+    default_tdc = _bool_series(components, "enters_tdc_deposit_support_default")
+    if (direct & default_tdc).any():
+        raise VerificationError("TDC component cannot enter both direct interest and default TDC support")
+    if not set(components.loc[direct, "holder_subsector"].astype(str).unique()) <= {"domestic_nonbank_deposit_funded"}:
+        raise VerificationError("direct-interest overlap components must be domestic nonbank only")
+    grouped_direct = (
+        components.loc[direct]
+        .assign(amount_bil=_numeric(components.loc[direct], "amount_bil"))
+        .groupby(["period_start", "period_end"], dropna=False)["amount_bil"]
+        .sum()
+    )
+    grouped_tdc = (
+        components.loc[default_tdc]
+        .assign(amount_bil=_numeric(components.loc[default_tdc], "amount_bil"))
+        .groupby(["period_start", "period_end"], dropna=False)["amount_bil"]
+        .sum()
+    )
+    summary_indexed = summary.set_index(["period_start", "period_end"], drop=False)
+    direct_delta = grouped_direct.reindex(summary_indexed.index, fill_value=0.0) - _numeric(
+        summary_indexed, "overlap_cashflow_bil"
+    )
+    if direct_delta.abs().max() > 1e-7:
+        raise VerificationError("TDC direct-interest overlap components do not match summary overlap")
+    tdc_delta = grouped_tdc.reindex(summary_indexed.index, fill_value=0.0) - _numeric(
+        summary_indexed, "tdc_change_ex_overlap_bil"
+    )
+    if tdc_delta.abs().max() > 1e-7:
+        raise VerificationError("TDC default-support components do not match summary ex-overlap")
 
 
 def _read_results(path: Path) -> pd.DataFrame:
@@ -480,6 +579,24 @@ def _max_abs(frame: pd.DataFrame, column: str) -> float:
     if values.notna().sum() == 0:
         raise VerificationError(f"required result column has no numeric evidence: {column}")
     return float(values.fillna(0.0).abs().max())
+
+
+def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        raise VerificationError(f"required numeric column is missing: {column}")
+    return pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+
+
+def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        raise VerificationError(f"required boolean column is missing: {column}")
+    values = frame[column]
+    if values.dtype == bool:
+        return values.fillna(False)
+    normalized = values.astype(str).str.strip().str.lower()
+    if not normalized.isin({"true", "false"}).all():
+        raise VerificationError(f"required boolean column has invalid values: {column}")
+    return normalized.eq("true")
 
 
 def _require_columns(frame: pd.DataFrame, columns: tuple[str, ...], *, label: str) -> None:
