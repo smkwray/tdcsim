@@ -201,15 +201,23 @@ def example_scenarios(
                 }
             },
         ),
-        "11_primary_deficit_plus_1pct.json": _scenario(
+        "11_primary_deficit_down_1pct.json": _scenario(
             baseline,
-            scenario_id="tdcsim_primary_deficit_plus_1pct_v1",
-            label="Primary deficit plus 1 percent",
+            scenario_id="tdcsim_primary_deficit_down_1pct_v1",
+            label="Primary deficit down 1 percent",
+            simulation=simulation,
+            coupling=_baseline_coupling(),
+            overrides={"primary_deficit": {"mode": "scale_path", "scale": 0.99}},
+        ),
+        "12_primary_deficit_up_1pct.json": _scenario(
+            baseline,
+            scenario_id="tdcsim_primary_deficit_up_1pct_v1",
+            label="Primary deficit up 1 percent",
             simulation=simulation,
             coupling=_baseline_coupling(),
             overrides={"primary_deficit": {"mode": "scale_path", "scale": 1.01}},
         ),
-        "12_operating_cash_inflation_beta_50.json": _scenario(
+        "13_operating_cash_inflation_beta_50.json": _scenario(
             baseline,
             scenario_id="tdcsim_operating_cash_inflation_beta_50_v1",
             label="Operating cash inflation beta 0.5",
@@ -217,7 +225,7 @@ def example_scenarios(
             coupling=_baseline_coupling(),
             overrides={"operating_cash": {"mode": "inflation_beta", "beta": 0.5}},
         ),
-        "13_fed_holdings_scale_1.json": _scenario(
+        "14_fed_holdings_scale_1.json": _scenario(
             baseline,
             scenario_id="tdcsim_fed_holdings_scale_1_v1",
             label="Fed holdings unchanged stock path",

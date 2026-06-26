@@ -46,9 +46,10 @@ def test_downstream_quickstart_generates_and_runs_public_examples(tmp_path: Path
         "08_issuance_longer.json",
         "09_private_holder_high.json",
         "10_private_holder_low.json",
-        "11_primary_deficit_plus_1pct.json",
-        "12_operating_cash_inflation_beta_50.json",
-        "13_fed_holdings_scale_1.json",
+        "11_primary_deficit_down_1pct.json",
+        "12_primary_deficit_up_1pct.json",
+        "13_operating_cash_inflation_beta_50.json",
+        "14_fed_holdings_scale_1.json",
     ]
     assert completed.stdout.count(".json") == len(scenario_paths)
     holder_example = json.loads((scenarios_dir / "03_sector_holders.json").read_text(encoding="utf-8"))
@@ -188,6 +189,11 @@ def _assert_matched_scenario_boundaries(scenarios_dir: Path) -> None:
     assert high_share == 0.70
     assert low_share == 0.30
 
-    assert set(scenarios["11_primary_deficit_plus_1pct.json"]["overrides"]) == {"primary_deficit"}
-    assert set(scenarios["12_operating_cash_inflation_beta_50.json"]["overrides"]) == {"operating_cash"}
-    assert set(scenarios["13_fed_holdings_scale_1.json"]["overrides"]) == {"fed_holdings"}
+    primary_down = scenarios["11_primary_deficit_down_1pct.json"]["overrides"]
+    primary_up = scenarios["12_primary_deficit_up_1pct.json"]["overrides"]
+    assert set(primary_down) == {"primary_deficit"}
+    assert set(primary_up) == {"primary_deficit"}
+    assert primary_down["primary_deficit"]["scale"] == 0.99
+    assert primary_up["primary_deficit"]["scale"] == 1.01
+    assert set(scenarios["13_operating_cash_inflation_beta_50.json"]["overrides"]) == {"operating_cash"}
+    assert set(scenarios["14_fed_holdings_scale_1.json"]["overrides"]) == {"fed_holdings"}
