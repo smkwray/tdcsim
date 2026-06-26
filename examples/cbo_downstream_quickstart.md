@@ -24,7 +24,7 @@ python scripts/write_cbo_example_scenarios.py \
   --output-dir /tmp/tdcsim-cbo-scenarios
 ```
 
-This writes fifteen ready-to-run examples:
+This writes twenty-three ready-to-run examples:
 
 - `00_baseline_noop.json`: run the baseline without scenario changes.
 - `01_rates_inflation_frn_tips.json`: change the nominal curve, inflation, FRN benchmark, TIPS real yield, and real operating cash.
@@ -41,6 +41,14 @@ This writes fifteen ready-to-run examples:
 - `12_primary_deficit_up_1pct.json`: matched primary-deficit up case.
 - `13_operating_cash_inflation_beta_50.json`: operating-cash-only inflation-beta scenario.
 - `14_fed_holdings_scale_1.json`: Fed-holdings-only passthrough scenario.
+- `15_empirical_issuance_shorter_uncoupled.json`: moderate empirical shorter-issuance control.
+- `16_empirical_issuance_longer_uncoupled.json`: moderate empirical longer-issuance control.
+- `17_empirical_shorter_termprem_down_cons.json`: shorter issuance plus conservative long-end rate decline.
+- `18_empirical_shorter_termprem_down_central.json`: shorter issuance plus central long-end rate decline.
+- `19_empirical_shorter_termprem_down_high.json`: shorter issuance plus high long-end rate decline.
+- `20_empirical_longer_termprem_up_cons.json`: longer issuance plus conservative long-end rate rise.
+- `21_empirical_longer_termprem_up_central.json`: longer issuance plus central long-end rate rise.
+- `22_empirical_longer_termprem_up_high.json`: longer issuance plus high long-end rate rise.
 
 The simulation start date must match the package opening-state date. For the
 current release-bound package that is `2026-06-21`. For a short smoke run, add:
@@ -152,6 +160,7 @@ The CBO scenario interface supports the main downstream controls:
 - MMF deposit pass-through, defaulting to `0.97`.
 - Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
 - Operating cash can be constant nominal, constant real, explicit path-based, or `inflation_beta` where `0.0` means constant nominal and `1.0` means fully inflation-scaled.
+- Empirical issuance-duration scenarios can combine an issuance-mix override with a long-end `key_rate_bp` nominal-curve shock. These are externally calibrated assumption scenarios, not endogenous TDCSIM yield-response estimates.
 
 ## Boundaries
 

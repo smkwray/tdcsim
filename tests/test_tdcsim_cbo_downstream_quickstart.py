@@ -50,6 +50,14 @@ def test_downstream_quickstart_generates_and_runs_public_examples(tmp_path: Path
         "12_primary_deficit_up_1pct.json",
         "13_operating_cash_inflation_beta_50.json",
         "14_fed_holdings_scale_1.json",
+        "15_empirical_issuance_shorter_uncoupled.json",
+        "16_empirical_issuance_longer_uncoupled.json",
+        "17_empirical_shorter_termprem_down_cons.json",
+        "18_empirical_shorter_termprem_down_central.json",
+        "19_empirical_shorter_termprem_down_high.json",
+        "20_empirical_longer_termprem_up_cons.json",
+        "21_empirical_longer_termprem_up_central.json",
+        "22_empirical_longer_termprem_up_high.json",
     ]
     assert completed.stdout.count(".json") == len(scenario_paths)
     holder_example = json.loads((scenarios_dir / "03_sector_holders.json").read_text(encoding="utf-8"))
@@ -197,3 +205,40 @@ def _assert_matched_scenario_boundaries(scenarios_dir: Path) -> None:
     assert primary_up["primary_deficit"]["scale"] == 1.01
     assert set(scenarios["13_operating_cash_inflation_beta_50.json"]["overrides"]) == {"operating_cash"}
     assert set(scenarios["14_fed_holdings_scale_1.json"]["overrides"]) == {"fed_holdings"}
+    empirical_shorter = scenarios["15_empirical_issuance_shorter_uncoupled.json"]
+    empirical_longer = scenarios["16_empirical_issuance_longer_uncoupled.json"]
+    assert empirical_shorter["scenario_id"] == "tdcsim_issuance_empirical_shorter_uncoupled_v1"
+    assert empirical_longer["scenario_id"] == "tdcsim_issuance_empirical_longer_uncoupled_v1"
+    assert set(empirical_shorter["overrides"]) == {"issuance_mix"}
+    assert set(empirical_longer["overrides"]) == {"issuance_mix"}
+    assert empirical_shorter["overrides"]["issuance_mix"]["frn_share"] == 0.04
+    assert empirical_longer["overrides"]["issuance_mix"]["frn_share"] == 0.04
+
+    shorter_central = scenarios["18_empirical_shorter_termprem_down_central.json"]
+    longer_central = scenarios["21_empirical_longer_termprem_up_central.json"]
+    assert shorter_central["coupling"]["frn_benchmark"] == "derive_from_scenario_nominal_curve"
+    assert longer_central["coupling"]["frn_benchmark"] == "derive_from_scenario_nominal_curve"
+    assert set(shorter_central["overrides"]) == {
+        "frn_benchmark",
+        "issuance_mix",
+        "nominal_yield_curve",
+    }
+    assert set(longer_central["overrides"]) == {
+        "frn_benchmark",
+        "issuance_mix",
+        "nominal_yield_curve",
+    }
+    shorter_shocks = {
+        item["tenor_years"]: item["shock_bp"]
+        for item in shorter_central["overrides"]["nominal_yield_curve"]["shocks"]
+    }
+    longer_shocks = {
+        item["tenor_years"]: item["shock_bp"]
+        for item in longer_central["overrides"]["nominal_yield_curve"]["shocks"]
+    }
+    assert shorter_shocks == {0.25: 0.0, 2.0: 0.0, 5.0: -4.0, 10.0: -8.0, 30.0: -8.0}
+    assert longer_shocks == {0.25: 0.0, 2.0: 0.0, 5.0: 4.0, 10.0: 8.0, 30.0: 8.0}
+    assert shorter_central["overrides"]["frn_benchmark"] == {
+        "mode": "linked_to_nominal_curve",
+        "spread_bp": 0,
+    }
