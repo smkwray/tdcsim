@@ -233,6 +233,68 @@ def example_scenarios(
             coupling=_baseline_coupling(),
             overrides={"fed_holdings": {"mode": "scale_path", "scale": 1.0}},
         ),
+        "15_empirical_issuance_shorter_uncoupled.json": _empirical_issuance_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_shorter_uncoupled_v1",
+            label="Empirical shorter issuance mix",
+            simulation=simulation,
+            kind="shorter",
+        ),
+        "16_empirical_issuance_longer_uncoupled.json": _empirical_issuance_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_longer_uncoupled_v1",
+            label="Empirical longer issuance mix",
+            simulation=simulation,
+            kind="longer",
+        ),
+        "17_empirical_shorter_termprem_down_cons.json": _empirical_issuance_term_premium_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_shorter_termprem_down_cons_v1",
+            label="Empirical shorter issuance with conservative long-rate decline",
+            simulation=simulation,
+            kind="shorter",
+            tier="conservative",
+        ),
+        "18_empirical_shorter_termprem_down_central.json": _empirical_issuance_term_premium_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_shorter_termprem_down_central_v1",
+            label="Empirical shorter issuance with central long-rate decline",
+            simulation=simulation,
+            kind="shorter",
+            tier="central",
+        ),
+        "19_empirical_shorter_termprem_down_high.json": _empirical_issuance_term_premium_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_shorter_termprem_down_high_v1",
+            label="Empirical shorter issuance with high long-rate decline",
+            simulation=simulation,
+            kind="shorter",
+            tier="high",
+        ),
+        "20_empirical_longer_termprem_up_cons.json": _empirical_issuance_term_premium_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_longer_termprem_up_cons_v1",
+            label="Empirical longer issuance with conservative long-rate rise",
+            simulation=simulation,
+            kind="longer",
+            tier="conservative",
+        ),
+        "21_empirical_longer_termprem_up_central.json": _empirical_issuance_term_premium_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_longer_termprem_up_central_v1",
+            label="Empirical longer issuance with central long-rate rise",
+            simulation=simulation,
+            kind="longer",
+            tier="central",
+        ),
+        "22_empirical_longer_termprem_up_high.json": _empirical_issuance_term_premium_scenario(
+            baseline,
+            scenario_id="tdcsim_issuance_empirical_longer_termprem_up_high_v1",
+            label="Empirical longer issuance with high long-rate rise",
+            simulation=simulation,
+            kind="longer",
+            tier="high",
+        ),
     }
 
 
@@ -277,6 +339,154 @@ def _rate_parallel_override(shock_bp: int) -> dict[str, Any]:
     return {
         "nominal_yield_curve": {"mode": "parallel_bp", "shock_bp": shock_bp},
         "frn_benchmark": {"mode": "linked_to_nominal_curve", "spread_bp": 0},
+    }
+
+
+def _empirical_issuance_scenario(
+    baseline: CboBaselinePackage,
+    *,
+    scenario_id: str,
+    label: str,
+    simulation: dict[str, str] | None,
+    kind: str,
+) -> dict[str, Any]:
+    scenario = _scenario(
+        baseline,
+        scenario_id=scenario_id,
+        label=label,
+        simulation=simulation,
+        coupling=_baseline_coupling(),
+        overrides={"issuance_mix": _empirical_issuance_mix(kind)},
+    )
+    scenario["provenance"] = _empirical_term_premium_provenance(label)
+    return scenario
+
+
+def _empirical_issuance_term_premium_scenario(
+    baseline: CboBaselinePackage,
+    *,
+    scenario_id: str,
+    label: str,
+    simulation: dict[str, str] | None,
+    kind: str,
+    tier: str,
+) -> dict[str, Any]:
+    scenario = _scenario(
+        baseline,
+        scenario_id=scenario_id,
+        label=label,
+        simulation=simulation,
+        coupling={
+            "frn_benchmark": "derive_from_scenario_nominal_curve",
+            "tips_real_yield": "independent_explicit_path",
+            "operating_cash_inflation": "baseline_cpi",
+        },
+        overrides={
+            "issuance_mix": _empirical_issuance_mix(kind),
+            "nominal_yield_curve": _empirical_term_premium_curve(kind, tier),
+            "frn_benchmark": {"mode": "linked_to_nominal_curve", "spread_bp": 0},
+        },
+    )
+    scenario["provenance"] = _empirical_term_premium_provenance(label)
+    return scenario
+
+
+def _empirical_term_premium_provenance(label: str) -> dict[str, Any]:
+    return {
+        "kind": "external_source_assumption",
+        "label": label,
+        "prepared_by": "TDCSim example scenario writer",
+        "as_of_date": "2026-06-26",
+        "notes": (
+            "Externally calibrated assumption-mode scenario. More long-duration "
+            "Treasury supply is assumed to raise long rates/term premia; shorter "
+            "issuance is assumed to lower them. Calibration follows the 2026-06-26 "
+            "scenario-batch calibration review using Gagnon et al., "
+            "Li and Wei, Hamilton and Wu, and related LSAP/duration-supply evidence."
+        ),
+    }
+
+
+def _empirical_term_premium_curve(kind: str, tier: str) -> dict[str, Any]:
+    ten_year_by_tier = {
+        "conservative": 5.0,
+        "central": 8.0,
+        "high": 10.0,
+    }
+    if kind == "shorter":
+        sign = -1.0
+    elif kind == "longer":
+        sign = 1.0
+    else:
+        raise ValueError(f"unknown empirical issuance kind: {kind}")
+    if tier not in ten_year_by_tier:
+        raise ValueError(f"unknown empirical term-premium tier: {tier}")
+    ten_year = sign * ten_year_by_tier[tier]
+    five_year = ten_year / 2.0
+    return {
+        "mode": "key_rate_bp",
+        "interpolation": "log_tenor_linear",
+        "shocks": [
+            {"tenor_years": 0.25, "shock_bp": 0.0},
+            {"tenor_years": 2.0, "shock_bp": 0.0},
+            {"tenor_years": 5.0, "shock_bp": five_year},
+            {"tenor_years": 10.0, "shock_bp": ten_year},
+            {"tenor_years": 30.0, "shock_bp": ten_year},
+        ],
+    }
+
+
+def _empirical_issuance_mix(kind: str) -> dict[str, Any]:
+    if kind == "shorter":
+        fixed_remainder_shares = {
+            "bills": 0.335030,
+            "notes": 0.507485,
+            "bonds": 0.157485,
+        }
+        maturity_distributions = {
+            "bills": [
+                {"maturity_years": 0.25, "share": 0.141717},
+                {"maturity_years": 0.5, "share": 0.858283},
+            ],
+            "notes": [
+                {"maturity_years": 2.0, "share": 0.198404},
+                {"maturity_years": 5.0, "share": 0.801596},
+            ],
+            "bonds": [
+                {"maturity_years": 20.0, "share": 0.858283},
+                {"maturity_years": 30.0, "share": 0.141717},
+            ],
+            "tips": [{"maturity_years": 10.0, "share": 1.0}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        }
+    elif kind == "longer":
+        fixed_remainder_shares = {
+            "bills": 0.228928,
+            "notes": 0.535952,
+            "bonds": 0.235120,
+        }
+        maturity_distributions = {
+            "bills": [{"maturity_years": 0.5, "share": 1.0}],
+            "notes": [
+                {"maturity_years": 5.0, "share": 0.859522},
+                {"maturity_years": 7.0, "share": 0.063215},
+                {"maturity_years": 10.0, "share": 0.077263},
+            ],
+            "bonds": [
+                {"maturity_years": 20.0, "share": 0.908689},
+                {"maturity_years": 30.0, "share": 0.091311},
+            ],
+            "tips": [{"maturity_years": 10.0, "share": 1.0}],
+            "frn": [{"maturity_years": 2.0, "share": 1.0}],
+        }
+    else:
+        raise ValueError(f"unknown empirical issuance kind: {kind}")
+    return {
+        "mode": "replace_shares",
+        "tips_share": 0.06,
+        "frn_share": 0.04,
+        "fixed_remainder_shares": fixed_remainder_shares,
+        "maturity_distributions": maturity_distributions,
     }
 
 
