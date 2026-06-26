@@ -24,7 +24,7 @@ python scripts/write_cbo_example_scenarios.py \
   --output-dir /tmp/tdcsim-cbo-scenarios
 ```
 
-This writes fourteen ready-to-run examples:
+This writes fifteen ready-to-run examples:
 
 - `00_baseline_noop.json`: run the baseline without scenario changes.
 - `01_rates_inflation_frn_tips.json`: change the nominal curve, inflation, FRN benchmark, TIPS real yield, and real operating cash.
@@ -37,9 +37,10 @@ This writes fourteen ready-to-run examples:
 - `08_issuance_longer.json`: matched longer issuance mix, holding TIPS/FRN shares fixed against the shorter case.
 - `09_private_holder_high.json`: high private new-issuance holder share.
 - `10_private_holder_low.json`: low private new-issuance holder share.
-- `11_primary_deficit_plus_1pct.json`: primary-deficit-only scale scenario.
-- `12_operating_cash_inflation_beta_50.json`: operating-cash-only inflation-beta scenario.
-- `13_fed_holdings_scale_1.json`: Fed-holdings-only passthrough scenario.
+- `11_primary_deficit_down_1pct.json`: matched primary-deficit down case.
+- `12_primary_deficit_up_1pct.json`: matched primary-deficit up case.
+- `13_operating_cash_inflation_beta_50.json`: operating-cash-only inflation-beta scenario.
+- `14_fed_holdings_scale_1.json`: Fed-holdings-only passthrough scenario.
 
 The simulation start date must match the package opening-state date. For the
 current release-bound package that is `2026-06-21`. For a short smoke run, add:
