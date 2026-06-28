@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from forecast_paths import compiled_forecast_input_paths
+from sim_engine import _handoff_append_payment
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
 from tdcsim_cbo._json import read_json, sha256_file, write_json
 from tdcsim_cbo.compiler import digest_input_tree, input_tree_hashes
@@ -28,6 +29,36 @@ from test_cbo_engine_integration import (
     _write_tips_forward_paths,
 )
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
+
+
+def test_handoff_payment_flow_id_distinguishes_same_security_different_holders() -> None:
+    tables = {"tdcsim_period_payment_flows": []}
+    base = {
+        "BondID": 11926,
+        "SecurityType": "TIPS",
+        "OriginalMaturityYears": 10.0,
+        "MaturityCategory": "notes",
+    }
+
+    for holder_type in ("CB", "Banks"):
+        _handoff_append_payment(
+            tables,
+            "2028-04-14",
+            "2028-04-15",
+            pd.Series({**base, "HolderType": holder_type, "HolderSubBucket": ""}),
+            "tips_coupon",
+            "cash",
+            0.01,
+            is_additive_to_cash_total=True,
+        )
+
+    flow_ids = [row["flow_id"] for row in tables["tdcsim_period_payment_flows"]]
+    assert len(flow_ids) == 2
+    assert len(set(flow_ids)) == 2
+    assert flow_ids == [
+        "payment|2028-04-15|11926|CB||tips_coupon|cash",
+        "payment|2028-04-15|11926|Banks||tips_coupon|cash",
+    ]
 
 
 def test_compiled_forecast_input_paths_maps_required_engine_paths(tmp_path: Path) -> None:
