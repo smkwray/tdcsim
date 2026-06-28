@@ -626,6 +626,7 @@ def _handoff_append_payment(
         return
     security_type = _handoff_instrument_type(row)
     security_id = _handoff_security_id(row)
+    holder = _handoff_holder(row)
     handoff_tables['tdcsim_period_payment_flows'].append(
         {
             **_handoff_period(prev_date, current_date),
@@ -633,11 +634,13 @@ def _handoff_append_payment(
                 'payment',
                 pd.Timestamp(current_date).date(),
                 security_id,
+                holder['holder_sector'],
+                holder['holder_subsector'],
                 payment_type,
                 accounting_basis,
             ),
             'security_id': security_id,
-            **_handoff_holder(row),
+            **holder,
             'instrument_type': security_type,
             'maturity_bucket': _handoff_maturity_bucket(
                 security_type,
