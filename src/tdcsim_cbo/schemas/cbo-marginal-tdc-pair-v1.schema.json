@@ -1,0 +1,324 @@
+{
+  "$id": "https://tdcsim.local/schemas/cbo-marginal-tdc-pair-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "actuals_available_as_of": {
+      "format": "date",
+      "type": "string"
+    },
+    "baseline_run_dir": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "baseline_scenario_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "baseline_state_fingerprint_sha256": {
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "type": "string"
+    },
+    "compiled_non_rate_inputs_digest": {
+      "type": "string"
+    },
+    "debt_stock_path_sha256": {
+      "type": "string"
+    },
+    "demand_conversion_cases": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "beta": {
+            "type": "number"
+          },
+          "beta_assumption_id": {
+            "type": "string"
+          },
+          "beta_source_status": {
+            "type": "string"
+          },
+          "chi": {
+            "type": "number"
+          },
+          "chi_assumption_id": {
+            "type": "string"
+          },
+          "chi_source_status": {
+            "type": "string"
+          },
+          "demand_conversion_case": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "demand_conversion_case",
+          "beta",
+          "chi"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "denominator_equivalence_key": {
+      "enum": [
+        "ratewall_D_conv_plus_100bp_year_v1",
+        "tdc_fiscal_injection_2028_no_rate_shock_v1"
+      ]
+    },
+    "derived_state_package_sha256": {
+      "type": "string"
+    },
+    "fed_holdings_path_sha256": {
+      "type": "string"
+    },
+    "forecast_state_export_manifest_sha256": {
+      "type": "string"
+    },
+    "holder_route_assumptions_sha256": {
+      "type": "string"
+    },
+    "horizon": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "horizon_end_date": {
+      "format": "date",
+      "type": "string"
+    },
+    "horizon_index": {
+      "type": "string"
+    },
+    "horizon_start_date": {
+      "format": "date",
+      "type": "string"
+    },
+    "issuance_mix_sha256": {
+      "type": "string"
+    },
+    "mmf_split_assumptions_sha256": {
+      "type": "string"
+    },
+    "nominal_gdp_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "object_id": {
+      "enum": [
+        "RW_M_PLUS_100BP_YEAR",
+        "TDC_FISCAL_INJECTION_2028"
+      ]
+    },
+    "one_named_rate_shock_only": {
+      "type": "boolean"
+    },
+    "opening_deposit_liquidity_stock_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_portfolio_sha256": {
+      "type": "string"
+    },
+    "opening_route_stock_bank_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_route_stock_domestic_nonbank_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_route_stock_fed_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_route_stock_foreign_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_route_stock_mmf_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_route_stock_total_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "opening_state_date": {
+      "format": "date",
+      "type": "string"
+    },
+    "opening_tdc_stock_bil": {
+      "type": [
+        "number",
+        "string"
+      ]
+    },
+    "operating_cash_path_sha256": {
+      "type": "string"
+    },
+    "pair_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "parent_attestation_sha256": {
+      "type": "string"
+    },
+    "parent_baseline_manifest_sha256": {
+      "type": "string"
+    },
+    "parent_baseline_package_sha256": {
+      "type": "string"
+    },
+    "primary_deficit_path_sha256": {
+      "type": "string"
+    },
+    "ratewall_period": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "require_same_actuals_available_as_of": {
+      "const": true
+    },
+    "require_same_baseline_hashes": {
+      "const": true
+    },
+    "require_same_non_rate_compiled_inputs": {
+      "type": "boolean"
+    },
+    "require_same_opening_state": {
+      "const": true
+    },
+    "require_same_period_index": {
+      "const": true
+    },
+    "require_same_simulation_dates": {
+      "const": true
+    },
+    "rollforward_run_manifest_sha256": {
+      "type": "string"
+    },
+    "scenario_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "scenario_state_set_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "tdcsim_cbo_marginal_tdc_pair_v1"
+    },
+    "shock_bps_year": {
+      "maximum": 100,
+      "minimum": 0,
+      "type": "number"
+    },
+    "shock_path_id": {
+      "enum": [
+        "plus_100bp_year",
+        "fiscal_injection_2028_v1"
+      ]
+    },
+    "shock_run_dir": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "shock_scenario_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "shock_state_fingerprint_sha256": {
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "type": "string"
+    },
+    "source_grade_status": {
+      "type": "string"
+    },
+    "source_vintage": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "state_component_inventory_sha256": {
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "type": "string"
+    },
+    "state_construction_method": {
+      "type": "string"
+    },
+    "state_fingerprint_sha256": {
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "type": "string"
+    },
+    "state_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "state_kind": {
+      "enum": [
+        "current_state",
+        "forecast_state",
+        "historical_state",
+        "scenario_state"
+      ]
+    },
+    "state_period": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "pair_id",
+    "scenario_state_set_id",
+    "state_id",
+    "state_kind",
+    "state_period",
+    "scenario_id",
+    "state_fingerprint_sha256",
+    "state_component_inventory_sha256",
+    "baseline_state_fingerprint_sha256",
+    "shock_state_fingerprint_sha256",
+    "opening_state_date",
+    "actuals_available_as_of",
+    "source_vintage",
+    "horizon_start_date",
+    "horizon_end_date",
+    "horizon",
+    "baseline_run_dir",
+    "shock_run_dir",
+    "baseline_scenario_id",
+    "shock_scenario_id",
+    "object_id",
+    "shock_path_id",
+    "shock_bps_year",
+    "denominator_equivalence_key",
+    "require_same_baseline_hashes",
+    "require_same_opening_state",
+    "require_same_actuals_available_as_of",
+    "require_same_simulation_dates",
+    "require_same_period_index",
+    "require_same_non_rate_compiled_inputs",
+    "one_named_rate_shock_only",
+    "demand_conversion_cases"
+  ],
+  "title": "TDCSIM CBO marginal TDC pair spec v1",
+  "type": "object"
+}

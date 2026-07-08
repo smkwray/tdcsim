@@ -6,12 +6,11 @@ set -euo pipefail
 # Two checks before any commit lands:
 #
 #   1. Refuse staged paths inside gitignored zones (do/, docs/, var/, data/,
-#      outputs/, dist/). Catches `git add -f` accidents.
+#      output/, outputs/, dist/). Catches `git add -f` accidents.
 #
 #   2. Run scripts/hygiene_check.sh --staged on staged files: fails on
 #      absolute system paths, data.md references in src/tests/configs,
-#      repo-local caches, and git diff --check issues. AI tool name
-#      mentions are reported as warnings only.
+#      repo-local caches, and git diff --check issues.
 #
 # Install once per clone:
 #   git config core.hooksPath .githooks
@@ -29,7 +28,7 @@ if [[ -z "$staged" ]]; then
 fi
 
 # --- Rule 1: refuse staged paths under gitignored zones ---
-banned_zones='^(do|docs|var|data|outputs|dist)/'
+banned_zones='^(do|docs|var|data|output|outputs|dist)/'
 banned_hits="$(printf '%s\n' "$staged" | grep -E "$banned_zones" || true)"
 
 if [[ -n "$banned_hits" ]]; then
@@ -37,10 +36,11 @@ if [[ -n "$banned_hits" ]]; then
   printf '  %s\n' $banned_hits >&2
   echo "" >&2
   echo "These directories are private working state and must never be committed:" >&2
-  echo "  do/      — agent memory, handoff, todo, changes, plans" >&2
+  echo "  do/      — private project notes, plans, and working state" >&2
   echo "  docs/    — private design docs" >&2
   echo "  var/     — async job state" >&2
   echo "  data/    — local data" >&2
+  echo "  output/  — generated artifacts" >&2
   echo "  outputs/ — generated artifacts" >&2
   echo "  dist/    — build outputs" >&2
   echo "" >&2

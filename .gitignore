@@ -43,12 +43,13 @@ src.zip
 # Legacy
 old/
 
-# Generated outputs
-output/*
-!output/.gitkeep
+# Local data and generated outputs
+data/
+output/
 plots/
 *.pdf
 *.svg
 
-# Local historical replay data/evidence
-data/historical_replay/
+# Agent root stubs
+CLAUDE.md
+AGENTS.md

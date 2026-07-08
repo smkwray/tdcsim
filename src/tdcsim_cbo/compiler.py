@@ -483,7 +483,7 @@ def _assert_replacement_coverage(
 ) -> None:
     if not replacement_rows:
         raise CompilerError(f"{mode} replacement file has no rows")
-    if baseline_rows and len(replacement_rows) != len(baseline_rows):
+    if baseline_rows and len(replacement_rows) != len(baseline_rows) and mode != "full_surface_file":
         raise CompilerError(
             f"{mode} replacement row count must match baseline coverage: "
             f"{len(replacement_rows)} != {len(baseline_rows)}"
@@ -492,11 +492,16 @@ def _assert_replacement_coverage(
     if key_cols:
         baseline_keys = _unique_keys(baseline_rows, key_cols, label="baseline")
         replacement_keys = _unique_keys(replacement_rows, key_cols, label="replacement")
-        if baseline_keys != replacement_keys:
+        if mode == "full_surface_file":
+            coverage_failed = not baseline_keys <= replacement_keys
+        else:
+            coverage_failed = baseline_keys != replacement_keys
+        if coverage_failed:
             missing = sorted(baseline_keys - replacement_keys)[:5]
             extra = sorted(replacement_keys - baseline_keys)[:5]
             raise CompilerError(
-                f"{mode} replacement key coverage mismatch for {key_cols}: "
+                f"{mode} replacement row count must match baseline coverage; "
+                f"key coverage mismatch for {key_cols}: "
                 f"missing={missing}, extra={extra}"
             )
 
