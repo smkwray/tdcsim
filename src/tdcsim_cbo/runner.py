@@ -158,12 +158,13 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
     initial_portfolio = _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv")
     operating_cash = pd.read_csv(inputs / "tdcsim_operating_cash_path.csv")
     base_tga = float(operating_cash.iloc[0].get("operating_cash_target_bil", 0.0))
+    initial_values = _opening_runtime_initial_values(inputs, base_tga=base_tga)
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
     holder_events = _holder_preference_events(inputs / HOLDER_PREFERENCE_EVENTS_FILE)
     if _fed_target_active(inputs / "tdcsim_fed_holdings_path.csv"):
         _assert_no_cb_auction_preferences(holder_preferences)
     return {
-        "initial_values": {"reserves": 3000.0, "tdc_level": 0.0, "tga": base_tga},
+        "initial_values": initial_values,
         "tga_params": {"target_balance": base_tga, "floor": -1e15},
         "fiscal_params": {
             "initial_weekly_spending": 0.0,
@@ -310,6 +311,40 @@ def _validate_opening_alignment(start_date: str, source_metadata: Mapping[str, s
             f"opening portfolio has {len(stale)} active securities maturing on/before simulation.start_date "
             f"{start_date}; stale face={float(face):.6f} billion"
         )
+
+
+def _opening_runtime_initial_values(inputs: Path, *, base_tga: float) -> dict[str, float]:
+    manifest_path = inputs.parent.parent / "baseline" / "manifest.json"
+    runtime_state_path = inputs / "tdcsim_opening_runtime_state.json"
+    if manifest_path.exists():
+        manifest = read_json(manifest_path)
+        if isinstance(manifest, Mapping) and isinstance(manifest.get("derived_forecast_state"), Mapping) and not runtime_state_path.exists():
+            raise RunnerError("derived forecast-state package requires tdcsim_opening_runtime_state.json")
+    if not runtime_state_path.exists():
+        return {"reserves": 3000.0, "tdc_level": 0.0, "tga": base_tga}
+    payload = read_json(runtime_state_path)
+    if not isinstance(payload, Mapping):
+        raise RunnerError("tdcsim_opening_runtime_state.json must be an object")
+    opening = str(payload.get("opening_state_date") or "")
+    expected_opening = _opening_state_date(inputs)
+    if opening != str(expected_opening or ""):
+        raise RunnerError("opening runtime state date does not match opening_state_date")
+    raw = payload.get("initial_values")
+    if not isinstance(raw, Mapping):
+        raise RunnerError("opening runtime state initial_values must be an object")
+    try:
+        values = {
+            "reserves": float(raw.get("reserves", 3000.0)),
+            "tdc_level": float(raw.get("tdc_level", 0.0)),
+            "tga": float(raw["tga"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunnerError("opening runtime state initial_values must be numeric") from exc
+    if abs(values["tga"] - base_tga) > 1e-9:
+        raise RunnerError("opening runtime state TGA does not match operating cash opening target")
+    if not all(math.isfinite(value) for value in values.values()):
+        raise RunnerError("opening runtime state initial_values must be finite")
+    return values
 
 
 def _opening_state_date(inputs_dir: Path) -> str | None:

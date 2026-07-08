@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tdcsim.local/schemas/cbo-marginal-tdc-manifest-v1.schema.json",
+  "title": "TDCSIM CBO marginal TDC pair manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pair_id",
+    "generated_at_utc",
+    "pair_spec",
+    "baseline_run",
+    "shock_run",
+    "validation",
+    "files",
+    "claim_boundary",
+    "pair_manifest_config_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "tdcsim_cbo_marginal_tdc_manifest_v1"},
+    "pair_id": {"type": "string", "minLength": 1},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "pair_spec": {"type": "object"},
+    "baseline_run": {"$ref": "#/$defs/sourceRun"},
+    "shock_run": {"$ref": "#/$defs/sourceRun"},
+    "validation": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"const": "pass"}
+      }
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "claim_boundary": {"const": "tdcsim_marginal_pair_assumption_mode_not_evidence_not_channel_classifier"},
+    "pair_manifest_config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "sourceRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_dir", "manifest_sha256", "compiled_inputs_digest"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "run_dir": {"type": "string", "minLength": 1},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "compiled_inputs_digest": {"type": "string"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_name", "relative_path", "sha256", "bytes", "media_type"],
+      "properties": {
+        "logical_name": {"type": "string", "minLength": 1},
+        "relative_path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

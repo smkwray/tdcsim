@@ -5,15 +5,16 @@ understand the verifier internals to run scenarios.
 
 ## Inputs
 
-Use one baseline package and its attestation:
+Use one locally generated or supplied baseline package and its attestation:
 
 ```bash
 output/cbo_forecast_release_bound_package.zip
 output/cbo_forecast_release_bound_attestation.json
 ```
 
-That baseline is the fixed CBO input package. Scenario files only describe what
-you want to change.
+That baseline is the fixed CBO input package for the run. Scenario files only
+describe what you want to change. Generated packages and attestations are local
+artifacts and are not shipped in the repository.
 
 ## Generate Example Scenarios
 

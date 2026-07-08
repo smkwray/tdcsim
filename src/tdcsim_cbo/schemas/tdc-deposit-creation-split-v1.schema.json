@@ -1,0 +1,40 @@
+{
+  "$id": "https://tdcsim.local/schemas/tdc-deposit-creation-split-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TDCSIM deposit creation split v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "tdc_deposit_creation_split_schema_version"
+  ],
+  "properties": {
+    "tdc_deposit_creation_split_schema_version": {
+      "const": "tdc_deposit_creation_split_v1"
+    },
+    "deposit_creation_driver_bucket": {
+      "enum": [
+        "interest_driven_direct_interest_collision_excluded",
+        "non_interest_auction_absorption_admissible",
+        "non_interest_principal_redemption_admissible",
+        "non_interest_fiscal_flow_admissible",
+        "route_plumbing_memo_excluded",
+        "not_in_delta_tdc_ex_overlap_excluded"
+      ]
+    },
+    "delta_tdc_ex_overlap_split_remainder_bil": {
+      "const": 0
+    },
+    "chi_selected_status": {
+      "const": "retired_not_selected"
+    },
+    "tdc_income_addendum_route_family": {
+      "const": "tdc_income_from_tdcsim_marginal_deposit_stock"
+    },
+    "tdc_income_addendum_admission_status": {
+      "const": "admitted_split_non_interest_bucket"
+    },
+    "tdc_income_addendum_collision_status": {
+      "const": "pass_split_collision_excluded"
+    }
+  }
+}

@@ -984,7 +984,7 @@ def build_plausibility_audit() -> pd.DataFrame:
                 else "fail",
                 f"{len(sample_manifest)} sample rows; sources={sorted(sources)}; min sample rows={int(sample_rows.min()) if len(sample_rows) else 0}; required columns={has_cols}; sample_statuses={sample_statuses}; bad_strata={bad_strata[:5]}",
                 "large-artifact samples are deterministic, nonempty, tied to full-file/sample hashes, and select every declared positive stratum",
-                "GPT audit packages can sample oversized CSVs without losing provenance or silently selecting empty rows.",
+                "External audit packages can sample oversized CSVs without losing provenance or silently selecting empty rows.",
             )
         )
 

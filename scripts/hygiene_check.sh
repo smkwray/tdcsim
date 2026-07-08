@@ -3,14 +3,13 @@ set -euo pipefail
 
 # hygiene_check.sh — Repo hygiene scan for tracked-eligible files.
 #
-# Enforces the rules in memory-system.md § Git hygiene:
+# Enforces the repository hygiene rules:
 #   - no full system paths (/Users/..., /home/...) in tracked-eligible files
 #   - no references to ../data.md or sibling data inventory paths in src/, tests/, configs/
-#   - no repo-local Python caches or virtualenvs
 #   - git diff --check passes
 #
 # Warns (does not fail) on:
-#   - AI tool name mentions in tracked-eligible files (deferred pre-public scrub)
+#   - automation/tool-name mentions in tracked-eligible files
 #
 # Usage:
 #   scripts/hygiene_check.sh              # scan the whole repo
@@ -147,7 +146,7 @@ done
 
 if [[ -n "$warn_ai" ]]; then
   ai_count="$(printf '%s' "$warn_ai" | grep -c .)"
-  echo "hygiene_check: WARN — ${ai_count} AI/tool-name mention(s) in tracked-eligible files (deferred pre-public scrub):" >&2
+  echo "hygiene_check: WARN — ${ai_count} automation/tool-name mention(s) in tracked-eligible files:" >&2
   printf '%s' "$warn_ai" | head -20 >&2
   if [[ "$ai_count" -gt 20 ]]; then
     echo "  ... and $((ai_count - 20)) more." >&2
@@ -168,24 +167,8 @@ else
   fi
 fi
 
-# --- Check 5: repo-local caches/envs (FAIL) ---
-if [[ "$MODE" != "staged" ]]; then
-  scan_paths=("$ROOT")
-  for sp in ${SIBLING_PROJECTS[@]+"${SIBLING_PROJECTS[@]}"}; do
-    [[ -d "$sp" ]] && scan_paths+=("$sp")
-  done
-  found="$(find "${scan_paths[@]}" -maxdepth 4 -type d \( \
-    -name '__pycache__' -o -name '.pytest_cache' -o -name '.ruff_cache' -o \
-    -name '.mypy_cache' -o -name '.cache' -o -name '.venv' -o -name 'venv' \
-  \) 2>/dev/null || true)"
-
-  if [[ -n "$found" ]]; then
-    echo "hygiene_check: FAIL — repo-local cache/env directories found:" >&2
-    echo "$found" >&2
-    echo "  Fix: delete them. PYTHONDONTWRITEBYTECODE=1 plus PYTEST_ADDOPTS='-p no:cacheprovider' should prevent recurrence." >&2
-    violations=$((violations + 1))
-  fi
-fi
+# (Repo-local .venv/cache directories are no longer policed — they're ignored by
+# git, Syncthing, rclone, and remrun, so they never propagate.)
 
 if [[ "$violations" -gt 0 ]]; then
   echo "hygiene_check: FAIL ($violations violation(s), $warnings warning(s))" >&2

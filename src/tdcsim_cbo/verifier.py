@@ -24,6 +24,7 @@ from .output import hash_output_tree, write_scenario_outputs
 from .runtime_identity import distribution_identity, wheel_file_digest
 from . import runner as runner_module
 from ._schema import validate_schema
+from .marginal_tdc import verify_marginal_tdc_pair
 
 
 class VerificationError(ValueError):
@@ -769,4 +770,4 @@ def _strip_absent_order(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(records, key=lambda item: item["path"])
 
 
-__all__ = ["VerificationError", "verify_compiled_scenario", "verify_scenario_run"]
+__all__ = ["VerificationError", "verify_compiled_scenario", "verify_marginal_tdc_pair", "verify_scenario_run"]

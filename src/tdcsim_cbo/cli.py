@@ -9,6 +9,12 @@ from typing import Sequence
 from .baseline import CboBaselinePackage
 from .compiler import CboScenarioCompiler
 from .contract import CboScenarioSpec
+from .forecast_state import (
+    export_forecast_state_package,
+    forecast_state_window,
+    run_no_shock_rollforward,
+)
+from .marginal_tdc import assemble_marginal_tdc_pair, verify_marginal_tdc_pair
 from .runner import run_cbo_scenario
 from .verifier import verify_compiled_scenario, verify_scenario_run
 
@@ -37,7 +43,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify.add_argument("--baseline", type=Path)
     verify.add_argument("--attestation", type=Path)
 
+    marginal_pair = sub.add_parser("assemble-marginal-pair", help="Assemble a RateWall marginal TDC pair")
+    marginal_pair.add_argument("--pair-spec", required=True, type=Path)
+    marginal_pair.add_argument("--output-dir", required=True, type=Path)
+
+    verify_marginal_pair = sub.add_parser("verify-marginal-pair", help="Verify a RateWall marginal TDC pair")
+    verify_marginal_pair.add_argument("--pair-dir", required=True, type=Path)
+
+    export_forecast = sub.add_parser("export-forecast-state", help="Export a derived forecast opening-state package")
+    _add_baseline_args(export_forecast)
+    export_forecast.add_argument("--year", required=True, type=int)
+    export_forecast.add_argument("--output-dir", required=True, type=Path)
+    export_forecast.add_argument("--work-dir", required=True, type=Path)
+    export_forecast.add_argument("--force", action="store_true")
+
     args = parser.parse_args(argv)
+    if args.command == "assemble-marginal-pair":
+        result = assemble_marginal_tdc_pair(args.pair_spec, args.output_dir)
+        print(result.manifest_path)
+        return 0
+    if args.command == "verify-marginal-pair":
+        result = verify_marginal_tdc_pair(args.pair_dir)
+        print(result["status"])
+        return 0
+    if args.command == "export-forecast-state":
+        baseline = CboBaselinePackage.open(args.baseline, attestation_path=args.attestation)
+        window = forecast_state_window(args.year)
+        rollforward = run_no_shock_rollforward(
+            baseline,
+            state_window=window,
+            output_dir=args.work_dir / "rollforward",
+            scenario_dir=args.work_dir / "scenarios",
+            force=args.force,
+        )
+        result = export_forecast_state_package(
+            baseline,
+            state_window=window,
+            rollforward_run_dir=rollforward,
+            output_zip=args.output_dir / f"cbo_baseline_state_{args.year}_opening_package.zip",
+            output_attestation=args.output_dir / f"cbo_baseline_state_{args.year}_opening_attestation.json",
+            output_manifest=args.output_dir / f"cbo_baseline_state_{args.year}_opening_export_manifest.json",
+            force=args.force,
+        )
+        print(result.package_zip)
+        return 0
     if args.command == "verify":
         if bool(args.compiled_dir) == bool(args.run_dir):
             parser.error("verify requires exactly one of --compiled-dir or --run-dir")

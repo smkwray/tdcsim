@@ -1,6 +1,6 @@
 # TDCsim — Treasury Deposit Contribution Simulator
 
-TDCsim is a **stock-flow Treasury funding-chain simulator** built for thesis research. It answers a focused question: **how Treasury issuance, debt service, holder mix, and Treasury cash management change the Treasury-attributed deposit contribution (TDC), reserves, and the maturity structure of debt**.
+TDCsim is a **stock-flow Treasury funding-chain simulator** for research and scenario analysis. It answers a focused question: **how Treasury issuance, debt service, holder mix, and Treasury cash management change the Treasury-attributed deposit contribution (TDC), reserves, and the maturity structure of debt**.
 
 The simulator is designed for scenario analysis, not forecasting. It makes the Treasury funding chain explicit so you can compare mechanisms across counterfactuals — different issuance mixes, yield curves, holder preferences, Treasury operating-cash paths, and debt-service dynamics.
 
@@ -21,7 +21,7 @@ By default, the project uses the shipped `tdc_config.yaml` and generates a synth
 
 The release-bound CBO lane has a simple downstream workflow:
 
-1. Use the single CBO baseline package in `output/cbo_forecast_release_bound_package.zip`.
+1. Use a locally generated or supplied CBO baseline package, such as `output/cbo_forecast_release_bound_package.zip`.
 2. Generate example scenario files with `scripts/write_cbo_example_scenarios.py`.
 3. Run a scenario with `tdcsim-cbo run` or the `tdcsim_cbo` Python API.
 4. Read `outputs/results_compact.csv.gz`, `outputs/final_portfolio_compact.csv.gz`, and `outputs/summary.json`.

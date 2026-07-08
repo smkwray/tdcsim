@@ -14,6 +14,7 @@ from ._json import read_json, sha256_file
 EXPECTED_ATTESTATION_SCHEMAS = {
     "tdcsim_cbo_external_release_attestation_v1",
     "tdcsim_cbo_release_attestation_v1",
+    "tdcsim_cbo_forecast_state_attestation_v1",
 }
 
 APPROVED_EXTERNAL_ATTESTATION_KEYS = {
@@ -59,6 +60,30 @@ APPROVED_SCAFFOLD_ATTESTATION_KEYS = {
     "signature",
     "status",
     "verifier_sha256",
+}
+
+APPROVED_FORECAST_STATE_ATTESTATION_KEYS = {
+    "actuals_available_as_of",
+    "attestation_created_at_utc",
+    "baseline_manifest_sha256",
+    "baseline_package_zip",
+    "baseline_package_zip_sha256",
+    "claim_boundary",
+    "commands",
+    "dirty_state",
+    "forecast_state_export_manifest_sha256",
+    "opening_state_date",
+    "parent_attestation_sha256",
+    "parent_baseline_manifest_sha256",
+    "parent_baseline_package_sha256",
+    "release_commit_sha",
+    "requirements_lock_sha256",
+    "rollforward_run_manifest_sha256",
+    "schema_version",
+    "source_vintage",
+    "state_id",
+    "state_period",
+    "validation_grade",
 }
 
 
@@ -192,11 +217,12 @@ def _verify_attestation_schema(data: Mapping[str, Any]) -> None:
     schema = data.get("schema_version")
     if schema not in EXPECTED_ATTESTATION_SCHEMAS:
         raise ValueError(f"unsupported CBO release attestation schema: {schema!r}")
-    approved = (
-        APPROVED_EXTERNAL_ATTESTATION_KEYS
-        if schema == "tdcsim_cbo_external_release_attestation_v1"
-        else APPROVED_SCAFFOLD_ATTESTATION_KEYS
-    )
+    if schema == "tdcsim_cbo_external_release_attestation_v1":
+        approved = APPROVED_EXTERNAL_ATTESTATION_KEYS
+    elif schema == "tdcsim_cbo_forecast_state_attestation_v1":
+        approved = APPROVED_FORECAST_STATE_ATTESTATION_KEYS
+    else:
+        approved = APPROVED_SCAFFOLD_ATTESTATION_KEYS
     unknown = sorted(set(str(key) for key in data) - approved)
     if unknown:
         raise ValueError(f"release attestation contains unknown fields: {unknown}")
@@ -238,6 +264,25 @@ def _verify_attestation(
         raise ValueError("package manifest trust_anchor dirty_state must be false for release use")
     if str(trust.get("code_revision") or "") != attestation.release_commit_sha:
         raise ValueError("package manifest code_revision does not match release attestation")
+    if attestation.data.get("schema_version") == "tdcsim_cbo_forecast_state_attestation_v1":
+        derived = manifest.get("derived_forecast_state")
+        date_range = manifest.get("date_range", {})
+        if not isinstance(derived, Mapping):
+            raise ValueError("forecast-state attestation requires manifest derived_forecast_state")
+        if not isinstance(date_range, Mapping):
+            raise ValueError("forecast-state attestation requires manifest date_range")
+        checks = {
+            "parent_baseline_package_sha256": derived.get("parent_baseline_package_sha256"),
+            "parent_baseline_manifest_sha256": derived.get("parent_baseline_manifest_sha256"),
+            "parent_attestation_sha256": derived.get("parent_attestation_sha256"),
+            "forecast_state_export_manifest_sha256": derived.get("forecast_state_export_manifest_sha256"),
+            "rollforward_run_manifest_sha256": derived.get("rollforward_run_manifest_sha256"),
+            "opening_state_date": date_range.get("opening_state_date"),
+            "actuals_available_as_of": date_range.get("actuals_available_as_of"),
+        }
+        for key, observed in checks.items():
+            if str(attestation.data.get(key) or "") != str(observed or ""):
+                raise ValueError(f"forecast-state attestation mismatch: {key}")
     if str(trust.get("requirements_lock_sha256") or "") != lock_sha:
         raise ValueError("package manifest requirements lock SHA-256 does not match package")
     verifier_sha = str(attestation.data.get("verifier_sha256") or "")
