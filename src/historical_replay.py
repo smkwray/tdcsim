@@ -959,7 +959,11 @@ def _attach_maturity_bucket_priors(
             cohort_supply = float(supply.get(bucket, 0.0))
             cohort_supply_share = cohort_supply / supply_total if supply_total else 0.0
             prior_ratio = observed_share / cohort_supply_share if cohort_supply_share > 0.0 else 0.0
-            prior_weight = min(2.0, max(0.5, prior_ratio**0.25 if prior_ratio > 0.0 else 0.5))
+            prior_weight = (
+                1.0
+                if scope == "ffiec_bank_broad_debt_maturity_prior"
+                else min(2.0, max(0.5, prior_ratio**0.25 if prior_ratio > 0.0 else 0.5))
+            )
             bucket_weights[bucket] = prior_weight
             rows.append(
                 {
@@ -1011,7 +1015,6 @@ def _build_maturity_prior_reconciliation(
         out["modeled_minus_observed_share"] = -pd.to_numeric(out["observed_share"], errors="coerce").fillna(0.0)
         out["post_solve_status"] = "no_allocations"
         return out[columns]
-    cohort_meta = cohorts[["quarter", "cohort_id"]].drop_duplicates().copy()
     modeled_frames = []
     for (quarter, scope, target_sector), group in prior_rows.groupby(
         ["quarter", "source_scope", "target_sector"],
@@ -1666,7 +1669,6 @@ def _net_negative_native_sectors(sector_levels: pd.DataFrame) -> pd.DataFrame:
             protected = adjusted.apply(_is_mmf_sector_row, axis=1)
             positive = values.clip(lower=0.0)
             negative_abs = abs(float(values.clip(upper=0.0).sum()))
-            protected_positive = float(positive[protected].sum())
             unprotected_positive = positive.where(~protected, 0.0)
             unprotected_positive_sum = float(unprotected_positive.sum())
             adjusted_values = values.clip(lower=0.0)
