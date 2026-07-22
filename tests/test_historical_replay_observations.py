@@ -71,6 +71,32 @@ def test_observation_registry_preserves_z1_lm_fl_valuation_basis():
     }
 
 
+def test_ffiec_broad_debt_scope_requires_explicit_source_kind(tmp_path):
+    ffiec_path = tmp_path / "ffiec.csv"
+    frame = pd.DataFrame(
+        [
+            {
+                "date": "2025-03-31",
+                "bank_class": "all_commercial_banks",
+                "constraint_source_kind": "broad_debt_bucket_bounds",
+                "treasury_bucket_3m_or_less": 1_000.0,
+            }
+        ]
+    )
+    frame.to_csv(ffiec_path, index=False)
+    declared = build_historical_replay_observations(
+        pd.DataFrame(), pd.DataFrame(), ffiec_path=ffiec_path, ncua_path=None, tier2_constraints_path=None
+    )
+
+    frame.drop(columns="constraint_source_kind").to_csv(ffiec_path, index=False)
+    undeclared = build_historical_replay_observations(
+        pd.DataFrame(), pd.DataFrame(), ffiec_path=ffiec_path, ncua_path=None, tier2_constraints_path=None
+    )
+
+    assert "ffiec_bank_broad_debt_maturity_prior" in set(declared["scope"])
+    assert "ffiec_bank_broad_debt_maturity_prior" not in set(undeclared["scope"])
+
+
 def test_observation_registry_includes_ncua_and_tier2_interest_constraints(tmp_path):
     ncua_path = tmp_path / "ncua.csv"
     tier2_path = tmp_path / "tier2.csv"

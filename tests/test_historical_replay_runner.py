@@ -218,6 +218,7 @@ def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibil
                 "date": "2025-03-31",
                 "reporter_id": 1,
                 "bank_class": "all_commercial_banks",
+                "constraint_source_kind": "broad_debt_bucket_bounds",
                 "treasury_bucket_3m_or_less": 100000.0,
                 "treasury_bucket_3_12m": 0.0,
                 "treasury_bucket_1_3y": 0.0,
@@ -261,6 +262,7 @@ def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibil
     ]
     assert not ffiec_rows.empty
     assert set(ffiec_rows["constraint_role"]) == {"soft_broad_debt_prior_only"}
+    assert set(ffiec_rows["prior_weight"]) == {1.0}
     assert "solver_prior_applied" not in set(ffiec_rows["prior_status"])
     assert "soft_solver_prior_applied" in set(ffiec_rows["prior_status"])
     assert "maturity_prior_reconciliation" in results.attrs["run_metadata"]["historical_replay_output_paths"]

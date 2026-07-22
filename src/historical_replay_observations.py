@@ -426,7 +426,17 @@ def _ffiec_observations(
             group_key = (group_key,)
         quarter = str(group_key[0])
         bank_class = group_key[1] if len(group_key) > 1 else "all_ffiec_banks"
+        source_kinds = (
+            group.get("constraint_source_kind", pd.Series(dtype="string")).dropna().astype(str).unique()
+        )
+        constraint_source_kind = source_kinds[0] if len(source_kinds) == 1 else ""
         for value_col in value_columns:
+            maturity_bucket = _ffiec_maturity_bucket(value_col)
+            broad_debt_support = (
+                constraint_source_kind == "broad_debt_bucket_bounds" and pd.notna(maturity_bucket)
+            )
+            if pd.notna(maturity_bucket) and not broad_debt_support:
+                continue
             value = pd.to_numeric(group[value_col], errors="coerce").sum(min_count=1)
             if pd.isna(value):
                 continue
@@ -439,7 +449,7 @@ def _ffiec_observations(
                     "source_row_key": f"{quarter}|{bank_class}|{value_col}",
                     "scope": (
                         "ffiec_bank_broad_debt_maturity_prior"
-                        if value_col.startswith("treasury_bucket_")
+                        if broad_debt_support
                         else "ffiec_bank_treasury_constraint"
                     ),
                     "holder": "Banks",
@@ -447,7 +457,7 @@ def _ffiec_observations(
                     "auction_class": pd.NA,
                     "security_id": pd.NA,
                     "security_type": pd.NA,
-                    "maturity_bucket": _ffiec_maturity_bucket(value_col),
+                    "maturity_bucket": maturity_bucket,
                     "measure": value_col,
                     "valuation_basis": _ffiec_valuation_basis(value_col),
                     "reported_value_mil": float(value) / 1000.0,
@@ -456,7 +466,7 @@ def _ffiec_observations(
                     "absolute_tolerance_mil": 0.0,
                     "enforcement": (
                         "penalized_bank_broad_debt_maturity_prior"
-                        if value_col.startswith("treasury_bucket_")
+                        if broad_debt_support
                         else "penalized_bank_subconstraint"
                     ),
                     "priority": 15,
