@@ -438,7 +438,7 @@ def _ffiec_observations(
                     "source_file": str(path),
                     "source_row_key": f"{quarter}|{bank_class}|{value_col}",
                     "scope": (
-                        "ffiec_bank_maturity_prior"
+                        "ffiec_bank_broad_debt_maturity_prior"
                         if value_col.startswith("treasury_bucket_")
                         else "ffiec_bank_treasury_constraint"
                     ),
@@ -455,7 +455,7 @@ def _ffiec_observations(
                     "upper_bound_mil": float(value) / 1000.0,
                     "absolute_tolerance_mil": 0.0,
                     "enforcement": (
-                        "penalized_bank_maturity_prior"
+                        "penalized_bank_broad_debt_maturity_prior"
                         if value_col.startswith("treasury_bucket_")
                         else "penalized_bank_subconstraint"
                     ),
@@ -691,8 +691,8 @@ def _solver_treatment_for_scope(scope: str) -> str:
         return "aggregate_transition_diagnostic_not_exact_transfer"
     if scope == "ffiec_bank_treasury_constraint":
         return "bank_subconstraint_reference_with_basis_slack"
-    if scope == "ffiec_bank_maturity_prior":
-        return "bank_maturity_prior_reference_with_basis_slack"
+    if scope == "ffiec_bank_broad_debt_maturity_prior":
+        return "bank_broad_debt_maturity_prior_reference_with_basis_slack"
     if scope in {
         "mmf_treasury_total",
         "mmf_treasury_bill_component",
@@ -717,7 +717,7 @@ def _coverage_status_for_scope(scope: str) -> str:
         return "observed_aggregate_not_security_level"
     if scope == "z1_transaction_flow":
         return "observed_aggregate_flow_not_security_level_transfer"
-    if scope in {"ffiec_bank_treasury_constraint", "ffiec_bank_maturity_prior"}:
+    if scope in {"ffiec_bank_treasury_constraint", "ffiec_bank_broad_debt_maturity_prior"}:
         return "observed_bank_aggregate_or_bucket"
     if scope == "ncua_credit_union_treasury_constraint":
         return "observed_credit_union_aggregate"
