@@ -565,6 +565,8 @@ def materialize_portfolio(
             "CouponRate": coupon_rate,
             "HolderType": holder_type,
             "HolderSubBucket": holder_subbucket,
+            "TDCPrincipalHolderType": holder_type,
+            "TDCPrincipalHolderSubBucket": holder_subbucket,
             "Status": _first_nonblank_text(merged, "Status").replace("", "Active"),
             "MaturityCategory": maturity_category,
             "OriginalPrincipal": original_principal,
