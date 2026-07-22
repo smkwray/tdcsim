@@ -159,7 +159,7 @@ def test_run_simulation_dispatches_historical_replay(tmp_path):
     assert set(portfolio["broad_holder_class"]) == {"banks", "money_market_cash"}
 
 
-def test_historical_replay_ffiec_maturity_prior_affects_bank_allocation_and_exports(tmp_path):
+def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibility(tmp_path):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -250,11 +250,19 @@ def test_historical_replay_ffiec_maturity_prior_affects_bank_allocation_and_expo
         snapshot["native_sector"].astype(str).eq("us_chartered_depository_institutions")
         & snapshot["cohort_id"].astype(str).eq("SHORT")
     ]["FaceValue"].sum()
-    assert bank_short > 49.0
+    assert 0.0 < bank_short < 50.0
+    assert not snapshot["source_sector"].astype(str).str.startswith(
+        "us_chartered_depository_institutions__"
+    ).any()
     maturity_prior = results.attrs["maturity_prior_reconciliation"]
     assert not maturity_prior.empty
-    assert "ffiec_bank_maturity_prior" in set(maturity_prior["source_scope"])
-    assert (maturity_prior["prior_status"] == "solver_prior_applied").any()
+    ffiec_rows = maturity_prior[
+        maturity_prior["source_scope"].astype(str).eq("ffiec_bank_broad_debt_maturity_prior")
+    ]
+    assert not ffiec_rows.empty
+    assert set(ffiec_rows["constraint_role"]) == {"soft_broad_debt_prior_only"}
+    assert "solver_prior_applied" not in set(ffiec_rows["prior_status"])
+    assert "soft_solver_prior_applied" in set(ffiec_rows["prior_status"])
     assert "maturity_prior_reconciliation" in results.attrs["run_metadata"]["historical_replay_output_paths"]
 
 

@@ -409,11 +409,6 @@ def run_historical_replay(params: dict, start_date, end_date, scenario_name: str
     sector_levels = _net_negative_native_sectors(sector_levels)
     negative_sector_netting_bridge = _build_negative_sector_netting_bridge(sector_levels)
     cohorts, maturity_prior_input = _attach_maturity_bucket_priors(cohorts, observation_registry)
-    sector_levels, cohorts = _apply_maturity_bucket_proxy_constraints(
-        sector_levels,
-        cohorts,
-        maturity_prior_input,
-    )
     solver_tolerance = float(cfg.get("solver_tolerance", 1.0e-6) or 1.0e-6)
     allocations, diagnostics = _solve_by_quarter(
         cohorts,
@@ -921,7 +916,7 @@ def _attach_maturity_bucket_priors(
         return cohorts.copy(), pd.DataFrame(columns=columns)
     obs = observation_registry[
         observation_registry["scope"].astype(str).isin(
-            {"ffiec_bank_maturity_prior", "ncua_credit_union_maturity_proxy"}
+            {"ffiec_bank_broad_debt_maturity_prior", "ncua_credit_union_maturity_proxy"}
         )
         & observation_registry["maturity_bucket"].notna()
     ].copy()
@@ -936,7 +931,7 @@ def _attach_maturity_bucket_priors(
         scope = str(scope)
         target_sector = (
             "us_chartered_depository_institutions"
-            if scope == "ffiec_bank_maturity_prior"
+            if scope == "ffiec_bank_broad_debt_maturity_prior"
             else "credit_unions"
         )
         prior_column = f"prior_{target_sector}"
@@ -964,11 +959,8 @@ def _attach_maturity_bucket_priors(
             cohort_supply = float(supply.get(bucket, 0.0))
             cohort_supply_share = cohort_supply / supply_total if supply_total else 0.0
             prior_ratio = observed_share / cohort_supply_share if cohort_supply_share > 0.0 else 0.0
-            prior_power = 1.0 if scope == "ffiec_bank_maturity_prior" else 0.25
-            prior_weight = prior_ratio**prior_power
-            prior_weight = max(prior_weight, 1.0e-9)
+            prior_weight = min(2.0, max(0.5, prior_ratio**0.25 if prior_ratio > 0.0 else 0.5))
             bucket_weights[bucket] = prior_weight
-            is_hard_bucket_constraint = scope == "ffiec_bank_maturity_prior"
             rows.append(
                 {
                     "quarter": quarter,
@@ -981,21 +973,15 @@ def _attach_maturity_bucket_priors(
                     "cohort_supply_share": cohort_supply_share,
                     "prior_weight": prior_weight,
                     "prior_column": prior_column,
-                    "prior_status": (
-                        "solver_prior_applied"
-                        if is_hard_bucket_constraint and cohort_supply > 0.0
-                        else "soft_solver_prior_applied"
-                        if cohort_supply > 0.0
-                        else "no_current_cohort_supply"
-                    ),
+                    "prior_status": "soft_solver_prior_applied" if cohort_supply > 0.0 else "no_current_cohort_supply",
                     "constraint_role": (
-                        "hard_bucket_proxy_constraint"
-                        if is_hard_bucket_constraint
+                        "soft_broad_debt_prior_only"
+                        if scope == "ffiec_bank_broad_debt_maturity_prior"
                         else "soft_all_investment_prior_only"
                     ),
                     "coverage_note": (
-                        "FFIEC bank maturity ladder prior; population/basis differs from Z1 sector stock."
-                        if scope == "ffiec_bank_maturity_prior"
+                        "FFIEC broad-debt maturity/repricing diagnostic; not a Treasury ladder or eligibility constraint."
+                        if scope == "ffiec_bank_broad_debt_maturity_prior"
                         else "NCUA credit-union investment maturity proxy; fallback split, not exact Treasury holdings."
                     ),
                 }
@@ -1003,102 +989,6 @@ def _attach_maturity_bucket_priors(
         for idx, bucket in q_cohorts["_maturity_bucket"].items():
             working.loc[idx, prior_column] = bucket_weights.get(str(bucket), 1.0e-9)
     return working, pd.DataFrame(rows, columns=columns)
-
-
-def _apply_maturity_bucket_proxy_constraints(
-    sector_levels: pd.DataFrame,
-    cohorts: pd.DataFrame,
-    prior_rows: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if sector_levels.empty or cohorts.empty or prior_rows.empty:
-        return sector_levels.copy(), cohorts.copy()
-    required = {"quarter", "source_scope", "target_sector", "maturity_bucket", "observed_share", "prior_status"}
-    if not required.issubset(prior_rows.columns):
-        return sector_levels.copy(), cohorts.copy()
-
-    constraint_role = prior_rows.get(
-        "constraint_role",
-        pd.Series("hard_bucket_proxy_constraint", index=prior_rows.index),
-    ).astype(str)
-    active = prior_rows[
-        prior_rows["prior_status"].astype(str).eq("solver_prior_applied")
-        & constraint_role.eq("hard_bucket_proxy_constraint")
-    ].copy()
-    if active.empty:
-        return sector_levels.copy(), cohorts.copy()
-    active["observed_share"] = pd.to_numeric(active["observed_share"], errors="coerce").fillna(0.0)
-
-    out_sectors = sector_levels.copy()
-    out_cohorts = cohorts.copy()
-    sector_stock_col = next(
-        (
-            column
-            for column in ("sector_stock", "sector_outstanding", "stock", "outstanding", "amount", "value", "holding")
-            if column in out_sectors.columns
-        ),
-        None,
-    )
-    if sector_stock_col is None:
-        return sector_levels.copy(), cohorts.copy()
-
-    replacement_rows = []
-    drop_index: list[int] = []
-    for (quarter, scope, target_sector), group in active.groupby(
-        ["quarter", "source_scope", "target_sector"],
-        sort=False,
-        dropna=False,
-    ):
-        quarter = str(quarter)
-        scope = str(scope)
-        target_sector = str(target_sector)
-        sector_mask = (
-            out_sectors["quarter"].astype(str).eq(quarter)
-            & out_sectors["sector"].astype(str).eq(target_sector)
-        )
-        if not sector_mask.any():
-            continue
-        base_rows = out_sectors.loc[sector_mask]
-        drop_index.extend(base_rows.index.tolist())
-
-        q_mask = out_cohorts["quarter"].astype(str).eq(quarter)
-        q_buckets = _maturity_bucket_for_scope(out_cohorts.loc[q_mask], quarter=quarter, scope=scope)
-        for bucket in group["maturity_bucket"].dropna().astype(str).unique():
-            eligibility_col = f"eligible_{target_sector}__{bucket}"
-            if eligibility_col not in out_cohorts.columns:
-                out_cohorts[eligibility_col] = False
-            out_cohorts.loc[q_mask, eligibility_col] = q_buckets.astype(str).eq(bucket).to_numpy(dtype=bool)
-
-        total_share = float(group["observed_share"].sum())
-        if total_share <= 0.0:
-            continue
-        for _, base_row in base_rows.iterrows():
-            for _, prior_row in group.iterrows():
-                share = float(prior_row["observed_share"]) / total_share
-                bucket = str(prior_row["maturity_bucket"])
-                new_row = base_row.copy()
-                new_row["sector"] = f"{target_sector}__{bucket}"
-                amount_columns = {
-                    sector_stock_col,
-                    "sector_stock",
-                    "sector_outstanding",
-                    "raw_z1_level",
-                    "sector_target_before_scale",
-                }
-                for amount_col in amount_columns:
-                    if amount_col in new_row.index:
-                        value = pd.to_numeric(pd.Series([new_row[amount_col]]), errors="coerce").fillna(0.0).iloc[0]
-                        new_row[amount_col] = float(value) * share
-                new_row["native_sector"] = target_sector
-                new_row["source_status"] = "maturity_bucket_proxy_constraint"
-                new_row["evidence_label"] = str(prior_row["source_scope"])
-                new_row["sector_adjustment_status"] = "maturity_bucket_proxy_split"
-                replacement_rows.append(new_row.to_dict())
-
-    if drop_index:
-        out_sectors = out_sectors.drop(index=drop_index)
-    if replacement_rows:
-        out_sectors = pd.concat([out_sectors, pd.DataFrame(replacement_rows)], ignore_index=True, sort=False)
-    return out_sectors, out_cohorts
 
 
 def _build_maturity_prior_reconciliation(
@@ -1186,7 +1076,7 @@ def _maturity_bucket_for_scope(cohorts: pd.DataFrame, *, quarter: str, scope: st
     maturity = pd.to_datetime(cohorts.get(maturity_col), errors="coerce")
     q_end = pd.Period(str(quarter), freq="Q").end_time.normalize()
     years = ((maturity - q_end).dt.days / 365.25).clip(lower=0.0)
-    if scope == "ffiec_bank_maturity_prior":
+    if scope == "ffiec_bank_broad_debt_maturity_prior":
         return years.map(_ffiec_bucket_from_years)
     return years.map(_ncua_bucket_from_years)
 
