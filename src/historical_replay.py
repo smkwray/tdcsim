@@ -14,6 +14,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from tdcsim_cbo.runtime_identity import include_runtime_file
+
 from historical_replay_contract import normalize_quarter_value
 from historical_replay_auction import (
     build_auction_absorption_reconciliation,
@@ -3870,10 +3872,15 @@ def _canonicalize_config_for_hash(value):
 
 
 def _code_identity_rows() -> list[dict[str, object]]:
-    source_paths = (
-        sorted((_PROJECT_ROOT / "src").glob("*.py"))
-        + sorted((_PROJECT_ROOT / "scripts").glob("*.py"))
-        + sorted(_PROJECT_ROOT.glob("tdc_config*.yaml"))
+    candidates = (
+        list((_PROJECT_ROOT / "src").rglob("*.py"))
+        + list((_PROJECT_ROOT / "scripts").rglob("*.py"))
+        + list(_PROJECT_ROOT.glob("tdc_config*.yaml"))
+    )
+    source_paths = sorted(
+        path
+        for path in candidates
+        if include_runtime_file(path.relative_to(_PROJECT_ROOT).as_posix())
     )
     rows = []
     for path in source_paths:
