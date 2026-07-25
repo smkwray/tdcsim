@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from csv_gen import generate_initial_portfolio
+from sim_engine import _handoff_append_holder_stocks, _handoff_maturity_bucket
 from simulation_core import (
     execute_preference_trades,
     get_security_category_for_prefs,
@@ -17,6 +18,7 @@ from tdc_shared import (
     HOLDER_TYPES,
     INTRAGOV_HOLDERS,
     PORTFOLIO_DTYPES,
+    PREFERENCE_CATEGORIES,
 )
 from tdc_validation import (
     validate_config,
@@ -239,14 +241,23 @@ class TestFederalBucketSplit:
         assert 'DebtHeld_Federal' not in results.columns
         assert 'DebtHeld_FederalOrInternal' not in results.columns
 
-    def test_intragov_debt_service_is_tga_wash(self):
+    def test_intragov_debt_service_is_tga_wash(self, monkeypatch):
         """P&I to FedInternal/TrustFunds should not drain TGA (intragovernmental wash).
 
         Strategy: create a portfolio with a maturing bond held by TrustFunds.
         Since the maturity is a TGA wash, less new debt should be issued to
         maintain TGA compared to when Private holds the same bond (where the
-        maturity drains TGA and requires issuance to refill).
+        maturity drains TGA and requires issuance to refill). Disable handoff
+        table traversal so this test isolates the simulation economics.
         """
+        for function_name in (
+            '_handoff_append_holder_stocks',
+            '_handoff_append_issuance',
+            '_handoff_append_payment',
+            '_handoff_append_principal',
+        ):
+            monkeypatch.setattr(f'sim_engine.{function_name}', lambda *args, **kwargs: None)
+
         # TrustFunds holds a maturing bond
         bond_tf = make_bond_row(
             BondID=201,
@@ -339,6 +350,52 @@ class TestFederalBucketSplit:
             f"Reserve change ({reserve_change}) should not be positive from "
             "intragovernmental debt maturity"
         )
+
+
+class TestRateWallHandoffMaturityBucket:
+    """Exact-export maturity buckets must be canonical or maturity-derived."""
+
+    @pytest.mark.parametrize(
+        ('maturity_category', 'maturity_years', 'expected'),
+        [
+            (pd.NA, 0.25, 'bills'),
+            (None, 5.0, 'notes'),
+            ('', 20.0, 'bonds'),
+            ('   ', 1.0, 'bills'),
+            (float('nan'), 10.0, 'notes'),
+        ],
+    )
+    def test_missing_fixed_category_falls_back_to_maturity(
+        self, maturity_category, maturity_years, expected
+    ):
+        assert _handoff_maturity_bucket(
+            'Fixed', maturity_years, maturity_category
+        ) == expected
+
+    @pytest.mark.parametrize('maturity_category', PREFERENCE_CATEGORIES)
+    def test_canonical_fixed_category_is_preserved(self, maturity_category):
+        assert _handoff_maturity_bucket(
+            'Fixed', 20.0, maturity_category
+        ) == maturity_category
+
+    @pytest.mark.parametrize('maturity_category', ['typo', 'nan', '<NA>', 'None'])
+    def test_noncanonical_fixed_category_raises(self, maturity_category):
+        with pytest.raises(ValueError, match='Non-canonical maturity category'):
+            _handoff_maturity_bucket('Fixed', 5.0, maturity_category)
+
+    def test_holder_stock_handoff_uses_canonical_validation(self):
+        active_bonds = pd.DataFrame(
+            [make_bond_row(MaturityCategory='typo')], columns=BOND_PORTFOLIO_COLS
+        ).astype(PORTFOLIO_DTYPES, errors='ignore')
+        handoff_tables = {
+            'tdcsim_holder_stocks': [],
+            'tdcsim_tdc_principal_route_stocks': [],
+        }
+
+        with pytest.raises(ValueError, match='Non-canonical maturity category'):
+            _handoff_append_holder_stocks(
+                handoff_tables, active_bonds, pd.Timestamp('2025-01-01')
+            )
 
 
 # ===================================================================
