@@ -69,6 +69,7 @@ from ratewall_paths import (
     load_holder_absorption_path,
     load_primary_flow_path,
     primary_flow_for_period,
+    resolve_holder_absorption_scenario,
 )
 from yield_curve_path import curve_for_date, load_yield_curve_surface
 
@@ -1737,6 +1738,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         ratewall_input_cfg = params.get('ratewall_input_paths', {})
         primary_flow_lookup = {}
         holder_absorption_lookup = {}
+        holder_absorption_source_scenario_id = None
+        holder_absorption_resolution_status = 'not_configured'
         primary_flow_warning_cache = set()
         holder_absorption_warning_cache = set()
         primary_flow_path_used_count = 0
@@ -1744,6 +1747,25 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             source_base_dir = ratewall_input_cfg.get('base_dir')
             primary_flow_lookup = load_primary_flow_path(ratewall_input_cfg, base_dir=source_base_dir)
             holder_absorption_lookup = load_holder_absorption_path(ratewall_input_cfg, base_dir=source_base_dir)
+            if ratewall_input_cfg.get('holder_absorption_path_file'):
+                holder_fallbacks = ratewall_input_cfg.get(
+                    'holder_absorption_scenario_fallbacks',
+                    {},
+                )
+                if not isinstance(holder_fallbacks, dict):
+                    raise ValueError(
+                        'holder_absorption_scenario_fallbacks must be a mapping of '
+                        'requested scenario IDs to source scenario IDs.'
+                    )
+                (
+                    holder_absorption_source_scenario_id,
+                    holder_absorption_resolution_status,
+                ) = resolve_holder_absorption_scenario(
+                    holder_absorption_lookup,
+                    scenario_name=scenario_name,
+                    required_quarters=set(period_counts_by_quarter),
+                    configured_fallbacks=holder_fallbacks,
+                )
         fiscal_p = params.get('fiscal_params', {})
         current_fiscal_params = copy.deepcopy(fiscal_p)
         q_start_spending = current_fiscal_params.get('initial_weekly_spending', 0.0)
@@ -2869,6 +2891,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             effective_auction_prefs_for_period = holder_preferences_for_period(
                 holder_absorption_lookup,
                 scenario_name=scenario_name,
+                resolved_scenario_id=holder_absorption_source_scenario_id,
                 current_date=current_date,
                 fallback_preferences=current_auction_prefs,
                 warning_cache=holder_absorption_warning_cache,
@@ -3655,6 +3678,13 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         ),
         'ratewall_primary_flow_loaded_rows': sum(len(rows) for rows in primary_flow_lookup.values()),
         'ratewall_primary_flow_used_periods': primary_flow_path_used_count,
+        'ratewall_holder_absorption_resolution_status': holder_absorption_resolution_status,
+        'ratewall_holder_absorption_source_scenario_id': holder_absorption_source_scenario_id,
+        'ratewall_holder_absorption_loaded_quarters': (
+            len(holder_absorption_lookup.get(holder_absorption_source_scenario_id, {}))
+            if holder_absorption_source_scenario_id
+            else 0
+        ),
         'funding_rule_mode': CBO_FUNDING_MODE if cbo_funding_mode else str(funding_rule_cfg.get('mode', 'legacy_cash_tga')),
         'cbo_funding_mode_active': bool(cbo_funding_mode),
         'cbo_net_interest_bridge_rows': (
