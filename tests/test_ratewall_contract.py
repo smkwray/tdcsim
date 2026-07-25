@@ -11,6 +11,7 @@ import pytest
 import ratewall_input_builder as rib
 from ratewall_contract import export_ratewall_bundle
 from ratewall_input_builder import (
+    RATEWALL_SCENARIO_REGISTRY,
     SCENARIO_CURVE_MAP,
     _cbo_budget_values,
     build_primary_flow_path,
@@ -253,6 +254,135 @@ def test_ratewall_configured_missing_input_paths_raise(tmp_path):
             freq="W",
             scenario_name="missing_holder_case",
         )
+
+
+def _write_holder_path(path: Path, *, scenario_id: str, quarter: str) -> None:
+    pd.DataFrame(
+        [
+            {
+                "scenario_id": scenario_id,
+                "quarter": quarter,
+                "holder_type": "Private",
+                "bills_pct": 0.75,
+                "notes_pct": 0.65,
+                "bonds_pct": 0.55,
+                "tips_pct": 0.45,
+                "frn_pct": 0.35,
+            },
+            {
+                "scenario_id": scenario_id,
+                "quarter": quarter,
+                "holder_type": "Banks",
+                "bills_pct": 0.25,
+                "notes_pct": 0.35,
+                "bonds_pct": 0.45,
+                "tips_pct": 0.55,
+                "frn_pct": 0.65,
+            },
+        ]
+    ).to_csv(path, index=False)
+
+
+def test_ratewall_holder_path_missing_named_scenario_fails_before_simulation(tmp_path):
+    holder_path = tmp_path / "holder.csv"
+    _write_holder_path(holder_path, scenario_id="other_scenario", quarter="2025Q1")
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "holder_absorption_path_file": str(holder_path),
+    }
+
+    with pytest.raises(ValueError, match="no exact scenario 'missing_holder_scenario'"):
+        run_simulation(
+            params,
+            "2025-01-01",
+            "2025-01-19",
+            freq="W",
+            scenario_name="missing_holder_scenario",
+        )
+
+
+def test_ratewall_holder_path_missing_required_quarter_fails_before_simulation(tmp_path):
+    holder_path = tmp_path / "holder.csv"
+    _write_holder_path(holder_path, scenario_id="quarter_gap_scenario", quarter="2025Q2")
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "holder_absorption_path_file": str(holder_path),
+    }
+
+    with pytest.raises(ValueError, match="missing required quarters: \\['2025Q1'\\]"):
+        run_simulation(
+            params,
+            "2025-01-01",
+            "2025-01-19",
+            freq="W",
+            scenario_name="quarter_gap_scenario",
+        )
+
+
+def test_ratewall_holder_path_exact_scenario_preserves_preferences_and_records_source(tmp_path):
+    holder_path = tmp_path / "holder.csv"
+    _write_holder_path(holder_path, scenario_id="exact_holder_scenario", quarter="2025Q1")
+    params = minimal_params()
+    baseline_banks = dict(params["sector_preferences"]["Banks"])
+    params["ratewall_input_paths"] = {
+        "holder_absorption_path_file": str(holder_path),
+    }
+
+    results, _ = run_simulation(
+        params,
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="exact_holder_scenario",
+    )
+
+    metadata = results.attrs["run_metadata"]
+    assert metadata["ratewall_holder_absorption_resolution_status"] == "exact_scenario"
+    assert metadata["ratewall_holder_absorption_source_scenario_id"] == "exact_holder_scenario"
+    assert baseline_banks == params["sector_preferences"]["Banks"]
+    final_public_debt = float(
+        results[["DebtHeld_Banks", "DebtHeld_DomesticNonBanks"]].iloc[-1].sum()
+    )
+    assert float(results["DebtHeld_Banks"].iloc[-1]) / final_public_debt == pytest.approx(0.25)
+    assert float(results["DebtHeld_DomesticNonBanks"].iloc[-1]) / final_public_debt == pytest.approx(0.75)
+    paths = export_ratewall_bundle(
+        {"exact_holder_scenario": results},
+        tmp_path / "bundle",
+    )
+    summary = pd.read_csv(paths["summary"])
+    assert set(summary["holder_path_resolution_status"]) == {"exact_scenario"}
+    assert set(summary["holder_path_source_scenario_id"]) == {"exact_holder_scenario"}
+
+
+def test_ratewall_holder_path_configured_fallback_is_explicit_and_recorded(tmp_path):
+    holder_path = tmp_path / "holder.csv"
+    _write_holder_path(holder_path, scenario_id="declared_source", quarter="2025Q1")
+    params = minimal_params()
+    params["ratewall_input_paths"] = {
+        "holder_absorption_path_file": str(holder_path),
+        "holder_absorption_scenario_fallbacks": {
+            "requested_scenario": "declared_source",
+        },
+    }
+
+    results, _ = run_simulation(
+        params,
+        "2025-01-01",
+        "2025-01-19",
+        freq="W",
+        scenario_name="requested_scenario",
+    )
+
+    metadata = results.attrs["run_metadata"]
+    assert metadata["ratewall_holder_absorption_resolution_status"] == "configured_fallback"
+    assert metadata["ratewall_holder_absorption_source_scenario_id"] == "declared_source"
+    paths = export_ratewall_bundle(
+        {"requested_scenario": results},
+        tmp_path / "bundle",
+    )
+    summary = pd.read_csv(paths["summary"])
+    assert set(summary["holder_path_resolution_status"]) == {"configured_fallback"}
+    assert set(summary["holder_path_source_scenario_id"]) == {"declared_source"}
 
 
 def test_ratewall_primary_flow_fallback_warns_once(tmp_path, capsys):
@@ -541,6 +671,26 @@ def test_primary_flow_path_maps_cbo_fiscal_year_to_calendar_quarters(tmp_path, m
     ).all()
 
 
+def test_ratewall_scenario_registry_drives_catalog_and_primary_rows(tmp_path, monkeypatch):
+    registry_map = {
+        scenario.scenario_id: scenario.curve_id
+        for scenario in RATEWALL_SCENARIO_REGISTRY
+    }
+    assert SCENARIO_CURVE_MAP == registry_map
+    monkeypatch.setattr(
+        rib,
+        "_cbo_budget_values",
+        lambda _path: {2026: {"deficit_bil": -100.0, "net_interest_bil": 20.0}},
+    )
+
+    frame, _ = build_primary_flow_path(
+        tmp_path / "primary.csv",
+        cbo_budget_path=tmp_path / "unused.xlsx",
+    )
+
+    assert set(frame["scenario_id"]) == set(registry_map)
+
+
 def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
     ratewall_root = repo_root.parent / "ratewall"
@@ -720,6 +870,9 @@ def test_ratewall_absorption_scenario_lambda_comes_from_calibration(tmp_path):
         holder_absorption_calibration=calibration,
     )
 
+    assert set(frame["scenario_id"]) == {
+        scenario.scenario_id for scenario in RATEWALL_SCENARIO_REGISTRY
+    }
     current = frame[
         (frame["scenario_id"] == "domestic_nonbank_absorption_shift")
         & (frame["quarter"] == "2026Q1")
