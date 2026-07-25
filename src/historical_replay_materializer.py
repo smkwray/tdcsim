@@ -7,6 +7,7 @@ import re
 import numpy as np
 import pandas as pd
 
+from historical_replay_contract import _NUMERIC_NULL_MARKERS
 from historical_replay_solver import _COHORT_ID_COL, _QUARTER_COL, _pick_column
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
@@ -336,13 +337,63 @@ def _holder_type_from_label(value) -> str:
     return "Private"
 
 
+def _invalid_allocation_sample(
+    allocations: pd.DataFrame,
+    raw_values: pd.Series,
+    invalid: pd.Series,
+) -> list[dict[str, str | int]]:
+    identifier_columns = [
+        column
+        for column in (_QUARTER_COL, _SECTOR_COL, _COHORT_ID_COL)
+        if column in allocations.columns
+    ]
+    sample = []
+    for position in np.flatnonzero(invalid.to_numpy())[:3]:
+        row = allocations.iloc[position]
+        sample.append(
+            {
+                "row_position": int(position),
+                **{column: str(row[column]) for column in identifier_columns},
+                _ALLOCATION_COL: str(raw_values.iloc[position]),
+            }
+        )
+    return sample
+
+
+def _allocation_materialization_status(
+    *,
+    input_row_count: int,
+    absent_or_blank_row_count: int,
+    zero_row_count: int,
+    materialized_row_count: int,
+) -> dict[str, int | str]:
+    elided_row_count = absent_or_blank_row_count + zero_row_count
+    return {
+        "status": "materialized_with_elisions" if elided_row_count else "materialized",
+        "input_allocation_row_count": input_row_count,
+        "absent_or_blank_allocation_row_count": absent_or_blank_row_count,
+        "zero_allocation_row_count": zero_row_count,
+        "elided_allocation_row_count": elided_row_count,
+        "materialized_allocation_row_count": materialized_row_count,
+        "absent_or_blank_allocation_policy": "treated_as_absent_and_elided",
+        "zero_allocation_policy": "deliberately_elided",
+    }
+
+
 def materialize_portfolio(
     allocations: pd.DataFrame,
     cohorts: pd.DataFrame,
     *,
     start_bond_id: int = 1,
 ) -> pd.DataFrame:
-    """Convert coarse sector/cohort allocations into tdcsim portfolio rows."""
+    """Convert coarse sector/cohort allocations into tdcsim portfolio rows.
+
+    Absent or blank allocation values follow the replay loader's numeric-null
+    precedent: they are treated as absent and elided. Exact zeros are deliberately
+    elided. Counts for both cases are recorded in the returned frame's
+    ``materialization_status`` attribute. Non-numeric, non-finite, and negative
+    allocation values raise before any rows are filtered.
+    """
 
     required_cols = {_SECTOR_COL, _COHORT_ID_COL, _ALLOCATION_COL}
     missing = required_cols.difference(allocations.columns)
@@ -351,10 +402,33 @@ def materialize_portfolio(
 
     prepared_cohorts, cohort_value_col, cohort_key_cols = _prepare_cohorts(cohorts)
     working_allocations = allocations.copy()
-    working_allocations[_ALLOCATION_COL] = pd.to_numeric(
-        working_allocations[_ALLOCATION_COL], errors="coerce"
-    ).fillna(0.0)
-    working_allocations = working_allocations.loc[working_allocations[_ALLOCATION_COL] > 0.0].copy()
+    raw_allocations = working_allocations[_ALLOCATION_COL]
+    normalized_allocations = (
+        raw_allocations.where(raw_allocations.notna(), "").astype(str).str.strip().str.lower()
+    )
+    source_null = raw_allocations.isna() | normalized_allocations.isin(_NUMERIC_NULL_MARKERS)
+    numeric_allocations = pd.to_numeric(raw_allocations.mask(source_null), errors="coerce")
+    nonfinite = numeric_allocations.notna() & ~np.isfinite(numeric_allocations)
+    invalid = (~source_null & numeric_allocations.isna()) | nonfinite | numeric_allocations.lt(0.0)
+    if invalid.any():
+        invalid_count = int(invalid.sum())
+        sample = _invalid_allocation_sample(working_allocations, raw_allocations, invalid)
+        raise ValueError(
+            f"allocations column {_ALLOCATION_COL} has invalid allocation values "
+            f"(count={invalid_count}; non-numeric, non-finite, or negative): {sample}"
+        )
+
+    absent_or_blank_row_count = int(source_null.sum())
+    zero = numeric_allocations.eq(0.0)
+    zero_row_count = int(zero.sum())
+    working_allocations[_ALLOCATION_COL] = numeric_allocations.fillna(0.0)
+    working_allocations = working_allocations.loc[~source_null & ~zero].copy()
+    materialization_status = _allocation_materialization_status(
+        input_row_count=len(allocations.index),
+        absent_or_blank_row_count=absent_or_blank_row_count,
+        zero_row_count=zero_row_count,
+        materialized_row_count=len(working_allocations.index),
+    )
 
     metadata_columns = [
         _QUARTER_COL,
@@ -377,7 +451,9 @@ def materialize_portfolio(
     empty_columns = BOND_PORTFOLIO_COLS + metadata_columns
     if working_allocations.empty:
         empty = pd.DataFrame(columns=empty_columns)
-        return empty.astype({**PORTFOLIO_DTYPES}, errors="ignore")
+        empty = empty.astype({**PORTFOLIO_DTYPES}, errors="ignore")
+        empty.attrs["materialization_status"] = materialization_status
+        return empty
 
     merge_keys = [
         column
@@ -609,4 +685,5 @@ def materialize_portfolio(
     )
     materialized = materialized[BOND_PORTFOLIO_COLS + metadata_columns]
     materialized[BOND_PORTFOLIO_COLS] = materialized[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES, errors="ignore")
+    materialized.attrs["materialization_status"] = materialization_status
     return materialized
