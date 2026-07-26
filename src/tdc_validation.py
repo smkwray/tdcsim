@@ -47,6 +47,10 @@ CBO_CONFIG_BLOCK_SCHEMAS = {
         'target_enforcement': None,
         'negative_required_issuance_action': None,
         'target_tolerance_bil': None,
+        'fed_secondary_sale_buyer_mix': {
+            'type': None,
+            'basis': None,
+        },
     },
     'baseline_input_paths': {
         'source_contract_file': None,

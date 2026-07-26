@@ -340,7 +340,7 @@ def test_run_cbo_scenario_net_interest_is_diagnostic_only(tmp_path: Path) -> Non
     assert set(ni_results["NetInterestDiagnosticStatus"].dropna()) == {"cbo_reported_check_only"}
 
 
-def test_run_cbo_scenario_fed_target_reallocates_only_and_remittance_unsupported(tmp_path: Path) -> None:
+def test_run_cbo_scenario_fed_target_settles_and_remittance_unsupported(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
 
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
@@ -349,6 +349,10 @@ def test_run_cbo_scenario_fed_target_reallocates_only_and_remittance_unsupported
     fed_results = pd.read_csv(fed.results_path)
 
     assert fed_results["CBOFedAuctionShare"].abs().max() == pytest.approx(0.0)
+    assert fed_results["CBOFedSecondaryPurchaseCash"].sum() > 0.0
+    assert fed_results["CBOFedSecondaryPurchaseReserveEffect"].sum() == pytest.approx(
+        fed_results["CBOFedSecondaryPurchaseCash"].sum()
+    )
     assert fed_results["CBORemittanceCashEffect"].fillna(0.0).abs().max() == pytest.approx(0.0)
     assert set(fed_results["CBORemittanceStatus"]) == {
         "not_modeled_cbo_primary_deficit_embeds_baseline_revenues"
@@ -360,7 +364,7 @@ def test_run_cbo_scenario_fed_target_reallocates_only_and_remittance_unsupported
     )
 
 
-def test_stock_only_fed_reallocation_preserves_tdc_principal_settlement_route(tmp_path: Path) -> None:
+def test_cb_beneficial_holder_maturity_creates_no_private_principal_tdc(tmp_path: Path) -> None:
     opening = _opening_controlled_portfolio(1_000.0)
     opening.loc[:, "SecurityType"] = "Fixed"
     opening.loc[:, "MaturityDate"] = pd.Timestamp("2026-09-25")
@@ -374,33 +378,29 @@ def test_stock_only_fed_reallocation_preserves_tdc_principal_settlement_route(tm
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-fed-principal-route")
     principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
     summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
-    cb_actual = principal[
-        (principal["holder_sector"] == "CB")
-        & (principal["tdc_principal_recipient_sector"] == "Private")
-        & (principal["tdc_principal_cash_paid_to_du_bil"] > 0.0)
-    ]
+    cb_actual = principal[principal["holder_sector"] == "CB"]
 
     assert not cb_actual.empty
+    assert cb_actual["tdc_principal_recipient_sector"].eq("CB").all()
+    assert cb_actual["tdc_principal_recipient_subsector"].fillna("").eq("").all()
+    assert cb_actual["tdc_principal_cash_paid_to_du_bil"].eq(0.0).all()
+    assert cb_actual["tdc_principal_redeemed_to_du_bil"].eq(0.0).all()
     assert cb_actual["tdc_principal_recipient_basis"].eq(
-        "tdc_principal_settlement_route_preserved_through_stock_only_reallocation"
+        "current_cb_beneficial_holder_otherwise_recorded_tdc_principal_route"
     ).all()
-    assert principal["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(1_000.0)
-    assert summary["gross_principal_cash_paid_to_du_bil"].sum() == pytest.approx(1_000.0)
+    assert cb_actual["cash_paid_bil"].sum() == pytest.approx(100.0)
+    assert principal["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(900.0)
+    assert summary["gross_principal_cash_paid_to_du_bil"].sum() == pytest.approx(900.0)
     assert summary["tdc_debt_service_principal_to_du_bil"].sum() == pytest.approx(
         principal["tdc_principal_redeemed_to_du_bil"].sum()
     )
-    assert summary["tdc_debt_service_principal_to_du_bil"].sum() > 990.0
-    assert (
-        summary["gross_principal_cash_paid_to_du_bil"]
-        - summary["gross_issuance_proceeds_absorbed_by_du_bil"]
-        - summary["net_du_principal_issuance_cashflow_bil"]
-    ).abs().max() <= 1e-9
+    assert summary["tdc_debt_service_principal_to_du_bil"].sum() > 890.0
     assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)[
         "status"
     ] == "pass"
 
 
-def test_explicit_retirement_preserves_tdc_principal_settlement_route(tmp_path: Path) -> None:
+def test_explicit_retirement_routes_cb_principal_to_current_holder(tmp_path: Path) -> None:
     opening = _opening_retirement_route_portfolio()
     package, attestation = _write_runner_package(
         tmp_path,
@@ -419,23 +419,18 @@ def test_explicit_retirement_preserves_tdc_principal_settlement_route(tmp_path: 
     principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
     summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
     retirements = principal[principal["redemption_type"] == "explicit_retirement_at_par"]
-    actual_cb_tdc_private = retirements[
-        (retirements["holder_sector"] == "CB")
-        & (retirements["tdc_principal_recipient_sector"] == "Private")
-        & (retirements["tdc_principal_cash_paid_to_du_bil"] > 0.0)
-    ]
+    actual_cb = retirements[retirements["holder_sector"] == "CB"]
     actual_private_tdc_cb = retirements[
         (retirements["holder_sector"] == "Private")
         & (retirements["tdc_principal_recipient_sector"] == "CB")
     ]
 
     assert not retirements.empty
-    assert not actual_cb_tdc_private.empty
+    assert not actual_cb.empty
     assert not actual_private_tdc_cb.empty
-    assert actual_cb_tdc_private["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(
-        actual_cb_tdc_private["cash_paid_bil"].sum()
-    )
-    assert actual_cb_tdc_private["tdc_principal_cash_paid_to_du_bil"].sum() > 0.0
+    assert actual_cb["tdc_principal_recipient_sector"].eq("CB").all()
+    assert actual_cb["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(0.0)
+    assert actual_cb["cash_paid_bil"].sum() > 0.0
     assert actual_private_tdc_cb["cash_paid_bil"].sum() > 0.0
     assert actual_private_tdc_cb["tdc_principal_cash_paid_to_du_bil"].sum() == pytest.approx(0.0)
     assert retirements["tdc_principal_cash_paid_to_du_bil"].sum() < retirements["cash_paid_bil"].sum()
