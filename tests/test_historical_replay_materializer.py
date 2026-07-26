@@ -270,3 +270,80 @@ def test_materializer_first_interest_schedule_handles_missing_maturity():
 
     assert portfolio.loc[0, "FirstInterestPaymentDate"] == pd.Timestamp("2025-07-15")
     assert portfolio.loc[0, "InterestPaymentFrequency"] == pytest.approx(2.0)
+
+
+def test_materializer_rejects_malformed_allocation_with_row_identifiers_and_count():
+    cohorts = pd.DataFrame(
+        [
+            {
+                "quarter": "2025Q1",
+                "cohort_id": "valid_cohort",
+                "outstanding": 10.0,
+            }
+        ]
+    )
+    allocations = pd.DataFrame(
+        [
+            {
+                "quarter": "2025Q1",
+                "sector": "Banks",
+                "cohort_id": "valid_cohort",
+                "allocated_outstanding": "not-a-number",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        materialize_portfolio(allocations, cohorts)
+
+    message = str(exc_info.value)
+    assert "allocated_outstanding has invalid allocation values (count=1;" in message
+    assert "row_position" in message
+    assert "2025Q1" in message
+    assert "Banks" in message
+    assert "valid_cohort" in message
+    assert "not-a-number" in message
+
+
+@pytest.mark.parametrize("invalid_value", [float("inf"), float("-inf"), -1.0])
+def test_materializer_rejects_nonfinite_and_negative_allocations(invalid_value):
+    cohorts = pd.DataFrame([{"cohort_id": "cohort_a", "outstanding": 10.0}])
+    allocations = pd.DataFrame(
+        [
+            {
+                "sector": "Banks",
+                "cohort_id": "cohort_a",
+                "allocated_outstanding": invalid_value,
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="invalid allocation values \\(count=1;"):
+        materialize_portfolio(allocations, cohorts)
+
+
+def test_materializer_records_blank_and_zero_allocation_elision_counts():
+    cohorts = pd.DataFrame([{"cohort_id": "positive", "outstanding": 10.0}])
+    allocations = pd.DataFrame(
+        [
+            {"sector": "Banks", "cohort_id": "positive", "allocated_outstanding": 10.0},
+            {"sector": "Banks", "cohort_id": "zero", "allocated_outstanding": 0.0},
+            {"sector": "Banks", "cohort_id": "blank", "allocated_outstanding": "  "},
+            {"sector": "Banks", "cohort_id": "absent", "allocated_outstanding": None},
+            {"sector": "Banks", "cohort_id": "source_null", "allocated_outstanding": "N/A"},
+        ]
+    )
+
+    portfolio = materialize_portfolio(allocations, cohorts)
+
+    assert portfolio["cohort_id"].tolist() == ["positive"]
+    assert portfolio.attrs["materialization_status"] == {
+        "status": "materialized_with_elisions",
+        "input_allocation_row_count": 5,
+        "absent_or_blank_allocation_row_count": 3,
+        "zero_allocation_row_count": 1,
+        "elided_allocation_row_count": 4,
+        "materialized_allocation_row_count": 1,
+        "absent_or_blank_allocation_policy": "treated_as_absent_and_elided",
+        "zero_allocation_policy": "deliberately_elided",
+    }
