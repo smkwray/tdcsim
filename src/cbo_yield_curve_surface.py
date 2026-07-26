@@ -7,6 +7,11 @@ from datetime import date, datetime
 import math
 from typing import Any
 
+from bill_quote_basis import discount_rate_to_investment_rate
+
+
+# CBO's 3-month bill forecast is a 13-week quote; 91 days is its actual term.
+_BILL_QUOTE_DAYS = 91.0
 
 SCHEMA_VERSION = "tdcsim_yield_curve_surface_v1"
 CONSTRUCTION_METHOD = "frozen_reference_log_tenor_shift_tilt_pchip_v1"
@@ -48,7 +53,15 @@ def build_yield_curve_surface_rows(
     for macro_row in macro_forecast_rows:
         scenario_id = str(macro_row["scenario_id"])
         curve_date = str(macro_row.get("period_start") or macro_row.get("curve_date"))
-        anchor_3m = float(macro_row["cbo_3m_tbill_rate_pct"])
+        # CBO forecasts the 3-month bill on the secondary-market DISCOUNT basis the Federal
+        # Reserve publishes, but this surface is declared a nominal par-yield surface and par
+        # yields are bond-equivalent. Anchoring it at the raw quote understates the 3-month par
+        # point by roughly 11.5bp at a 4.5% discount rate, and the log-tenor blend below then
+        # propagates that error across the whole short end.
+        anchor_3m = discount_rate_to_investment_rate(
+            float(macro_row["cbo_3m_tbill_rate_pct"]) / 100.0,
+            _BILL_QUOTE_DAYS,
+        ) * 100.0
         anchor_10y = float(macro_row["cbo_10y_treasury_rate_pct"])
         available_date = str(macro_row.get("available_date") or base_curve["available_date"].isoformat())
         for tenor in tenors:
