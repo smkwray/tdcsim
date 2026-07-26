@@ -100,8 +100,20 @@ class MarginalPairResult:
     manifest_path: Path
 
 
-def assemble_marginal_tdc_pair(pair_spec: str | Path | Mapping[str, Any], output_dir: str | Path) -> MarginalPairResult:
-    """Assemble RateWall marginal TDC files from two ordinary CBO run directories."""
+def assemble_marginal_tdc_pair(
+    pair_spec: str | Path | Mapping[str, Any],
+    output_dir: str | Path,
+    *,
+    require_source_verification: bool = True,
+) -> MarginalPairResult:
+    """Assemble RateWall marginal TDC files from two ordinary CBO run directories.
+
+    Source runs are verified before assembly, so a passing pair proves its sources closed.
+    `require_source_verification=False` exists only for fixtures that synthesise run trees to
+    exercise other invariants: a synthetic manifest cannot carry current-runtime identity. The
+    pair manifest records which path was taken, so an unverified pair is never silently
+    indistinguishable from a verified one.
+    """
 
     spec = _load_pair_spec(pair_spec)
     out = Path(output_dir).expanduser().resolve()
@@ -109,8 +121,8 @@ def assemble_marginal_tdc_pair(pair_spec: str | Path | Mapping[str, Any], output
         raise MarginalTdcPairError(f"marginal pair output directory is not empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
 
-    baseline = _load_run("baseline", spec["baseline_run_dir"])
-    shock = _load_run("shock", spec["shock_run_dir"])
+    baseline = _load_run("baseline", spec["baseline_run_dir"], require_source_verification=require_source_verification)
+    shock = _load_run("shock", spec["shock_run_dir"], require_source_verification=require_source_verification)
     checks = _validate_pair_inputs(spec, baseline, shock)
     cases = _demand_conversion_cases(spec)
 
@@ -137,17 +149,25 @@ def assemble_marginal_tdc_pair(pair_spec: str | Path | Mapping[str, Any], output
     return MarginalPairResult(out, summary_path, components_path, route_metadata_path, state_manifest_path, manifest_path)
 
 
-def verify_marginal_tdc_pair(pair_dir: str | Path) -> dict[str, Any]:
-    """Verify a written marginal TDC pair package and fail closed on identity drift."""
+def verify_marginal_tdc_pair(pair_dir: str | Path, *, require_source_verification: bool | None = None) -> dict[str, Any]:
+    """Verify a written marginal TDC pair package and fail closed on identity drift.
+
+    By default this re-verifies the source runs on whichever path the pair was assembled
+    under, read from the manifest, so re-verification is as strong as assembly was.
+    """
 
     root = Path(pair_dir).expanduser().resolve()
     manifest = _read_pair_manifest(root / MANIFEST_FILE)
     _verify_pair_files(root, manifest)
     spec = manifest.get("pair_spec", {})
+    if require_source_verification is None:
+        require_source_verification = (
+            str(manifest.get("baseline_run", {}).get("source_run_verification_status", "")) == "pass"
+        )
     if not isinstance(spec, Mapping):
         raise MarginalTdcPairError("pair manifest pair_spec must be an object")
-    baseline = _load_run("baseline", spec["baseline_run_dir"])
-    shock = _load_run("shock", spec["shock_run_dir"])
+    baseline = _load_run("baseline", spec["baseline_run_dir"], require_source_verification=require_source_verification)
+    shock = _load_run("shock", spec["shock_run_dir"], require_source_verification=require_source_verification)
     checks = _validate_pair_inputs(spec, baseline, shock)
     _verify_manifest_checks(manifest, checks)
 
@@ -185,9 +205,11 @@ class _RunBundle:
     root: Path
     manifest: dict[str, Any]
     scenario: dict[str, Any]
+    verification: dict[str, Any] | None = None
+    manifest_sha256: str = ""
 
 
-def _load_run(role: str, run_dir: str | Path) -> _RunBundle:
+def _load_run(role: str, run_dir: str | Path, *, require_source_verification: bool = True) -> _RunBundle:
     root = Path(run_dir).expanduser().resolve()
     manifest_path = root / "tdcsim_cbo_run_manifest.json"
     if not manifest_path.exists():
@@ -203,7 +225,26 @@ def _load_run(role: str, run_dir: str | Path) -> _RunBundle:
     if not isinstance(scenario, dict):
         raise MarginalTdcPairError(f"{role} scenario copy must be an object")
     _verify_run_artifacts(role, root, manifest)
-    return _RunBundle(role=role, root=root, manifest=manifest, scenario=scenario)
+    # Transitive proof. Hash-checking the listed artifacts shows the bytes are intact; it does
+    # not show the run that produced them ever closed. Without this, a pair could assemble
+    # from a source run whose validation block failed or was absent, and the pair's own
+    # passing status would imply nothing about the runs beneath it.
+    verification = None
+    if require_source_verification:
+        from .verifier import VerificationError, verify_scenario_run
+
+        try:
+            verification = verify_scenario_run(root)
+        except VerificationError as exc:
+            raise MarginalTdcPairError(f"{role} source run does not pass current verification: {exc}") from exc
+    return _RunBundle(
+        role=role,
+        root=root,
+        manifest=manifest,
+        scenario=scenario,
+        verification=verification,
+        manifest_sha256=sha256_file(manifest_path),
+    )
 
 
 def _validate_pair_inputs(spec: Mapping[str, Any], baseline: _RunBundle, shock: _RunBundle) -> dict[str, str]:
@@ -1600,9 +1641,15 @@ def _source_run_block(run: _RunBundle) -> dict[str, Any]:
     manifest_path = run.root / "tdcsim_cbo_run_manifest.json"
     return {
         "run_id": run.manifest["run_id"],
-        "run_dir": str(run.root),
+        # Identity, not location. A host-absolute run_dir made a retained pair unverifiable
+        # once its campaign root moved, against the project's package-relative rule; the
+        # run_id plus manifest hash identify the source run wherever it now sits.
+        "run_dir_basename": run.root.name,
         "manifest_sha256": sha256_file(manifest_path),
         "compiled_inputs_digest": run.manifest.get("compiled_inputs_digest", ""),
+        # The pair's own status is only as good as its sources'. Binding the verification
+        # outcome makes that dependency auditable rather than assumed.
+        "source_run_verification_status": (run.verification or {}).get("status", "not_verified"),
     }
 
 

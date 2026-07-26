@@ -26,7 +26,7 @@ def test_marginal_tdc_pair_assembles_ratewall_summary_and_verifies(tmp_path: Pat
     baseline, shock = _write_pair_runs(tmp_path)
     spec = _pair_spec(tmp_path, baseline, shock)
 
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
     summary = pd.read_csv(result.summary_path)
     assert verify_marginal_tdc_pair(result.output_dir)["status"] == "pass"
@@ -48,7 +48,7 @@ def test_marginal_tdc_pair_deposit_creation_split_current_check_against(tmp_path
     spec["demand_conversion_cases"][0]["beta"] = 0.5307509589554447
     spec["demand_conversion_cases"][0]["chi"] = 0.07
 
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
     summary = pd.read_csv(result.summary_path)
     components = pd.read_csv(result.components_path)
@@ -83,7 +83,7 @@ def test_marginal_tdc_pair_deposit_creation_split_current_check_against(tmp_path
 def test_marginal_tdc_pair_verifier_fails_closed_on_missing_split(tmp_path: Path) -> None:
     baseline, shock = _write_pair_runs(tmp_path)
     spec = _pair_spec(tmp_path, baseline, shock)
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
     summary = pd.read_csv(result.summary_path).drop(columns=["delta_tdc_ex_overlap_non_interest_admissible_bil"])
     summary.to_csv(result.summary_path, index=False)
     _refresh_pair_manifest_file(result.output_dir, SUMMARY_FILE)
@@ -97,7 +97,7 @@ def test_marginal_tdc_pair_uses_ratewall_period_when_present(tmp_path: Path) -> 
     spec = _pair_spec(tmp_path, baseline, shock)
     spec["ratewall_period"] = "2026"
 
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
     summary = pd.read_csv(result.summary_path)
     components = pd.read_csv(result.components_path)
@@ -114,7 +114,7 @@ def test_marginal_tdc_pair_collapses_raw_rows_to_ratewall_period(tmp_path: Path)
     spec = _pair_spec(tmp_path, baseline, shock)
     spec["ratewall_period"] = "2026"
 
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
     summary = pd.read_csv(result.summary_path)
     assert len(summary) == 1
@@ -140,7 +140,7 @@ def test_marginal_tdc_pair_excludes_overlap_components_from_support(tmp_path: Pa
     )
     spec = _pair_spec(tmp_path, baseline, shock)
 
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
     summary = pd.read_csv(result.summary_path)
     components = pd.read_csv(result.components_path)
@@ -160,7 +160,7 @@ def test_marginal_tdc_pair_rejects_state_fingerprint_mismatch(tmp_path: Path) ->
     spec["shock_state_fingerprint_sha256"] = "b" * 64
 
     with pytest.raises(MarginalTdcPairError, match="state fingerprints"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+        assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
 
 def test_two_state_pairs_may_differ_across_pairs_without_cross_state_delta(tmp_path: Path) -> None:
@@ -183,8 +183,8 @@ def test_two_state_pairs_may_differ_across_pairs_without_cross_state_delta(tmp_p
         opening_tdc_stock=20.0,
     )
 
-    result_a = assemble_marginal_tdc_pair(spec_a, tmp_path / "pair-a")
-    result_b = assemble_marginal_tdc_pair(spec_b, tmp_path / "pair-b")
+    result_a = assemble_marginal_tdc_pair(spec_a, tmp_path / "pair-a", require_source_verification=False)
+    result_b = assemble_marginal_tdc_pair(spec_b, tmp_path / "pair-b", require_source_verification=False)
 
     summary_a = pd.read_csv(result_a.summary_path)
     summary_b = pd.read_csv(result_b.summary_path)
@@ -198,7 +198,7 @@ def test_marginal_tdc_pair_fails_closed_on_non_rate_input_drift(tmp_path: Path) 
     spec = _pair_spec(tmp_path, baseline, shock)
 
     with pytest.raises(MarginalTdcPairError, match="non-rate compiled input drift"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+        assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
 
 def test_marginal_tdc_pair_fails_closed_on_wrong_path_area(tmp_path: Path) -> None:
@@ -206,7 +206,7 @@ def test_marginal_tdc_pair_fails_closed_on_wrong_path_area(tmp_path: Path) -> No
     spec = _pair_spec(tmp_path, baseline, shock)
 
     with pytest.raises(MarginalTdcPairError, match="\\+100bp|100 bp-years"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+        assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
 
 def test_marginal_tdc_pair_fails_closed_when_overlap_removed(tmp_path: Path) -> None:
@@ -218,13 +218,13 @@ def test_marginal_tdc_pair_fails_closed_when_overlap_removed(tmp_path: Path) -> 
     spec = _pair_spec(tmp_path, baseline, shock)
 
     with pytest.raises(MarginalTdcPairError, match="missing required columns"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+        assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
 
 def test_marginal_tdc_pair_verifier_rejects_gross_delta_substitution(tmp_path: Path) -> None:
     baseline, shock = _write_pair_runs(tmp_path)
     spec = _pair_spec(tmp_path, baseline, shock)
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
     summary = pd.read_csv(result.summary_path)
     summary.loc[0, "legacy_chi_support_diagnostic_bil"] = (
         summary.loc[0, "delta_tdc_change_bil"] * summary.loc[0, "beta"] * summary.loc[0, "chi"]
@@ -239,7 +239,7 @@ def test_marginal_tdc_pair_verifier_rejects_gross_delta_substitution(tmp_path: P
 def test_marginal_tdc_pair_verifier_rejects_beta_change_without_manifest_update(tmp_path: Path) -> None:
     baseline, shock = _write_pair_runs(tmp_path)
     spec = _pair_spec(tmp_path, baseline, shock)
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
     summary = pd.read_csv(result.summary_path)
     summary.loc[0, "beta"] = 0.9
     summary.to_csv(result.summary_path, index=False)
@@ -275,7 +275,7 @@ def test_fiscal_injection_pair_allows_named_non_rate_drift_without_rate_shock(tm
         }
     )
 
-    result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
     summary = pd.read_csv(result.summary_path)
     assert verify_marginal_tdc_pair(result.output_dir)["status"] == "pass"
@@ -303,7 +303,7 @@ def test_fiscal_injection_pair_rejects_rate_input_drift(tmp_path: Path) -> None:
     )
 
     with pytest.raises(MarginalTdcPairError, match="must not change rate input"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair")
+        assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
 
 
 def _write_pair_runs(
@@ -743,3 +743,41 @@ def _refresh_pair_manifest_file(pair_dir: Path, filename: str) -> None:
     manifest["files"][filename]["sha256"] = sha256_file(path)
     manifest["files"][filename]["bytes"] = path.stat().st_size
     write_json(manifest_path, manifest)
+
+
+def test_pair_rejects_a_source_run_that_does_not_pass_verification(tmp_path: Path) -> None:
+    """A passing pair must prove its source runs closed, not merely that their bytes are intact.
+
+    Hash-checking the listed artifacts shows nothing about whether the run producing them
+    passed its own verifier. Without this, a pair could assemble on top of a run whose
+    validation block failed or was absent, and the pair's own passing status would imply
+    nothing about the runs beneath it.
+    """
+
+    baseline, shock = _write_pair_runs(tmp_path)
+    spec = _pair_spec(tmp_path, baseline, shock)
+
+    with pytest.raises(MarginalTdcPairError, match="does not pass current verification"):
+        assemble_marginal_tdc_pair(spec, tmp_path / "pair-verified")
+
+
+def test_pair_manifest_records_no_host_absolute_source_paths(tmp_path: Path) -> None:
+    """Retained pairs must survive their campaign root moving.
+
+    A host-absolute run_dir made a pair unverifiable once its campaign was relocated or
+    restored elsewhere, against the project's package-relative identity rule. The source run
+    is identified by run_id and manifest hash instead.
+    """
+
+    baseline, shock = _write_pair_runs(tmp_path)
+    spec = _pair_spec(tmp_path, baseline, shock)
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
+    manifest = json.loads((result.output_dir / "tdcsim_ratewall_marginal_tdc_pair_manifest.json").read_text())
+
+    for role in ("baseline_run", "shock_run"):
+        block = manifest[role]
+        assert "run_dir" not in block
+        assert block["run_id"]
+        assert len(block["manifest_sha256"]) == 64
+        for value in block.values():
+            assert not str(value).startswith("/"), f"{role} carries a host-absolute reference"
