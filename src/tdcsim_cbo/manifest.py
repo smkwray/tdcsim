@@ -129,7 +129,24 @@ def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
             if cash_residual_affects_issuance_size == {False}
             else "fail",
             "observed": ",".join(str(value) for value in boundary_checks.get("cash_residual_affects_issuance_size", [])),
-        }
+        },
+        # The modeled Treasury cash chain must actually close. A negative TGA is an
+        # unmodeled overdraft; a cash residual booked to the TGA alone creates cash
+        # with no counterparty. Either one makes the run's TDC an open-chain figure,
+        # so both fail the run rather than being reported as diagnostics.
+        {
+            "id": "tga_nonnegative",
+            "status": "pass" if boundary_checks.get("tga_nonnegative") is True else "fail",
+            "observed": (
+                f"min_tga={boundary_checks.get('min_tga', '')};"
+                f"negative_periods={boundary_checks.get('negative_tga_periods', '')}"
+            ),
+        },
+        {
+            "id": "cash_residual_fully_booked",
+            "status": "pass" if boundary_checks.get("cash_residual_fully_booked") is True else "fail",
+            "observed": str(boundary_checks.get("sum_abs_unbooked_cash_residual", "")),
+        },
     ]
     return {
         "status": "pass"
