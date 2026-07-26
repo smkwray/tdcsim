@@ -294,7 +294,7 @@
           "const": "operating_cash_sensitivity_not_debt_or_issuance_driver"
         },
         "fed_holdings_role": {
-          "const": "synthetic_stock_target_par_reallocation"
+          "const": "beneficial_holder_with_model_dirty_value_settlement"
         },
         "remittance_role": {
           "const": "not_modeled_in_cbo_lane"

@@ -211,6 +211,10 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
             "target_enforcement": "every_period",
             "negative_required_issuance_action": _negative_issuance_action(inputs),
             "target_tolerance_bil": 0.000001,
+            "fed_secondary_sale_buyer_mix": {
+                "type": "contemporaneous_non_cb_public_holder_mix",
+                "basis": "par_or_adjusted_principal_stock",
+            },
         },
         "baseline_input_paths": compiled_forecast_input_paths(inputs),
         "data_vintage": {

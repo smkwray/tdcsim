@@ -32,7 +32,9 @@ from tdc_shared import (
 )
 from sim_helpers import OUTPUT_COLUMN_RENAMES, apply_event_actions, validate_run_params
 from sim_pricing import (
+    calculate_accrued_interest,
     calculate_coupon_rate,
+    calculate_coupon_security_issue_price_ratio,
     calculate_face_from_proceeds_target,
     get_coupon_dates_in_period,
     get_maturity_category,
@@ -735,7 +737,7 @@ def _handoff_append_principal(
             'tdc_principal_redeemed_to_du_mmf_bil': tdc_principal_to_du_mmf,
             'tdc_principal_cash_paid_to_du_mmf_plumbing_bil': tdc_cash_to_du_mmf_plumbing,
             'tdc_principal_redeemed_to_du_mmf_plumbing_bil': tdc_principal_to_du_mmf_plumbing,
-            'tdc_principal_recipient_basis': 'tdc_principal_settlement_route_preserved_through_stock_only_reallocation',
+            'tdc_principal_recipient_basis': 'current_cb_beneficial_holder_otherwise_recorded_tdc_principal_route',
         }
     )
 
@@ -989,26 +991,219 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
     return bond_portfolio, retired_total, paid_by_holder, paid_by_tdc_private_route, retirement_events
 
 
-def _transfer_public_marketable_debt_to_cb(bond_portfolio, amount_to_purchase):
-    """Move active public marketable debt from non-CB holders to CB as a secondary purchase."""
+_FED_SALE_MIX_CONTEMPORANEOUS = 'contemporaneous_non_cb_public_holder_mix'
+_FED_SALE_MIX_PRIVATE = 'private_domestic_nonbank'
+_FED_TRANSFER_SCALABLE_COLUMNS = [
+    'FaceValue',
+    'OriginalPrincipal',
+    'AdjustedPrincipal',
+    'AccruedInterest_FRN',
+    'IssueProceeds',
+    'CleanPrice',
+    'AccruedInterest',
+    'DirtyValue',
+]
+
+
+def _fed_secondary_dirty_value(
+    row,
+    stock_amount,
+    current_date,
+    yield_curve_years,
+    yield_curve_rates,
+    *,
+    interpolation_method,
+    floor_zero,
+):
+    """Return dirty market value for a transferred par/adjusted-principal stock amount."""
+    debt_base = _bond_debt_base(row)
+    if not np.isfinite(debt_base) or debt_base <= TGA_FLOOR_TOLERANCE:
+        raise ValueError('Fed secondary transfer row has no positive stock quantity.')
+    maturity_date = pd.to_datetime(row.get('MaturityDate'), errors='coerce')
+    settlement_date = pd.to_datetime(current_date, errors='coerce')
+    if pd.isna(maturity_date) or pd.isna(settlement_date) or maturity_date <= settlement_date:
+        raise ValueError('Fed secondary transfer row has no valid post-settlement maturity date.')
+    security_type = str(row.get('SecurityType', ''))
+    if security_type not in {'Fixed', 'TIPS', 'FRN'}:
+        raise ValueError(f'Fed secondary transfer cannot price security type {security_type!r}.')
+    stock_amount = float(stock_amount)
+    if not np.isfinite(stock_amount) or stock_amount <= TGA_FLOOR_TOLERANCE:
+        raise ValueError('Fed secondary transfer amount must be positive and finite.')
+    fraction = stock_amount / debt_base
+    if security_type == 'FRN':
+        accrued_total = row.get('AccruedInterest_FRN', 0.0)
+        accrued_total = 0.0 if pd.isna(accrued_total) else float(accrued_total)
+        if not np.isfinite(accrued_total) or accrued_total < -TGA_FLOOR_TOLERANCE:
+            raise ValueError('Fed secondary FRN transfer has invalid accrued interest.')
+        clean_value = stock_amount
+        accrued_interest = max(0.0, accrued_total) * fraction
+        dirty_value = clean_value + accrued_interest
+        discount_yield = np.nan
+        time_to_maturity = (maturity_date - settlement_date).total_seconds() / (
+            DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60
+        )
+    else:
+        coupon_rate = row.get('CouponRate')
+        if pd.isna(coupon_rate) or not np.isfinite(float(coupon_rate)) or float(coupon_rate) < 0.0:
+            raise ValueError('Fed secondary transfer row has an invalid coupon rate.')
+        coupon_rate = float(coupon_rate)
+        time_to_maturity = (maturity_date - settlement_date).total_seconds() / (
+            DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60
+        )
+        discount_yield = get_yield_for_maturity(
+            time_to_maturity,
+            yield_curve_years,
+            yield_curve_rates,
+            method=interpolation_method,
+            floor_zero=floor_zero,
+        )
+        if pd.isna(discount_yield) or not np.isfinite(float(discount_yield)):
+            raise ValueError('Fed secondary transfer row has no finite market yield.')
+        price_ratio = calculate_coupon_security_issue_price_ratio(
+            time_to_maturity,
+            coupon_rate,
+            float(discount_yield),
+        )
+        if not np.isfinite(price_ratio) or price_ratio <= TGA_FLOOR_TOLERANCE:
+            raise ValueError('Fed secondary transfer row produced an invalid clean price.')
+        clean_value = stock_amount * float(price_ratio)
+        issue_date = pd.to_datetime(row.get('IssueDate'), errors='coerce')
+        if coupon_rate > TGA_FLOOR_TOLERANCE and (
+            pd.isna(issue_date) or issue_date > settlement_date
+        ):
+            raise ValueError('Fed secondary coupon transfer has no valid issue date for accrued interest.')
+        accrued_total = calculate_accrued_interest(
+            float(row.get('FaceValue', 0.0) or 0.0),
+            coupon_rate,
+            settlement_date,
+            issue_date,
+            security_type,
+            row.get('AdjustedPrincipal'),
+            row.get('AccruedInterest_FRN'),
+            2,
+        )
+        if not np.isfinite(accrued_total) or accrued_total < -TGA_FLOOR_TOLERANCE:
+            raise ValueError('Fed secondary transfer row produced invalid accrued interest.')
+        accrued_interest = max(0.0, float(accrued_total)) * fraction
+        dirty_value = clean_value + accrued_interest
+    if not np.isfinite(dirty_value) or dirty_value <= TGA_FLOOR_TOLERANCE:
+        raise ValueError('Fed secondary transfer row produced invalid dirty market value.')
+    return {
+        'clean_value': float(clean_value),
+        'accrued_interest': float(accrued_interest),
+        'dirty_value': float(dirty_value),
+        'dirty_price_ratio': float(dirty_value / stock_amount),
+        'discount_yield': discount_yield,
+        'time_to_maturity': float(time_to_maturity),
+    }
+
+
+def _cache_fed_transfer_price(bond_portfolio, idx, pricing):
+    debt_base = _bond_debt_base(bond_portfolio.loc[idx])
+    if debt_base <= TGA_FLOOR_TOLERANCE:
+        return
+    bond_portfolio.loc[idx, 'TimeToMaturity'] = pricing['time_to_maturity']
+    bond_portfolio.loc[idx, 'DiscountYield'] = pricing['discount_yield']
+    bond_portfolio.loc[idx, 'CleanPrice'] = pricing['clean_value']
+    bond_portfolio.loc[idx, 'AccruedInterest'] = pricing['accrued_interest']
+    bond_portfolio.loc[idx, 'DirtyValue'] = pricing['dirty_value']
+    bond_portfolio.loc[idx, 'DirtyPriceRatio'] = pricing['dirty_value'] / debt_base
+
+
+def _next_portfolio_bond_id(bond_portfolio):
+    numeric_ids = pd.to_numeric(bond_portfolio['BondID'], errors='coerce')
+    return int(numeric_ids.max()) + 1 if numeric_ids.notna().any() else 1
+
+
+def _resolve_fed_secondary_sale_buyer_mix(bond_portfolio, mix_spec=None):
+    """Resolve the declared sale policy to a typed holder/subbucket stock-share vector."""
+    if mix_spec is None:
+        mix_type = _FED_SALE_MIX_CONTEMPORANEOUS
+    elif isinstance(mix_spec, str):
+        mix_type = mix_spec.strip()
+    elif isinstance(mix_spec, dict):
+        mix_type = str(mix_spec.get('type', _FED_SALE_MIX_CONTEMPORANEOUS)).strip()
+        mix_basis = str(mix_spec.get('basis', 'par_or_adjusted_principal_stock')).strip()
+        if mix_basis != 'par_or_adjusted_principal_stock':
+            raise ValueError(f'Unsupported Fed secondary sale buyer mix basis: {mix_basis!r}.')
+    else:
+        raise ValueError('funding_rule.fed_secondary_sale_buyer_mix must be a string or mapping.')
+    if mix_type == _FED_SALE_MIX_PRIVATE:
+        return [
+            {
+                'holder_type': 'Private',
+                'holder_subbucket': PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+                'share': 1.0,
+            }
+        ]
+    if mix_type != _FED_SALE_MIX_CONTEMPORANEOUS:
+        raise ValueError(f'Unsupported Fed secondary sale buyer mix type: {mix_type!r}.')
+    active = bond_portfolio[
+        (bond_portfolio['Status'] == 'Active')
+        & (bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS', 'FRN']))
+        & (bond_portfolio['HolderType'].isin(['Banks', 'Private', 'Foreign']))
+    ].copy()
+    if active.empty:
+        raise ValueError('Fed secondary sale buyer mix has no contemporaneous non-CB public holders.')
+    active['StockQuantity'] = pd.to_numeric(
+        np.where(
+            active['SecurityType'] == 'TIPS',
+            active['AdjustedPrincipal'].fillna(active['FaceValue']),
+            active['FaceValue'],
+        ),
+        errors='coerce',
+    )
+    if active['StockQuantity'].isna().any() or (active['StockQuantity'] < 0.0).any():
+        raise ValueError('Fed secondary sale buyer mix contains malformed public holder stock.')
+    active['BuyerSubBucket'] = ''
+    private_mask = active['HolderType'] == 'Private'
+    active.loc[private_mask, 'BuyerSubBucket'] = active.loc[private_mask].apply(_private_subbucket, axis=1)
+    grouped = active.groupby(['HolderType', 'BuyerSubBucket'], dropna=False)['StockQuantity'].sum()
+    total = float(grouped.sum())
+    if not np.isfinite(total) or total <= TGA_FLOOR_TOLERANCE:
+        raise ValueError('Fed secondary sale buyer mix has no positive contemporaneous stock.')
+    vector = []
+    for (holder, subbucket), amount in grouped.items():
+        if float(amount) <= TGA_FLOOR_TOLERANCE:
+            continue
+        vector.append(
+            {
+                'holder_type': str(holder),
+                'holder_subbucket': str(subbucket) if str(holder) == 'Private' else '',
+                'share': float(amount) / total,
+            }
+        )
+    return vector
+
+
+def _format_fed_holder_mix(vector):
+    return '|'.join(
+        f"{item['holder_type']}/{item['holder_subbucket']}={item['share']:.12f}"
+        for item in vector
+    )
+
+
+def _transfer_public_marketable_debt_to_cb(
+    bond_portfolio,
+    amount_to_purchase,
+    current_date,
+    yield_curve_years,
+    yield_curve_rates,
+    *,
+    interpolation_method='linear',
+    floor_zero=True,
+):
+    """Move public marketable debt to CB and return dirty-value settlement by seller."""
     if bond_portfolio is None or bond_portfolio.empty:
-        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes()
+        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), 0.0
     remaining = max(0.0, float(amount_to_purchase))
     sold_by_holder = {h: 0.0 for h in HOLDER_TYPES}
     sold_by_private_route = _zero_private_routes()
     holder_order = ['Private', 'Banks', 'Foreign']
     next_bond_id = None
     purchased_total = 0.0
+    purchase_cash = 0.0
     new_rows = []
-    scalable_columns = [
-        'FaceValue',
-        'OriginalPrincipal',
-        'AdjustedPrincipal',
-        'AccruedInterest_FRN',
-        'IssueProceeds',
-        'AccruedInterest',
-        'DirtyValue',
-    ]
     while remaining > TGA_FLOOR_TOLERANCE:
         idx = None
         for holder in holder_order:
@@ -1032,59 +1227,83 @@ def _transfer_public_marketable_debt_to_cb(bond_portfolio, amount_to_purchase):
             break
         if idx is None:
             break
-        row = bond_portfolio.loc[idx]
+        row = bond_portfolio.loc[idx].copy()
         debt_base = _bond_debt_base(row)
         if debt_base <= TGA_FLOOR_TOLERANCE:
             bond_portfolio.loc[idx, 'FaceValue'] = 0.0
             continue
         purchase_amount = min(remaining, debt_base)
+        pricing = _fed_secondary_dirty_value(
+            row,
+            purchase_amount,
+            current_date,
+            yield_curve_years,
+            yield_curve_rates,
+            interpolation_method=interpolation_method,
+            floor_zero=floor_zero,
+        )
+        full_pricing = {**pricing}
+        scale_to_full = debt_base / purchase_amount
+        for key in ('clean_value', 'accrued_interest', 'dirty_value'):
+            full_pricing[key] *= scale_to_full
+        _cache_fed_transfer_price(bond_portfolio, idx, full_pricing)
         fraction = purchase_amount / debt_base
         holder = str(row['HolderType'])
-        sold_by_holder[holder] = sold_by_holder.get(holder, 0.0) + purchase_amount
+        dirty_value = pricing['dirty_value']
+        sold_by_holder[holder] = sold_by_holder.get(holder, 0.0) + dirty_value
         if holder == 'Private':
             route = _private_subbucket(row)
-            sold_by_private_route[route] += purchase_amount
+            sold_by_private_route[route] += dirty_value
         if purchase_amount >= debt_base - TGA_FLOOR_TOLERANCE:
             bond_portfolio.loc[idx, 'HolderType'] = 'CB'
             bond_portfolio.loc[idx, 'HolderSubBucket'] = ''
+            bond_portfolio.loc[idx, 'TDCPrincipalHolderType'] = 'CB'
+            bond_portfolio.loc[idx, 'TDCPrincipalHolderSubBucket'] = ''
         else:
             cb_row = bond_portfolio.loc[idx].copy()
             if next_bond_id is None:
-                next_bond_id = int(pd.to_numeric(bond_portfolio['BondID'], errors='coerce').max()) + 1
+                next_bond_id = _next_portfolio_bond_id(bond_portfolio)
             cb_row['BondID'] = next_bond_id
             next_bond_id += 1
             cb_row['HolderType'] = 'CB'
             cb_row['HolderSubBucket'] = ''
-            for col in scalable_columns:
+            cb_row['TDCPrincipalHolderType'] = 'CB'
+            cb_row['TDCPrincipalHolderSubBucket'] = ''
+            for col in _FED_TRANSFER_SCALABLE_COLUMNS:
                 if col in bond_portfolio.columns and pd.notna(bond_portfolio.loc[idx, col]):
                     original_value = float(bond_portfolio.loc[idx, col])
                     cb_row[col] = original_value * fraction
                     bond_portfolio.loc[idx, col] = original_value * (1.0 - fraction)
             new_rows.append(cb_row)
         purchased_total += purchase_amount
+        purchase_cash += dirty_value
         remaining -= purchase_amount
     if new_rows:
         bond_portfolio = pd.concat([bond_portfolio, pd.DataFrame(new_rows)], ignore_index=True)
-    return bond_portfolio, purchased_total, sold_by_holder, sold_by_private_route
+    return bond_portfolio, purchased_total, sold_by_holder, sold_by_private_route, purchase_cash
 
 
-def _transfer_cb_marketable_debt_to_public(bond_portfolio, amount_to_sell):
-    """Move active marketable CB holdings to Private as a synthetic stock-only sale."""
+def _transfer_cb_marketable_debt_to_public(
+    bond_portfolio,
+    amount_to_sell,
+    current_date,
+    yield_curve_years,
+    yield_curve_rates,
+    buyer_mix,
+    *,
+    interpolation_method='linear',
+    floor_zero=True,
+):
+    """Move CB marketable holdings to the declared public buyer vector at dirty value."""
     if bond_portfolio is None or bond_portfolio.empty:
-        return bond_portfolio, 0.0
+        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), 0.0
     remaining = max(0.0, float(amount_to_sell))
     sold_total = 0.0
+    sale_cash = 0.0
+    bought_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+    bought_by_private_route = _zero_private_routes()
     next_bond_id = None
     new_rows = []
-    scalable_columns = [
-        'FaceValue',
-        'OriginalPrincipal',
-        'AdjustedPrincipal',
-        'AccruedInterest_FRN',
-        'IssueProceeds',
-        'AccruedInterest',
-        'DirtyValue',
-    ]
     while remaining > TGA_FLOOR_TOLERANCE:
         cb_mask = (
             (bond_portfolio['Status'] == 'Active')
@@ -1103,35 +1322,80 @@ def _transfer_cb_marketable_debt_to_public(bond_portfolio, amount_to_sell):
         if len(eligible_indices) == 0:
             break
         idx = bond_portfolio.loc[eligible_indices, 'MaturityDate'].idxmin()
-        row = bond_portfolio.loc[idx]
+        row = bond_portfolio.loc[idx].copy()
         debt_base = _bond_debt_base(row)
         if debt_base <= TGA_FLOOR_TOLERANCE:
             bond_portfolio.loc[idx, 'FaceValue'] = 0.0
             continue
         sale_amount = min(remaining, debt_base)
-        fraction = sale_amount / debt_base
-        if sale_amount >= debt_base - TGA_FLOOR_TOLERANCE:
-            bond_portfolio.loc[idx, 'HolderType'] = 'Private'
-            bond_portfolio.loc[idx, 'HolderSubBucket'] = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+        pricing = _fed_secondary_dirty_value(
+            row,
+            sale_amount,
+            current_date,
+            yield_curve_years,
+            yield_curve_rates,
+            interpolation_method=interpolation_method,
+            floor_zero=floor_zero,
+        )
+        full_pricing = {**pricing}
+        scale_to_full = debt_base / sale_amount
+        for key in ('clean_value', 'accrued_interest', 'dirty_value'):
+            full_pricing[key] *= scale_to_full
+        _cache_fed_transfer_price(bond_portfolio, idx, full_pricing)
+        row = bond_portfolio.loc[idx].copy()
+        fraction_sold = sale_amount / debt_base
+        allocations = []
+        allocated_face = 0.0
+        for mix_index, item in enumerate(buyer_mix):
+            allocation = sale_amount - allocated_face if mix_index == len(buyer_mix) - 1 else sale_amount * float(item['share'])
+            allocated_face += allocation
+            if allocation <= TGA_FLOOR_TOLERANCE:
+                continue
+            allocations.append((item, allocation, allocation / debt_base))
+        if not allocations:
+            raise ValueError('Fed secondary sale buyer mix resolved to no positive allocations.')
+        if sale_amount < debt_base - TGA_FLOOR_TOLERANCE:
+            for col in _FED_TRANSFER_SCALABLE_COLUMNS:
+                if col in bond_portfolio.columns and pd.notna(bond_portfolio.loc[idx, col]):
+                    bond_portfolio.loc[idx, col] = float(bond_portfolio.loc[idx, col]) * (1.0 - fraction_sold)
+            allocation_rows = allocations
         else:
-            public_row = bond_portfolio.loc[idx].copy()
+            first_item, first_amount, first_fraction = allocations[0]
+            bond_portfolio.loc[idx, 'HolderType'] = first_item['holder_type']
+            bond_portfolio.loc[idx, 'HolderSubBucket'] = first_item['holder_subbucket']
+            bond_portfolio.loc[idx, 'TDCPrincipalHolderType'] = first_item['holder_type']
+            bond_portfolio.loc[idx, 'TDCPrincipalHolderSubBucket'] = first_item['holder_subbucket']
+            if len(allocations) > 1:
+                for col in _FED_TRANSFER_SCALABLE_COLUMNS:
+                    if col in bond_portfolio.columns and pd.notna(bond_portfolio.loc[idx, col]):
+                        bond_portfolio.loc[idx, col] = float(bond_portfolio.loc[idx, col]) * first_fraction
+            allocation_rows = allocations[1:]
+        for item, allocation, allocation_fraction in allocation_rows:
+            public_row = row.copy()
             if next_bond_id is None:
-                next_bond_id = int(pd.to_numeric(bond_portfolio['BondID'], errors='coerce').max()) + 1
+                next_bond_id = _next_portfolio_bond_id(bond_portfolio)
             public_row['BondID'] = next_bond_id
             next_bond_id += 1
-            public_row['HolderType'] = 'Private'
-            public_row['HolderSubBucket'] = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
-            for col in scalable_columns:
-                if col in bond_portfolio.columns and pd.notna(bond_portfolio.loc[idx, col]):
-                    original_value = float(bond_portfolio.loc[idx, col])
-                    public_row[col] = original_value * fraction
-                    bond_portfolio.loc[idx, col] = original_value * (1.0 - fraction)
+            public_row['HolderType'] = item['holder_type']
+            public_row['HolderSubBucket'] = item['holder_subbucket']
+            public_row['TDCPrincipalHolderType'] = item['holder_type']
+            public_row['TDCPrincipalHolderSubBucket'] = item['holder_subbucket']
+            for col in _FED_TRANSFER_SCALABLE_COLUMNS:
+                if col in row.index and pd.notna(row[col]):
+                    public_row[col] = float(row[col]) * allocation_fraction
             new_rows.append(public_row)
+        for item, allocation, _allocation_fraction in allocations:
+            allocation_cash = pricing['dirty_value'] * (allocation / sale_amount)
+            holder = item['holder_type']
+            bought_by_holder[holder] = bought_by_holder.get(holder, 0.0) + allocation_cash
+            if holder == 'Private':
+                bought_by_private_route[item['holder_subbucket']] += allocation_cash
         sold_total += sale_amount
+        sale_cash += pricing['dirty_value']
         remaining -= sale_amount
     if new_rows:
         bond_portfolio = pd.concat([bond_portfolio, pd.DataFrame(new_rows)], ignore_index=True)
-    return bond_portfolio, sold_total
+    return bond_portfolio, sold_total, bought_by_holder, bought_by_private_route, sale_cash
 
 
 def _quote_issuance(security_type, maturity_years, coupon_rate, yield_at_issuance, amount, face_target_mode):
@@ -1349,7 +1613,10 @@ def _ensure_tdc_principal_route_columns(bond_portfolio: pd.DataFrame) -> pd.Data
 def _tdc_principal_holder(row_or_mapping) -> dict[str, str]:
     if not hasattr(row_or_mapping, 'get'):
         return {'holder_sector': '', 'holder_subsector': ''}
-    holder = _normalize_holder_value(row_or_mapping.get('TDCPrincipalHolderType', row_or_mapping.get('HolderType', '')))
+    current_holder = _normalize_holder_value(row_or_mapping.get('HolderType', ''))
+    if current_holder == 'CB':
+        return {'holder_sector': 'CB', 'holder_subsector': ''}
+    holder = _normalize_holder_value(row_or_mapping.get('TDCPrincipalHolderType', current_holder))
     subbucket = _normalize_holder_value(
         row_or_mapping.get('TDCPrincipalHolderSubBucket', row_or_mapping.get('HolderSubBucket', ''))
     )
@@ -1658,7 +1925,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         empty_results = pd.DataFrame(index=dates, columns=results_cols_on_skip, dtype=float).fillna(0.0)
         return (empty_results, pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
     print(f'--- Starting Simulation: {scenario_name} ---')
-    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
+    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_TreasuryInterestCashReceived', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBOFedSecondarySaleCash', 'CBOFedSecondarySaleReserveEffect', 'CBOFedSecondarySaleDepositEffect', 'CBOFedPrivateMaturityTDC', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
     handoff_tables = {
         'tdcsim_period_issuance_flows': [],
@@ -1671,7 +1938,13 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     }
     for status_col in ['FundingMode', 'FiscalIncidenceStatus', 'NetInterestDiagnosticStatus', 'CBOCashResidualStatus']:
         results[status_col] = ''
-    for status_col in ['CBOFedStockMode', 'CBOFedSettlementScope', 'CBORemittanceStatus']:
+    for status_col in [
+        'CBOFedStockMode',
+        'CBOFedSettlementScope',
+        'CBOFedAcquisitionChannel',
+        'CBOFedSecondarySaleBuyerMix',
+        'CBORemittanceStatus',
+    ]:
         results[status_col] = ''
     for numeric_col in [
         'CBOControlledDebtTargetApplicable',
@@ -1977,7 +2250,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         t0,
     )
     if cbo_funding_mode:
-        results.loc[t0, 'CBOFedStockMode'] = 'synthetic_cb_treasury_stock_target_par_reallocation'
+        results.loc[t0, 'CBOFedStockMode'] = 'synthetic_cb_treasury_stock_target_beneficial_holder'
         results.loc[t0, 'CBOFedSettlementScope'] = 'not_applicable_opening_row'
         results.loc[t0, 'CBORemittanceStatus'] = 'not_modeled_cbo_primary_deficit_embeds_baseline_revenues'
         results.loc[t0, ['CB_Remittance', 'CB_DeferredAsset']] = np.nan
@@ -2004,7 +2277,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     results.loc[t0, 'Taxes'] = q_start_taxes
     results.loc[t0, ['PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative']] = 0.0
     results.loc[t0, ['ReserveChange', 'TDC_Change', 'TGAChange']] = 0.0
-    results.loc[t0, 'CB_InterestIncome'] = 0.0
+    results.loc[t0, 'CB_TreasuryInterestCashReceived'] = 0.0
     if cbo_funding_mode:
         results.loc[t0, ['CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset']] = np.nan
     else:
@@ -2371,6 +2644,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         frn_interest_paid_by_private_route = _zero_private_routes()
         tips_coupon_interest_paid_by_private_route = _zero_private_routes()
         tips_inflation_compensation_paid_by_private_route = _zero_private_routes()
+        cb_private_maturity_tdc_period = 0.0
         total_principal_paid_period = 0.0
         total_interest_paid_period = 0.0
         maturing_mask = bond_portfolio['MaturityDate'].notna() & (bond_portfolio['MaturityDate'] > prev_date) & (bond_portfolio['MaturityDate'] <= current_date) & (bond_portfolio['Status'] == 'Active')
@@ -2480,6 +2754,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     tips_inflation_compensation_payment
                 )
                 if tdc_principal_recipient['holder_sector'] == 'Private':
+                    if holder == 'CB':
+                        cb_private_maturity_tdc_period += principal_payment
                     principal_route = tdc_principal_recipient['holder_subsector']
                     principal_paid_by_private_route[principal_route] += principal_payment
                     principal_component_paid_by_private_route[principal_route] += max(
@@ -2679,6 +2955,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 bond_portfolio.loc[nonmkt_mask, 'FaceValue'] += interest_to_credit
                 nonmkt_interest_capitalized_period = interest_to_credit.sum()
         results.loc[current_date, 'PrincipalPaid_Bonds'] = total_principal_paid_period
+        results.loc[current_date, 'CBOFedPrivateMaturityTDC'] = cb_private_maturity_tdc_period
         results.loc[current_date, 'InterestPaid_Bonds'] = total_interest_paid_period
         results.loc[current_date, 'PrincipalRollover_Period'] = total_principal_paid_period
         results.loc[current_date, 'InterestOutlay_Period'] = total_interest_paid_period
@@ -2715,7 +2992,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         reserve_change_period += debt_service_reserve_change
         deposit_change_period += debt_service_deposit_change
         tga_change_period += debt_service_tga_change
-        cb_interest_income_period = interest_paid_by_holder.get('CB', 0.0)
+        cb_treasury_interest_cash_received_period = interest_paid_by_holder.get('CB', 0.0)
         if cbo_funding_mode:
             cb_net_income_period = np.nan
             cb_remittance_period = np.nan
@@ -2726,7 +3003,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             )
         else:
             prev_deferred_asset = results.loc[prev_date, 'CB_DeferredAsset']
-            cb_net_income_period = cb_interest_income_period - cb_net_expense
+            cb_net_income_period = cb_treasury_interest_cash_received_period - cb_net_expense
             cb_remittance_period = 0.0
             current_deferred_asset = prev_deferred_asset
             if current_deferred_asset > TGA_FLOOR_TOLERANCE:
@@ -2738,7 +3015,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             else:
                 current_deferred_asset += abs(cb_net_income_period)
             cb_remit_tga_change = cb_remittance_period
-        results.loc[current_date, 'CB_InterestIncome'] = cb_interest_income_period
+        results.loc[current_date, 'CB_TreasuryInterestCashReceived'] = cb_treasury_interest_cash_received_period
         results.loc[current_date, 'CB_NetIncome'] = cb_net_income_period
         results.loc[current_date, 'CB_Remittance'] = cb_remittance_period
         results.loc[current_date, 'CB_DeferredAsset'] = current_deferred_asset
@@ -2765,7 +3042,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         cbo_fed_allocation_override_active = False
         cbo_fed_begin_stock = float(results.loc[prev_date, 'DebtHeld_CB'])
         fed_secondary_purchase_face = 0.0
+        fed_secondary_purchase_cash = 0.0
         fed_secondary_sale_face = 0.0
+        fed_secondary_sale_cash = 0.0
+        fed_secondary_reserve_effect = 0.0
+        fed_secondary_deposit_effect = 0.0
+        fed_secondary_private_route_effects = _zero_private_routes()
         if cbo_funding_mode:
             cbo_debt_row = _cbo_exact_date_row(
                 cbo_inputs['debt_stock'],
@@ -2888,11 +3170,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             results.loc[current_date, 'CBOFedAuctionShare'] = cbo_fed_auction_share
             if cbo_fed_allocation_override_active:
                 results.loc[current_date, 'CBOFedStockMode'] = (
-                    'synthetic_cb_treasury_stock_target_par_reallocation'
+                    'synthetic_cb_treasury_stock_target_beneficial_holder'
                 )
                 results.loc[current_date, 'CBOFedSettlementScope'] = (
-                    'stock_reallocation_only_no_reserve_deposit_or_market_price_claim'
+                    'beneficial_holder_with_model_dirty_value_settlement'
                 )
+                results.loc[current_date, 'CBOFedAcquisitionChannel'] = 'none_required_to_hit_cbo_stock_path'
             results.loc[current_date, 'CBOCashResidualStatus'] = cbo_cash_residual_status
         new_bonds_added_list = []
         total_issued_face_by_holder = {h: 0.0 for h in HOLDER_TYPES}
@@ -3240,7 +3523,16 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     fed_secondary_purchase_face,
                     fed_secondary_sellers,
                     fed_secondary_private_routes,
-                ) = _transfer_public_marketable_debt_to_cb(bond_portfolio, fed_purchase_shortfall)
+                    fed_secondary_purchase_cash,
+                ) = _transfer_public_marketable_debt_to_cb(
+                    bond_portfolio,
+                    fed_purchase_shortfall,
+                    current_date,
+                    current_yield_curve_years,
+                    current_yield_curve_rates,
+                    interpolation_method=yield_interpolation_method,
+                    floor_zero=yield_floor_zero,
+                )
                 if abs(fed_secondary_purchase_face - fed_purchase_shortfall) > float(
                     funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001
                 ):
@@ -3248,16 +3540,47 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         f"CBO Fed holdings target cannot be met by secondary purchases at {current_date.date()}: "
                         f"target={cbo_fed_holdings_target:.12f}, current={current_cb_after_issuance:.12f}, "
                         f"purchased={fed_secondary_purchase_face:.12f}"
+                    )
+                fed_secondary_reserve_effect = sum(
+                    fed_secondary_sellers.get(holder, 0.0)
+                    for holder in ('Banks', 'Private', 'Foreign')
                 )
-                fed_secondary_purchase_cash = 0.0
-                results.loc[current_date, 'CBOFedSecondaryPurchaseReserveEffect'] = 0.0
-                results.loc[current_date, 'CBOFedSecondaryPurchaseDepositEffect'] = 0.0
+                fed_secondary_deposit_effect = _effective_private_amount(
+                    fed_secondary_private_routes,
+                    mmf_deposit_pass_through,
+                    legacy_total=fed_secondary_sellers.get('Private', 0.0),
+                )
+                for route in PRIVATE_SUBBUCKETS:
+                    fed_secondary_private_route_effects[route] += fed_secondary_private_routes[route]
+                reserve_change_period += fed_secondary_reserve_effect
+                deposit_change_period += fed_secondary_deposit_effect
+                results.loc[current_date, 'CBOFedSecondaryPurchaseReserveEffect'] = fed_secondary_reserve_effect
+                results.loc[current_date, 'CBOFedSecondaryPurchaseDepositEffect'] = fed_secondary_deposit_effect
                 results.loc[current_date, 'CBOFedSecondaryPurchaseFace'] = fed_secondary_purchase_face
                 results.loc[current_date, 'CBOFedSecondaryPurchaseCash'] = fed_secondary_purchase_cash
+                results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
+                    'synthetic_secondary_purchase_to_hit_cbo_stock_path'
+                )
             elif fed_purchase_shortfall < -fed_target_tolerance:
-                bond_portfolio, fed_secondary_sale_face = _transfer_cb_marketable_debt_to_public(
+                fed_secondary_sale_buyer_mix = _resolve_fed_secondary_sale_buyer_mix(
+                    bond_portfolio,
+                    funding_rule_cfg.get('fed_secondary_sale_buyer_mix'),
+                )
+                (
+                    bond_portfolio,
+                    fed_secondary_sale_face,
+                    fed_secondary_buyers,
+                    fed_secondary_buyer_private_routes,
+                    fed_secondary_sale_cash,
+                ) = _transfer_cb_marketable_debt_to_public(
                     bond_portfolio,
                     abs(fed_purchase_shortfall),
+                    current_date,
+                    current_yield_curve_years,
+                    current_yield_curve_rates,
+                    fed_secondary_sale_buyer_mix,
+                    interpolation_method=yield_interpolation_method,
+                    floor_zero=yield_floor_zero,
                 )
                 if abs(fed_secondary_sale_face - abs(fed_purchase_shortfall)) > fed_target_tolerance:
                     raise RuntimeError(
@@ -3265,6 +3588,28 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         f"target={cbo_fed_holdings_target:.12f}, current={current_cb_after_issuance:.12f}, "
                         f"sold={fed_secondary_sale_face:.12f}"
                     )
+                fed_secondary_reserve_effect = -sum(
+                    fed_secondary_buyers.get(holder, 0.0)
+                    for holder in ('Banks', 'Private', 'Foreign')
+                )
+                fed_secondary_deposit_effect = -_effective_private_amount(
+                    fed_secondary_buyer_private_routes,
+                    mmf_deposit_pass_through,
+                    legacy_total=fed_secondary_buyers.get('Private', 0.0),
+                )
+                for route in PRIVATE_SUBBUCKETS:
+                    fed_secondary_private_route_effects[route] -= fed_secondary_buyer_private_routes[route]
+                reserve_change_period += fed_secondary_reserve_effect
+                deposit_change_period += fed_secondary_deposit_effect
+                results.loc[current_date, 'CBOFedSecondarySaleCash'] = fed_secondary_sale_cash
+                results.loc[current_date, 'CBOFedSecondarySaleReserveEffect'] = fed_secondary_reserve_effect
+                results.loc[current_date, 'CBOFedSecondarySaleDepositEffect'] = fed_secondary_deposit_effect
+                results.loc[current_date, 'CBOFedSecondarySaleBuyerMix'] = _format_fed_holder_mix(
+                    fed_secondary_sale_buyer_mix
+                )
+                results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
+                    'synthetic_secondary_sale_to_hit_cbo_stock_path'
+                )
         if current_enable_trading and (not cbo_fed_allocation_override_active) and (not bond_portfolio.empty):
             try:
                 pref_trade_monetary_impact = {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0}
@@ -3495,9 +3840,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         results.loc[current_date, 'TDC_FiscalFlow'] = fiscal_deposit_change
         results.loc[current_date, 'TDC_DebtService'] = debt_service_deposit_change
         results.loc[current_date, 'TDC_AuctionAbsorption'] = issuance_deposit_change
-        results.loc[current_date, 'TDC_SecondaryTrades'] = pref_trade_monetary_impact.get('deposit_change', 0.0)
+        results.loc[current_date, 'TDC_SecondaryTrades'] = (
+            pref_trade_monetary_impact.get('deposit_change', 0.0)
+            + fed_secondary_deposit_effect
+        )
         results.loc[current_date, 'TDC_Other'] = other_deposit_change
-        private_secondary_change = pref_trade_monetary_impact.get('deposit_change', 0.0)
+        private_secondary_change = results.loc[current_date, 'TDC_SecondaryTrades']
         results.loc[current_date, 'TDC_AuctionAbsorption_DomesticNonbank'] = -_private_route_value(
             total_issued_proceeds_by_private_route,
             PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
@@ -3646,17 +3994,21 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             results.loc[current_date, 'TDC_PrincipalCashToDU']
             - results.loc[current_date, 'TDC_GrossIssuanceProceedsAbsorbedByDU']
         )
-        results.loc[current_date, 'TDC_SecondaryTrades_DomesticNonbank'] = pref_trade_monetary_impact.get(
-            'deposit_change_private_deposit_funded',
-            0.0,
+        results.loc[current_date, 'TDC_SecondaryTrades_DomesticNonbank'] = (
+            pref_trade_monetary_impact.get('deposit_change_private_deposit_funded', 0.0)
+            + fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK]
         )
+        fed_secondary_mmf_gross = fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_MMF]
         results.loc[current_date, 'TDC_SecondaryTrades_MMF'] = (
             mmf_deposit_pass_through
-            * pref_trade_monetary_impact.get('deposit_change_private_mmf', 0.0)
+            * (
+                pref_trade_monetary_impact.get('deposit_change_private_mmf', 0.0)
+                + fed_secondary_mmf_gross
+            )
         )
-        results.loc[current_date, 'TDC_SecondaryTrades_MMFPlumbing'] = pref_trade_monetary_impact.get(
-            'deposit_change_private_mmf_plumbing',
-            0.0,
+        results.loc[current_date, 'TDC_SecondaryTrades_MMFPlumbing'] = (
+            pref_trade_monetary_impact.get('deposit_change_private_mmf_plumbing', 0.0)
+            + (1.0 - mmf_deposit_pass_through) * fed_secondary_mmf_gross
         )
         results.loc[current_date, 'TDC_SecondaryDUToRU'] = max(0.0, private_secondary_change)
         results.loc[current_date, 'TDC_SecondaryRUToDU'] = max(0.0, -private_secondary_change)
