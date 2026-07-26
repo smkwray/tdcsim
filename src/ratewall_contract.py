@@ -59,11 +59,23 @@ def _primary_flow_status(config: dict | None, results: pd.DataFrame | None = Non
     return "simulation_fiscal_flow_to_du_proxy"
 
 
+def _holder_path_status(results: pd.DataFrame) -> tuple[str, str]:
+    metadata = results.attrs.get("run_metadata", {})
+    if not isinstance(metadata, dict):
+        return "not_recorded", ""
+    return (
+        str(metadata.get("ratewall_holder_absorption_resolution_status", "not_recorded")),
+        str(metadata.get("ratewall_holder_absorption_source_scenario_id") or ""),
+    )
+
+
 def _quarterly_summary_for_scenario(
     results: pd.DataFrame,
     scenario_id: str,
     *,
     primary_flow_status: str,
+    holder_path_resolution_status: str,
+    holder_path_source_scenario_id: str,
 ) -> pd.DataFrame:
     frame = results.copy()
     frame.insert(0, "Date", pd.to_datetime(frame.index))
@@ -155,6 +167,8 @@ def _quarterly_summary_for_scenario(
                 "component_sum_bil": f"{component_sum:.12f}",
                 "component_sum_error_bil": f"{component_sum - tdc_change:.12f}",
                 "primary_flow_status": primary_flow_status,
+                "holder_path_resolution_status": holder_path_resolution_status,
+                "holder_path_source_scenario_id": holder_path_source_scenario_id,
                 "secondary_trade_status": "simulated" if abs(float(secondary)) > 1e-12 else "absent_not_imputed",
                 "other_status": "explicit_zero" if abs(float(other)) <= 1e-12 else "explicit_configured",
                 "claim_boundary": CLAIM_BOUNDARY,
@@ -543,15 +557,20 @@ def export_ratewall_bundle(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    summary_frames = [
-        _quarterly_summary_for_scenario(
-            results,
-            scenario_id,
-            primary_flow_status=_primary_flow_status(config, results),
+    summary_frames = []
+    for scenario_id, results in scenario_results.items():
+        if not isinstance(results, pd.DataFrame) or results.empty:
+            continue
+        holder_path_status, holder_path_source_id = _holder_path_status(results)
+        summary_frames.append(
+            _quarterly_summary_for_scenario(
+                results,
+                scenario_id,
+                primary_flow_status=_primary_flow_status(config, results),
+                holder_path_resolution_status=holder_path_status,
+                holder_path_source_scenario_id=holder_path_source_id,
+            )
         )
-        for scenario_id, results in scenario_results.items()
-        if isinstance(results, pd.DataFrame) and not results.empty
-    ]
     summary = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
     components = _components_for_summary(summary) if not summary.empty else pd.DataFrame()
     source_registry = pd.DataFrame(_source_registry_rows(config))
