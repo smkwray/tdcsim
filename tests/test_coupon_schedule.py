@@ -664,3 +664,114 @@ def test_unified_pricer_honours_negative_yields():
         face_value=100.0,
     )
     assert priced["clean"] > 100.0
+
+
+# --- TIPS real-vs-nominal discounting -----------------------------------------------------
+#
+# A TIPS holds real cash flows: adjusted principal is fixed at today's index ratio rather
+# than projected forward. Discounting those at a nominal rate double-counts inflation.
+
+
+def test_tips_base_discounts_at_the_real_curve():
+    """Real par identity: 1.25% coupon at 1.25% real yield on adjusted 105 is worth 105."""
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    priced = value_treasury_security(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=10),
+        coupon_rate=0.0125,
+        discount_yield=0.0125,
+        security_type="TIPS",
+        face_value=100.0,
+        adjusted_principal=105.0,
+        original_principal=100.0,
+        projected_adjusted_principal_at_maturity=105.0,
+        nominal_discount_yield=0.045,
+    )
+    assert priced["clean"] == pytest.approx(105.0, abs=1e-6)
+
+
+def test_tips_base_is_immune_to_the_nominal_curve():
+    """Changing only the nominal curve must not move the indexed base."""
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    common = dict(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=10),
+        coupon_rate=0.0125,
+        discount_yield=0.0125,
+        security_type="TIPS",
+        face_value=100.0,
+        adjusted_principal=105.0,
+        original_principal=100.0,
+        projected_adjusted_principal_at_maturity=105.0,
+    )
+    low = value_treasury_security(nominal_discount_yield=0.045, **common)
+    high = value_treasury_security(nominal_discount_yield=0.090, **common)
+
+    assert low["clean"] == pytest.approx(high["clean"], abs=1e-9)
+    assert low["deflation_floor_value"] == pytest.approx(0.0)
+
+
+def test_tips_deflation_floor_is_a_separate_nominal_topup():
+    """The floor is a nominal payoff, so it takes the nominal discount factor, not the real one.
+
+    Collapsing it into max(original, adjusted) and discounting the whole thing at one rate
+    misprices whichever leg gets the wrong curve.
+    """
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    common = dict(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=7),
+        coupon_rate=0.01,
+        discount_yield=0.015,
+        security_type="TIPS",
+        face_value=100.0,
+        adjusted_principal=92.0,
+        original_principal=100.0,
+        projected_adjusted_principal_at_maturity=92.0,
+    )
+    cheap = value_treasury_security(nominal_discount_yield=0.02, **common)
+    dear = value_treasury_security(nominal_discount_yield=0.08, **common)
+
+    assert cheap["deflation_floor_value"] > dear["deflation_floor_value"]
+    assert cheap["deflation_floor_basis"] == "deterministic_scenario_payoff_no_option_time_value"
+    # Coupons keep accruing on unfloored adjusted principal even while the floor binds.
+    assert cheap["clean"] > 92.0
+
+
+def test_tips_floor_does_not_bind_above_original_principal():
+    """No top-up when the scenario projects adjusted principal above original."""
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    priced = value_treasury_security(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=7),
+        coupon_rate=0.01,
+        discount_yield=0.015,
+        security_type="TIPS",
+        face_value=100.0,
+        adjusted_principal=108.0,
+        original_principal=100.0,
+        projected_adjusted_principal_at_maturity=112.0,
+        nominal_discount_yield=0.045,
+    )
+    assert priced["deflation_floor_value"] == pytest.approx(0.0)
+    assert priced["deflation_floor_basis"] == "not_binding"

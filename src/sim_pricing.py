@@ -136,6 +136,8 @@ def value_treasury_security(
     issue_date=None,
     first_interest_payment_date=None,
     frequency=2,
+    projected_adjusted_principal_at_maturity=None,
+    nominal_discount_yield=None,
 ):
     """Value one Treasury security at a settlement date. The single owner of that question.
 
@@ -152,16 +154,30 @@ def value_treasury_security(
       structurally deletes accrued interest from the price — up to a full half-coupon, 1.125
       per 100 face on a 4.5% coupon.
 
-    The TIPS deflation floor is applied as a property of the instrument, never a caller
-    choice: Treasury redeems at max(original, adjusted) principal under 31 CFR 356, so a
-    price without it values a security Treasury does not issue. Coupons continue to accrue on
-    unfloored adjusted principal even when the floor binds.
+    A TIPS is priced as two legs, because they are not discountable at the same rate. The
+    indexed base carries *real* cash flows — the model holds adjusted principal at today's
+    index ratio rather than projecting it forward — so `discount_yield` must be a **real**
+    yield at the security's *remaining* maturity. The deflation floor is a *nominal* dollar
+    payoff, max(original - adjusted-at-maturity, 0), and takes `nominal_discount_yield`.
+    Discounting real flows at a nominal rate misprices by roughly the inflation wedge times
+    duration: a 10-year TIPS with a 1.25% real coupon and adjusted principal 105 prices at
+    77.76 against a correct 105.00.
+
+    Coupons continue to accrue on unfloored adjusted principal even when the floor binds, and
+    the engine still pays max(original, realized adjusted) at actual maturity.
+
+    The floor is a **deterministic scenario approximation with no option time value**: it
+    values the payoff implied by `projected_adjusted_principal_at_maturity` rather than an
+    expectation over an inflation distribution. Reported as `deflation_floor_basis`. Pricing
+    the embedded option properly would need an inflation volatility surface or a joint
+    nominal-real term-structure model, neither of which this project holds.
 
     Negative yields are honoured. TIPS real yields were materially negative in 2020-22, and
     the issuance path already supports negative-yield premium pricing.
 
-    Returns a mapping with `clean`, `accrued` and `dirty`. Settlement of an actual purchase
-    or sale is the *dirty* value — that invoice amount is what becomes reserves and deposits.
+    Returns `clean`, `accrued`, `dirty`, plus the floor value and its basis. Settlement of an
+    actual purchase or sale is the *dirty* value — that invoice amount becomes reserves and
+    deposits.
     """
 
     if pd.isna(maturity_date) or pd.isna(settlement_date):
@@ -187,11 +203,21 @@ def value_treasury_security(
 
     principal_at_maturity = face
     principal_for_coupons = face
+    floor_excess = 0.0
     if security_type == 'TIPS':
         adj = float(adjusted_principal) if adjusted_principal not in (None,) and not pd.isna(adjusted_principal) and float(adjusted_principal) > 0 else face
         orig = float(original_principal) if original_principal not in (None,) and not pd.isna(original_principal) and float(original_principal) > 0 else face
-        principal_at_maturity = max(orig, adj)
+        # A TIPS decomposes into a floorless indexed bond plus a nominal contingent claim on
+        # terminal deflation. The two legs are NOT discountable at the same rate: the indexed
+        # base carries real cash flows and must be discounted at a real yield, while the floor
+        # top-up max(original - adjusted_at_maturity, 0) is a nominal dollar payoff and takes
+        # the nominal maturity discount factor. Collapsing them into one
+        # max(original, adjusted) term discounted at a single rate misprices whichever leg
+        # gets the wrong curve.
+        principal_at_maturity = adj
         principal_for_coupons = adj
+        projected = adj if projected_adjusted_principal_at_maturity is None or pd.isna(projected_adjusted_principal_at_maturity) else float(projected_adjusted_principal_at_maturity)
+        floor_excess = max(0.0, orig - projected)
 
     freq = max(1, int(round(float(frequency))))
     yld_per_period = float(discount_yield) / freq
@@ -228,6 +254,19 @@ def value_treasury_security(
     except (OverflowError, ValueError, ZeroDivisionError):
         raise ValueError('Treasury valuation overflowed while discounting principal.')
 
+    # The deflation floor is a nominal payoff, so it takes the nominal maturity discount
+    # factor rather than the real one used for the indexed base above. Deterministic
+    # scenario approximation: it carries no option time value, which is a stated limitation.
+    floor_value = 0.0
+    if floor_excess > TGA_FLOOR_TOLERANCE:
+        nominal_yield = float(discount_yield) if nominal_discount_yield is None or pd.isna(nominal_discount_yield) else float(nominal_discount_yield)
+        nominal_per_period = max(-1.0 + 1e-9, nominal_yield / freq)
+        try:
+            floor_value = floor_excess / (1.0 + nominal_per_period) ** terminal_exponent
+        except (OverflowError, ValueError, ZeroDivisionError):
+            raise ValueError('Treasury valuation overflowed while discounting the deflation floor.')
+        clean_pv += floor_value
+
     accrued = 0.0
     if coupon > TGA_FLOOR_TOLERANCE and remaining:
         next_coupon = remaining[0]
@@ -238,7 +277,15 @@ def value_treasury_security(
             accrued = coupon_payment * min(1.0, elapsed / span)
 
     clean = clean_pv - accrued
-    return {'clean': clean, 'accrued': accrued, 'dirty': clean_pv}
+    return {
+        'clean': clean,
+        'accrued': accrued,
+        'dirty': clean_pv,
+        'deflation_floor_value': floor_value,
+        'deflation_floor_basis': (
+            'deterministic_scenario_payoff_no_option_time_value' if floor_excess > TGA_FLOOR_TOLERANCE else 'not_binding'
+        ),
+    }
 
 
 def _remaining_coupon_dates(*, settlement_date, maturity_date, issue_date, first_interest_payment_date, frequency):
