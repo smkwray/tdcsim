@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import historical_replay as historical_replay_module
 from historical_replay import (
     _build_z1_transaction_flow_diagnostics,
     _deterministic_large_artifact_sample,
@@ -23,6 +24,34 @@ def _write_mmf_component_source(path: Path, *, total: float, bills: float, date:
             }
         ]
     ).to_csv(path, index=False)
+
+
+def test_code_identity_manifest_recurses_and_uses_runtime_exclusions(tmp_path, monkeypatch):
+    included = {
+        "src/top.py": "top",
+        "src/tdcsim_cbo/runner.py": "runner",
+        "src/tdcsim_cbo/transforms/rates.py": "rates",
+        "scripts/nested/tool.py": "tool",
+        "tdc_config_fixture.yaml": "fixture: true\n",
+    }
+    excluded = {
+        "src/__pycache__/source.py": "cache",
+        "src/tdcsim_cbo/module.pyc": "compiled",
+        "src/package.dist-info/plugin.py": "dist-info",
+        "scripts/package.egg-info/tool.py": "egg-info",
+    }
+    for relative_path, content in (included | excluded).items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(historical_replay_module, "_PROJECT_ROOT", tmp_path)
+
+    rows = historical_replay_module._code_identity_rows()
+
+    expected_paths = sorted(included)
+    assert [row["path"] for row in rows] == expected_paths
+    assert all(list(row) == ["path", "bytes", "sha256"] for row in rows)
+    assert all(len(str(row["sha256"])) == 64 for row in rows)
 
 
 def test_z1_transaction_flow_diagnostics_convert_fa_saar_to_quarterly_moment():
