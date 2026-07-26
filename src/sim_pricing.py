@@ -8,6 +8,9 @@ from scipy.interpolate import CubicSpline, PchipInterpolator
 
 from tdc_shared import DAYS_PER_YEAR_ACTUAL, TGA_FLOOR_TOLERANCE
 
+# Appendix B counts coupon periods on a 365-day nominal year; actual/actual applies within.
+_DAYS_PER_YEAR_NOMINAL = 365.0
+
 def _is_bill_like_fixed(security_type, original_maturity_years, coupon_rate):
     """Return True for zero-coupon fixed-rate securities at or below the bill cutoff."""
     if security_type != 'Fixed':
@@ -117,6 +120,147 @@ def calculate_coupon_security_issue_price_ratio(
         discounts = np.array([(1.0 + yld_per_period) ** -period for period in range(1, periods + 1)])
         price = coupon_per_period * float(discounts.sum()) + float(discounts[-1])
     return round(max(TGA_FLOOR_TOLERANCE, float(price)), 8)
+
+
+def value_treasury_security(
+    *,
+    settlement_date,
+    maturity_date,
+    coupon_rate,
+    discount_yield,
+    security_type='Fixed',
+    face_value=1.0,
+    adjusted_principal=None,
+    original_principal=None,
+    accrued_frn=None,
+    issue_date=None,
+    first_interest_payment_date=None,
+    frequency=2,
+):
+    """Value one Treasury security at a settlement date. The single owner of that question.
+
+    Discounts the *dated* remaining cash flows at the semiannual bond-equivalent convention
+    of 31 CFR 356 Appendix B, including its fractional stub exponent v**(r/s) for a
+    settlement date inside a coupon period. That combination matters:
+
+    * The convention must be semiannual because the model's yields come from a Treasury par
+      curve (`nominal_par_yield_coupon_setting_surface`), and par yields are semiannual
+      bond-equivalent by definition. Annual-effective discounting of the same numeric yield
+      misprices by roughly duration * y**2 / 4 — about 24bp on a 7-year note at 4%, 141bp on
+      a 12.5-year at 8.84%.
+    * The periods must be dated rather than rounded to whole halves, because rounding
+      structurally deletes accrued interest from the price — up to a full half-coupon, 1.125
+      per 100 face on a 4.5% coupon.
+
+    The TIPS deflation floor is applied as a property of the instrument, never a caller
+    choice: Treasury redeems at max(original, adjusted) principal under 31 CFR 356, so a
+    price without it values a security Treasury does not issue. Coupons continue to accrue on
+    unfloored adjusted principal even when the floor binds.
+
+    Negative yields are honoured. TIPS real yields were materially negative in 2020-22, and
+    the issuance path already supports negative-yield premium pricing.
+
+    Returns a mapping with `clean`, `accrued` and `dirty`. Settlement of an actual purchase
+    or sale is the *dirty* value — that invoice amount is what becomes reserves and deposits.
+    """
+
+    if pd.isna(maturity_date) or pd.isna(settlement_date):
+        raise ValueError('Treasury valuation requires settlement and maturity dates.')
+    if settlement_date >= maturity_date:
+        raise ValueError('Treasury valuation requires a settlement date before maturity.')
+    if pd.isna(face_value) or float(face_value) <= TGA_FLOOR_TOLERANCE:
+        raise ValueError('Treasury valuation requires a positive face value.')
+
+    face = float(face_value)
+    coupon = 0.0 if pd.isna(coupon_rate) else max(0.0, float(coupon_rate))
+
+    # Nonmarketables are not traded and FRNs reset to their index, so both sit at par plus
+    # any accrued. Neither is a discounting question.
+    if security_type in ('NonMarketable', 'FRN'):
+        accrued = 0.0
+        if security_type == 'FRN' and accrued_frn is not None and not pd.isna(accrued_frn):
+            accrued = max(0.0, float(accrued_frn))
+        return {'clean': face, 'accrued': accrued, 'dirty': face + accrued}
+
+    if pd.isna(discount_yield):
+        raise ValueError('Treasury valuation requires a discount yield for a coupon security.')
+
+    principal_at_maturity = face
+    principal_for_coupons = face
+    if security_type == 'TIPS':
+        adj = float(adjusted_principal) if adjusted_principal not in (None,) and not pd.isna(adjusted_principal) and float(adjusted_principal) > 0 else face
+        orig = float(original_principal) if original_principal not in (None,) and not pd.isna(original_principal) and float(original_principal) > 0 else face
+        principal_at_maturity = max(orig, adj)
+        principal_for_coupons = adj
+
+    freq = max(1, int(round(float(frequency))))
+    yld_per_period = float(discount_yield) / freq
+    if yld_per_period <= -1.0 + 1e-9:
+        yld_per_period = -1.0 + 1e-9
+    discount_base = 1.0 + yld_per_period
+
+    remaining = _remaining_coupon_dates(
+        settlement_date=settlement_date,
+        maturity_date=maturity_date,
+        issue_date=issue_date,
+        first_interest_payment_date=first_interest_payment_date,
+        frequency=freq,
+    )
+    coupon_payment = principal_for_coupons * coupon / freq
+
+    # Appendix B indexes cash flows by WHOLE coupon periods, with a single fractional stub
+    # r/s for the part-period between settlement and the next coupon. Counting every flow in
+    # days against a nominal period length instead would drift, because real semiannual
+    # periods are 181-184 days: a par bond would not price at exactly 100.
+    prior_coupon = remaining[0] - relativedelta(months=12 // freq) if remaining else settlement_date
+    span_days = max(1, (remaining[0] - prior_coupon).days) if remaining else 1
+    stub = (remaining[0] - settlement_date).days / span_days if remaining else 0.0
+
+    clean_pv = 0.0
+    for index, _pay_date in enumerate(remaining):
+        try:
+            clean_pv += coupon_payment / discount_base ** (stub + index)
+        except (OverflowError, ValueError, ZeroDivisionError):
+            raise ValueError('Treasury valuation overflowed while discounting a coupon.')
+    terminal_exponent = stub + max(0, len(remaining) - 1)
+    try:
+        clean_pv += principal_at_maturity / discount_base ** terminal_exponent
+    except (OverflowError, ValueError, ZeroDivisionError):
+        raise ValueError('Treasury valuation overflowed while discounting principal.')
+
+    accrued = 0.0
+    if coupon > TGA_FLOOR_TOLERANCE and remaining:
+        next_coupon = remaining[0]
+        prior_coupon = next_coupon - relativedelta(months=12 // freq)
+        span = (next_coupon - prior_coupon).days
+        if span > 0:
+            elapsed = max(0, (settlement_date - prior_coupon).days)
+            accrued = coupon_payment * min(1.0, elapsed / span)
+
+    clean = clean_pv - accrued
+    return {'clean': clean, 'accrued': accrued, 'dirty': clean_pv}
+
+
+def _remaining_coupon_dates(*, settlement_date, maturity_date, issue_date, first_interest_payment_date, frequency):
+    """Coupon dates strictly after settlement, through maturity, newest schedule info first."""
+
+    months = 12 // max(1, int(frequency))
+    anchor = first_interest_payment_date if first_interest_payment_date is not None and not pd.isna(first_interest_payment_date) else None
+    if anchor is None:
+        # Treasury coupons fall on the maturity day-of-month, so walk back from maturity.
+        anchor = maturity_date
+    dates = []
+    cursor = pd.Timestamp(anchor)
+    while cursor > settlement_date + pd.Timedelta(days=1):
+        cursor = cursor - relativedelta(months=months)
+    cursor = cursor + relativedelta(months=months)
+    while cursor <= maturity_date + pd.Timedelta(days=1):
+        if cursor > settlement_date:
+            dates.append(min(pd.Timestamp(cursor), pd.Timestamp(maturity_date)))
+        cursor = cursor + relativedelta(months=months)
+    if not dates or dates[-1] < maturity_date:
+        dates.append(pd.Timestamp(maturity_date))
+    return sorted(set(dates))
 
 def calculate_face_from_proceeds_target(security_type, maturity_years, coupon_rate, yield_at_issuance, proceeds_target):
     """Convert a proceeds target into face issued, accounting for bill discounts."""
@@ -531,6 +675,7 @@ __all__ = [
     'calculate_face_from_proceeds_target',
     'quote_issuance_from_face_target',
     'calculate_auction_coupon_rate',
+    'value_treasury_security',
     'calculate_coupon_security_issue_price_ratio',
     'infer_issue_data_for_loaded_bill',
     'get_maturity_category',

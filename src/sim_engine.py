@@ -34,7 +34,7 @@ from sim_helpers import OUTPUT_COLUMN_RENAMES, apply_event_actions, validate_run
 from sim_pricing import (
     calculate_accrued_interest,
     calculate_coupon_rate,
-    calculate_coupon_security_issue_price_ratio,
+    value_treasury_security,
     calculate_face_from_proceeds_target,
     get_coupon_dates_in_period,
     get_maturity_category,
@@ -1059,32 +1059,35 @@ def _fed_secondary_dirty_value(
         )
         if pd.isna(discount_yield) or not np.isfinite(float(discount_yield)):
             raise ValueError('Fed secondary transfer row has no finite market yield.')
-        price_ratio = calculate_coupon_security_issue_price_ratio(
-            time_to_maturity,
-            coupon_rate,
-            float(discount_yield),
-        )
-        if not np.isfinite(price_ratio) or price_ratio <= TGA_FLOOR_TOLERANCE:
-            raise ValueError('Fed secondary transfer row produced an invalid clean price.')
-        clean_value = stock_amount * float(price_ratio)
+        # One owner of "what is this security worth": dated remaining cash flows at the
+        # Appendix B semiannual convention, with the TIPS deflation floor applied as a
+        # property of the instrument. The issue-price kernel used here previously rounded
+        # remaining life to whole coupon periods, which structurally deleted accrued
+        # interest from settlement, and carried no deflation-floor concept at all.
         issue_date = pd.to_datetime(row.get('IssueDate'), errors='coerce')
         if coupon_rate > TGA_FLOOR_TOLERANCE and (
             pd.isna(issue_date) or issue_date > settlement_date
         ):
             raise ValueError('Fed secondary coupon transfer has no valid issue date for accrued interest.')
-        accrued_total = calculate_accrued_interest(
-            float(row.get('FaceValue', 0.0) or 0.0),
-            coupon_rate,
-            settlement_date,
-            issue_date,
-            security_type,
-            row.get('AdjustedPrincipal'),
-            row.get('AccruedInterest_FRN'),
-            2,
+        valuation = value_treasury_security(
+            settlement_date=settlement_date,
+            maturity_date=maturity_date,
+            coupon_rate=coupon_rate,
+            discount_yield=float(discount_yield),
+            security_type=security_type,
+            face_value=float(row.get('FaceValue', 0.0) or 0.0),
+            adjusted_principal=row.get('AdjustedPrincipal'),
+            original_principal=row.get('OriginalPrincipal'),
+            accrued_frn=row.get('AccruedInterest_FRN'),
+            issue_date=issue_date,
+            first_interest_payment_date=pd.to_datetime(row.get('FirstInterestPaymentDate'), errors='coerce'),
         )
-        if not np.isfinite(accrued_total) or accrued_total < -TGA_FLOOR_TOLERANCE:
+        clean_value = float(valuation['clean']) * fraction
+        accrued_interest = max(0.0, float(valuation['accrued'])) * fraction
+        if not np.isfinite(clean_value) or clean_value <= TGA_FLOOR_TOLERANCE:
+            raise ValueError('Fed secondary transfer row produced an invalid clean price.')
+        if not np.isfinite(accrued_interest) or accrued_interest < -TGA_FLOOR_TOLERANCE:
             raise ValueError('Fed secondary transfer row produced invalid accrued interest.')
-        accrued_interest = max(0.0, float(accrued_total)) * fraction
         dirty_value = clean_value + accrued_interest
     if not np.isfinite(dirty_value) or dirty_value <= TGA_FLOOR_TOLERANCE:
         raise ValueError('Fed secondary transfer row produced invalid dirty market value.')
