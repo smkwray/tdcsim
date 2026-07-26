@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from bill_quote_basis import discount_rate_to_investment_rate
 from cbo_yield_curve_surface import CONSTRUCTION_METHOD, build_yield_curve_surface_rows
 from forecast_input_builder import write_forecast_rows_csv
 from forecast_paths import load_yield_curve_surface
@@ -89,10 +90,15 @@ def test_yield_surface_reproduces_cbo_anchors_and_loads_through_schema(tmp_path)
     assert len(loaded) == 10
     assert set(loaded["construction_method"]) == {CONSTRUCTION_METHOD}
     assert set(loaded["base_curve_sha256"]) == {"abc123frozen"}
-    for curve_date, expected_3m, expected_10y in [
+    # The 3-month anchor is a CBO *discount-basis* quote, and this surface is a par-yield
+    # surface, so the 0.25y point must carry the converted investment-basis rate rather than
+    # the raw quote. The 10-year anchor is already a par yield and passes through unchanged.
+    for curve_date, quoted_3m, expected_10y in [
         ("2026-04-01", 3.70, 4.05),
         ("2026-07-01", 3.45, 3.95),
     ]:
+        expected_3m = discount_rate_to_investment_rate(quoted_3m / 100.0, 91.0) * 100.0
+        assert expected_3m > quoted_3m, "conversion must move the anchor off the raw quote"
         quarter = loaded[loaded["curve_date"] == curve_date]
         rate_3m = quarter.loc[quarter["tenor_years"] == 0.25, "nominal_rate"].iloc[0]
         rate_10y = quarter.loc[quarter["tenor_years"] == 10.0, "nominal_rate"].iloc[0]
@@ -119,7 +125,9 @@ def test_runtime_loader_converts_generated_surface_to_decimal_rates(tmp_path):
 
     assert status == "dynamic_curve_surface:2026-04-01"
     assert years[0] == pytest.approx(0.25)
-    assert rates[0] == pytest.approx(0.037)
+    # Converted from the 3.70% discount quote, not the raw number.
+    assert rates[0] == pytest.approx(discount_rate_to_investment_rate(0.037, 91.0))
+    assert rates[0] > 0.037
     assert rates[years.index(10.0)] == pytest.approx(0.0405)
 
 
@@ -221,6 +229,10 @@ def test_yield_surface_applies_no_implicit_zero_floor():
         output_tenors=(0.25, 1.0, 10.0),
     )
 
+    # No implicit zero floor: a negative CBO quote must stay negative through the
+    # discount-to-investment conversion as well as through the blend.
+    expected_3m = discount_rate_to_investment_rate(-0.0050, 91.0) * 100.0
     assert min(row["nominal_rate"] for row in rows) < 0.0
-    assert rows[0]["nominal_rate"] == pytest.approx(-0.50)
+    assert expected_3m < 0.0
+    assert rows[0]["nominal_rate"] == pytest.approx(expected_3m)
     assert rows[2]["nominal_rate"] == pytest.approx(-0.10)
