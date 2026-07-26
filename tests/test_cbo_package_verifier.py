@@ -56,6 +56,12 @@ RESULT_COLUMNS = [
     "CBOFedSecondaryPurchaseCash",
     "CBOFedSecondaryPurchaseReserveEffect",
     "CBOFedSecondaryPurchaseDepositEffect",
+    "CBOFedSecondarySaleCash",
+    "CBOFedSecondarySaleReserveEffect",
+    "CBOFedSecondarySaleDepositEffect",
+    "CBOFedPrivateMaturityTDC",
+    "CBOFedAcquisitionChannel",
+    "CBOFedSecondarySaleBuyerMix",
     "CBOFedBeginStock",
     "CBOFedMaturitiesAndRedemptions",
     "CBOFedTipsPrincipalIndexation",
@@ -68,7 +74,7 @@ RESULT_COLUMNS = [
     "CBOFedStockMode",
     "CBOFedSettlementScope",
     "CBORemittanceStatus",
-    "CB_InterestIncome",
+    "CB_TreasuryInterestCashReceived",
     "CB_NetIncome",
     "CB_Remittance",
     "CB_DeferredAsset",
@@ -586,7 +592,7 @@ def _write_valid_package(package: Path) -> Path:
             "runtime_effect": "FRN benchmark accrual only; not a cash, issuance, or net-interest plug"
         },
         "fed_holdings_path": {
-            "claim_boundary": "fed_holdings_path_guides_cb_absorption_not_total_debt_or_cash",
+            "claim_boundary": "fed_holdings_path_guides_beneficial_holder_settlement_not_total_debt_or_tga",
             "mode": "cbo_fed_holdings_endpoints_linear_actual_days_holder_target",
             "runtime_columns": [
                 "CBOFedHoldingsTarget",
@@ -651,7 +657,7 @@ def _claim_boundary() -> dict:
             "does_not_claim_receipts_outlays_decomposition",
             "does_not_use_cbo_net_interest_as_cash_or_issuance_plug",
             "does_not_claim_cbo_issuance_mix",
-            "does_not_model_remittances_or_monetary_settlement_effects",
+            "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
         ],
     }
 
@@ -1237,9 +1243,17 @@ def _result_rows(
             "CBOFedHoldingsTargetError": 0.0,
             "CBOFedAuctionShare": 0.0,
             "CBOFedSecondaryPurchaseFace": 0.0 if index == 0 else fed_purchase,
-            "CBOFedSecondaryPurchaseCash": 0.0,
-            "CBOFedSecondaryPurchaseReserveEffect": 0.0,
-            "CBOFedSecondaryPurchaseDepositEffect": 0.0,
+            "CBOFedSecondaryPurchaseCash": 0.0 if index == 0 else fed_purchase * 0.99,
+            "CBOFedSecondaryPurchaseReserveEffect": 0.0 if index == 0 else fed_purchase * 0.99,
+            "CBOFedSecondaryPurchaseDepositEffect": 0.0 if index == 0 else fed_purchase * 0.80,
+            "CBOFedSecondarySaleCash": 0.0,
+            "CBOFedSecondarySaleReserveEffect": 0.0,
+            "CBOFedSecondarySaleDepositEffect": 0.0,
+            "CBOFedPrivateMaturityTDC": 0.0,
+            "CBOFedAcquisitionChannel": (
+                "synthetic_secondary_purchase_to_hit_cbo_stock_path" if index > 0 else ""
+            ),
+            "CBOFedSecondarySaleBuyerMix": "",
             "CBOFedBeginStock": fed_begin,
             "CBOFedMaturitiesAndRedemptions": 0.0,
             "CBOFedTipsPrincipalIndexation": 0.0,
@@ -1250,13 +1264,13 @@ def _result_rows(
             "CBOFedGrossStockFlow": 0.0 if index == 0 else abs(fed_purchase),
             "CBOFedNetStockChange": fed_end - fed_begin,
             "CBOFedStockMode": (
-                "synthetic_cb_treasury_stock_target_par_reallocation" if index > 0 else ""
+                "synthetic_cb_treasury_stock_target_beneficial_holder" if index > 0 else ""
             ),
             "CBOFedSettlementScope": (
-                "stock_reallocation_only_no_reserve_deposit_or_market_price_claim" if index > 0 else ""
+                "beneficial_holder_with_model_dirty_value_settlement" if index > 0 else ""
             ),
             "CBORemittanceStatus": "not_modeled_cbo_primary_deficit_embeds_baseline_revenues",
-            "CB_InterestIncome": 0.0,
+            "CB_TreasuryInterestCashReceived": 0.0,
             "CB_NetIncome": "" if index > 0 else 0.0,
             "CB_Remittance": "" if index > 0 else 0.0,
             "CB_DeferredAsset": "" if index > 0 else 0.0,
