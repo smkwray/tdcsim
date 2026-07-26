@@ -595,8 +595,14 @@ def _handoff_flow_id(*parts):
 
 
 def _handoff_maturity_bucket(security_type, maturity_years=None, maturity_category=None):
-    if str(security_type) == 'Fixed' and maturity_category and not pd.isna(maturity_category):
-        return str(maturity_category)
+    if str(security_type) == 'Fixed' and not pd.isna(maturity_category):
+        category = str(maturity_category).strip()
+        if category:
+            if category not in PREFERENCE_CATEGORIES:
+                raise ValueError(
+                    f"Non-canonical maturity category at RateWall handoff: {category!r}"
+                )
+            return category
     try:
         years = float(maturity_years)
     except (TypeError, ValueError):
@@ -844,15 +850,24 @@ def _handoff_append_holder_stocks(handoff_tables, active_bonds, current_date):
     )
     security_type = frame['SecurityType'].astype(str)
     maturity_years = pd.to_numeric(frame.get('OriginalMaturityYears', np.nan), errors='coerce')
-    maturity_category = frame.get('MaturityCategory', pd.Series('', index=frame.index)).fillna('').astype(str)
+    maturity_category = frame.get(
+        'MaturityCategory', pd.Series(pd.NA, index=frame.index, dtype='string')
+    ).astype('string').str.strip()
+    fixed_category_provided = (
+        security_type.eq('Fixed')
+        & maturity_category.notna()
+        & maturity_category.ne('')
+    )
+    for category in maturity_category.loc[fixed_category_provided].unique():
+        _handoff_maturity_bucket('Fixed', maturity_category=category)
     frame['maturity_bucket'] = np.select(
         [
-            security_type.eq('Fixed') & maturity_category.ne(''),
+            fixed_category_provided,
             maturity_years <= 1.0 + TGA_FLOOR_TOLERANCE,
             maturity_years <= 10.0 + TGA_FLOOR_TOLERANCE,
             maturity_years > 10.0 + TGA_FLOOR_TOLERANCE,
         ],
-        [maturity_category, 'bills', 'notes', 'bonds'],
+        [maturity_category.fillna(''), 'bills', 'notes', 'bonds'],
         default='unknown',
     )
     for debt_scope, rows in (
