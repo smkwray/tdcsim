@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from budget_interest import build_net_interest_diagnostic
+from bill_quote_basis import discount_rate_to_investment_rate
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from cbo_policy_bundle import (
     allocate_signed_primary_flow,
@@ -897,7 +898,10 @@ def test_cbo_dynamic_yield_surface_prices_bills_with_decimal_runtime_rates(tmp_p
     params["yield_curve_surface"] = {"file": str(surface_path), "scenario_id": "baseline"}
     params["treasury_issuance_profile"]["bills"]["maturities"] = [0.25]
     params["treasury_issuance_profile"]["bills"]["maturity_distribution"] = [1.0]
-    assert load_runtime_yield_curve_surface(surface_path)["nominal_rate_decimal"].iloc[0] == pytest.approx(0.037)
+    # The 3m point carries the CBO discount quote converted to an investment basis, since
+    # this is a par-yield surface. Pinning the raw 0.037 would re-encode that defect.
+    expected_3m = discount_rate_to_investment_rate(0.037, 91.0)
+    assert load_runtime_yield_curve_surface(surface_path)["nominal_rate_decimal"].iloc[0] == pytest.approx(expected_3m)
 
     _, portfolio = run_simulation(
         params,
@@ -908,8 +912,9 @@ def test_cbo_dynamic_yield_surface_prices_bills_with_decimal_runtime_rates(tmp_p
     )
     issued = portfolio[portfolio["Status"] == "Active"].iloc[0]
 
-    assert issued["IssueYieldAtIssue"] == pytest.approx(0.037)
-    assert issued["IssuePriceRatio"] == pytest.approx(1.0 / ((1.0 + 0.037) ** 0.25))
+    expected_3m = discount_rate_to_investment_rate(0.037, 91.0)
+    assert issued["IssueYieldAtIssue"] == pytest.approx(expected_3m)
+    assert issued["IssuePriceRatio"] == pytest.approx(1.0 / ((1.0 + expected_3m) ** 0.25))
     assert issued["IssuePriceRatio"] > 0.99
 
 
@@ -1009,7 +1014,7 @@ def test_engine_uses_baseline_input_yield_surface(tmp_path: Path) -> None:
     )
     issued = portfolio[portfolio["Status"] == "Active"].iloc[0]
 
-    assert issued["IssueYieldAtIssue"] == pytest.approx(0.037)
+    assert issued["IssueYieldAtIssue"] == pytest.approx(discount_rate_to_investment_rate(0.037, 91.0))
 
 
 def test_cbo_macro_cpi_path_drives_tips_reference_cpi_and_adjusted_principal(tmp_path: Path) -> None:
