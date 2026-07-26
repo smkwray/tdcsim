@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
-PUBLIC_MARKETABLE_SECURITY_TYPES = frozenset({"Fixed", "TIPS", "FRN"})
+from tdc_shared import PUBLIC_MARKETABLE_SECURITY_TYPES
 DEFAULT_TOLERANCE_BIL = 1e-9
 
 

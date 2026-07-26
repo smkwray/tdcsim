@@ -18,6 +18,9 @@ BOND_PORTFOLIO_COLS = [
 HOLDER_TYPES = ['Banks', 'CB', 'Foreign', 'FedInternal', 'TrustFunds', 'Private']
 INTRAGOV_HOLDERS = frozenset({'FedInternal', 'TrustFunds'})
 SECURITY_TYPES = ['Fixed', 'TIPS', 'FRN', 'NonMarketable']
+# The publicly marketable subset of SECURITY_TYPES. Derived, not restated, so adding a
+# security type is one edit here rather than an edit plus a hunt for parallel copies.
+PUBLIC_MARKETABLE_SECURITY_TYPES = frozenset(SECURITY_TYPES) - {'NonMarketable'}
 MATURITY_CATEGORIES = ['bills', 'notes', 'bonds']
 PREFERENCE_CATEGORIES = ['bills', 'notes', 'bonds', 'tips', 'frn', 'nonmarketable']
 PRIVATE_SUBBUCKET_DOMESTIC_NONBANK = 'domestic_nonbank_deposit_funded'
