@@ -161,37 +161,91 @@ def load_holder_absorption_path(config: dict, *, base_dir: str | os.PathLike[str
     return lookup
 
 
+def resolve_holder_absorption_scenario(
+    lookup: dict[str, dict[str, dict[str, dict[str, float]]]],
+    *,
+    scenario_name: str,
+    required_quarters: list[str] | set[str] | tuple[str, ...],
+    configured_fallbacks: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Resolve one holder-path source and require complete quarter coverage."""
+
+    requested_id = str(scenario_name)
+    fallback_map = configured_fallbacks or {}
+    malformed_fallbacks = {
+        str(key): value
+        for key, value in fallback_map.items()
+        if not isinstance(value, str) or not value
+    }
+    if malformed_fallbacks:
+        raise ValueError(
+            "holder_absorption_scenario_fallbacks must map scenario IDs to non-empty "
+            f"source scenario IDs: {malformed_fallbacks}"
+        )
+
+    if requested_id in lookup:
+        source_id = requested_id
+        status = "exact_scenario"
+    else:
+        source_id = fallback_map.get(requested_id, "")
+        if not source_id:
+            raise ValueError(
+                f"Holder absorption path has no exact scenario {requested_id!r}; "
+                "declare holder_absorption_scenario_fallbacks explicitly to permit a fallback."
+            )
+        if source_id not in lookup:
+            raise ValueError(
+                f"Holder absorption fallback for {requested_id!r} references missing source "
+                f"scenario {source_id!r}."
+            )
+        status = "configured_fallback"
+
+    missing_quarters = sorted(set(required_quarters) - set(lookup[source_id]))
+    if missing_quarters:
+        raise ValueError(
+            f"Holder absorption source scenario {source_id!r} for {requested_id!r} is missing "
+            f"required quarters: {missing_quarters}"
+        )
+    return source_id, status
+
+
 def holder_preferences_for_period(
     lookup: dict[str, dict[str, dict[str, dict[str, float]]]],
     *,
     scenario_name: str,
+    resolved_scenario_id: str | None,
     current_date,
     fallback_preferences: dict,
     warning_cache: set[str] | None = None,
 ) -> dict:
-    """Return quarter-specific auction preferences when available."""
+    """Return quarter-specific auction preferences from a pre-resolved source."""
 
     if not lookup:
         return fallback_preferences
+    if not resolved_scenario_id:
+        raise ValueError(
+            f"Holder absorption source was not resolved for configured scenario {scenario_name!r}."
+        )
     quarter = _quarter_label(current_date)
-    for scenario_id in _scenario_candidates(scenario_name):
-        scenario_rows = lookup.get(scenario_id, {})
-        if quarter not in scenario_rows:
+    scenario_rows = lookup.get(resolved_scenario_id, {})
+    if quarter not in scenario_rows:
+        raise ValueError(
+            f"Holder absorption source scenario {resolved_scenario_id!r} for {scenario_name!r} "
+            f"has no row for {quarter}."
+        )
+    if resolved_scenario_id != scenario_name and warning_cache is not None:
+        key = f"holder_absorption:{scenario_name}:{resolved_scenario_id}"
+        if key not in warning_cache:
+            print(
+                f"WARNING [{scenario_name}]: holder_absorption path used configured fallback "
+                f"scenario '{resolved_scenario_id}'."
+            )
+            warning_cache.add(key)
+    prefs = {holder: dict(fallback_preferences.get(holder, {})) for holder in HOLDER_TYPES}
+    for holder, holder_prefs in scenario_rows[quarter].items():
+        if holder == "__private_subbucket_shares__":
             continue
-        if scenario_id != scenario_name and warning_cache is not None:
-            key = f"holder_absorption:{scenario_name}:{scenario_id}"
-            if key not in warning_cache:
-                print(
-                    f"WARNING [{scenario_name}]: holder_absorption path used fallback scenario "
-                    f"'{scenario_id}' instead of '{scenario_name}'."
-                )
-                warning_cache.add(key)
-        prefs = {holder: dict(fallback_preferences.get(holder, {})) for holder in HOLDER_TYPES}
-        for holder, holder_prefs in scenario_rows[quarter].items():
-            if holder == "__private_subbucket_shares__":
-                continue
-            prefs.setdefault(holder, {}).update(holder_prefs)
-        if "__private_subbucket_shares__" in scenario_rows[quarter]:
-            prefs["__private_subbucket_shares__"] = scenario_rows[quarter]["__private_subbucket_shares__"]
-        return prefs
-    return fallback_preferences
+        prefs.setdefault(holder, {}).update(holder_prefs)
+    if "__private_subbucket_shares__" in scenario_rows[quarter]:
+        prefs["__private_subbucket_shares__"] = scenario_rows[quarter]["__private_subbucket_shares__"]
+    return prefs

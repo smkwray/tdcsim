@@ -14,6 +14,7 @@ import json
 import math
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -87,18 +88,85 @@ RATE_SCENARIOS = {
         "source_status": "transparent_curve_shape_stress_around_source_backed_cbo_curve",
     },
 }
+
+
+@dataclass(frozen=True)
+class RateWallScenario:
+    scenario_id: str
+    curve_id: str
+    holder_target: str
+
+
+RATEWALL_SCENARIO_REGISTRY = (
+    RateWallScenario("current_mix_baseline", "cbo_shape_preserving_baseline", "current_mix_baseline"),
+    RateWallScenario(
+        "domestic_nonbank_absorption_shift",
+        "cbo_shape_preserving_baseline",
+        "domestic_nonbank_absorption_shift",
+    ),
+    RateWallScenario(
+        "reserve_user_absorption_shift",
+        "cbo_shape_preserving_baseline",
+        "reserve_user_absorption_shift",
+    ),
+    RateWallScenario(
+        "current_mix_higher_for_longer",
+        "higher_for_longer_sensitivity",
+        "current_mix_baseline",
+    ),
+    RateWallScenario(
+        "current_mix_rapid_easing",
+        "rapid_easing_sensitivity",
+        "current_mix_baseline",
+    ),
+    RateWallScenario(
+        "domestic_nonbank_absorption_shift_higher_for_longer",
+        "higher_for_longer_sensitivity",
+        "domestic_nonbank_absorption_shift",
+    ),
+    RateWallScenario(
+        "domestic_nonbank_absorption_shift_rapid_easing",
+        "rapid_easing_sensitivity",
+        "domestic_nonbank_absorption_shift",
+    ),
+    RateWallScenario(
+        "reserve_user_absorption_shift_higher_for_longer",
+        "higher_for_longer_sensitivity",
+        "reserve_user_absorption_shift",
+    ),
+    RateWallScenario(
+        "reserve_user_absorption_shift_rapid_easing",
+        "rapid_easing_sensitivity",
+        "reserve_user_absorption_shift",
+    ),
+    RateWallScenario(
+        "current_mix_bear_steepener",
+        "bear_steepener_sensitivity",
+        "current_mix_baseline",
+    ),
+    RateWallScenario(
+        "current_mix_bull_flattener",
+        "bull_flattener_sensitivity",
+        "current_mix_baseline",
+    ),
+)
+
+
+def _ratewall_scenarios() -> tuple[RateWallScenario, ...]:
+    scenario_ids = [row.scenario_id for row in RATEWALL_SCENARIO_REGISTRY]
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise ValueError("RateWall scenario registry contains duplicate scenario IDs.")
+    unknown_curves = sorted(
+        {row.curve_id for row in RATEWALL_SCENARIO_REGISTRY} - set(RATE_SCENARIOS)
+    )
+    if unknown_curves:
+        raise ValueError(f"RateWall scenario registry references unknown curves: {unknown_curves}")
+    return RATEWALL_SCENARIO_REGISTRY
+
+
 SCENARIO_CURVE_MAP = {
-    "current_mix_baseline": "cbo_shape_preserving_baseline",
-    "domestic_nonbank_absorption_shift": "cbo_shape_preserving_baseline",
-    "reserve_user_absorption_shift": "cbo_shape_preserving_baseline",
-    "current_mix_higher_for_longer": "higher_for_longer_sensitivity",
-    "current_mix_rapid_easing": "rapid_easing_sensitivity",
-    "domestic_nonbank_absorption_shift_higher_for_longer": "higher_for_longer_sensitivity",
-    "domestic_nonbank_absorption_shift_rapid_easing": "rapid_easing_sensitivity",
-    "reserve_user_absorption_shift_higher_for_longer": "higher_for_longer_sensitivity",
-    "reserve_user_absorption_shift_rapid_easing": "rapid_easing_sensitivity",
-    "current_mix_bear_steepener": "bear_steepener_sensitivity",
-    "current_mix_bull_flattener": "bull_flattener_sensitivity",
+    row.scenario_id: row.curve_id
+    for row in _ratewall_scenarios()
 }
 
 
@@ -592,48 +660,38 @@ def _load_absorption_scenarios(
         baseline_by_category[category] = shares
         baseline_private_by_category[category] = baseline_private_split
 
-    scenarios: dict[str, dict[str, dict[str, float]]] = {
-        "current_mix_baseline": baseline_by_category,
-        "current_mix_higher_for_longer": baseline_by_category,
-        "current_mix_rapid_easing": baseline_by_category,
-        "current_mix_bear_steepener": baseline_by_category,
-        "current_mix_bull_flattener": baseline_by_category,
+    scenarios: dict[str, dict[str, dict[str, float]]] = {}
+    private_subbucket_scenarios: dict[str, dict[str, dict[str, float]]] = {}
+    registry = _ratewall_scenarios()
+    holder_target_order = {
+        target: index
+        for index, target in enumerate(dict.fromkeys(row.holder_target for row in registry))
     }
-    private_subbucket_scenarios: dict[str, dict[str, dict[str, float]]] = {
-        "current_mix_baseline": baseline_private_by_category,
-        "current_mix_higher_for_longer": baseline_private_by_category,
-        "current_mix_rapid_easing": baseline_private_by_category,
-        "current_mix_bear_steepener": baseline_private_by_category,
-        "current_mix_bull_flattener": baseline_private_by_category,
-    }
-    holder_shift_specs = [
-        ("domestic_nonbank_absorption_shift", "domestic_nonbank_absorption_shift"),
-        (
-            "domestic_nonbank_absorption_shift_higher_for_longer",
-            "domestic_nonbank_absorption_shift",
+    curve_order = {curve_id: index for index, curve_id in enumerate(RATE_SCENARIOS)}
+    holder_scenarios = sorted(
+        registry,
+        key=lambda row: (
+            holder_target_order[row.holder_target],
+            curve_order[row.curve_id],
         ),
-        (
-            "domestic_nonbank_absorption_shift_rapid_easing",
-            "domestic_nonbank_absorption_shift",
-        ),
-        ("reserve_user_absorption_shift", "reserve_user_absorption_shift"),
-        (
-            "reserve_user_absorption_shift_higher_for_longer",
-            "reserve_user_absorption_shift",
-        ),
-        (
-            "reserve_user_absorption_shift_rapid_easing",
-            "reserve_user_absorption_shift",
-        ),
-    ]
-    for scenario_id, target_key in holder_shift_specs:
-        target = tdcmix_targets[target_key]
-        scenarios[scenario_id] = {
+    )
+    for scenario in holder_scenarios:
+        if scenario.holder_target == "current_mix_baseline":
+            scenarios[scenario.scenario_id] = baseline_by_category
+            private_subbucket_scenarios[scenario.scenario_id] = baseline_private_by_category
+            continue
+        if scenario.holder_target not in tdcmix_targets:
+            raise ValueError(
+                f"RateWall scenario {scenario.scenario_id!r} references unknown holder target "
+                f"{scenario.holder_target!r}."
+            )
+        target = tdcmix_targets[scenario.holder_target]
+        scenarios[scenario.scenario_id] = {
             category: _blend_shares(shares, target, right_weight=scenario_shift_lambda_default)
             for category, shares in baseline_by_category.items()
         }
-        target_private = tdcmix_private_targets[target_key]
-        private_subbucket_scenarios[scenario_id] = {
+        target_private = tdcmix_private_targets[scenario.holder_target]
+        private_subbucket_scenarios[scenario.scenario_id] = {
             category: _blend_private_subbucket_shares(
                 baseline_private_by_category[category],
                 target_private,
@@ -981,7 +1039,17 @@ def _federal_fiscal_year_calendar_quarters(year: int) -> list[str]:
     return [f"{year - 1}Q4", f"{year}Q1", f"{year}Q2", f"{year}Q3"]
 
 
-def build_primary_flow_path(output_path: Path, *, cbo_budget_path: Path, scenario_ids: list[str]) -> tuple[pd.DataFrame, dict]:
+def build_primary_flow_path(
+    output_path: Path,
+    *,
+    cbo_budget_path: Path,
+    scenario_ids: list[str] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    selected_scenario_ids = (
+        scenario_ids
+        if scenario_ids is not None
+        else [scenario.scenario_id for scenario in _ratewall_scenarios()]
+    )
     values = _cbo_budget_values(cbo_budget_path)
     rows: list[dict] = []
     for year, metrics in sorted(values.items()):
@@ -991,7 +1059,7 @@ def build_primary_flow_path(output_path: Path, *, cbo_budget_path: Path, scenari
         net_interest = metrics.get("net_interest_bil", 0.0)
         primary_deficit = deficit_magnitude - net_interest
         for quarter in _federal_fiscal_year_calendar_quarters(year):
-            for scenario_id in scenario_ids:
+            for scenario_id in selected_scenario_ids:
                 rows.append(
                     {
                         "scenario_id": scenario_id,
@@ -1351,7 +1419,10 @@ def build_ratewall_config(
                 }
             },
         }
-        for scenario_id, curve_id in SCENARIO_CURVE_MAP.items()
+        for scenario_id, curve_id in (
+            (scenario.scenario_id, scenario.curve_id)
+            for scenario in _ratewall_scenarios()
+        )
     ]
     config = {
         "simulation_period": {"start_date": "2026-04-30", "end_date": "2036-12-31", "frequency": "W", "enable_preference_trading": False, "coarse_frequency_action": "warn"},
@@ -1421,7 +1492,6 @@ def build_all(
     coupons_primary_path = ratewall_root.parent / "tsyparty" / "data" / "interim" / "nominal_coupons_quarterly_composition.csv"
     cbo_budget_path = ratewall_root / "data" / "raw" / "cbo" / "51118-2026-02-Budget-Projections.xlsx"
     cbo_economic_path = ratewall_root / "data" / "raw" / "cbo" / "51135-2026-02-Economic-Projections.xlsx"
-    scenario_ids = list(SCENARIO_CURVE_MAP)
     holder_absorption_calibration = _load_holder_absorption_calibration(config_path)
 
     artifacts = {}
@@ -1432,7 +1502,6 @@ def build_all(
     _, artifacts["primary_flow"] = build_primary_flow_path(
         output_dir / "tdcsim_primary_flow_to_du_path.csv",
         cbo_budget_path=cbo_budget_path,
-        scenario_ids=scenario_ids,
     )
     _, artifacts["yield_curve"] = build_yield_curve_surface(
         output_dir / "tdcsim_yield_curve_surface.csv",
