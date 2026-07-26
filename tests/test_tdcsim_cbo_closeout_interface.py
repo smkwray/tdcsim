@@ -305,8 +305,19 @@ def test_file_backed_run_package_is_self_contained_for_baseline_recompile(tmp_pa
     scenario_block = cash.run_manifest["scenario"]
     assert scenario_block["referenced_files"][0]["relative_path"] == "cash_residual_override.csv"
     assert (cash.output_dir / "cash_residual_override.csv").exists()
+    # The cash fixture books a reconciliation residual to the TGA with no counterparty,
+    # so it deliberately fails the cash-closure invariant. Self-containment is a
+    # packaging property and is asserted here independently of that economic verdict.
+    assert _invariant_status(cash.run_manifest, "cash_residual_fully_booked") == "fail"
+    with pytest.raises(VerificationError, match="validation.status must be pass"):
+        verify_scenario_run(
+            cash.output_dir,
+            baseline_package=baseline.package_path,
+            attestation=baseline.attestation.path,
+        )
+    noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop-selfcontained")
     assert verify_scenario_run(
-        cash.output_dir,
+        noop.output_dir,
         baseline_package=baseline.package_path,
         attestation=baseline.attestation.path,
     )["status"] == "pass"
@@ -554,10 +565,63 @@ def test_verifier_rejects_cash_residual_true_even_if_validation_claims_pass(tmp_
     manifest = read_json(run.manifest_path)
     manifest["boundary_checks"]["cash_residual_affects_issuance_size"] = ["False", "True"]
     manifest["boundary_checks"]["cash_residual_nonfunding_flags"]["affects_issuance_size"] = ["False", "True"]
+    # This test targets the issuance-sizing boundary specifically, so the unrelated
+    # cash-closure invariant is forced to pass; otherwise validation.status short-circuits
+    # first and the assertion below would prove nothing about issuance sizing.
+    manifest["validation"]["status"] = "pass"
+    for invariant in manifest["validation"]["invariants"]:
+        invariant["status"] = "pass"
     write_json(run.manifest_path, manifest)
 
     with pytest.raises(VerificationError, match="cash_residual_affects_issuance_size must be exactly false"):
         verify_scenario_run(run.output_dir)
+
+
+def test_cash_closure_invariants_fail_an_unbooked_residual(tmp_path: Path) -> None:
+    """A residual booked to the TGA alone creates cash with no counterparty."""
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
+    cash = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run-cash")
+
+    assert _invariant_status(noop.run_manifest, "cash_residual_fully_booked") == "pass"
+    assert _invariant_status(noop.run_manifest, "tga_nonnegative") == "pass"
+    assert noop.run_manifest["validation"]["status"] == "pass"
+
+    assert _invariant_status(cash.run_manifest, "cash_residual_fully_booked") == "fail"
+    assert cash.run_manifest["validation"]["status"] == "fail"
+    assert float(cash.run_manifest["boundary_checks"]["sum_abs_unbooked_cash_residual"]) > 0.0
+
+
+def test_cash_closure_invariant_fails_a_negative_tga(tmp_path: Path) -> None:
+    """A negative TGA is an unmodeled Treasury overdraft, not a fundable position."""
+
+    import pandas as pd
+
+    from tdcsim_cbo.runner import validate_run_boundaries
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    results = pd.read_csv(run.results_path)
+    inputs_dir = run.compiled.forecast_inputs_dir
+
+    clean = validate_run_boundaries(results, inputs_dir)
+    assert clean["tga_nonnegative"] is True
+    assert clean["negative_tga_periods"] == 0
+
+    overdrawn = results.copy()
+    overdrawn.loc[overdrawn.index[-1], "TGA"] = -1_500.0
+    breached = validate_run_boundaries(overdrawn, inputs_dir)
+    assert breached["tga_nonnegative"] is False
+    assert breached["negative_tga_periods"] == 1
+    assert breached["min_tga"] == pytest.approx(-1_500.0)
+
+
+def _invariant_status(manifest: dict, invariant_id: str) -> str:
+    for invariant in manifest["validation"]["invariants"]:
+        if invariant["id"] == invariant_id:
+            return str(invariant["status"])
+    raise AssertionError(f"invariant not present in manifest: {invariant_id}")
 
 
 def test_verifier_rejects_fabricated_release_verified_grade(tmp_path: Path) -> None:

@@ -36,6 +36,11 @@ from .output import hash_output_tree, write_scenario_outputs
 from .runtime_identity import distribution_identity
 
 
+# Cash-closure checks compare accumulated stock balances, so the tolerance absorbs
+# float accumulation over a long horizon without admitting an economically real gap.
+CASH_CLOSURE_TOLERANCE = 1e-6
+
+
 class RunnerError(ValueError):
     """Raised when a compiled CBO scenario cannot run safely."""
 
@@ -237,6 +242,7 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
     fed_auction_face_max = _max_abs(results, "CBOFedAuctionRolloverAddons")
     fed_auction_face_sum = _sum_abs(results, "CBOFedAuctionRolloverAddons")
     fed_boundary_pass = fed_auction_share_max <= 1e-12 and fed_auction_face_max <= 1e-12
+    cash_closure = _cash_closure_checks(results)
     return {
         "cash_residual_nonfunding_flags": residual_flags,
         "cash_residual_affects_issuance_size": residual_flags.get("affects_issuance_size", []),
@@ -246,7 +252,63 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
         "fed_target_holder_allocation_only": fed_boundary_pass,
         "net_interest_role": "diagnostic_nonbinding",
         "remittance_deferred_asset_status": "unsupported_in_cbo_scenario_lane",
+        **cash_closure,
     }
+
+
+def _cash_closure_checks(results: pd.DataFrame) -> dict[str, Any]:
+    """Measure whether the modeled Treasury cash chain actually closes.
+
+    Two distinct defects are detected, because the CBO lane can fail either way:
+
+    * a negative TGA is an unmodeled Treasury overdraft — the run financed itself from
+      an account that does not exist in the modeled funding chain;
+    * a nonzero cash-reconciliation residual is booked to the TGA alone
+      (``sim_engine`` adds it to ``tga_change_period`` with no reserve, Fed asset, or
+      named financing instrument on the other side), so it creates or destroys cash
+      without a counterparty.
+
+    Both are reported as observed magnitudes so a consumer can see the size of the
+    breach rather than only that one occurred.
+    """
+
+    tga = _numeric_column(results, "TGA")
+    min_tga = float(tga.min()) if not tga.empty else 0.0
+    negative_tga_periods = int((tga < -CASH_CLOSURE_TOLERANCE).sum()) if not tga.empty else 0
+
+    # An operating-cash gap is only a defect where a target was actually configured;
+    # `operating_cash_path_not_configured` periods set the target to the projected
+    # balance, so measuring them would compare a value against itself.
+    targeted = results
+    if "CBOCashResidualStatus" in results.columns:
+        targeted = results[results["CBOCashResidualStatus"].astype("string") == "operating_cash_target_loaded"]
+    targeted_tga = _numeric_column(targeted, "TGA")
+    targeted_target = _numeric_column(targeted, "CBOOperatingCashTarget")
+    if targeted_tga.empty or targeted_target.empty:
+        max_gap = 0.0
+        targeted_periods = 0
+    else:
+        aligned = targeted_tga.align(targeted_target, join="inner")
+        max_gap = float((aligned[0] - aligned[1]).abs().max())
+        targeted_periods = int(len(aligned[0]))
+
+    unbooked_residual = _sum_abs(results, "CBOCashReconciliationResidual")
+    return {
+        "min_tga": min_tga,
+        "negative_tga_periods": negative_tga_periods,
+        "tga_nonnegative": negative_tga_periods == 0,
+        "max_abs_operating_cash_gap": max_gap,
+        "operating_cash_targeted_periods": targeted_periods,
+        "operating_cash_target_met": max_gap <= CASH_CLOSURE_TOLERANCE,
+        "sum_abs_unbooked_cash_residual": unbooked_residual,
+        "cash_residual_fully_booked": unbooked_residual <= CASH_CLOSURE_TOLERANCE,
+    }
+
+
+def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(frame[column], errors="coerce").dropna()
 
 
 def _simulation_dates(spec: CboScenarioSpec, inputs_dir: Path) -> tuple[str, str]:
