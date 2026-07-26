@@ -63,10 +63,44 @@ def calculate_portfolio_value_and_composition(portfolio_df, current_date, yield_
         active_portfolio['DiscountYield'] = active_portfolio['TimeToMaturity'].apply(lambda ttm: get_yield_for_maturity(ttm, yield_curve_years, yield_curve_rates, method='pchip') if ttm > TGA_FLOOR_TOLERANCE else np.nan)
 
         def calculate_row_prices(row):
-            frequency = 4 if row['SecurityType'] == 'FRN' else 2
-            clean_price = calculate_bond_market_price(row['FaceValue'], row['CouponRate'], row['MaturityDate'], current_date, row['DiscountYield'], row['SecurityType'], row.get('AdjustedPrincipal'), row.get('OriginalPrincipal'), row.get('AccruedInterest_FRN'), frequency)
-            accrued_interest = calculate_accrued_interest(row['FaceValue'], row['CouponRate'], current_date, row['IssueDate'], row['SecurityType'], row.get('AdjustedPrincipal'), row.get('AccruedInterest_FRN'), frequency)
-            dirty_value = clean_price + accrued_interest
+            security_type = row['SecurityType']
+            frequency = 4 if security_type == 'FRN' else 2
+            discounted_cash_flow_value = calculate_bond_market_price(
+                row['FaceValue'],
+                row['CouponRate'],
+                row['MaturityDate'],
+                current_date,
+                row['DiscountYield'],
+                security_type,
+                row.get('AdjustedPrincipal'),
+                row.get('OriginalPrincipal'),
+                row.get('AccruedInterest_FRN'),
+                frequency,
+            )
+            accrued_interest = calculate_accrued_interest(
+                row['FaceValue'],
+                row['CouponRate'],
+                current_date,
+                row['IssueDate'],
+                security_type,
+                row.get('AdjustedPrincipal'),
+                row.get('AccruedInterest_FRN'),
+                frequency,
+            )
+            coupon_rate = row['CouponRate']
+            # The legacy pricing kernel returns a dirty discounted-cash-flow value for
+            # coupon-bearing Fixed/TIPS, but a clean par value for FRNs/nonmarketables.
+            is_coupon_bearing_discounted_security = (
+                security_type in ('Fixed', 'TIPS')
+                and not pd.isna(coupon_rate)
+                and float(coupon_rate) > TGA_FLOOR_TOLERANCE
+            )
+            if is_coupon_bearing_discounted_security:
+                dirty_value = discounted_cash_flow_value
+                clean_price = dirty_value - accrued_interest
+            else:
+                clean_price = discounted_cash_flow_value
+                dirty_value = clean_price + accrued_interest
             dirty_price_ratio = dirty_value / row['FaceValue'] if row['FaceValue'] > TGA_FLOOR_TOLERANCE else 1.0
             return pd.Series([clean_price, accrued_interest, dirty_value, dirty_price_ratio])
         price_results = active_portfolio.apply(calculate_row_prices, axis=1)
