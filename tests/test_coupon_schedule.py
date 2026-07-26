@@ -550,3 +550,117 @@ def test_bills_and_frns_are_unaffected_by_the_coupon_security_path():
     assert calculate_issue_price_ratio('Fixed', 0.5, 0.0, 0.05) < 1.0
     assert calculate_issue_price_ratio('FRN', 2.0, 0.0, 0.05) == pytest.approx(1.0)
     assert calculate_issue_price_ratio('NonMarketable', 5.0, 0.03, 0.05) == pytest.approx(1.0)
+
+
+# --- Unified Treasury valuation ---------------------------------------------------------
+#
+# One owner of "what is this security worth at a date". Dated remaining cash flows at the
+# Appendix B semiannual convention, TIPS deflation floor as an instrument property.
+
+
+def test_unified_pricer_reproduces_appendix_b_at_issue():
+    """At issue with whole periods remaining it must reduce exactly to Appendix B."""
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    priced = value_treasury_security(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=30),
+        coupon_rate=0.0875,
+        discount_yield=0.0884,
+        face_value=100.0,
+    )
+    assert priced["clean"] == pytest.approx(99.057893, abs=5e-7)
+    assert priced["accrued"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_unified_pricer_prices_a_par_bond_at_par():
+    """A coupon equal to its yield must price at exactly 100 under the curve's own convention.
+
+    The model's yields come from a Treasury par curve, so this identity is what makes the
+    semiannual convention the correct one. Annual-effective discounting of the same numeric
+    yield misses par by roughly duration * y**2 / 4.
+    """
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    for rate in (0.04626, 0.0450, 0.0325):
+        priced = value_treasury_security(
+            settlement_date=settle,
+            maturity_date=settle + relativedelta(years=10),
+            coupon_rate=rate,
+            discount_yield=rate,
+            face_value=100.0,
+        )
+        assert priced["clean"] == pytest.approx(100.0, abs=1e-6)
+
+
+def test_unified_pricer_applies_the_tips_deflation_floor():
+    """Treasury redeems TIPS at max(original, adjusted) principal, so the floor has value.
+
+    Pricing a deflated TIPS without it values a security Treasury does not issue, and would
+    settle a Fed purchase below what the seller is contractually owed.
+    """
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    common = dict(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=7),
+        coupon_rate=0.01,
+        discount_yield=0.015,
+        security_type="TIPS",
+        face_value=100.0,
+        adjusted_principal=92.0,
+    )
+    floored = value_treasury_security(original_principal=100.0, **common)
+    unfloored = value_treasury_security(original_principal=92.0, **common)
+
+    assert floored["clean"] > unfloored["clean"]
+    assert floored["clean"] - unfloored["clean"] == pytest.approx(7.2054, abs=1e-3)
+
+
+def test_unified_pricer_splits_clean_and_accrued():
+    """Settlement is the dirty price - that invoice amount is what becomes reserves."""
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    priced = value_treasury_security(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(months=9),
+        coupon_rate=0.045,
+        discount_yield=0.046,
+        face_value=100.0,
+    )
+    assert priced["accrued"] > 1.0
+    assert priced["dirty"] == pytest.approx(priced["clean"] + priced["accrued"], abs=1e-9)
+
+
+def test_unified_pricer_honours_negative_yields():
+    """TIPS real yields were materially negative in 2020-22; a floor at zero would be wrong."""
+
+    from dateutil.relativedelta import relativedelta
+
+    from sim_pricing import value_treasury_security
+
+    settle = pd.Timestamp("2026-07-26")
+    priced = value_treasury_security(
+        settlement_date=settle,
+        maturity_date=settle + relativedelta(years=10),
+        coupon_rate=0.00125,
+        discount_yield=-0.005,
+        face_value=100.0,
+    )
+    assert priced["clean"] > 100.0
