@@ -8,6 +8,7 @@ that only detected coupons in the first year after issuance.
 import sys
 import pandas as pd
 import numpy as np
+import pytest
 
 # ============================================================
 # Function under test (will be moved to simulation_core.py)
@@ -464,3 +465,88 @@ if __name__ == "__main__":
     else:
         print("All tests passed!")
         sys.exit(0)
+
+
+# --- Treasury original-issue pricing anchors -------------------------------------------
+#
+# These are EXTERNAL anchors, not re-baselined pins: each expected value comes from Treasury's
+# own published formula or worked example (31 CFR 356 Appendix B), so they would catch a wrong
+# implementation rather than merely recording whatever the code emits.
+
+
+def test_appendix_b_worked_example_reproduces_treasury_price():
+    """31 CFR 356 App. B worked example: 30y, 8.75% coupon, 8.84% yield -> 99.057893 per 100."""
+
+    from sim_pricing import calculate_coupon_security_issue_price_ratio
+
+    price = calculate_coupon_security_issue_price_ratio(30.0, 0.0875, 0.0884) * 100.0
+    assert price == pytest.approx(99.057893, abs=5e-7)
+
+
+def test_thirty_year_discount_anchor():
+    """30y, 4.50% coupon, 4.57% yield prices at a discount near 98.863151 per 100."""
+
+    from sim_pricing import calculate_coupon_security_issue_price_ratio
+
+    price = calculate_coupon_security_issue_price_ratio(30.0, 0.0450, 0.0457) * 100.0
+    assert price == pytest.approx(98.863151, abs=5e-7)
+
+
+def test_par_identity_when_coupon_equals_yield():
+    """A coupon exactly equal to its yield prices at par - the identity the old code assumed."""
+
+    from sim_pricing import calculate_coupon_security_issue_price_ratio
+
+    for years, rate in ((30.0, 0.0457), (10.0, 0.0325), (2.0, 0.05)):
+        assert calculate_coupon_security_issue_price_ratio(years, rate, rate) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_auction_coupon_sits_on_the_eighth_point_grid():
+    """Treasury sets the coupon closest to but NOT above par, i.e. floored onto the 1/8 grid."""
+
+    from sim_pricing import calculate_auction_coupon_rate
+
+    assert calculate_auction_coupon_rate(0.0457) == pytest.approx(0.04500)
+    assert calculate_auction_coupon_rate(0.04500) == pytest.approx(0.04500)
+    assert calculate_auction_coupon_rate(0.04499) == pytest.approx(0.04375)
+    # 0.125% minimum coupon applies below the first grid step.
+    assert calculate_auction_coupon_rate(0.0005) == pytest.approx(0.00125)
+    assert calculate_auction_coupon_rate(0.0) == pytest.approx(0.00125)
+    assert calculate_auction_coupon_rate(-0.01) == pytest.approx(0.00125)
+
+
+def test_coupon_below_yield_discounts_and_above_yield_premiums():
+    """Direction test: the sign of (coupon - yield) sets the sign of (price - par)."""
+
+    from sim_pricing import calculate_coupon_security_issue_price_ratio
+
+    assert calculate_coupon_security_issue_price_ratio(10.0, 0.0400, 0.0450) < 1.0
+    assert calculate_coupon_security_issue_price_ratio(10.0, 0.0500, 0.0450) > 1.0
+
+
+def test_selected_coupon_and_price_are_consistent_at_issue():
+    """The two halves must agree: the grid coupon must price at or below par at its own yield.
+
+    This is the atomicity check. Selecting a coupon without pricing it, or pricing without
+    selecting, each leaves the pair inconsistent.
+    """
+
+    from sim_pricing import calculate_auction_coupon_rate, calculate_issue_price_ratio
+
+    for yld in (0.0457, 0.0325, 0.0499, 0.0125, 0.0626):
+        coupon = calculate_auction_coupon_rate(yld)
+        ratio = calculate_issue_price_ratio('Fixed', 10.0, coupon, yld)
+        assert coupon <= yld + 1e-12
+        assert ratio <= 1.0 + 1e-9
+        # Flooring never costs more than one full grid step of price.
+        assert ratio > 0.90
+
+
+def test_bills_and_frns_are_unaffected_by_the_coupon_security_path():
+    """Bills keep their declared discount approximation; FRNs price at par by construction."""
+
+    from sim_pricing import calculate_issue_price_ratio
+
+    assert calculate_issue_price_ratio('Fixed', 0.5, 0.0, 0.05) < 1.0
+    assert calculate_issue_price_ratio('FRN', 2.0, 0.0, 0.05) == pytest.approx(1.0)
+    assert calculate_issue_price_ratio('NonMarketable', 5.0, 0.03, 0.05) == pytest.approx(1.0)

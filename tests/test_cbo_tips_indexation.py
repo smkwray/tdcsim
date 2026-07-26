@@ -5,7 +5,7 @@ import pytest
 
 from forecast_input_builder import write_forecast_rows_csv
 from forecast_paths import load_tips_cpi_path, load_tips_real_yield_path
-from sim_pricing import calculate_tips_issue_price_ratio
+from sim_pricing import calculate_coupon_security_issue_price_ratio
 from tips_indexation import (
     build_monthly_tips_cpi_path_rows,
     build_projected_cpi_lookup_from_macro,
@@ -319,7 +319,7 @@ def test_tips_real_yield_path_and_issue_price_support_premiums(tmp_path: Path) -
     loaded = load_tips_real_yield_path(path, actuals_available_as_of="2026-06-30")
     real_yield = float(loaded.iloc[0]["real_yield_decimal"])
     coupon = float(loaded.iloc[0]["real_coupon_decimal"])
-    price = calculate_tips_issue_price_ratio(1.0, coupon, real_yield)
+    price = calculate_coupon_security_issue_price_ratio(1.0, coupon, real_yield)
 
     assert real_yield < 0.0
     assert coupon >= 0.00125

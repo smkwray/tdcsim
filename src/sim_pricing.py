@@ -33,9 +33,17 @@ def calculate_issue_price_ratio(
     """
     Returns the cash-proceeds-to-face ratio at auction.
 
-    The simulator keeps coupon-bearing nominal/TIPS/FRN/nonmarketable issuance at par for now.
-    Bills are issued at a discount using the same simple zero-coupon discount convention
-    used elsewhere in the model's pricing logic.
+    Coupon-bearing nominal notes and bonds and TIPS are priced as the present value of their
+    contractual cash flows at the auction yield. Because Treasury sets the coupon on a discrete
+    1/8-point grid, the coupon generally differs from the stop-out yield, so the price is
+    generally not par: a coupon below the yield issues at a discount, above it at a premium.
+
+    Bills are issued at a discount using the simple zero-coupon convention used elsewhere in
+    this module. That is a declared approximation to Treasury's discount/investment-rate
+    quoting, not an implementation of it.
+
+    FRNs and nonmarketables remain at par: an FRN's coupon resets to its index, so it prices at
+    par at issue by construction, and nonmarketables are not auctioned.
     """
     if _is_bill_like_fixed(security_type, maturity_years, coupon_rate):
         eff_yield = 0.0 if pd.isna(yield_at_issuance) else float(yield_at_issuance)
@@ -46,8 +54,8 @@ def calculate_issue_price_ratio(
             return max(TGA_FLOOR_TOLERANCE, 1.0 / (1.0 + eff_yield) ** maturity_val)
         except Exception:
             return 1.0
-    if security_type == 'TIPS':
-        return calculate_tips_issue_price_ratio(
+    if security_type in ('TIPS', 'Fixed'):
+        return calculate_coupon_security_issue_price_ratio(
             maturity_years,
             coupon_rate,
             yield_at_issuance,
@@ -55,39 +63,51 @@ def calculate_issue_price_ratio(
     return 1.0
 
 
-def calculate_tips_auction_coupon_rate(
-    real_yield,
+def calculate_auction_coupon_rate(
+    yield_at_issuance,
     *,
     minimum_coupon_rate=0.00125,
     coupon_increment=0.00125,
 ):
-    """Return a Treasury-style TIPS coupon rounded down to 1/8 percentage point."""
+    """Return the Treasury auction coupon: the 1/8-point grid rate closest to but not above par.
 
-    if pd.isna(real_yield):
+    Treasury establishes the coupon that gives a price closest to, but not above, par at the
+    accepted yield, subject to a 0.125% minimum (31 CFR 356 App. B). For ordinary positive
+    yields that is exactly flooring the yield onto the 1/8-point grid: a coupon at or below the
+    yield prices at or below par, so the largest grid rate not exceeding the yield is the one
+    closest to par from below. Applies to nominal notes and bonds and to TIPS real coupons.
+    """
+
+    if pd.isna(yield_at_issuance):
         return max(0.0, float(minimum_coupon_rate))
-    yld = float(real_yield)
+    yld = float(yield_at_issuance)
     increment = max(TGA_FLOOR_TOLERANCE, float(coupon_increment))
     rounded = np.floor(max(yld, 0.0) / increment) * increment
     return max(float(minimum_coupon_rate), float(rounded))
 
 
-def calculate_tips_issue_price_ratio(
+def calculate_coupon_security_issue_price_ratio(
     maturity_years,
     coupon_rate,
-    real_yield,
+    yield_at_issuance,
     *,
     frequency=2,
 ):
-    """Price new TIPS on real cash flows per dollar of original principal."""
+    """Price a new coupon security as the PV of its contractual cash flows per unit of face.
+
+    Semiannual discounting per 31 CFR 356 Appendix B. Nominal notes and bonds discount nominal
+    cash flows at the nominal auction yield; TIPS discount real cash flows at the real yield,
+    per dollar of original principal. The mathematics is identical - only the units differ.
+    """
 
     if pd.isna(maturity_years) or float(maturity_years) <= TGA_FLOOR_TOLERANCE:
         return 1.0
-    if pd.isna(real_yield):
+    if pd.isna(yield_at_issuance):
         return 1.0
     maturity_val = max(0.0, float(maturity_years))
     freq = max(1, int(round(float(frequency))))
     periods = max(1, int(round(maturity_val * freq)))
-    yld_per_period = float(real_yield) / freq
+    yld_per_period = float(yield_at_issuance) / freq
     if yld_per_period <= -1.0 + 1e-9:
         yld_per_period = -1.0 + 1e-9
     coupon_per_period = max(0.0, float(coupon_rate)) / freq
@@ -231,11 +251,13 @@ def calculate_coupon_rate(security_type, maturity_years, yield_at_issuance, tips
     if security_type == 'Fixed':
         if maturity_years <= 1.0 + TGA_FLOOR_TOLERANCE:
             return 0.0
-        else:
-            return max(0.0, yield_at_issuance)
+        # Notes and bonds carry a coupon set on Treasury's 1/8-point grid, not the stop-out
+        # yield itself. Setting coupon == yield would make every security price at exactly par
+        # by construction and understate both issue discount and the coupon/principal split.
+        return calculate_auction_coupon_rate(yield_at_issuance)
     elif security_type == 'TIPS':
         if not pd.isna(yield_at_issuance):
-            return calculate_tips_auction_coupon_rate(yield_at_issuance)
+            return calculate_auction_coupon_rate(yield_at_issuance)
         return max(0.0, tips_real_coupon)
     elif security_type == 'FRN':
         return 0.0
@@ -508,8 +530,8 @@ __all__ = [
     'calculate_issue_price_ratio',
     'calculate_face_from_proceeds_target',
     'quote_issuance_from_face_target',
-    'calculate_tips_auction_coupon_rate',
-    'calculate_tips_issue_price_ratio',
+    'calculate_auction_coupon_rate',
+    'calculate_coupon_security_issue_price_ratio',
     'infer_issue_data_for_loaded_bill',
     'get_maturity_category',
     'get_security_category_for_prefs',

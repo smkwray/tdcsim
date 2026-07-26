@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 
-from sim_pricing import calculate_tips_auction_coupon_rate
+from sim_pricing import calculate_auction_coupon_rate
 
 
 def load_tips_cpi_detail(path: str | Path) -> pd.DataFrame:
@@ -366,7 +366,7 @@ def build_tips_real_yield_path_rows(
                 "nominal_rate_decimal": nominal_rate_decimal,
                 "expected_inflation_decimal": expected_inflation,
                 "real_yield_decimal": real_yield,
-                "real_coupon_decimal": calculate_tips_auction_coupon_rate(real_yield),
+                "real_coupon_decimal": calculate_auction_coupon_rate(real_yield),
                 "expected_inflation_horizon_date": horizon_date.date().isoformat(),
                 "expected_inflation_cpi_terminal_rule": terminal_rule.get("terminal_cpi_rule", ""),
                 "terminal_annualized_cpi_growth_decimal": terminal_rule.get(
