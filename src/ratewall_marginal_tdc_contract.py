@@ -53,15 +53,15 @@ REQUIRED_SUMMARY_FIELDS = {
     "tdc_income_addendum_admission_status",
     "tdc_income_addendum_collision_status",
     "selected_support_formula",
+    "legacy_support_formula",
     "beta_assumption_id",
     "beta",
     "chi_assumption_id",
     "chi",
     "beta_times_chi",
     "tdc_amount_basis",
-    "support_formula",
-    "marginal_tdc_support_bil",
     "legacy_chi_support_diagnostic_bil",
+    "legacy_chi_support_eligible_for_main_ratio",
     "chi_selected_status",
     "same_state_status",
     "rate_shock_only_status",
@@ -100,8 +100,6 @@ def validate_ratewall_marginal_tdc_summary(summary: pd.DataFrame) -> dict[str, o
     if (beta_chi - _series(summary, "beta_times_chi")).abs().max() > 1e-12:
         return {"status": "fail", "failure_reason": "beta_times_chi identity failed"}
     support = _series(summary, "delta_tdc_ex_overlap_bil") * beta_chi
-    if (support - _series(summary, "marginal_tdc_support_bil")).abs().max() > 1e-7:
-        return {"status": "fail", "failure_reason": "marginal support identity failed"}
     split = (
         _series(summary, "delta_tdc_ex_overlap_interest_driven_excluded_bil")
         + _series(summary, "delta_tdc_ex_overlap_non_interest_admissible_bil")
@@ -138,6 +136,8 @@ def validate_ratewall_marginal_tdc_summary(summary: pd.DataFrame) -> dict[str, o
         return {"status": "fail", "failure_reason": "selected support formula failed"}
     if (support - _series(summary, "legacy_chi_support_diagnostic_bil")).abs().max() > 1e-7:
         return {"status": "fail", "failure_reason": "legacy chi diagnostic failed"}
+    if set(summary["legacy_chi_support_eligible_for_main_ratio"].astype(str)) != {"False"}:
+        return {"status": "fail", "failure_reason": "legacy chi support must be ineligible for the main ratio"}
     if set(summary["chi_selected_status"].astype(str)) != {"retired_not_selected"}:
         return {"status": "fail", "failure_reason": "chi selected status failed"}
     if set(summary["claim_boundary"].astype(str)) != {CLAIM_BOUNDARY}:
@@ -148,8 +148,8 @@ def validate_ratewall_marginal_tdc_summary(summary: pd.DataFrame) -> dict[str, o
         return {"status": "fail", "failure_reason": "shock_path_id failed"}
     if set(summary["tdc_amount_basis"].astype(str)) != {"pre_beta_ex_overlap_delta"}:
         return {"status": "fail", "failure_reason": "tdc_amount_basis failed"}
-    if set(summary["support_formula"].astype(str)) != {"delta_tdc_ex_overlap_bil * beta * chi"}:
-        return {"status": "fail", "failure_reason": "support_formula failed"}
+    if set(summary["legacy_support_formula"].astype(str)) != {"delta_tdc_ex_overlap_bil * beta * chi"}:
+        return {"status": "fail", "failure_reason": "legacy_support_formula failed"}
     for field in (
         "same_state_status",
         "shock_path_validation_status",

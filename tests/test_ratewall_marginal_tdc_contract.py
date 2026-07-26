@@ -7,8 +7,36 @@ def test_ratewall_marginal_tdc_contract_validates_support_identity() -> None:
     summary = pd.DataFrame([_summary_row()])
 
     assert validate_ratewall_marginal_tdc_summary(summary) == {"status": "pass", "rows": 1}
-    summary.loc[0, "marginal_tdc_support_bil"] = 0.6
+    summary.loc[0, "legacy_chi_support_diagnostic_bil"] = 0.6
     assert validate_ratewall_marginal_tdc_summary(summary)["status"] == "fail"
+
+
+def test_retired_chi_support_is_not_published_as_a_neutral_headline_field() -> None:
+    """The retired beta-chi object must not look like the selected one.
+
+    It previously shipped as `marginal_tdc_support_bil` with a neutral
+    `support_formula`, in the same row that declared chi `retired_not_selected`.
+    A consumer reading the obvious field got the retired construction, which also
+    reintroduced the interest component the split declares excluded.
+    """
+
+    summary = pd.DataFrame([_summary_row()])
+
+    assert "marginal_tdc_support_bil" not in summary.columns
+    assert "support_formula" not in summary.columns
+    assert summary.loc[0, "chi_selected_status"] == "retired_not_selected"
+    assert bool(summary.loc[0, "legacy_chi_support_eligible_for_main_ratio"]) is False
+    assert validate_ratewall_marginal_tdc_summary(summary) == {"status": "pass", "rows": 1}
+
+
+def test_ratewall_contract_rejects_legacy_support_marked_ratio_eligible() -> None:
+    summary = pd.DataFrame([_summary_row()])
+    summary.loc[0, "legacy_chi_support_eligible_for_main_ratio"] = True
+
+    result = validate_ratewall_marginal_tdc_summary(summary)
+
+    assert result["status"] == "fail"
+    assert "ineligible for the main ratio" in result["failure_reason"]
 
 
 def test_ratewall_marginal_tdc_contract_fails_closed_without_split_fields() -> None:
@@ -142,9 +170,9 @@ def _summary_row(
         "chi": chi,
         "beta_times_chi": beta_times_chi,
         "tdc_amount_basis": "pre_beta_ex_overlap_delta",
-        "support_formula": "delta_tdc_ex_overlap_bil * beta * chi",
-        "marginal_tdc_support_bil": support,
+        "legacy_support_formula": "delta_tdc_ex_overlap_bil * beta * chi",
         "legacy_chi_support_diagnostic_bil": support,
+        "legacy_chi_support_eligible_for_main_ratio": False,
         "chi_selected_status": "retired_not_selected",
         "same_state_status": "pass",
         "rate_shock_only_status": rate_shock_only_status,

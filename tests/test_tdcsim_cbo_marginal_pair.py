@@ -34,7 +34,7 @@ def test_marginal_tdc_pair_assembles_ratewall_summary_and_verifies(tmp_path: Pat
     assert summary.loc[0, "delta_tdc_change_bil"] == pytest.approx(3.0)
     assert summary.loc[0, "delta_overlap_bil"] == pytest.approx(1.0)
     assert summary.loc[0, "delta_tdc_ex_overlap_bil"] == pytest.approx(2.0)
-    assert summary.loc[0, "marginal_tdc_support_bil"] == pytest.approx(0.4)
+    assert summary.loc[0, "legacy_chi_support_diagnostic_bil"] == pytest.approx(0.4)
     assert summary.loc[0, "state_manifest_status"] == "pass"
     assert summary.loc[0, "tdc_amount_basis"] == "pre_beta_ex_overlap_delta"
     assert (result.output_dir / STATE_MANIFEST_FILE).exists()
@@ -150,7 +150,7 @@ def test_marginal_tdc_pair_excludes_overlap_components_from_support(tmp_path: Pa
     ).lower() == "false"
     assert excluded["marginal_component_support_bil"] == pytest.approx(0.0)
     assert summary.loc[0, "delta_tdc_ex_overlap_bil"] == pytest.approx(2.0)
-    assert summary.loc[0, "marginal_tdc_support_bil"] == pytest.approx(0.4)
+    assert summary.loc[0, "legacy_chi_support_diagnostic_bil"] == pytest.approx(0.4)
     assert verify_marginal_tdc_pair(result.output_dir)["status"] == "pass"
 
 
@@ -226,7 +226,7 @@ def test_marginal_tdc_pair_verifier_rejects_gross_delta_substitution(tmp_path: P
     spec = _pair_spec(tmp_path, baseline, shock)
     result = assemble_marginal_tdc_pair(spec, tmp_path / "pair")
     summary = pd.read_csv(result.summary_path)
-    summary.loc[0, "marginal_tdc_support_bil"] = (
+    summary.loc[0, "legacy_chi_support_diagnostic_bil"] = (
         summary.loc[0, "delta_tdc_change_bil"] * summary.loc[0, "beta"] * summary.loc[0, "chi"]
     )
     summary.to_csv(result.summary_path, index=False)
