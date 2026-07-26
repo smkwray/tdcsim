@@ -51,7 +51,9 @@ warnings=0
 
 is_self_referential() {
   case "$1" in
-    scripts/hygiene_check.sh) return 0 ;;
+    # These two files must name the banned tokens in order to ban them:
+    # hygiene_check.sh holds the pattern, .gitignore holds the stub rules.
+    scripts/hygiene_check.sh|.gitignore) return 0 ;;
   esac
   return 1
 }
@@ -132,26 +134,31 @@ if [[ -n "$fail_datamd" ]]; then
   violations=$((violations + 1))
 fi
 
-# --- Check 3: AI tool name mentions in tracked-eligible files (WARN) ---
-warn_ai=""
+# --- Check 3: AI tool name mentions in tracked-eligible files (FAIL) ---
+# The project contract states that tracked files carry no AI-tool names and that this
+# script enforces it. A warning does not enforce anything — it exits 0 and the commit
+# lands — so this check fails the run. Files that must name the tokens in order to ban
+# them are exempted in is_self_referential above.
+fail_ai=""
 for f in ${FILES[@]+"${FILES[@]}"}; do
   [[ -f "$f" ]] || continue
   if hits="$(grep -niE '\b(codex|claude|gpt[- ]?pro|gpt-?5|openai|anthropic|\borca\b|\bmako\b|\bdairy\b|\btandy\b)\b' "$f" 2>/dev/null)"; then
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
-      warn_ai+="${f}:${line}"$'\n'
+      fail_ai+="${f}:${line}"$'\n'
     done <<< "$hits"
   fi
 done
 
-if [[ -n "$warn_ai" ]]; then
-  ai_count="$(printf '%s' "$warn_ai" | grep -c .)"
-  echo "hygiene_check: WARN — ${ai_count} automation/tool-name mention(s) in tracked-eligible files:" >&2
-  printf '%s' "$warn_ai" | head -20 >&2
+if [[ -n "$fail_ai" ]]; then
+  ai_count="$(printf '%s' "$fail_ai" | grep -c .)"
+  echo "hygiene_check: FAIL — ${ai_count} automation/tool-name mention(s) in tracked-eligible files:" >&2
+  printf '%s' "$fail_ai" | head -20 >&2
   if [[ "$ai_count" -gt 20 ]]; then
     echo "  ... and $((ai_count - 20)) more." >&2
   fi
-  warnings=$((warnings + 1))
+  echo "  Fix: remove the tool name, or exempt a genuinely self-referential file." >&2
+  violations=$((violations + 1))
 fi
 
 # --- Check 4: git diff --check (FAIL); staged mode checks the index (--cached) ---
