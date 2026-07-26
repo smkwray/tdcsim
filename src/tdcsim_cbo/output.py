@@ -38,8 +38,16 @@ SUMMARY_COLUMNS = [
     "CBOFedSecondaryPurchaseCash",
     "CBOFedSecondaryPurchaseReserveEffect",
     "CBOFedSecondaryPurchaseDepositEffect",
+    "CBOFedSecondarySaleCash",
+    "CBOFedSecondarySaleReserveEffect",
+    "CBOFedSecondarySaleDepositEffect",
+    "CBOFedPrivateMaturityTDC",
     "CBOFedSyntheticSecondaryPurchases",
     "CBOFedSyntheticSecondarySales",
+    "CBOFedStockMode",
+    "CBOFedSettlementScope",
+    "CBOFedAcquisitionChannel",
+    "CBOFedSecondarySaleBuyerMix",
     "CBORemittanceCashEffect",
     "CBORemittanceStatus",
     "CB_Remittance",
@@ -765,7 +773,7 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
                     "route_stock_basis": "tdc_principal_settlement_route",
                     "residual_basis": (
                         "closing_minus_opening_less_issuance_plus_redemption;"
-                        "captures_stock_only_reallocation_rounding_and_tips_indexation"
+                        "captures_beneficial_holder_reallocation_rounding_and_tips_indexation"
                     ),
                 }
             )

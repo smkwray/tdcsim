@@ -693,30 +693,40 @@ def test_ratewall_scenario_registry_drives_catalog_and_primary_rows(tmp_path, mo
 
 def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
-    ratewall_root = repo_root.parent / "ratewall"
+    project_parent = next(
+        (
+            parent
+            for parent in repo_root.parents
+            if (parent / "ratewall").exists()
+            and (parent / "tdcmix").exists()
+            and (parent / "tsyparty").exists()
+        ),
+        repo_root.parent,
+    )
+    ratewall_root = project_parent / "ratewall"
     tdcmix_prior = (
-        repo_root.parent
+        project_parent
         / "tdcmix"
         / "data"
         / "processed"
         / "holder_absorption_prior_contract.csv"
     )
     z1_absorption = (
-        repo_root.parent
+        project_parent
         / "tdcmix"
         / "data"
         / "processed"
         / "z1_exact_holder_absorption_panel.csv"
     )
     bills_primary = (
-        repo_root.parent
+        project_parent
         / "tsyparty"
         / "data"
         / "interim"
         / "bills_quarterly_composition.csv"
     )
     coupons_primary = (
-        repo_root.parent
+        project_parent
         / "tsyparty"
         / "data"
         / "interim"

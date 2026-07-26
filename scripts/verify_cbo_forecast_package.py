@@ -235,7 +235,7 @@ CLAIM_BOUNDARY_EXCLUSIONS = {
     "does_not_claim_receipts_outlays_decomposition",
     "does_not_use_cbo_net_interest_as_cash_or_issuance_plug",
     "does_not_claim_cbo_issuance_mix",
-    "does_not_model_remittances_or_monetary_settlement_effects",
+    "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
 }
 APPROVED_OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
     "prebuilt_mspd_table3_market_derived_cohort_book_with_z1_holder_provenance_metadata; "
@@ -646,6 +646,12 @@ def _compute_run_metrics(
         "CBOFedSecondaryPurchaseCash",
         "CBOFedSecondaryPurchaseReserveEffect",
         "CBOFedSecondaryPurchaseDepositEffect",
+        "CBOFedSecondarySaleCash",
+        "CBOFedSecondarySaleReserveEffect",
+        "CBOFedSecondarySaleDepositEffect",
+        "CBOFedPrivateMaturityTDC",
+        "CBOFedAcquisitionChannel",
+        "CBOFedSecondarySaleBuyerMix",
         "CBOFedBeginStock",
         "CBOFedMaturitiesAndRedemptions",
         "CBOFedTipsPrincipalIndexation",
@@ -763,16 +769,72 @@ def _verify_fed_stock_bridge(run_id: str, rows: list[dict[str, str]]) -> None:
             if _float(row, "CBOFedHoldingsTarget") != 0.0 or _float(row, "CBOFedHoldingsTargetError") != 0.0:
                 raise ValueError(f"{run_id} row {row_index} has opening/nonapplicable Fed target sentinels")
             continue
-        if row["CBOFedStockMode"] != "synthetic_cb_treasury_stock_target_par_reallocation":
-            raise ValueError(f"{run_id} row {row_index} Fed stock mode is not explicit synthetic mode")
-        if row["CBOFedSettlementScope"] != "stock_reallocation_only_no_reserve_deposit_or_market_price_claim":
-            raise ValueError(f"{run_id} row {row_index} Fed settlement scope overclaims monetary effects")
+        if row["CBOFedStockMode"] != "synthetic_cb_treasury_stock_target_beneficial_holder":
+            raise ValueError(f"{run_id} row {row_index} Fed stock mode is not beneficial-holder mode")
+        if row["CBOFedSettlementScope"] != "beneficial_holder_with_model_dirty_value_settlement":
+            raise ValueError(f"{run_id} row {row_index} Fed settlement scope omits monetary settlement")
+        if abs(_float(row, "CBOFedPrivateMaturityTDC")) > NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} row {row_index} CB-held maturity routes principal to private TDC")
         begin_stock = _float(row, "CBOFedBeginStock")
         maturities = _float(row, "CBOFedMaturitiesAndRedemptions")
         tips_indexation = _float(row, "CBOFedTipsPrincipalIndexation")
         auction_addons = _float(row, "CBOFedAuctionRolloverAddons")
         purchases = _float(row, "CBOFedSyntheticSecondaryPurchases")
         sales = _float(row, "CBOFedSyntheticSecondarySales")
+        purchase_cash = _float(row, "CBOFedSecondaryPurchaseCash")
+        purchase_reserve = _float(row, "CBOFedSecondaryPurchaseReserveEffect")
+        purchase_deposit = _float(row, "CBOFedSecondaryPurchaseDepositEffect")
+        sale_cash = _float(row, "CBOFedSecondarySaleCash")
+        sale_reserve = _float(row, "CBOFedSecondarySaleReserveEffect")
+        sale_deposit = _float(row, "CBOFedSecondarySaleDepositEffect")
+        acquisition_channel = row["CBOFedAcquisitionChannel"]
+        if purchases > NUMERIC_TOLERANCE:
+            if purchase_cash <= NUMERIC_TOLERANCE:
+                raise ValueError(f"{run_id} row {row_index} Fed purchase has no dirty-value settlement")
+            _assert_close(
+                f"{run_id} row {row_index} Fed purchase reserve settlement",
+                purchase_reserve,
+                purchase_cash,
+                NUMERIC_TOLERANCE,
+            )
+            if purchase_deposit < -NUMERIC_TOLERANCE or purchase_deposit > purchase_cash + NUMERIC_TOLERANCE:
+                raise ValueError(f"{run_id} row {row_index} Fed purchase deposit settlement is invalid")
+            if acquisition_channel != "synthetic_secondary_purchase_to_hit_cbo_stock_path":
+                raise ValueError(f"{run_id} row {row_index} Fed purchase channel is not explicit")
+        else:
+            for label, value in (
+                ("purchase cash", purchase_cash),
+                ("purchase reserve effect", purchase_reserve),
+                ("purchase deposit effect", purchase_deposit),
+            ):
+                if abs(value) > NUMERIC_TOLERANCE:
+                    raise ValueError(f"{run_id} row {row_index} has {label} without a purchase")
+        if sales > NUMERIC_TOLERANCE:
+            if sale_cash <= NUMERIC_TOLERANCE:
+                raise ValueError(f"{run_id} row {row_index} Fed sale has no dirty-value settlement")
+            _assert_close(
+                f"{run_id} row {row_index} Fed sale reserve settlement",
+                sale_reserve,
+                -sale_cash,
+                NUMERIC_TOLERANCE,
+            )
+            if sale_deposit > NUMERIC_TOLERANCE or sale_deposit < -sale_cash - NUMERIC_TOLERANCE:
+                raise ValueError(f"{run_id} row {row_index} Fed sale deposit settlement is invalid")
+            if not row["CBOFedSecondarySaleBuyerMix"]:
+                raise ValueError(f"{run_id} row {row_index} Fed sale buyer mix is not explicit")
+            if acquisition_channel != "synthetic_secondary_sale_to_hit_cbo_stock_path":
+                raise ValueError(f"{run_id} row {row_index} Fed sale channel is not explicit")
+        else:
+            for label, value in (
+                ("sale cash", sale_cash),
+                ("sale reserve effect", sale_reserve),
+                ("sale deposit effect", sale_deposit),
+            ):
+                if abs(value) > NUMERIC_TOLERANCE:
+                    raise ValueError(f"{run_id} row {row_index} has {label} without a sale")
+        if purchases <= NUMERIC_TOLERANCE and sales <= NUMERIC_TOLERANCE:
+            if acquisition_channel != "none_required_to_hit_cbo_stock_path":
+                raise ValueError(f"{run_id} row {row_index} Fed no-transfer channel is not explicit")
         end_stock = _float(row, "CBOFedEndStock")
         expected_end = begin_stock - maturities + tips_indexation + auction_addons + purchases - sales
         _assert_close(f"{run_id} row {row_index} Fed stock bridge", end_stock, expected_end, NUMERIC_TOLERANCE)

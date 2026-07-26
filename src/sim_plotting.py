@@ -57,7 +57,7 @@ def plot_multi_results(all_results_data, config_for_plots, scenario_order=None, 
     final_graphs_to_plot = []
     processed_keys_single = set()
     cb_balance_requested = 'CB_Balances' in expanded_graphs_to_show
-    cb_related_keys = ['CB_InterestIncome', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset']
+    cb_related_keys = ['CB_TreasuryInterestCashReceived', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset']
     for key in expanded_graphs_to_show:
         is_cb_related = key in cb_related_keys
         if is_cb_related:
