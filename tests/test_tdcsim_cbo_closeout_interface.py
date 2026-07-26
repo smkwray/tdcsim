@@ -1426,5 +1426,5 @@ def test_omf_reconciliation_reports_whether_cbo_control_can_carry_the_cash_gap(t
 
     # The diagnosis reaches the manifest as an observation, not a second failure condition.
     invariant_ids = {item["id"] for item in run.run_manifest["validation"]["invariants"]}
-    assert "cash_gap_reconcilable_to_cbo_omf_control" in invariant_ids
-    assert _invariant_status(run.run_manifest, "cash_gap_reconcilable_to_cbo_omf_control") == "pass"
+    assert "operating_cash_gap_measured_against_cbo_omf_control" in invariant_ids
+    assert _invariant_status(run.run_manifest, "operating_cash_gap_measured_against_cbo_omf_control") == "pass"

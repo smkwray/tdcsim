@@ -16,7 +16,7 @@ from typing import Any
 
 import pandas as pd
 
-from forecast_paths import compiled_forecast_input_paths
+from forecast_paths import compiled_forecast_input_paths, load_cbo_fiscal_baseline
 from sim_engine import run_simulation
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
@@ -333,10 +333,21 @@ def omf_reconciliation(results: pd.DataFrame, inputs_dir: str | Path) -> dict[st
     fiscal = Path(inputs_dir) / "tdcsim_cbo_fiscal_baseline.csv"
     if not fiscal.is_file():
         return {"omf_control_available": False}
-    frame = pd.read_csv(fiscal)
+    frame = load_cbo_fiscal_baseline(fiscal)
     if "cbo_other_means_financing_bil" not in frame.columns:
         return {"omf_control_available": False}
-    omf = pd.to_numeric(frame["cbo_other_means_financing_bil"], errors="coerce").dropna()
+    raw = frame["cbo_other_means_financing_bil"]
+    omf = pd.to_numeric(raw, errors="coerce")
+    # The OMF row is a required governed input. Coercing an unparsable value to NaN and
+    # dropping it would silently shrink the control this comparison is measured against,
+    # making an unreconcilable gap look reconcilable.
+    malformed = int((omf.isna() & raw.notna()).sum())
+    if malformed:
+        raise RunnerError(
+            f"CBO fiscal baseline has {malformed} malformed cbo_other_means_financing_bil "
+            f"value(s) in {fiscal.name}"
+        )
+    omf = omf.dropna()
     max_abs_omf = float(omf.abs().max()) if not omf.empty else 0.0
     gap = float(_cash_closure_checks(results).get("max_abs_operating_cash_gap", 0.0))
     return {

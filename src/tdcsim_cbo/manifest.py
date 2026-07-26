@@ -148,25 +148,26 @@ def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
             "observed": str(boundary_checks.get("sum_abs_unbooked_cash_residual", "")),
         },
         # CBO's published "other means of financing" row is the only source-controlled
-        # account available to absorb a cash gap, and it closes CBO's own debt identity
-        # exactly at a scale of tens of billions per year. A gap larger than that control
-        # is not an OMF flow — treating it as one would be a project plug wearing a CBO
-        # label. Recorded as an observation rather than a failure because the run has
-        # already failed `tga_nonnegative` in that case; this names *why* it cannot be
-        # closed through OMF, which is what tells a reader the operating-cash path must
-        # yield instead.
+        # account that could absorb a cash gap, and it closes CBO's own debt identity
+        # exactly at a scale of tens of billions per year. The modeled gap exceeds it by
+        # roughly two orders of magnitude, so no decomposition of that control could close
+        # it and calling the difference OMF would be a project plug wearing a CBO label.
+        #
+        # Reported, not gated. The operating-cash path is a scenario proxy
+        # (source_role=scenario_assumption), so failing on its gap would fail every run
+        # against an assumption the project does not hold. Note this is NOT because
+        # tga_nonnegative already covers it — a positive but off-target TGA passes that
+        # gate while carrying a material gap. What must be visible is the comparison
+        # itself, next to the only account that could ever have absorbed it.
         {
-            "id": "cash_gap_reconcilable_to_cbo_omf_control",
-            # Always "pass": this invariant does not add a new failure condition. A run with
-            # an unreconcilable gap has already failed `tga_nonnegative`. What this records
-            # is the diagnosis — whether the gap could ever have been closed through CBO's
-            # published control, which is what tells a reader the operating-cash path (a
-            # declared scenario assumption) must yield rather than the CBO debt path.
+            "id": "operating_cash_gap_measured_against_cbo_omf_control",
             "status": "pass",
             "observed": (
-                f"reconcilable={boundary_checks.get('cash_gap_within_omf_control', 'unknown')};"
+                f"target_met={boundary_checks.get('operating_cash_target_met', 'unknown')};"
+                f"reconcilable_to_omf={boundary_checks.get('cash_gap_within_omf_control', 'unknown')};"
                 f"max_gap_bil={boundary_checks.get('max_abs_operating_cash_gap_bil', '')};"
-                f"max_cbo_omf_bil={boundary_checks.get('max_abs_cbo_omf_control_bil', '')}"
+                f"max_cbo_omf_bil={boundary_checks.get('max_abs_cbo_omf_control_bil', '')};"
+                f"targeted_periods={boundary_checks.get('operating_cash_targeted_periods', '')}"
             ),
         },
     ]

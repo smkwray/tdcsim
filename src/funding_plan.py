@@ -8,7 +8,7 @@ from typing import Any
 from sim_pricing import quote_issuance_from_face_target
 
 DEFAULT_TOLERANCE = 1e-9
-PUBLIC_MARKETABLE_SECURITY_TYPES = frozenset({"Fixed", "TIPS", "FRN", "Bill", "Note", "Bond"})
+from tdc_shared import PUBLIC_MARKETABLE_SECURITY_TYPES
 NONPUBLIC_HOLDERS = frozenset({"TrustFunds", "FedInternal", "Intragovernmental"})
 
 
