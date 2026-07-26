@@ -875,12 +875,11 @@ def _verify_fed_stock_bridge(run_id: str, rows: list[dict[str, str]]) -> None:
             end_stock - begin_stock,
             NUMERIC_TOLERANCE,
         )
-        for unsupported_column in (
-            "CBOFedSecondaryPurchaseCash",
-            "CBOFedSecondaryPurchaseReserveEffect",
-            "CBOFedSecondaryPurchaseDepositEffect",
-            "CBORemittanceCashEffect",
-        ):
+        # Fed secondary purchase cash, reserve and deposit effects are no longer required to
+        # be zero: CB is a beneficial holder and its purchases settle at dirty market value,
+        # checked above. Remittances remain unmodelled in this lane, so their cash effect
+        # must still be zero.
+        for unsupported_column in ("CBORemittanceCashEffect",):
             if abs(_float(row, unsupported_column)) > NUMERIC_TOLERANCE:
                 raise ValueError(f"{run_id} row {row_index} {unsupported_column} must remain zero in synthetic Fed mode")
         if row["CBORemittanceStatus"] != "not_modeled_cbo_primary_deficit_embeds_baseline_revenues":
