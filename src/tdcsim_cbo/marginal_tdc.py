@@ -681,9 +681,15 @@ def _assemble_summary(
                     "chi_source_status": case["chi_source_status"],
                     "beta_times_chi": beta * chi,
                     "tdc_amount_basis": TDC_AMOUNT_BASIS,
-                    "support_formula": "delta_tdc_ex_overlap_bil * beta * chi",
-                    "marginal_tdc_support_bil": delta_ex * beta * chi,
+                    # The beta-chi construction is retired, not selected. It is exported
+                    # only under the legacy_* name so an existing consumer can still find
+                    # it deliberately; it is no longer published under a neutral headline
+                    # field that reads as the selected object. The selected object is the
+                    # admissible stock and its income addendum, per
+                    # TDC_SELECTED_SUPPORT_FORMULA.
+                    "legacy_support_formula": "delta_tdc_ex_overlap_bil * beta * chi",
                     "legacy_chi_support_diagnostic_bil": delta_ex * beta * chi,
+                    "legacy_chi_support_eligible_for_main_ratio": False,
                     "chi_selected_status": TDC_CHI_SELECTED_STATUS,
                     "same_state_status": "pass",
                     "rate_shock_only_status": (
@@ -1166,9 +1172,9 @@ def _verify_summary(summary: pd.DataFrame) -> None:
         "chi",
         "beta_times_chi",
         "tdc_amount_basis",
-        "support_formula",
-        "marginal_tdc_support_bil",
+        "legacy_support_formula",
         "legacy_chi_support_diagnostic_bil",
+        "legacy_chi_support_eligible_for_main_ratio",
         "chi_selected_status",
         "state_manifest_status",
         "route_identity_status",
@@ -1202,16 +1208,16 @@ def _verify_summary(summary: pd.DataFrame) -> None:
         raise MarginalTdcPairError("marginal summary shock_path_id is invalid")
     if set(summary["tdc_amount_basis"].astype(str)) != {TDC_AMOUNT_BASIS}:
         raise MarginalTdcPairError("marginal summary TDC amount basis is invalid")
-    if set(summary["support_formula"].astype(str)) != {"delta_tdc_ex_overlap_bil * beta * chi"}:
-        raise MarginalTdcPairError("marginal summary support formula is invalid")
+    if set(summary["legacy_support_formula"].astype(str)) != {"delta_tdc_ex_overlap_bil * beta * chi"}:
+        raise MarginalTdcPairError("marginal summary legacy support formula is invalid")
     identity = _series(summary, "delta_tdc_change_bil") - _series(summary, "delta_overlap_bil")
     if (identity - _series(summary, "delta_tdc_ex_overlap_bil")).abs().max() > 1e-7:
         raise MarginalTdcPairError("marginal summary ex-overlap identity failed")
     if (_series(summary, "beta") * _series(summary, "chi") - _series(summary, "beta_times_chi")).abs().max() > 1e-12:
         raise MarginalTdcPairError("marginal summary beta_times_chi identity failed")
     support = _series(summary, "delta_tdc_ex_overlap_bil") * _series(summary, "beta") * _series(summary, "chi")
-    if (support - _series(summary, "marginal_tdc_support_bil")).abs().max() > 1e-7:
-        raise MarginalTdcPairError("marginal summary support identity failed")
+    if (support - _series(summary, "legacy_chi_support_diagnostic_bil")).abs().max() > 1e-7:
+        raise MarginalTdcPairError("marginal summary legacy support identity failed")
     split_reconciled = (
         _series(summary, "delta_tdc_ex_overlap_interest_driven_excluded_bil")
         + _series(summary, "delta_tdc_ex_overlap_non_interest_admissible_bil")
@@ -1388,7 +1394,7 @@ def _verify_components(components: pd.DataFrame, summary: pd.DataFrame) -> None:
         if abs(delta_ex - float(summary_row["delta_tdc_ex_overlap_bil"])) > 1e-7:
             raise MarginalTdcPairError("marginal component ex-overlap sum failed")
         support = float(pd.to_numeric(frame["marginal_component_support_bil"], errors="coerce").fillna(0.0).sum())
-        if abs(support - float(summary_row["marginal_tdc_support_bil"])) > 1e-7:
+        if abs(support - float(summary_row["legacy_chi_support_diagnostic_bil"])) > 1e-7:
             raise MarginalTdcPairError("marginal component support sum failed")
         interest_excluded_sum = float(
             pd.to_numeric(frame["tdc_split_component_interest_driven_excluded_bil"], errors="coerce").fillna(0.0).sum()
