@@ -54,3 +54,7 @@ plots/
 # Agent root stubs
 CLAUDE.md
 AGENTS.md
+
+# Syncthing transfer residue
+.syncthing.*
+**/.syncthing.*
