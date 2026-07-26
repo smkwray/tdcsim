@@ -243,6 +243,7 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
     fed_auction_face_sum = _sum_abs(results, "CBOFedAuctionRolloverAddons")
     fed_boundary_pass = fed_auction_share_max <= 1e-12 and fed_auction_face_max <= 1e-12
     cash_closure = _cash_closure_checks(results)
+    omf = omf_reconciliation(results, inputs)
     return {
         "cash_residual_nonfunding_flags": residual_flags,
         "cash_residual_affects_issuance_size": residual_flags.get("affects_issuance_size", []),
@@ -253,6 +254,7 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
         "net_interest_role": "diagnostic_nonbinding",
         "remittance_deferred_asset_status": "unsupported_in_cbo_scenario_lane",
         **cash_closure,
+        **omf,
     }
 
 
@@ -302,6 +304,44 @@ def _cash_closure_checks(results: pd.DataFrame) -> dict[str, Any]:
         "operating_cash_target_met": max_gap <= CASH_CLOSURE_TOLERANCE,
         "sum_abs_unbooked_cash_residual": unbooked_residual,
         "cash_residual_fully_booked": unbooked_residual <= CASH_CLOSURE_TOLERANCE,
+    }
+
+
+def omf_reconciliation(results: pd.DataFrame, inputs_dir: str | Path) -> dict[str, Any]:
+    """Test whether the modeled cash gap is reconcilable to CBO's published OMF control.
+
+    CBO's debt identity is ``debt_begin + total_deficit + other_means_financing = debt_end``,
+    and the published "other means of financing" row is a bounded reconciliation category —
+    changes in government cash balances, federal-credit cash flows, accrual-versus-paid
+    timing, agency debt. It closes CBO's own identity exactly, at a scale of tens of billions
+    per year.
+
+    So OMF authorises a *decomposition bridge*, not a plug. If the modeled cash gap exceeds
+    what the published control can carry, the honest conclusion is not that OMF absorbs it —
+    it is that the operating-cash path cannot be a hard constraint. That path declares itself
+    ``source_role=scenario_assumption`` with claim boundary
+    ``operating_cash_proxy_not_debt_target_or_issuance_supply``, whereas debt stock, total
+    deficit, and OMF are published CBO controls. The assumption yields; the controls do not.
+
+    Returns the comparison so a reader sees the magnitudes rather than only a verdict.
+    """
+
+    fiscal = Path(inputs_dir) / "tdcsim_cbo_fiscal_baseline.csv"
+    if not fiscal.is_file():
+        return {"omf_control_available": False}
+    frame = pd.read_csv(fiscal)
+    if "cbo_other_means_financing_bil" not in frame.columns:
+        return {"omf_control_available": False}
+    omf = pd.to_numeric(frame["cbo_other_means_financing_bil"], errors="coerce").dropna()
+    max_abs_omf = float(omf.abs().max()) if not omf.empty else 0.0
+    gap = float(_cash_closure_checks(results).get("max_abs_operating_cash_gap", 0.0))
+    return {
+        "omf_control_available": True,
+        "max_abs_cbo_omf_control_bil": max_abs_omf,
+        "max_abs_operating_cash_gap_bil": gap,
+        # A gap the published control cannot carry is not an OMF flow. Calling it one would
+        # be a project-created plug wearing a CBO label.
+        "cash_gap_within_omf_control": gap <= max_abs_omf + CASH_CLOSURE_TOLERANCE,
     }
 
 

@@ -147,6 +147,28 @@ def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
             "status": "pass" if boundary_checks.get("cash_residual_fully_booked") is True else "fail",
             "observed": str(boundary_checks.get("sum_abs_unbooked_cash_residual", "")),
         },
+        # CBO's published "other means of financing" row is the only source-controlled
+        # account available to absorb a cash gap, and it closes CBO's own debt identity
+        # exactly at a scale of tens of billions per year. A gap larger than that control
+        # is not an OMF flow — treating it as one would be a project plug wearing a CBO
+        # label. Recorded as an observation rather than a failure because the run has
+        # already failed `tga_nonnegative` in that case; this names *why* it cannot be
+        # closed through OMF, which is what tells a reader the operating-cash path must
+        # yield instead.
+        {
+            "id": "cash_gap_reconcilable_to_cbo_omf_control",
+            # Always "pass": this invariant does not add a new failure condition. A run with
+            # an unreconcilable gap has already failed `tga_nonnegative`. What this records
+            # is the diagnosis — whether the gap could ever have been closed through CBO's
+            # published control, which is what tells a reader the operating-cash path (a
+            # declared scenario assumption) must yield rather than the CBO debt path.
+            "status": "pass",
+            "observed": (
+                f"reconcilable={boundary_checks.get('cash_gap_within_omf_control', 'unknown')};"
+                f"max_gap_bil={boundary_checks.get('max_abs_operating_cash_gap_bil', '')};"
+                f"max_cbo_omf_bil={boundary_checks.get('max_abs_cbo_omf_control_bil', '')}"
+            ),
+        },
     ]
     return {
         "status": "pass"

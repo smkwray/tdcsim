@@ -1397,3 +1397,39 @@ def _bill_only_issuance_mix_override() -> dict:
         },
         "negative_issuance_action": "retire_shortest_public_marketable",
     }
+
+
+def test_omf_reconciliation_reports_whether_cbo_control_can_carry_the_cash_gap(tmp_path: Path) -> None:
+    """CBO's published OMF row is a bounded control, not a plug of arbitrary size.
+
+    CBO's own debt identity closes exactly through OMF at a scale of tens of billions per
+    year. A modeled cash gap larger than that control cannot be an OMF flow, and the run
+    manifest must say so - that diagnosis is what tells a reader the operating-cash path (a
+    declared scenario assumption) has to yield rather than the published CBO debt path.
+    """
+
+    import pandas as pd
+
+    from tdcsim_cbo.runner import omf_reconciliation
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    inputs_dir = run.compiled.forecast_inputs_dir
+    results = pd.read_csv(run.results_path)
+
+    clean = omf_reconciliation(results, inputs_dir)
+    assert clean["omf_control_available"] is True
+    assert clean["max_abs_cbo_omf_control_bil"] > 0.0
+    assert clean["cash_gap_within_omf_control"] is True
+
+    # A gap far larger than the published control is not reconcilable through it.
+    overdrawn = results.copy()
+    overdrawn["TGA"] = pd.to_numeric(overdrawn["TGA"], errors="coerce") - 3_000.0
+    breached = omf_reconciliation(overdrawn, inputs_dir)
+    assert breached["cash_gap_within_omf_control"] is False
+    assert breached["max_abs_operating_cash_gap_bil"] > breached["max_abs_cbo_omf_control_bil"]
+
+    # The diagnosis reaches the manifest as an observation, not a second failure condition.
+    invariant_ids = {item["id"] for item in run.run_manifest["validation"]["invariants"]}
+    assert "cash_gap_reconcilable_to_cbo_omf_control" in invariant_ids
+    assert _invariant_status(run.run_manifest, "cash_gap_reconcilable_to_cbo_omf_control") == "pass"
