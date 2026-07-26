@@ -1560,3 +1560,39 @@ def test_current_cash_mode_regression_cbo_blocks_do_not_resize_legacy_cash_issua
     assert metadata_period["CBOFundingModeActive"] == pytest.approx(0.0)
     assert metadata_period["AuctionProceeds"] == pytest.approx(baseline_period["AuctionProceeds"])
     assert metadata_period["NewDebtIssued"] == pytest.approx(baseline_period["NewDebtIssued"])
+
+
+def test_named_private_buyer_option_resolves_to_a_single_declared_route():
+    """The 100% private/nonbank buyer mix stays reachable as a *named* sensitivity.
+
+    It used to be the silent hardcoded default for every Fed sale. It is now an option a
+    scenario must ask for by name, so a consequential incidence assumption cannot ride
+    along unnoticed. This pins that it still resolves, and resolves to exactly one route.
+    """
+
+    from sim_engine import _resolve_fed_secondary_sale_buyer_mix
+
+    resolved = _resolve_fed_secondary_sale_buyer_mix(
+        pd.DataFrame(),
+        {"type": "private_domestic_nonbank", "basis": "par_or_adjusted_principal_stock"},
+    )
+
+    assert resolved == [
+        {
+            "holder_type": "Private",
+            "holder_subbucket": "domestic_nonbank_deposit_funded",
+            "share": 1.0,
+        }
+    ]
+
+
+def test_fed_sale_buyer_mix_rejects_an_unsupported_stock_basis():
+    """A basis the resolver cannot honour must raise, not fall through to a default."""
+
+    from sim_engine import _resolve_fed_secondary_sale_buyer_mix
+
+    with pytest.raises(ValueError, match="Unsupported Fed secondary sale buyer mix basis"):
+        _resolve_fed_secondary_sale_buyer_mix(
+            pd.DataFrame(),
+            {"type": "private_domestic_nonbank", "basis": "market_value"},
+        )
