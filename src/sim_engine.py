@@ -1014,8 +1014,15 @@ def _fed_secondary_dirty_value(
     *,
     interpolation_method,
     floor_zero,
+    tips_real_curve_years=None,
+    tips_real_curve_rates=None,
 ):
-    """Return dirty market value for a transferred par/adjusted-principal stock amount."""
+    """Return dirty market value for a transferred par/adjusted-principal stock amount.
+
+    TIPS carry real cash flows, so their indexed base is discounted off the real curve when
+    one is configured; the deflation floor keeps the nominal curve because it is a nominal
+    payoff. Nominal securities use the nominal curve throughout.
+    """
     debt_base = _bond_debt_base(row)
     if not np.isfinite(debt_base) or debt_base <= TGA_FLOOR_TOLERANCE:
         raise ValueError('Fed secondary transfer row has no positive stock quantity.')
@@ -1050,15 +1057,31 @@ def _fed_secondary_dirty_value(
         time_to_maturity = (maturity_date - settlement_date).total_seconds() / (
             DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60
         )
-        discount_yield = get_yield_for_maturity(
+        nominal_yield = get_yield_for_maturity(
             time_to_maturity,
             yield_curve_years,
             yield_curve_rates,
             method=interpolation_method,
             floor_zero=floor_zero,
         )
-        if pd.isna(discount_yield) or not np.isfinite(float(discount_yield)):
+        if pd.isna(nominal_yield) or not np.isfinite(float(nominal_yield)):
             raise ValueError('Fed secondary transfer row has no finite market yield.')
+        # A TIPS holds real cash flows, so its indexed base takes a real yield interpolated at
+        # REMAINING maturity — a ten-year TIPS with three years left is a three-year real-rate
+        # instrument. Discounting those flows at the nominal curve double-counts inflation
+        # relative to cash flows already fixed at today's index ratio.
+        discount_yield = nominal_yield
+        if security_type == 'TIPS' and tips_real_curve_years and tips_real_curve_rates:
+            real_yield = get_yield_for_maturity(
+                time_to_maturity,
+                tips_real_curve_years,
+                tips_real_curve_rates,
+                method=interpolation_method,
+                floor_zero=False,
+            )
+            if pd.isna(real_yield) or not np.isfinite(float(real_yield)):
+                raise ValueError('Fed secondary TIPS transfer has no finite real yield.')
+            discount_yield = real_yield
         # One owner of "what is this security worth": dated remaining cash flows at the
         # Appendix B semiannual convention, with the TIPS deflation floor applied as a
         # property of the instrument. The issue-price kernel used here previously rounded
@@ -1081,6 +1104,7 @@ def _fed_secondary_dirty_value(
             accrued_frn=row.get('AccruedInterest_FRN'),
             issue_date=issue_date,
             first_interest_payment_date=pd.to_datetime(row.get('FirstInterestPaymentDate'), errors='coerce'),
+            nominal_discount_yield=float(nominal_yield),
         )
         clean_value = float(valuation['clean']) * fraction
         accrued_interest = max(0.0, float(valuation['accrued'])) * fraction
@@ -1195,6 +1219,9 @@ def _transfer_public_marketable_debt_to_cb(
     *,
     interpolation_method='linear',
     floor_zero=True,
+
+    tips_real_curve_years=None,
+    tips_real_curve_rates=None,
 ):
     """Move public marketable debt to CB and return dirty-value settlement by seller."""
     if bond_portfolio is None or bond_portfolio.empty:
@@ -1244,6 +1271,8 @@ def _transfer_public_marketable_debt_to_cb(
             yield_curve_rates,
             interpolation_method=interpolation_method,
             floor_zero=floor_zero,
+            tips_real_curve_years=tips_real_curve_years,
+            tips_real_curve_rates=tips_real_curve_rates,
         )
         full_pricing = {**pricing}
         scale_to_full = debt_base / purchase_amount
@@ -1296,6 +1325,9 @@ def _transfer_cb_marketable_debt_to_public(
     *,
     interpolation_method='linear',
     floor_zero=True,
+
+    tips_real_curve_years=None,
+    tips_real_curve_rates=None,
 ):
     """Move CB marketable holdings to the declared public buyer vector at dirty value."""
     if bond_portfolio is None or bond_portfolio.empty:
@@ -1339,6 +1371,8 @@ def _transfer_cb_marketable_debt_to_public(
             yield_curve_rates,
             interpolation_method=interpolation_method,
             floor_zero=floor_zero,
+            tips_real_curve_years=tips_real_curve_years,
+            tips_real_curve_rates=tips_real_curve_rates,
         )
         full_pricing = {**pricing}
         scale_to_full = debt_base / sale_amount
@@ -3188,6 +3222,16 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         actual_auction_proceeds = 0.0
         issue_discount_cost_period = 0.0
         results.loc[current_date, 'IssuanceProceedsTarget'] = 0.0 if cbo_funding_mode else total_issuance_target_period
+        # Period scope: a period can transfer Fed stock without issuing, and the TIPS
+        # real curve must still be resolvable for that settlement.
+        tips_real_curve_years = []
+        tips_real_curve_rates = []
+        if cbo_funding_mode and isinstance(cbo_inputs, dict):
+            tips_real_curve_years, tips_real_curve_rates, _tips_real_curve_status = _tips_real_curve_for_date(
+                cbo_inputs.get('tips_real_yield_path'),
+                current_date,
+                cbo_scenario_id,
+            )
         if total_issuance_target_period > TGA_FLOOR_TOLERANCE:
             effective_auction_prefs_for_period = holder_preferences_for_period(
                 holder_absorption_lookup,
@@ -3207,14 +3251,6 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             issued_nonmkt = total_issuance_target_period * nonmkt_pct_profile
             marketable_fixed_rate_issuance = max(0, total_issuance_target_period - issued_tips - issued_frn - issued_nonmkt)
             issuance_supply_schedule = []
-            tips_real_curve_years = []
-            tips_real_curve_rates = []
-            if cbo_funding_mode and isinstance(cbo_inputs, dict):
-                tips_real_curve_years, tips_real_curve_rates, _tips_real_curve_status = _tips_real_curve_for_date(
-                    cbo_inputs.get('tips_real_yield_path'),
-                    current_date,
-                    cbo_scenario_id,
-                )
             tips_profile = issuance_profile.get('TIPS', {})
             if issued_tips > TGA_FLOOR_TOLERANCE and tips_profile.get('maturities'):
                 dist = tips_profile.get('maturity_distribution', [])
@@ -3535,6 +3571,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     current_yield_curve_rates,
                     interpolation_method=yield_interpolation_method,
                     floor_zero=yield_floor_zero,
+                    tips_real_curve_years=tips_real_curve_years,
+                    tips_real_curve_rates=tips_real_curve_rates,
                 )
                 if abs(fed_secondary_purchase_face - fed_purchase_shortfall) > float(
                     funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001
@@ -3584,6 +3622,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     fed_secondary_sale_buyer_mix,
                     interpolation_method=yield_interpolation_method,
                     floor_zero=yield_floor_zero,
+                    tips_real_curve_years=tips_real_curve_years,
+                    tips_real_curve_rates=tips_real_curve_rates,
                 )
                 if abs(fed_secondary_sale_face - abs(fed_purchase_shortfall)) > fed_target_tolerance:
                     raise RuntimeError(
