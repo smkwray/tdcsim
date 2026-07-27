@@ -161,6 +161,18 @@ if [[ -n "$fail_ai" ]]; then
   violations=$((violations + 1))
 fi
 
+# --- Check 3b: tracked sync/editor residue (FAIL) ---
+# A Syncthing .tmp file reached a commit and survived a cleanup that only removed its
+# sibling, because the extension scan above never looks at .tmp files. Ignore rules do not
+# untrack an already-committed file, so this checks the tracked set directly.
+residue="$(git ls-files | grep -E '(^|/)\.syncthing\.|(^|/)\..*\.sw[po]$|~$|\.orig$' || true)"
+if [[ -n "$residue" ]]; then
+  echo "hygiene_check: FAIL - tracked sync/editor residue:" >&2
+  printf '  %s\n' $residue >&2
+  echo "  Fix: git rm --cached the listed paths; ignore rules alone do not untrack them." >&2
+  violations=$((violations + 1))
+fi
+
 # --- Check 4: git diff --check (FAIL); staged mode checks the index (--cached) ---
 if [[ "$MODE" == "staged" ]]; then
   if ! git diff --cached --check 2>/dev/null; then
