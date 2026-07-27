@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tdcsim_cbo._json import read_json, write_json  # noqa: E402
+from tdcsim_cbo.consumer_challenge import build_ingest_challenge  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     MANIFEST_FILE,
     SUMMARY_FILE,
@@ -29,6 +31,7 @@ SOURCE_GRADE_ROOT = PROJECT_ROOT / "output" / "ratewall_source_grade_marginal_pa
 FLOODED_ROOT = PROJECT_ROOT / "output" / "flooded_state_scenario_20260707"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output" / "ratewall_split_pairs_20260707"
 CUMULATIVE_SPLIT_FILE = "tdcsim_ratewall_cumulative_split_input.csv"
+CHALLENGE_FILE = "tdcsim_ratewall_ingest_challenge.json"
 PAIR_INDEX_FILE = "tdcsim_ratewall_split_pair_index.csv"
 
 
@@ -84,8 +87,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     index.to_csv(output_root / PAIR_INDEX_FILE, index=False)
     cumulative = _cumulative_split_table(cumulative_frames)
     cumulative.to_csv(output_root / CUMULATIVE_SPLIT_FILE, index=False)
+    # Producer half of the export-boundary claim: state exactly what was published and which
+    # field the consumer is expected to select, so its receipt can be compared field by field
+    # rather than taken on trust.
+    write_json(
+        output_root / CHALLENGE_FILE,
+        build_ingest_challenge(
+            output_root / CUMULATIVE_SPLIT_FILE,
+            pair_id="tdcsim_ratewall_cumulative_split_input",
+            runtime_release_sha=_runtime_release_sha(),
+        ),
+    )
     print(f"wrote {output_root}")
     return 0
+
+
+def _runtime_release_sha() -> str:
+    """The commit that produced these bytes, or an explicit marker when it cannot be read."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return "unknown_no_git_identity"
+    return result.stdout.strip() or "unknown_empty_git_identity"
 
 
 def _parser() -> argparse.ArgumentParser:
