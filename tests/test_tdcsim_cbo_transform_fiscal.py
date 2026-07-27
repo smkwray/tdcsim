@@ -1,5 +1,6 @@
 import pytest
 
+from forecast_paths import OPERATING_CASH_COMPARISON_ROLE, OPERATING_CASH_OPENING_STATE_ROLE
 from tdcsim_cbo.transforms.fiscal import (
     FiscalTransformError,
     apply_cash_residual_override,
@@ -37,6 +38,10 @@ def test_operating_cash_constant_nominal_preserves_component_identity() -> None:
     assert transformed[1]["operating_cash_target_bil"] == pytest.approx(100.0)
     assert transformed[1]["tga_target_bil"] == pytest.approx(90.0)
     assert transformed[1]["construction_mode"] == "scenario_constant_nominal"
+    assert [row["runtime_role"] for row in transformed] == [
+        OPERATING_CASH_OPENING_STATE_ROLE,
+        OPERATING_CASH_COMPARISON_ROLE,
+    ]
     assert transformed[1]["claim_boundary"] == "operating_cash_proxy_not_debt_target_or_issuance_supply"
 
 

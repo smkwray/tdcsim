@@ -6,6 +6,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import date
 from typing import Any
 
+from forecast_paths import operating_cash_runtime_role
+
 
 Row = dict[str, Any]
 SCENARIO_SOURCE_ROLE = "scenario_assumption"
@@ -34,12 +36,13 @@ def apply_operating_cash_override(
 
     mode = _required_mode(override)
     if mode == "aggregate_path_file":
-        return _replacement_rows(
+        out = _replacement_rows(
             replacement_rows,
             required_columns=("period_end", "operating_cash_target_bil"),
             mode=mode,
             claim_boundary="operating_cash_proxy_not_debt_target_or_issuance_supply",
         )
+        return _assign_operating_cash_runtime_roles(out)
     if mode == "component_path_file":
         out = _replacement_rows(
             replacement_rows,
@@ -49,7 +52,7 @@ def apply_operating_cash_override(
         )
         for row in out:
             _assert_cash_identity(row)
-        return out
+        return _assign_operating_cash_runtime_roles(out)
     baseline = [dict(row) for row in rows]
     if not baseline:
         return []
@@ -64,7 +67,7 @@ def apply_operating_cash_override(
     )
     if base_index <= 0 and not inflation_index:
         base_index = 1.0
-    for row in baseline:
+    for row_index, row in enumerate(baseline):
         new = dict(row)
         if mode == "constant_nominal":
             for col, value in base_values.items():
@@ -111,7 +114,14 @@ def apply_operating_cash_override(
         else:
             raise FiscalTransformError(f"unsupported operating_cash mode: {mode}")
         _assert_cash_identity(new)
-        out.append(_mark(new, mode, claim_boundary="operating_cash_proxy_not_debt_target_or_issuance_supply"))
+        out.append(
+            _mark(
+                new,
+                mode,
+                runtime_role=operating_cash_runtime_role(row_index),
+                claim_boundary="operating_cash_proxy_not_debt_target_or_issuance_supply",
+            )
+        )
     return out
 
 
@@ -411,6 +421,12 @@ def _replacement_rows(
             raise FiscalTransformError(f"{mode} replacement row is missing columns: {missing}")
         out.append(_mark(dict(row), mode, runtime_role=runtime_role, claim_boundary=claim_boundary))
     return out
+
+
+def _assign_operating_cash_runtime_roles(rows: list[Row]) -> list[Row]:
+    for row_index, row in enumerate(rows):
+        row["runtime_role"] = operating_cash_runtime_role(row_index)
+    return rows
 
 
 def _anchors(override: Mapping[str, Any]) -> dict[int, float]:
