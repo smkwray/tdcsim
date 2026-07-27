@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from typing import Any
 
+from forecast_paths import operating_cash_runtime_role
 from simulation_calendar import SimulationPeriod
 
 
@@ -334,7 +335,7 @@ def build_operating_cash_path_rows(
         construction_mode = "constant_real_cbo_cpi_u" if inflation_scalar == 1.0 else "partial_cbo_cpi_u_indexation"
 
     rows: list[dict[str, Any]] = []
-    for period in periods:
+    for row_index, period in enumerate(periods):
         cpi_level = _inflation_index_level(period.period_end, inflation_index_by_period_end)
         target = float(base_balance_bil)
         if inflation_scalar:
@@ -360,7 +361,7 @@ def build_operating_cash_path_rows(
                 "inflation_scalar": float(inflation_scalar),
                 "component_coverage": component_coverage,
                 "source_role": "scenario_assumption",
-                "runtime_role": "hard_target",
+                "runtime_role": operating_cash_runtime_role(row_index),
                 "observation_date": observed.isoformat(),
                 "available_date": available.isoformat(),
                 "source_status": source_status,

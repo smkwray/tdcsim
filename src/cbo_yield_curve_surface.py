@@ -7,11 +7,7 @@ from datetime import date, datetime
 import math
 from typing import Any
 
-from bill_quote_basis import discount_rate_to_investment_rate
-
-
-# CBO's 3-month bill forecast is a 13-week quote; 91 days is its actual term.
-_BILL_QUOTE_DAYS = 91.0
+from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
 
 SCHEMA_VERSION = "tdcsim_yield_curve_surface_v1"
 CONSTRUCTION_METHOD = "frozen_reference_log_tenor_shift_tilt_pchip_v1"
@@ -60,7 +56,7 @@ def build_yield_curve_surface_rows(
         # propagates that error across the whole short end.
         anchor_3m = discount_rate_to_investment_rate(
             float(macro_row["cbo_3m_tbill_rate_pct"]) / 100.0,
-            _BILL_QUOTE_DAYS,
+            CBO_3M_BILL_DAYS,
         ) * 100.0
         anchor_10y = float(macro_row["cbo_10y_treasury_rate_pct"])
         available_date = str(macro_row.get("available_date") or base_curve["available_date"].isoformat())

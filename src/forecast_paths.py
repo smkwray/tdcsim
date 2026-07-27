@@ -22,6 +22,9 @@ ALLOWED_SOURCE_ROLES = frozenset(
     }
 )
 
+OPERATING_CASH_OPENING_STATE_ROLE = "opening_state_anchor"
+OPERATING_CASH_COMPARISON_ROLE = "nonbinding_comparison_target"
+
 ALLOWED_RUNTIME_ROLES = frozenset(
     {
         "hard_target",
@@ -29,8 +32,21 @@ ALLOWED_RUNTIME_ROLES = frozenset(
         "check_only",
         "reconciliation_only",
         "memo_only",
+        OPERATING_CASH_OPENING_STATE_ROLE,
+        OPERATING_CASH_COMPARISON_ROLE,
     }
 )
+
+
+def operating_cash_runtime_role(row_index: int) -> str:
+    """Return the runtime role matching the engine's ordered operating-cash use."""
+
+    if row_index < 0:
+        raise ValueError("operating-cash row index must be nonnegative")
+    if row_index == 0:
+        return OPERATING_CASH_OPENING_STATE_ROLE
+    return OPERATING_CASH_COMPARISON_ROLE
+
 
 BASELINE_INPUT_PATH_KEYS = (
     "source_contract_file",
@@ -1001,6 +1017,8 @@ def load_baseline_input_paths(
 __all__ = [
     "ALLOWED_RUNTIME_ROLES",
     "ALLOWED_SOURCE_ROLES",
+    "OPERATING_CASH_COMPARISON_ROLE",
+    "OPERATING_CASH_OPENING_STATE_ROLE",
     "BASELINE_INPUT_PATH_KEYS",
     "BaselineInputPaths",
     "FORECAST_CSV_SCHEMAS",
@@ -1017,6 +1035,7 @@ __all__ = [
     "load_tips_cpi_path",
     "load_tips_real_yield_path",
     "load_macro_forecast_path",
+    "operating_cash_runtime_role",
     "load_net_interest_bridge",
     "load_operating_cash_path",
     "load_primary_deficit_path",
