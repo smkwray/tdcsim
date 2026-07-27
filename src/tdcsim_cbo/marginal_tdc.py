@@ -104,15 +104,16 @@ def assemble_marginal_tdc_pair(
     pair_spec: str | Path | Mapping[str, Any],
     output_dir: str | Path,
     *,
+    baseline_package: str | Path | None = None,
+    attestation: str | Path | None = None,
     require_source_verification: bool = True,
 ) -> MarginalPairResult:
     """Assemble RateWall marginal TDC files from two ordinary CBO run directories.
 
-    Source runs are verified before assembly, so a passing pair proves its sources closed.
-    `require_source_verification=False` exists only for fixtures that synthesise run trees to
-    exercise other invariants: a synthetic manifest cannot carry current-runtime identity. The
-    pair manifest records which path was taken, so an unverified pair is never silently
-    indistinguishable from a verified one.
+    Source runs are replay-verified before assembly, so a passing retained pair proves its
+    sources can be reproduced from the exact baseline package and attestation. The
+    `require_source_verification=False` path exists only for fixtures that synthesise run trees;
+    the pair manifest records that bypass explicitly.
     """
 
     spec = _load_pair_spec(pair_spec)
@@ -121,8 +122,20 @@ def assemble_marginal_tdc_pair(
         raise MarginalTdcPairError(f"marginal pair output directory is not empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
 
-    baseline = _load_run("baseline", spec["baseline_run_dir"], require_source_verification=require_source_verification)
-    shock = _load_run("shock", spec["shock_run_dir"], require_source_verification=require_source_verification)
+    baseline = _load_run(
+        "baseline",
+        spec["baseline_run_dir"],
+        baseline_package=baseline_package,
+        attestation=attestation,
+        require_source_verification=require_source_verification,
+    )
+    shock = _load_run(
+        "shock",
+        spec["shock_run_dir"],
+        baseline_package=baseline_package,
+        attestation=attestation,
+        require_source_verification=require_source_verification,
+    )
     checks = _validate_pair_inputs(spec, baseline, shock)
     cases = _demand_conversion_cases(spec)
 
@@ -145,11 +158,22 @@ def assemble_marginal_tdc_pair(
     manifest = _build_pair_manifest(spec, baseline, shock, checks, out)
     manifest_path = out / MANIFEST_FILE
     write_json(manifest_path, manifest)
-    verify_marginal_tdc_pair(out)
+    verify_marginal_tdc_pair(
+        out,
+        baseline_package=baseline_package,
+        attestation=attestation,
+        require_source_verification=require_source_verification,
+    )
     return MarginalPairResult(out, summary_path, components_path, route_metadata_path, state_manifest_path, manifest_path)
 
 
-def verify_marginal_tdc_pair(pair_dir: str | Path, *, require_source_verification: bool | None = None) -> dict[str, Any]:
+def verify_marginal_tdc_pair(
+    pair_dir: str | Path,
+    *,
+    baseline_package: str | Path | None = None,
+    attestation: str | Path | None = None,
+    require_source_verification: bool | None = None,
+) -> dict[str, Any]:
     """Verify a written marginal TDC pair package and fail closed on identity drift.
 
     By default this re-verifies the source runs on whichever path the pair was assembled
@@ -166,8 +190,20 @@ def verify_marginal_tdc_pair(pair_dir: str | Path, *, require_source_verificatio
         )
     if not isinstance(spec, Mapping):
         raise MarginalTdcPairError("pair manifest pair_spec must be an object")
-    baseline = _load_run("baseline", spec["baseline_run_dir"], require_source_verification=require_source_verification)
-    shock = _load_run("shock", spec["shock_run_dir"], require_source_verification=require_source_verification)
+    baseline = _load_run(
+        "baseline",
+        spec["baseline_run_dir"],
+        baseline_package=baseline_package,
+        attestation=attestation,
+        require_source_verification=require_source_verification,
+    )
+    shock = _load_run(
+        "shock",
+        spec["shock_run_dir"],
+        baseline_package=baseline_package,
+        attestation=attestation,
+        require_source_verification=require_source_verification,
+    )
     checks = _validate_pair_inputs(spec, baseline, shock)
     _verify_manifest_checks(manifest, checks)
 
@@ -209,7 +245,14 @@ class _RunBundle:
     manifest_sha256: str = ""
 
 
-def _load_run(role: str, run_dir: str | Path, *, require_source_verification: bool = True) -> _RunBundle:
+def _load_run(
+    role: str,
+    run_dir: str | Path,
+    *,
+    baseline_package: str | Path | None = None,
+    attestation: str | Path | None = None,
+    require_source_verification: bool = True,
+) -> _RunBundle:
     root = Path(run_dir).expanduser().resolve()
     manifest_path = root / "tdcsim_cbo_run_manifest.json"
     if not manifest_path.exists():
@@ -231,12 +274,22 @@ def _load_run(role: str, run_dir: str | Path, *, require_source_verification: bo
     # passing status would imply nothing about the runs beneath it.
     verification = None
     if require_source_verification:
+        if baseline_package is None or attestation is None:
+            raise MarginalTdcPairError(
+                "replay-grade source verification requires baseline_package and attestation"
+            )
         from .verifier import VerificationError, verify_scenario_run
 
         try:
-            verification = verify_scenario_run(root)
+            verification = verify_scenario_run(
+                root,
+                baseline_package=Path(baseline_package).expanduser().resolve(),
+                attestation=Path(attestation).expanduser().resolve(),
+            )
         except VerificationError as exc:
-            raise MarginalTdcPairError(f"{role} source run does not pass current verification: {exc}") from exc
+            raise MarginalTdcPairError(f"{role} source run does not pass replay verification: {exc}") from exc
+        if verification.get("verification_grade") != "replay":
+            raise MarginalTdcPairError(f"{role} source run did not achieve replay verification grade")
     return _RunBundle(
         role=role,
         root=root,
@@ -1649,7 +1702,8 @@ def _source_run_block(run: _RunBundle) -> dict[str, Any]:
         "compiled_inputs_digest": run.manifest.get("compiled_inputs_digest", ""),
         # The pair's own status is only as good as its sources'. Binding the verification
         # outcome makes that dependency auditable rather than assumed.
-        "source_run_verification_status": (run.verification or {}).get("status", "not_verified"),
+        "source_run_verification_status": (run.verification or {}).get("status", "not_verified_fixture_bypass"),
+        "source_run_verification_grade": (run.verification or {}).get("verification_grade", "fixture_bypass"),
     }
 
 

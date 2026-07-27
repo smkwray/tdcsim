@@ -116,6 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         pair_dir=output_root / "fiscal_injection_2028_v1_pair",
         spec_dir=pair_spec_dir,
+        baseline_package=pre_package,
     )
     rows.append({"stage": "assemble_fiscal_injection_pair", "path": str(injection_pair), "status": "pass"})
 
@@ -202,6 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             pair_dir=output_root / f"flooded_state_{year}_plus_100bp_year",
             spec_dir=pair_spec_dir,
+            baseline_package=packages[year],
         )
         rows.append({"stage": f"assemble_flooded_state_{year}_plus100", "path": str(pair_dir), "status": "pass"})
 
@@ -803,13 +805,28 @@ def _pair_spec(
     }
 
 
-def _assemble_pair(*, spec: dict[str, Any], pair_dir: Path, spec_dir: Path) -> Path:
+def _assemble_pair(
+    *,
+    spec: dict[str, Any],
+    pair_dir: Path,
+    spec_dir: Path,
+    baseline_package: CboBaselinePackage,
+) -> Path:
     if pair_dir.exists():
         shutil.rmtree(pair_dir)
     spec_path = spec_dir / f"{spec['pair_id']}.json"
     write_json(spec_path, spec)
-    result = assemble_marginal_tdc_pair(spec_path, pair_dir)
-    verify_marginal_tdc_pair(result.output_dir)
+    result = assemble_marginal_tdc_pair(
+        spec_path,
+        pair_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
+    verify_marginal_tdc_pair(
+        result.output_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
     return result.output_dir
 
 

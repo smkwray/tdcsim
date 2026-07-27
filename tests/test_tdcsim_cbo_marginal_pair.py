@@ -6,6 +6,7 @@ import pytest
 
 from ratewall_marginal_tdc_contract import validate_ratewall_marginal_tdc_summary
 from tdcsim_cbo._json import sha256_file, write_json
+from tdcsim_cbo.cli import main as cbo_cli_main
 from tdcsim_cbo.marginal_tdc import (
     MANIFEST_FILE,
     SUMMARY_FILE,
@@ -745,6 +746,51 @@ def _refresh_pair_manifest_file(pair_dir: Path, filename: str) -> None:
     write_json(manifest_path, manifest)
 
 
+def test_pair_cli_source_verification_reaches_replay_grade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline, shock = _write_pair_runs(tmp_path)
+    spec = _pair_spec(tmp_path, baseline, shock)
+    spec_path = tmp_path / "pair-spec.json"
+    write_json(spec_path, spec)
+    package = tmp_path / "baseline.zip"
+    attestation = tmp_path / "attestation.json"
+    package.write_bytes(b"fixture package")
+    attestation.write_text("{}\n", encoding="utf-8")
+    calls: list[tuple[Path, Path, Path]] = []
+
+    def fake_verify(run_dir: Path, *, baseline_package: Path, attestation: Path) -> dict:
+        calls.append((Path(run_dir), Path(baseline_package), Path(attestation)))
+        return {"status": "pass", "verification_grade": "replay"}
+
+    monkeypatch.setattr("tdcsim_cbo.verifier.verify_scenario_run", fake_verify)
+    pair_dir = tmp_path / "pair-replay"
+    assert cbo_cli_main(
+        [
+            "assemble-marginal-pair",
+            "--baseline",
+            str(package),
+            "--attestation",
+            str(attestation),
+            "--pair-spec",
+            str(spec_path),
+            "--output-dir",
+            str(pair_dir),
+        ]
+    ) == 0
+    manifest = json.loads((pair_dir / MANIFEST_FILE).read_text(encoding="utf-8"))
+
+    assert calls == [
+        (baseline.resolve(), package.resolve(), attestation.resolve()),
+        (shock.resolve(), package.resolve(), attestation.resolve()),
+        (baseline.resolve(), package.resolve(), attestation.resolve()),
+        (shock.resolve(), package.resolve(), attestation.resolve()),
+    ]
+    assert manifest["baseline_run"]["source_run_verification_grade"] == "replay"
+    assert manifest["shock_run"]["source_run_verification_grade"] == "replay"
+
+
 def test_pair_rejects_a_source_run_that_does_not_pass_verification(tmp_path: Path) -> None:
     """A passing pair must prove its source runs closed, not merely that their bytes are intact.
 
@@ -757,8 +803,17 @@ def test_pair_rejects_a_source_run_that_does_not_pass_verification(tmp_path: Pat
     baseline, shock = _write_pair_runs(tmp_path)
     spec = _pair_spec(tmp_path, baseline, shock)
 
-    with pytest.raises(MarginalTdcPairError, match="does not pass current verification"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair-verified")
+    package = tmp_path / "baseline.zip"
+    attestation = tmp_path / "attestation.json"
+    package.write_bytes(b"fixture package")
+    attestation.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(MarginalTdcPairError, match="does not pass replay verification"):
+        assemble_marginal_tdc_pair(
+            spec,
+            tmp_path / "pair-verified",
+            baseline_package=package,
+            attestation=attestation,
+        )
 
 
 def test_pair_manifest_records_no_host_absolute_source_paths(tmp_path: Path) -> None:

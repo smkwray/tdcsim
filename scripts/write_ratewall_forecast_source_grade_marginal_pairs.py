@@ -204,8 +204,17 @@ def _process_year(
     )
     spec_path = pair_spec_dir / f"{spec['pair_id']}.json"
     write_json(spec_path, spec)
-    result = assemble_marginal_tdc_pair(spec_path, pair_dir)
-    verified = verify_marginal_tdc_pair(result.output_dir)
+    result = assemble_marginal_tdc_pair(
+        spec_path,
+        pair_dir,
+        baseline_package=export.package_zip,
+        attestation=export.attestation_path,
+    )
+    verified = verify_marginal_tdc_pair(
+        result.output_dir,
+        baseline_package=export.package_zip,
+        attestation=export.attestation_path,
+    )
     print(f"{year}: {verified['status']} {result.output_dir}")
 
 

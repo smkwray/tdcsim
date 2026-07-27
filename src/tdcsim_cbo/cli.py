@@ -44,10 +44,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify.add_argument("--attestation", type=Path)
 
     marginal_pair = sub.add_parser("assemble-marginal-pair", help="Assemble a RateWall marginal TDC pair")
+    _add_baseline_args(marginal_pair)
     marginal_pair.add_argument("--pair-spec", required=True, type=Path)
     marginal_pair.add_argument("--output-dir", required=True, type=Path)
 
     verify_marginal_pair = sub.add_parser("verify-marginal-pair", help="Verify a RateWall marginal TDC pair")
+    _add_baseline_args(verify_marginal_pair)
     verify_marginal_pair.add_argument("--pair-dir", required=True, type=Path)
 
     export_forecast = sub.add_parser("export-forecast-state", help="Export a derived forecast opening-state package")
@@ -59,11 +61,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "assemble-marginal-pair":
-        result = assemble_marginal_tdc_pair(args.pair_spec, args.output_dir)
+        result = assemble_marginal_tdc_pair(
+            args.pair_spec,
+            args.output_dir,
+            baseline_package=args.baseline,
+            attestation=args.attestation,
+        )
         print(result.manifest_path)
         return 0
     if args.command == "verify-marginal-pair":
-        result = verify_marginal_tdc_pair(args.pair_dir)
+        result = verify_marginal_tdc_pair(
+            args.pair_dir,
+            baseline_package=args.baseline,
+            attestation=args.attestation,
+        )
         print(result["status"])
         return 0
     if args.command == "export-forecast-state":
