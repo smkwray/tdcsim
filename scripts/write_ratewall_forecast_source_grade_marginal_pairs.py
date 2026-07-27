@@ -28,6 +28,7 @@ from tdcsim_cbo import (  # noqa: E402
     run_no_shock_rollforward,
 )
 from tdcsim_cbo._json import canonical_json_sha256, read_json, sha256_file, write_json  # noqa: E402
+from tdcsim_cbo.campaign_store import register_source_run  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     DENOMINATOR_EQUIVALENCE_KEY,
     OBJECT_ID,
@@ -184,6 +185,18 @@ def _process_year(
     marker = beta_schedule_path.parent / "BETA_SCHEDULE_READY"
     if not marker.exists():
         raise SystemExit(f"RateWall beta schedule readiness marker absent at assembly: {marker}")
+    register_source_run(
+        output_root,
+        baseline_run_dir,
+        baseline_package=export.package_zip,
+        attestation=export.attestation_path,
+    )
+    register_source_run(
+        output_root,
+        shock_run_dir,
+        baseline_package=export.package_zip,
+        attestation=export.attestation_path,
+    )
     spec = _pair_spec(
         year=year,
         window=window,
@@ -204,8 +217,17 @@ def _process_year(
     )
     spec_path = pair_spec_dir / f"{spec['pair_id']}.json"
     write_json(spec_path, spec)
-    result = assemble_marginal_tdc_pair(spec_path, pair_dir)
-    verified = verify_marginal_tdc_pair(result.output_dir)
+    result = assemble_marginal_tdc_pair(
+        spec_path,
+        pair_dir,
+        baseline_package=export.package_zip,
+        attestation=export.attestation_path,
+    )
+    verified = verify_marginal_tdc_pair(
+        result.output_dir,
+        baseline_package=export.package_zip,
+        attestation=export.attestation_path,
+    )
     print(f"{year}: {verified['status']} {result.output_dir}")
 
 
@@ -461,8 +483,8 @@ def _pair_spec(
         "opening_route_stock_mmf_bil": "",
         "opening_route_stock_foreign_bil": float(by_holder.get("Foreign", 0)),
         "opening_route_stock_fed_bil": float(by_holder.get("CB", 0)),
-        "baseline_run_dir": str(baseline_run_dir),
-        "shock_run_dir": str(shock_run_dir),
+        "baseline_run_id": baseline_manifest["run_id"],
+        "shock_run_id": shock_manifest["run_id"],
         "baseline_scenario_id": baseline_scenario_id,
         "shock_scenario_id": shock_scenario_id,
         "object_id": OBJECT_ID,

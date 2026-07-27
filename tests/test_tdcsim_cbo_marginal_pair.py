@@ -1,11 +1,23 @@
 import json
+import shutil
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import tdcsim_cbo.marginal_tdc as marginal_tdc_module
+
 from ratewall_marginal_tdc_contract import validate_ratewall_marginal_tdc_summary
-from tdcsim_cbo._json import sha256_file, write_json
+from tdcsim_cbo import CboScenarioSpec, run_cbo_scenario
+from tdcsim_cbo._json import canonical_json_sha256, read_json, sha256_file, write_json
+from tdcsim_cbo.campaign_store import (
+    locate_source_run_catalog,
+    register_source_run,
+    resolve_source_run,
+    write_fixture_source_run_catalog,
+)
+from tdcsim_cbo.cli import main as cbo_cli_main
 from tdcsim_cbo.marginal_tdc import (
     MANIFEST_FILE,
     SUMMARY_FILE,
@@ -20,6 +32,8 @@ from tdcsim_cbo.marginal_tdc import (
     assemble_marginal_tdc_pair,
     verify_marginal_tdc_pair,
 )
+from tdcsim_cbo.verifier import verify_scenario_run
+from test_tdcsim_cbo_closeout_interface import _runner_baseline_and_scenarios
 
 
 def test_marginal_tdc_pair_assembles_ratewall_summary_and_verifies(tmp_path: Path) -> None:
@@ -183,8 +197,8 @@ def test_two_state_pairs_may_differ_across_pairs_without_cross_state_delta(tmp_p
         opening_tdc_stock=20.0,
     )
 
-    result_a = assemble_marginal_tdc_pair(spec_a, tmp_path / "pair-a", require_source_verification=False)
-    result_b = assemble_marginal_tdc_pair(spec_b, tmp_path / "pair-b", require_source_verification=False)
+    result_a = assemble_marginal_tdc_pair(spec_a, tmp_path / "a" / "pair-a", require_source_verification=False)
+    result_b = assemble_marginal_tdc_pair(spec_b, tmp_path / "b" / "pair-b", require_source_verification=False)
 
     summary_a = pd.read_csv(result_a.summary_path)
     summary_b = pd.read_csv(result_b.summary_path)
@@ -533,7 +547,12 @@ def _pair_spec(
     state_id: str = "fixture_state",
     state_fingerprint: str = "a" * 64,
     opening_tdc_stock: float = 10.0,
+    write_fixture_catalog: bool = True,
 ) -> dict:
+    if write_fixture_catalog:
+        write_fixture_source_run_catalog(tmp_path, [baseline, shock])
+    baseline_manifest = json.loads((baseline / "tdcsim_cbo_run_manifest.json").read_text(encoding="utf-8"))
+    shock_manifest = json.loads((shock / "tdcsim_cbo_run_manifest.json").read_text(encoding="utf-8"))
     return {
         "schema_version": "tdcsim_cbo_marginal_tdc_pair_v1",
         "pair_id": "fixture_pair",
@@ -557,8 +576,8 @@ def _pair_spec(
         "opening_tdc_stock_bil": opening_tdc_stock,
         "opening_route_stock_total_bil": opening_tdc_stock,
         "opening_route_stock_domestic_nonbank_bil": opening_tdc_stock,
-        "baseline_run_dir": str(baseline),
-        "shock_run_dir": str(shock),
+        "baseline_run_id": baseline_manifest["run_id"],
+        "shock_run_id": shock_manifest["run_id"],
         "baseline_scenario_id": "baseline_v1",
         "shock_scenario_id": "shock_v1",
         "object_id": OBJECT_ID,
@@ -742,7 +761,55 @@ def _refresh_pair_manifest_file(pair_dir: Path, filename: str) -> None:
     path = pair_dir / filename
     manifest["files"][filename]["sha256"] = sha256_file(path)
     manifest["files"][filename]["bytes"] = path.stat().st_size
+    manifest["pair_manifest_config_sha256"] = canonical_json_sha256(
+        {key: value for key, value in manifest.items() if key != "pair_manifest_config_sha256"}
+    )
     write_json(manifest_path, manifest)
+
+
+def test_pair_cli_source_verification_reaches_replay_grade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline, shock = _write_pair_runs(tmp_path)
+    spec = _pair_spec(tmp_path, baseline, shock)
+    spec_path = tmp_path / "pair-spec.json"
+    write_json(spec_path, spec)
+    package = tmp_path / "baseline.zip"
+    attestation = tmp_path / "attestation.json"
+    package.write_bytes(b"fixture package")
+    attestation.write_text("{}\n", encoding="utf-8")
+    calls: list[tuple[Path, Path, Path]] = []
+
+    def fake_verify(run_dir: Path, *, baseline_package: Path, attestation: Path) -> dict:
+        calls.append((Path(run_dir), Path(baseline_package), Path(attestation)))
+        return {"status": "pass", "verification_grade": "replay"}
+
+    monkeypatch.setattr("tdcsim_cbo.verifier.verify_scenario_run", fake_verify)
+    pair_dir = tmp_path / "pair-replay"
+    assert cbo_cli_main(
+        [
+            "assemble-marginal-pair",
+            "--baseline",
+            str(package),
+            "--attestation",
+            str(attestation),
+            "--pair-spec",
+            str(spec_path),
+            "--output-dir",
+            str(pair_dir),
+        ]
+    ) == 0
+    manifest = json.loads((pair_dir / MANIFEST_FILE).read_text(encoding="utf-8"))
+
+    assert calls == [
+        (baseline.resolve(), package.resolve(), attestation.resolve()),
+        (shock.resolve(), package.resolve(), attestation.resolve()),
+        (baseline.resolve(), package.resolve(), attestation.resolve()),
+        (shock.resolve(), package.resolve(), attestation.resolve()),
+    ]
+    assert manifest["baseline_run"]["source_run_verification_grade"] == "replay"
+    assert manifest["shock_run"]["source_run_verification_grade"] == "replay"
 
 
 def test_pair_rejects_a_source_run_that_does_not_pass_verification(tmp_path: Path) -> None:
@@ -757,27 +824,187 @@ def test_pair_rejects_a_source_run_that_does_not_pass_verification(tmp_path: Pat
     baseline, shock = _write_pair_runs(tmp_path)
     spec = _pair_spec(tmp_path, baseline, shock)
 
-    with pytest.raises(MarginalTdcPairError, match="does not pass current verification"):
-        assemble_marginal_tdc_pair(spec, tmp_path / "pair-verified")
+    package = tmp_path / "baseline.zip"
+    attestation = tmp_path / "attestation.json"
+    package.write_bytes(b"fixture package")
+    attestation.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(MarginalTdcPairError, match="does not pass replay verification"):
+        assemble_marginal_tdc_pair(
+            spec,
+            tmp_path / "pair-verified",
+            baseline_package=package,
+            attestation=attestation,
+        )
 
 
-def test_pair_manifest_records_no_host_absolute_source_paths(tmp_path: Path) -> None:
-    """Retained pairs must survive their campaign root moving.
+def test_pair_campaign_moves_without_host_absolute_manifest_paths(tmp_path: Path) -> None:
+    """Every retained reference must survive the original campaign root disappearing."""
 
-    A host-absolute run_dir made a pair unverifiable once its campaign was relocated or
-    restored elsewhere, against the project's package-relative identity rule. The source run
-    is identified by run_id and manifest hash instead.
-    """
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    baseline, shock = _write_pair_runs(campaign)
+    spec = _pair_spec(campaign, baseline, shock)
+    pair_dir = campaign / "pairs" / "fixture_pair"
+    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=pair_dir)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
 
-    baseline, shock = _write_pair_runs(tmp_path)
-    spec = _pair_spec(tmp_path, baseline, shock)
-    result = assemble_marginal_tdc_pair(spec, require_source_verification=False, output_dir=tmp_path / "pair")
-    manifest = json.loads((result.output_dir / "tdcsim_ratewall_marginal_tdc_pair_manifest.json").read_text())
+    def scan(value: object, path: str = "manifest") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                scan(child, f"{path}/{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                scan(child, f"{path}/{index}")
+        elif isinstance(value, str):
+            assert not Path(value).is_absolute(), f"{path} carries a host-absolute path: {value}"
 
-    for role in ("baseline_run", "shock_run"):
-        block = manifest[role]
-        assert "run_dir" not in block
-        assert block["run_id"]
-        assert len(block["manifest_sha256"]) == 64
-        for value in block.values():
-            assert not str(value).startswith("/"), f"{role} carries a host-absolute reference"
+    scan(manifest)
+    scan(json.loads(locate_source_run_catalog(pair_dir).read_text(encoding="utf-8")), path="catalog")
+    moved = tmp_path / "moved-campaign"
+    shutil.copytree(campaign, moved)
+    shutil.move(campaign, tmp_path / "original-campaign-unavailable")
+
+    assert verify_marginal_tdc_pair(moved / "pairs" / "fixture_pair")["status"] == "pass"
+
+
+def test_replay_campaign_verifies_after_relocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_package, scenarios = _runner_baseline_and_scenarios(tmp_path / "inputs")
+    work = tmp_path / "work"
+    baseline_run = run_cbo_scenario(
+        baseline_package,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        work / "baseline",
+        output_profile="summary",
+    )
+    baseline_manifest = read_json(baseline_run.manifest_path)
+    simulation = baseline_manifest["simulation"]
+    shock_surface = tmp_path / "inputs" / "plus100bp.csv"
+    _write_relocation_shock_surface(
+        baseline_run.compiled.forecast_inputs_dir / "tdcsim_yield_curve_surface.csv",
+        shock_surface,
+        shock_start=date.fromisoformat(simulation["start_date"]),
+        shock_end=date.fromisoformat(simulation["end_date"]),
+    )
+    shock_scenario = read_json(scenarios["noop"])
+    shock_scenario["scenario_id"] = "relocation_plus100bp_v1"
+    shock_scenario["overrides"] = {
+        "nominal_yield_curve": {
+            "mode": "full_surface_file",
+            "file": {
+                "relative_path": shock_surface.name,
+                "sha256": sha256_file(shock_surface),
+                "media_type": "text/csv",
+            },
+        }
+    }
+    shock_scenario_path = tmp_path / "inputs" / "relocation-plus100bp.json"
+    write_json(shock_scenario_path, shock_scenario)
+    shock_run = run_cbo_scenario(
+        baseline_package,
+        CboScenarioSpec.from_file(shock_scenario_path),
+        work / "shock",
+        output_profile="summary",
+    )
+
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    for run in (baseline_run, shock_run):
+        register_source_run(
+            campaign,
+            run.output_dir,
+            baseline_package=baseline_package.package_path,
+            attestation=baseline_package.attestation.path,
+        )
+    spec = _pair_spec(
+        campaign,
+        baseline_run.output_dir,
+        shock_run.output_dir,
+        write_fixture_catalog=False,
+    )
+    row_metadata = baseline_manifest["output_manifest"]["row_metadata"]
+    spec.update(
+        {
+            "pair_id": "relocation_replay_pair",
+            "opening_state_date": simulation["start_date"],
+            "actuals_available_as_of": row_metadata["actuals_available_as_of"],
+            "source_vintage": row_metadata["source_vintage"],
+            "horizon_start_date": simulation["start_date"],
+            "horizon_end_date": simulation["end_date"],
+            "baseline_scenario_id": baseline_manifest["scenario"]["scenario_id"],
+            "shock_scenario_id": shock_run.run_manifest["scenario"]["scenario_id"],
+        }
+    )
+    original_classifier = marginal_tdc_module._classify_deposit_creation_split
+
+    def relocation_classifier(row: dict, delta: float, included_ex_overlap: bool) -> dict:
+        if included_ex_overlap and str(row.get("component_family") or "") == "secondary_trades":
+            return {
+                "deposit_creation_driver_bucket": "non_interest_auction_absorption_admissible",
+                "admission_status": "admitted_non_interest_driver",
+                "collision_family": "none",
+                "bucket_reason": "relocation_test_non_interest_component",
+                "admitted": True,
+                "excluded": False,
+                "non_interest_admissible_bil": delta,
+                "interest_driven_excluded_bil": 0.0,
+                "out_of_scope_excluded_bil": 0.0,
+            }
+        return original_classifier(row, delta, included_ex_overlap)
+
+    monkeypatch.setattr(marginal_tdc_module, "_classify_deposit_creation_split", relocation_classifier)
+    pair = assemble_marginal_tdc_pair(spec, campaign / "pairs" / "relocation_replay_pair")
+    assert pair.manifest_path.exists()
+
+    moved = tmp_path / "moved-replay-campaign"
+    shutil.copytree(campaign, moved)
+    shutil.move(campaign, tmp_path / "original-replay-campaign-unavailable")
+    moved_pair = moved / "pairs" / "relocation_replay_pair"
+    assert verify_marginal_tdc_pair(moved_pair)["status"] == "pass"
+
+    catalog = locate_source_run_catalog(moved_pair)
+    for run_id in (spec["baseline_run_id"], spec["shock_run_id"]):
+        source = resolve_source_run(catalog, run_id)
+        verified = verify_scenario_run(
+            source.root,
+            baseline_package=source.baseline_package,
+            attestation=source.attestation,
+        )
+        assert verified["verification_grade"] == "replay"
+
+
+def _write_relocation_shock_surface(
+    baseline_surface: Path,
+    output_path: Path,
+    *,
+    shock_start: date,
+    shock_end: date,
+) -> None:
+    frame = pd.read_csv(baseline_surface, dtype=str)
+    rows = [row.to_dict() for _, row in frame.iterrows()]
+    tenors = sorted(set(frame["tenor_years"]), key=float)
+    for boundary in (shock_start, shock_end):
+        for tenor in tenors:
+            candidates = [
+                row
+                for row in rows
+                if row["tenor_years"] == tenor and date.fromisoformat(row["curve_date"]) <= boundary
+            ]
+            if not candidates:
+                candidates = [row for row in rows if row["tenor_years"] == tenor]
+            selected = dict(sorted(candidates, key=lambda row: row["curve_date"])[-1])
+            selected["curve_date"] = boundary.isoformat()
+            rows.append(selected)
+    keyed = {(row["curve_date"], row["tenor_years"]): dict(row) for row in rows}
+    output = pd.DataFrame(sorted(keyed.values(), key=lambda row: (row["curve_date"], float(row["tenor_years"]))))
+    dates = pd.to_datetime(output["curve_date"]).dt.date
+    shocked = (dates >= shock_start) & (dates < shock_end)
+    output["nominal_rate_decimal"] = pd.to_numeric(output["nominal_rate_decimal"])
+    output.loc[shocked, "nominal_rate_decimal"] += 0.01
+    for column in ("nominal_rate", "anchor_3m_pct", "anchor_10y_pct"):
+        if column in output.columns:
+            output[column] = pd.to_numeric(output[column], errors="coerce")
+            output.loc[shocked & output[column].notna(), column] += 1.0
+    output.to_csv(output_path, index=False)

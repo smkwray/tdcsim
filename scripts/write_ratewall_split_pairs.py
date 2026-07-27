@@ -17,6 +17,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tdcsim_cbo._json import read_json, write_json  # noqa: E402
+from tdcsim_cbo.campaign_store import (  # noqa: E402
+    locate_source_run_catalog,
+    register_source_run,
+    resolve_source_run,
+)
 from tdcsim_cbo.consumer_challenge import (  # noqa: E402
     build_handoff_package_manifest,
     build_ingest_challenge,
@@ -74,6 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pair_dir = output_root / source_dir.name
             copied_spec = spec_out / spec_path.name
             write_json(copied_spec, dict(spec))
+            _import_source_runs(spec, locate_source_run_catalog(spec_path), output_root)
             result = assemble_marginal_tdc_pair(copied_spec, pair_dir)
             verified = verify_marginal_tdc_pair(result.output_dir)
             index_rows.append(
@@ -137,6 +143,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--campaign-id", required=True)
     parser.add_argument("--force", action="store_true")
     return parser
+
+
+def _import_source_runs(spec: Mapping[str, Any], source_catalog: Path, output_root: Path) -> None:
+    for key in ("baseline_run_id", "shock_run_id"):
+        source = resolve_source_run(source_catalog, str(spec[key]))
+        if source.baseline_package is None or source.attestation is None:
+            raise SystemExit(f"source campaign lacks replay inputs for {source.run_id}")
+        register_source_run(
+            output_root,
+            source.root,
+            baseline_package=source.baseline_package,
+            attestation=source.attestation,
+        )
 
 
 def _specs(root: Path) -> list[Path]:

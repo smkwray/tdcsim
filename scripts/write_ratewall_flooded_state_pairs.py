@@ -29,6 +29,7 @@ from tdcsim_cbo import (  # noqa: E402
     run_no_shock_rollforward,
 )
 from tdcsim_cbo._json import canonical_json_sha256, read_json, sha256_file, write_json  # noqa: E402
+from tdcsim_cbo.campaign_store import register_source_run  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     DENOMINATOR_EQUIVALENCE_KEY,
     FISCAL_INJECTION_DENOMINATOR_EQUIVALENCE_KEY,
@@ -97,6 +98,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         work_root,
         force=args.force,
     )
+    register_source_run(
+        output_root,
+        baseline_run,
+        baseline_package=pre_package.package_path,
+        attestation=pre_package.attestation.path,
+    )
+    register_source_run(
+        output_root,
+        injection_run,
+        baseline_package=pre_package.package_path,
+        attestation=pre_package.attestation.path,
+    )
     injection_pair = _assemble_pair(
         spec=_pair_spec(
             pair_id="fiscal_injection_2028_v1_pair",
@@ -116,6 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         pair_dir=output_root / "fiscal_injection_2028_v1_pair",
         spec_dir=pair_spec_dir,
+        baseline_package=pre_package,
     )
     rows.append({"stage": "assemble_fiscal_injection_pair", "path": str(injection_pair), "status": "pass"})
 
@@ -183,6 +197,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             force=args.force,
             injection_paths=injection_paths if year == 2028 else None,
         )
+        register_source_run(
+            output_root,
+            baseline_run_dir,
+            baseline_package=packages[year].package_path,
+            attestation=packages[year].attestation.path,
+        )
+        register_source_run(
+            output_root,
+            shock_run_dir,
+            baseline_package=packages[year].package_path,
+            attestation=packages[year].attestation.path,
+        )
         pair_dir = _assemble_pair(
             spec=_pair_spec(
                 pair_id=f"flooded_state_{year}_plus100bp_year_pair",
@@ -202,6 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             pair_dir=output_root / f"flooded_state_{year}_plus_100bp_year",
             spec_dir=pair_spec_dir,
+            baseline_package=packages[year],
         )
         rows.append({"stage": f"assemble_flooded_state_{year}_plus100", "path": str(pair_dir), "status": "pass"})
 
@@ -784,8 +811,8 @@ def _pair_spec(
         "opening_route_stock_bank_bil": float(by_holder.get("Banks", 0)),
         "opening_route_stock_foreign_bil": float(by_holder.get("Foreign", 0)),
         "opening_route_stock_fed_bil": float(by_holder.get("CB", 0)),
-        "baseline_run_dir": str(baseline_run_dir),
-        "shock_run_dir": str(shock_run_dir),
+        "baseline_run_id": baseline_manifest["run_id"],
+        "shock_run_id": shock_manifest["run_id"],
         "baseline_scenario_id": baseline_scenario_id,
         "shock_scenario_id": shock_scenario_id,
         "object_id": object_id,
@@ -803,13 +830,28 @@ def _pair_spec(
     }
 
 
-def _assemble_pair(*, spec: dict[str, Any], pair_dir: Path, spec_dir: Path) -> Path:
+def _assemble_pair(
+    *,
+    spec: dict[str, Any],
+    pair_dir: Path,
+    spec_dir: Path,
+    baseline_package: CboBaselinePackage,
+) -> Path:
     if pair_dir.exists():
         shutil.rmtree(pair_dir)
     spec_path = spec_dir / f"{spec['pair_id']}.json"
     write_json(spec_path, spec)
-    result = assemble_marginal_tdc_pair(spec_path, pair_dir)
-    verify_marginal_tdc_pair(result.output_dir)
+    result = assemble_marginal_tdc_pair(
+        spec_path,
+        pair_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
+    verify_marginal_tdc_pair(
+        result.output_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
     return result.output_dir
 
 

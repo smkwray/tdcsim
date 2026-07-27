@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tdcsim.local/schemas/cbo-source-run-catalog-v1.schema.json",
+  "title": "TDCSIM CBO source-run campaign catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_runs"],
+  "properties": {
+    "schema_version": {"const": "tdcsim_cbo_source_run_catalog_v1"},
+    "source_runs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/sourceRun"}
+    }
+  },
+  "$defs": {
+    "sourceRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_relative_path", "run_manifest_sha256"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "run_relative_path": {"type": "string", "minLength": 1},
+        "run_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "baseline_package_relative_path": {"type": "string", "minLength": 1},
+        "baseline_package_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "attestation_relative_path": {"type": "string", "minLength": 1},
+        "attestation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

@@ -9,7 +9,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
-from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json
+from tdcsim_cbo._json import canonical_json_sha256, read_json, sha256_file, write_json
+from tdcsim_cbo.campaign_store import write_fixture_source_run_catalog
 from tdcsim_cbo.marginal_tdc import (
     DENOMINATOR_EQUIVALENCE_KEY,
     OBJECT_ID,
@@ -38,13 +39,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixture = _fixture_for(raw_period, project_root)
         _write_source_run(fixture, "baseline")
         _write_source_run(fixture, "shock")
+        write_fixture_source_run_catalog(
+            output_root,
+            [fixture["baseline_run_dir"], fixture["shock_run_dir"]],
+            copy_runs=True,
+        )
         spec = _pair_spec(fixture)
         spec_dir = project_root / "var" / "preliminary_scenario_results" / "marginal_tdcsim" / "pair_specs"
         spec_dir.mkdir(parents=True, exist_ok=True)
         spec_path = spec_dir / f"{fixture['pair_id']}.json"
         write_json(spec_path, spec)
         pair_dir = output_root / str(fixture["pair_dir_name"])
-        result = assemble_marginal_tdc_pair(spec, pair_dir)
+        result = assemble_marginal_tdc_pair(spec, pair_dir, require_source_verification=False)
         written.append(result.output_dir)
 
     for path in written:
@@ -303,6 +309,8 @@ def _write_yield_surface(path: Path, fixture: dict[str, Any], *, shock: bool) ->
 
 
 def _pair_spec(fixture: dict[str, Any]) -> dict[str, Any]:
+    baseline = read_json(fixture["baseline_run_dir"] / "tdcsim_cbo_run_manifest.json")
+    shock = read_json(fixture["shock_run_dir"] / "tdcsim_cbo_run_manifest.json")
     return {
         "schema_version": "tdcsim_cbo_marginal_tdc_pair_v1",
         "pair_id": fixture["pair_id"],
@@ -333,8 +341,8 @@ def _pair_spec(fixture: dict[str, Any]) -> dict[str, Any]:
         "opening_route_stock_mmf_bil": "0",
         "opening_route_stock_foreign_bil": "0",
         "opening_route_stock_fed_bil": "0",
-        "baseline_run_dir": str(fixture["baseline_run_dir"]),
-        "shock_run_dir": str(fixture["shock_run_dir"]),
+        "baseline_run_id": baseline["run_id"],
+        "shock_run_id": shock["run_id"],
         "baseline_scenario_id": fixture["baseline_scenario_id"],
         "shock_scenario_id": fixture["shock_scenario_id"],
         "object_id": OBJECT_ID,

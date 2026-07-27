@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import os
 import platform
 import tempfile
@@ -19,7 +20,7 @@ from ._json import read_json, sha256_file
 from .baseline import CboBaselinePackage
 from .compiler import CboScenarioCompiler, digest_input_tree
 from .contract import CboScenarioSpec
-from .manifest import RUN_CLAIM_BOUNDARY, RUN_UNSUPPORTED_COMPONENTS
+from .manifest import RUN_CLAIM_BOUNDARY, RUN_UNSUPPORTED_COMPONENTS, cash_closure_validation_invariants
 from .output import hash_output_tree, write_scenario_outputs
 from .runtime_identity import distribution_identity, wheel_file_digest
 from . import runner as runner_module
@@ -32,6 +33,10 @@ class VerificationError(ValueError):
 
 
 REQUIRED_RESULT_COLUMNS = (
+    "TGA",
+    "CBOCashReconciliationResidual",
+    "CBOCashResidualStatus",
+    "CBOOperatingCashTarget",
     "CBOControlledDebtTargetError",
     "CBOFedAuctionShare",
     "CBOFedAuctionRolloverAddons",
@@ -91,10 +96,12 @@ def verify_scenario_run(
     _verify_manifest_artifacts(root, manifest.get("outputs"), base=root)
     _verify_manifest_artifacts(root, manifest.get("compiled_inputs"), base=root)
     _verify_scenario_copy(root, manifest)
+    verification_grade = "local"
     if baseline_package is not None or attestation is not None:
         if baseline_package is None or attestation is None:
             raise VerificationError("baseline_package and attestation must be supplied together")
         _verify_recompile(root, manifest, baseline_package, attestation)
+        verification_grade = "replay"
     boundaries = manifest.get("boundary_checks")
     if not isinstance(boundaries, dict):
         raise VerificationError("run manifest boundary_checks must be an object")
@@ -107,6 +114,7 @@ def verify_scenario_run(
     recomputed = _verify_output_invariants(root, manifest)
     return {
         "status": "pass",
+        "verification_grade": verification_grade,
         "compiled": compiled,
         "output_count": len(manifest.get("output_hashes") or []),
         "recomputed": recomputed,
@@ -274,6 +282,9 @@ def _verify_validation_block(manifest: dict[str, Any]) -> None:
     invariant_ids = {str(item.get("id")) for item in validation.get("invariants", []) if isinstance(item, dict)}
     if "cash_residual_not_issuance_sizing" not in invariant_ids:
         raise VerificationError("cash_residual_not_issuance_sizing validation invariant is required")
+    required_cash_closure_ids = {"tga_nonnegative", "cash_residual_fully_booked"}
+    if not required_cash_closure_ids <= invariant_ids:
+        raise VerificationError("cash closure validation invariants are required")
 
 
 def _normalized_bool_set(values: Any) -> set[bool]:
@@ -425,10 +436,29 @@ def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path
             raise VerificationError("engine replay output hash mismatch")
 
 
-def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str, float]:
+def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     results_path = _result_artifact_path(root, manifest)
     results = _read_results(results_path)
     _require_columns(results, REQUIRED_RESULT_COLUMNS, label="results")
+    cash_closure = runner_module._cash_closure_checks(results)
+    if cash_closure["tga_nonnegative"] is not True:
+        raise VerificationError(
+            "negative TGA breaches the modeled cash chain: "
+            f"min_tga={cash_closure['min_tga']}, periods={cash_closure['negative_tga_periods']}"
+        )
+    if cash_closure["cash_residual_fully_booked"] is not True:
+        raise VerificationError(
+            "cash reconciliation residual is not fully booked: "
+            f"sum_abs={cash_closure['sum_abs_unbooked_cash_residual']}"
+        )
+    compiled_rel = Path(str(manifest.get("compiled_manifest") or ""))
+    inputs_dir = root / compiled_rel.parent / "forecast_inputs"
+    try:
+        omf_comparison = runner_module.omf_reconciliation(results, inputs_dir)
+    except Exception as exc:
+        raise VerificationError(f"operating-cash comparison could not be recomputed: {exc}") from exc
+    recomputed_cash = {**cash_closure, **omf_comparison}
+    _verify_recomputed_cash_claims(manifest, recomputed_cash)
     target_error = _max_abs(results, "CBOControlledDebtTargetError")
     fed_share = _max_abs(results, "CBOFedAuctionShare")
     fed_face = _max_abs(results, "CBOFedAuctionRolloverAddons")
@@ -458,7 +488,51 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         "max_abs_fed_auction_share": fed_share,
         "max_abs_fed_auction_face": fed_face,
         "max_abs_remittance_cash_effect": remittance_cash,
+        **recomputed_cash,
     }
+
+
+def _verify_recomputed_cash_claims(manifest: dict[str, Any], recomputed: dict[str, Any]) -> None:
+    boundaries = manifest.get("boundary_checks")
+    if not isinstance(boundaries, dict):
+        raise VerificationError("run manifest boundary_checks must be an object")
+    for key, expected in recomputed.items():
+        if key not in boundaries:
+            raise VerificationError(f"run manifest boundary_checks is missing recomputed value: {key}")
+        _compare_recomputed_value(f"boundary_checks {key}", boundaries[key], expected)
+
+    validation = manifest.get("validation")
+    invariants = validation.get("invariants") if isinstance(validation, dict) else None
+    if not isinstance(invariants, list):
+        raise VerificationError("run manifest validation.invariants must be an array")
+    by_id = {
+        str(item.get("id")): item
+        for item in invariants
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    for expected in cash_closure_validation_invariants(recomputed):
+        invariant_id = str(expected["id"])
+        actual = by_id.get(invariant_id)
+        if actual is None:
+            raise VerificationError(f"cash closure validation invariant is missing: {invariant_id}")
+        if actual.get("status") != expected.get("status") or actual.get("observed") != expected.get("observed"):
+            raise VerificationError(f"validation invariant {invariant_id} disagrees with recomputed results")
+
+
+def _compare_recomputed_value(label: str, actual: Any, expected: Any) -> None:
+    if isinstance(expected, bool):
+        matches = actual is expected
+    elif isinstance(expected, int):
+        matches = isinstance(actual, int) and not isinstance(actual, bool) and actual == expected
+    elif isinstance(expected, float):
+        try:
+            matches = math.isclose(float(actual), expected, rel_tol=1e-12, abs_tol=1e-9)
+        except (TypeError, ValueError):
+            matches = False
+    else:
+        matches = actual == expected
+    if not matches:
+        raise VerificationError(f"{label} disagrees with recomputed results: manifest={actual!r}, actual={expected!r}")
 
 
 def _result_artifact_path(root: Path, manifest: dict[str, Any]) -> Path:

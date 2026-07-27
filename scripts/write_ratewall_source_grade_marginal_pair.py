@@ -21,6 +21,7 @@ if str(SRC_DIR) not in sys.path:
 
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
+from tdcsim_cbo.campaign_store import register_source_run  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     DENOMINATOR_EQUIVALENCE_KEY,
     OBJECT_ID,
@@ -139,6 +140,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     marker = beta_schedule_path.parent / "BETA_SCHEDULE_READY"
     if not marker.exists():
         raise SystemExit(f"RateWall beta schedule readiness marker absent at assembly: {marker}")
+    register_source_run(
+        output_root,
+        baseline_run_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
+    register_source_run(
+        output_root,
+        shock_run_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
     pair_spec = _pair_spec(
         baseline_run_dir=baseline_run_dir,
         shock_run_dir=shock_run_dir,
@@ -156,8 +169,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     pair_spec_path = pair_spec_dir / f"{pair_spec['pair_id']}.json"
     write_json(pair_spec_path, pair_spec)
-    result = assemble_marginal_tdc_pair(pair_spec_path, pair_dir)
-    verified = verify_marginal_tdc_pair(result.output_dir)
+    result = assemble_marginal_tdc_pair(
+        pair_spec_path,
+        pair_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
+    verified = verify_marginal_tdc_pair(
+        result.output_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
     print(result.output_dir)
     print(verified["status"])
     return 0
@@ -358,8 +380,8 @@ def _pair_spec(
         "opening_route_stock_mmf_bil": "",
         "opening_route_stock_foreign_bil": float(by_holder.get("Foreign", 0)),
         "opening_route_stock_fed_bil": float(by_holder.get("CB", 0)),
-        "baseline_run_dir": str(baseline_run_dir),
-        "shock_run_dir": str(shock_run_dir),
+        "baseline_run_id": baseline_manifest["run_id"],
+        "shock_run_id": shock_manifest["run_id"],
         "baseline_scenario_id": baseline_scenario_id,
         "shock_scenario_id": shock_scenario_id,
         "object_id": OBJECT_ID,
