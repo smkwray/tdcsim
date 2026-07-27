@@ -1091,8 +1091,8 @@ def _fed_secondary_dirty_value(
             if pd.isna(real_yield) or not np.isfinite(float(real_yield)):
                 raise ValueError('Fed secondary TIPS transfer has no finite real yield.')
             discount_yield = real_yield
-        # One owner of "what is this security worth": dated remaining cash flows at the
-        # Appendix B semiannual convention, with the TIPS deflation floor applied as a
+        # For this Fed-secondary transfer path, value the security from dated remaining cash
+        # flows at the Appendix B semiannual convention, with the TIPS deflation floor as a
         # property of the instrument. The issue-price kernel used here previously rounded
         # remaining life to whole coupon periods, which structurally deleted accrued
         # interest from settlement, and carried no deflation-floor concept at all.
