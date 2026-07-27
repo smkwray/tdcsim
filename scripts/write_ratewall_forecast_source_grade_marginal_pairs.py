@@ -9,7 +9,7 @@ import shutil
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -99,6 +99,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--work-root", required=True, type=Path)
     parser.add_argument("--beta-schedule-path", default=None, type=Path)
+    # Regenerating a retained campaign needs the same beta/chi selection the retained pair
+    # specs were built with. beta is claim-relevant -- it multiplies into
+    # tdc_materialized_deposit_stock_admissible_bil, which the downstream consumer selects --
+    # so re-deriving it from a rebuilt schedule risks silently moving a consumed value.
+    # Pointing at the retained specs reuses the exact recorded selection instead.
+    parser.add_argument("--beta-case-from-spec-root", default=None, type=Path)
     parser.add_argument("--pair-spec-root", default=None, type=Path)
     parser.add_argument("--phase", choices=("compute", "assemble", "all"), default="all")
     parser.add_argument("--force", action="store_true")
@@ -182,9 +188,11 @@ def _process_year(
         print(f"{year}: computed {baseline_run_dir} {shock_run_dir}")
         return
 
-    marker = beta_schedule_path.parent / "BETA_SCHEDULE_READY"
-    if not marker.exists():
-        raise SystemExit(f"RateWall beta schedule readiness marker absent at assembly: {marker}")
+    spec_root = getattr(args, "beta_case_from_spec_root", None)
+    if spec_root is None:
+        marker = beta_schedule_path.parent / "BETA_SCHEDULE_READY"
+        if not marker.exists():
+            raise SystemExit(f"RateWall beta schedule readiness marker absent at assembly: {marker}")
     register_source_run(
         output_root,
         baseline_run_dir,
@@ -205,14 +213,18 @@ def _process_year(
         shock_run_dir=shock_run_dir,
         baseline_scenario_id=baseline_scenario["scenario_id"],
         shock_scenario_id=shock_scenario["scenario_id"],
-        beta_case=_load_beta_case(
-            beta_schedule_path=beta_schedule_path,
-            period_object="forecast",
-            period=str(year),
-            state_id=window.state_id,
-            state_kind="forecast_state",
-            horizon=window.horizon,
-            shock_path_id=SHOCK_PATH_ID,
+        beta_case=(
+            _beta_case_from_retained_spec(spec_root, year)
+            if spec_root is not None
+            else _load_beta_case(
+                beta_schedule_path=beta_schedule_path,
+                period_object="forecast",
+                period=str(year),
+                state_id=window.state_id,
+                state_kind="forecast_state",
+                horizon=window.horizon,
+                shock_path_id=SHOCK_PATH_ID,
+            )
         ),
     )
     spec_path = pair_spec_dir / f"{spec['pair_id']}.json"
@@ -500,6 +512,50 @@ def _pair_spec(
         "one_named_rate_shock_only": True,
         "demand_conversion_cases": [beta_case],
     }
+
+
+BETA_CASE_FIELDS = (
+    "demand_conversion_case",
+    "beta",
+    "beta_assumption_id",
+    "beta_source_status",
+    "chi",
+    "chi_assumption_id",
+    "chi_source_status",
+)
+
+
+def _beta_case_from_retained_spec(spec_root: Path, year: int) -> dict[str, Any]:
+    """Reuse the beta/chi selection a retained pair spec already recorded.
+
+    Regenerating a retained campaign must reproduce beta exactly. It is not confined to the
+    retired diagnostic: ``delta_tdc_ex_overlap_non_interest_admissible_bil * beta`` is
+    asserted equal to ``tdc_materialized_deposit_stock_admissible_bil``, which the downstream
+    consumer selects. Re-deriving beta from a rebuilt schedule could move a consumed value
+    without anything failing, so the recorded selection is the authority.
+    """
+
+    root = Path(spec_root).expanduser().resolve()
+    matches = sorted(root.glob(f"*forecast_cbo_baseline_{year}_*.json"))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"expected exactly one retained forecast pair spec for {year} under {root}, found {len(matches)}"
+        )
+    spec = read_json(matches[0])
+    if not isinstance(spec, Mapping):
+        raise SystemExit(f"retained pair spec must be an object: {matches[0]}")
+    cases = [
+        case
+        for case in spec.get("demand_conversion_cases", [])
+        if isinstance(case, Mapping) and case.get("demand_conversion_case") == "central"
+    ]
+    if len(cases) != 1:
+        raise SystemExit(f"retained pair spec must carry exactly one central case: {matches[0]}")
+    case = cases[0]
+    missing = [field for field in BETA_CASE_FIELDS if field not in case]
+    if missing:
+        raise SystemExit(f"retained beta case is missing required fields {missing}: {matches[0]}")
+    return {field: case[field] for field in BETA_CASE_FIELDS}
 
 
 def _load_beta_case(
