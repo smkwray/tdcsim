@@ -672,6 +672,55 @@ def test_verifier_rejects_stale_cash_closure_invariant_observation(tmp_path: Pat
         verify_scenario_run(run.output_dir)
 
 
+def test_verifier_tolerates_float_repr_noise_in_invariant_observations(tmp_path: Path) -> None:
+    """A faithful run must not fail on a last-digit repr difference.
+
+    The observations embed floats as strings, and reading results back from CSV can return
+    85.13373083354395 where the producer wrote 85.13373083354418. Comparing the whole string
+    exactly rejected real forecast runs over ~2e-13 of representation noise. The magnitude
+    still has to agree numerically, which the tamper cases below cover.
+    """
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    perturbed = False
+    for invariant in manifest["validation"]["invariants"]:
+        fields = str(invariant.get("observed", "")).split(";")
+        for index, field in enumerate(fields):
+            key, sep, value = field.partition("=")
+            if not sep:
+                continue
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            if number == 0.0 or float(value).is_integer():
+                continue
+            fields[index] = f"{key}={number * (1 + 1e-13)!r}"
+            perturbed = True
+        invariant["observed"] = ";".join(fields)
+    assert perturbed, "expected at least one float-valued observation to perturb"
+    write_json(run.manifest_path, manifest)
+
+    assert verify_scenario_run(run.output_dir)["status"] == "pass"
+
+
+def test_verifier_rejects_material_change_to_invariant_observation(tmp_path: Path) -> None:
+    """Tolerating repr noise must not tolerate a changed magnitude."""
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    for invariant in manifest["validation"]["invariants"]:
+        if invariant["id"] == "cash_residual_fully_booked":
+            invariant["observed"] = "7.5"
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="cash_residual_fully_booked.*disagrees"):
+        verify_scenario_run(run.output_dir)
+
+
 def test_verifier_requires_cash_closure_invariant_ids(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
