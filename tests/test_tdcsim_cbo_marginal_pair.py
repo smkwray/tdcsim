@@ -867,10 +867,53 @@ def test_pair_campaign_moves_without_host_absolute_manifest_paths(tmp_path: Path
     assert verify_marginal_tdc_pair(moved / "pairs" / "fixture_pair")["status"] == "pass"
 
 
-def test_replay_campaign_verifies_after_relocation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_secondary_settlement_is_admitted_as_non_interest(tmp_path: Path) -> None:
+    """D-20260727-07: Fed secondary settlement enters the consumer-selected non-interest value.
+
+    Admitted by the Treasury-security funding-chain boundary, not by actor causation. The
+    classifier previously raised on this family, which blocked the final campaign.
+    """
+
+    classify = marginal_tdc_module._classify_deposit_creation_split
+
+    for component_key in ("secondary_trades_domestic_nonbank", "secondary_trades_mmf"):
+        result = classify(
+            {"component_family": "secondary_trades", "component_key": component_key, "payment_type": "secondary_trade_cash"},
+            -19.101879,
+            True,
+        )
+        assert result["deposit_creation_driver_bucket"] == (
+            "non_interest_treasury_security_secondary_settlement_admissible"
+        )
+        assert result["admitted"] is True
+        assert result["non_interest_admissible_bil"] == pytest.approx(-19.101879)
+        # Admitted amounts must not leak into the interest bucket the consumer excludes.
+        assert result["interest_driven_excluded_bil"] == 0.0
+        assert result["out_of_scope_excluded_bil"] == 0.0
+
+    # The non-passed-through MMF remainder is a plumbing memo and stays excluded.
+    memo = classify(
+        {
+            "component_family": "route_plumbing_memo",
+            "component_key": "secondary_trades_mmf_ru_plumbing_memo",
+            "payment_type": "secondary_trade_cash",
+        },
+        -0.197624,
+        False,
+    )
+    assert memo["admitted"] is False
+    assert memo["deposit_creation_driver_bucket"] == "route_plumbing_memo_excluded"
+
+    # An unknown included family must still fail closed rather than defaulting to admitted.
+    with pytest.raises(marginal_tdc_module.MarginalTdcPairError, match="unsupported included split component"):
+        classify(
+            {"component_family": "not_a_real_family", "component_key": "mystery", "payment_type": "cash"},
+            1.0,
+            True,
+        )
+
+
+def test_replay_campaign_verifies_after_relocation(tmp_path: Path) -> None:
     baseline_package, scenarios = _runner_baseline_and_scenarios(tmp_path / "inputs")
     work = tmp_path / "work"
     baseline_run = run_cbo_scenario(
@@ -937,24 +980,10 @@ def test_replay_campaign_verifies_after_relocation(
             "shock_scenario_id": shock_run.run_manifest["scenario"]["scenario_id"],
         }
     )
-    original_classifier = marginal_tdc_module._classify_deposit_creation_split
-
-    def relocation_classifier(row: dict, delta: float, included_ex_overlap: bool) -> dict:
-        if included_ex_overlap and str(row.get("component_family") or "") == "secondary_trades":
-            return {
-                "deposit_creation_driver_bucket": "non_interest_auction_absorption_admissible",
-                "admission_status": "admitted_non_interest_driver",
-                "collision_family": "none",
-                "bucket_reason": "relocation_test_non_interest_component",
-                "admitted": True,
-                "excluded": False,
-                "non_interest_admissible_bil": delta,
-                "interest_driven_excluded_bil": 0.0,
-                "out_of_scope_excluded_bil": 0.0,
-            }
-        return original_classifier(row, delta, included_ex_overlap)
-
-    monkeypatch.setattr(marginal_tdc_module, "_classify_deposit_creation_split", relocation_classifier)
+    # This test previously monkeypatched the classifier because a real rate-shock run emits an
+    # included secondary_trades component the classifier had no bucket for. D-20260727-07
+    # settled that classification, so the production classifier handles it and the override is
+    # gone -- the relocation claim is now proved against the real code path.
     pair = assemble_marginal_tdc_pair(spec, campaign / "pairs" / "relocation_replay_pair")
     assert pair.manifest_path.exists()
 
