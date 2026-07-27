@@ -612,6 +612,73 @@ def test_cash_closure_invariant_fails_a_negative_tga(tmp_path: Path) -> None:
     assert breached["min_tga"] == pytest.approx(-1_500.0)
 
 
+@pytest.mark.parametrize(
+    ("column", "tampered_value", "error_match"),
+    [
+        ("TGA", -1_500.0, "negative TGA"),
+        ("CBOCashReconciliationResidual", 7.5, "cash reconciliation residual"),
+    ],
+)
+def test_verifier_recomputes_cash_closure_from_results(
+    tmp_path: Path,
+    column: str,
+    tampered_value: float,
+    error_match: str,
+) -> None:
+    """Fresh artifact hashes must not turn fabricated cash-chain values into proof."""
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    results = pd.read_csv(run.results_path)
+    results.loc[results.index[-1], column] = tampered_value
+    results.to_csv(run.results_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_result_hashes(run.output_dir, manifest)
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match=error_match):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_recomputes_operating_cash_comparison(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["boundary_checks"]["max_abs_operating_cash_gap_bil"] += 1.0
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="max_abs_operating_cash_gap_bil"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_stale_cash_closure_invariant_observation(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    for invariant in manifest["validation"]["invariants"]:
+        if invariant["id"] == "tga_nonnegative":
+            invariant["observed"] = "min_tga=-1500.0;negative_periods=1"
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="tga_nonnegative.*disagrees"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_requires_cash_closure_invariant_ids(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    manifest["validation"]["invariants"] = [
+        item
+        for item in manifest["validation"]["invariants"]
+        if item["id"] not in {"tga_nonnegative", "cash_residual_fully_booked"}
+    ]
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="cash closure validation invariants are required"):
+        verify_scenario_run(run.output_dir)
+
+
 def _invariant_status(manifest: dict, invariant_id: str) -> str:
     for invariant in manifest["validation"]["invariants"]:
         if invariant["id"] == invariant_id:
