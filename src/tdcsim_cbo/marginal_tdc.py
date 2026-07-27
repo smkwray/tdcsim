@@ -54,6 +54,7 @@ SPLIT_DRIVER_BUCKETS = {
     "non_interest_auction_absorption_admissible",
     "non_interest_principal_redemption_admissible",
     "non_interest_fiscal_flow_admissible",
+    "non_interest_treasury_security_secondary_settlement_admissible",
     "route_plumbing_memo_excluded",
     "not_in_delta_tdc_ex_overlap_excluded",
 }
@@ -1039,6 +1040,28 @@ def _classify_deposit_creation_split(row: Mapping[str, Any], delta: float, inclu
     elif component_family == "fiscal":
         bucket = "non_interest_fiscal_flow_admissible"
         reason = "fiscal_flow_non_interest_bucket_admitted"
+    elif component_family == "secondary_trades":
+        # Admitted by the Treasury-security funding-chain boundary, not by actor causation
+        # (D-20260727-07). A modeled Fed secondary purchase changes the deposit incidence of an
+        # outstanding Treasury security, which is exactly the holder transition the declared TDC
+        # identity covers -- its reserve-side sector names the central bank explicitly. The
+        # Treasury does not initiate the trade and TGA does not move, so this admission must
+        # never be described as Treasury-caused money creation.
+        #
+        # The gross leg is largely the opposite-signed counterpart of private auction
+        # absorption: excluding it would hold the original auction deposit drain fixed after
+        # beneficial ownership had already moved.
+        #
+        # Non-interest here means "not a direct Treasury debt-service-interest component", not
+        # that dirty settlement contains no accrued interest. No collision with the consumer's
+        # interest channel is presumed; if a receipt ever proves one, remove only the
+        # demonstrated duplicate.
+        #
+        # The MMF leg arrives already multiplied by mmf_deposit_pass_through
+        # (sim_engine.py:4054), so no further scaling belongs here; the non-passed-through
+        # remainder is a separate plumbing-memo component and stays excluded above.
+        bucket = "non_interest_treasury_security_secondary_settlement_admissible"
+        reason = "treasury_security_secondary_settlement_non_interest_bucket_admitted"
     else:
         raise MarginalTdcPairError(f"unsupported included split component: {component_key}")
     return {

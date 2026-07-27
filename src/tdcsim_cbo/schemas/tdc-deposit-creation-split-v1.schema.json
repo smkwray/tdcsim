@@ -17,6 +17,7 @@
         "non_interest_auction_absorption_admissible",
         "non_interest_principal_redemption_admissible",
         "non_interest_fiscal_flow_admissible",
+        "non_interest_treasury_security_secondary_settlement_admissible",
         "route_plumbing_memo_excluded",
         "not_in_delta_tdc_ex_overlap_excluded"
       ]
