@@ -1071,7 +1071,16 @@ def _fed_secondary_dirty_value(
         # instrument. Discounting those flows at the nominal curve double-counts inflation
         # relative to cash flows already fixed at today's index ratio.
         discount_yield = nominal_yield
-        if security_type == 'TIPS' and tips_real_curve_years and tips_real_curve_rates:
+        if security_type == 'TIPS':
+            # Fail closed rather than fall back. An absent real curve previously left the
+            # nominal yield in place, which prices real cash flows at a nominal rate - a ~26%
+            # error on a seasoned TIPS, arrived at silently. A missing curve is a configuration
+            # fault, and settling a Fed purchase on the wrong basis is worse than not settling.
+            if not tips_real_curve_years or not tips_real_curve_rates:
+                raise ValueError(
+                    'Fed secondary TIPS transfer requires a real yield curve; the nominal curve '
+                    'would misprice real cash flows.'
+                )
             real_yield = get_yield_for_maturity(
                 time_to_maturity,
                 tips_real_curve_years,
