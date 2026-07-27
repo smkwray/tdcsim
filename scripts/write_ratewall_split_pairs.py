@@ -18,6 +18,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tdcsim_cbo._json import read_json, write_json  # noqa: E402
+from tdcsim_cbo.campaign_store import (  # noqa: E402
+    locate_source_run_catalog,
+    register_source_run,
+    resolve_source_run,
+)
 from tdcsim_cbo.consumer_challenge import build_ingest_challenge  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     MANIFEST_FILE,
@@ -46,9 +51,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     spec_out = output_root / "pair_specs"
     spec_out.mkdir(parents=True, exist_ok=True)
 
-    verification_catalog = read_json(args.baseline_verification_catalog.expanduser().resolve())
-    if not isinstance(verification_catalog, Mapping):
-        raise SystemExit("baseline verification catalog must be an object")
     source_specs = _specs(args.source_grade_root.expanduser().resolve())
     flooded_specs = _specs(args.flooded_root.expanduser().resolve())
     source_dir_map = _pair_dir_map(args.source_grade_root.expanduser().resolve())
@@ -71,18 +73,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             pair_dir = output_root / source_dir.name
             copied_spec = spec_out / spec_path.name
             write_json(copied_spec, dict(spec))
-            baseline_package, attestation = _verification_paths(spec, verification_catalog)
-            result = assemble_marginal_tdc_pair(
-                copied_spec,
-                pair_dir,
-                baseline_package=baseline_package,
-                attestation=attestation,
-            )
-            verified = verify_marginal_tdc_pair(
-                result.output_dir,
-                baseline_package=baseline_package,
-                attestation=attestation,
-            )
+            _import_source_runs(spec, locate_source_run_catalog(spec_path), output_root)
+            result = assemble_marginal_tdc_pair(copied_spec, pair_dir)
+            verified = verify_marginal_tdc_pair(result.output_dir)
             index_rows.append(
                 {
                     "pair_id": pair_id,
@@ -136,29 +129,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-grade-root", default=SOURCE_GRADE_ROOT, type=Path)
     parser.add_argument("--flooded-root", default=FLOODED_ROOT, type=Path)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, type=Path)
-    parser.add_argument("--baseline-verification-catalog", required=True, type=Path)
     parser.add_argument("--force", action="store_true")
     return parser
 
 
-def _verification_paths(spec: Mapping[str, Any], catalog: Mapping[str, Any]) -> tuple[Path, Path]:
-    run_dir = Path(str(spec["baseline_run_dir"])).expanduser().resolve()
-    manifest = read_json(run_dir / "tdcsim_cbo_run_manifest.json")
-    if not isinstance(manifest, Mapping):
-        raise SystemExit(f"baseline run manifest must be an object: {run_dir}")
-    baseline = manifest.get("baseline")
-    if not isinstance(baseline, Mapping):
-        raise SystemExit(f"baseline run manifest has no baseline identity: {run_dir}")
-    package_sha = str(baseline.get("package_sha256") or "")
-    packages = catalog.get("packages")
-    entry = packages.get(package_sha) if isinstance(packages, Mapping) else None
-    if not isinstance(entry, Mapping):
-        raise SystemExit(f"baseline verification catalog has no package entry for {package_sha}")
-    package = Path(str(entry.get("baseline_package") or "")).expanduser().resolve()
-    attestation = Path(str(entry.get("attestation") or "")).expanduser().resolve()
-    if not package.is_file() or not attestation.is_file():
-        raise SystemExit(f"baseline verification files are missing for {package_sha}")
-    return package, attestation
+def _import_source_runs(spec: Mapping[str, Any], source_catalog: Path, output_root: Path) -> None:
+    for key in ("baseline_run_id", "shock_run_id"):
+        source = resolve_source_run(source_catalog, str(spec[key]))
+        if source.baseline_package is None or source.attestation is None:
+            raise SystemExit(f"source campaign lacks replay inputs for {source.run_id}")
+        register_source_run(
+            output_root,
+            source.root,
+            baseline_package=source.baseline_package,
+            attestation=source.attestation,
+        )
 
 
 def _specs(root: Path) -> list[Path]:

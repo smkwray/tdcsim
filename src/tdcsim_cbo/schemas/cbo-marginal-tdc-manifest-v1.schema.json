@@ -43,10 +43,9 @@
     "sourceRun": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["run_id", "run_dir_basename", "manifest_sha256", "compiled_inputs_digest", "source_run_verification_status", "source_run_verification_grade"],
+      "required": ["run_id", "manifest_sha256", "compiled_inputs_digest", "source_run_verification_status", "source_run_verification_grade"],
       "properties": {
         "run_id": {"type": "string", "minLength": 1},
-        "run_dir_basename": {"type": "string", "minLength": 1},
         "source_run_verification_status": {"type": "string", "minLength": 1},
         "source_run_verification_grade": {"enum": ["replay", "fixture_bypass"]},
         "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

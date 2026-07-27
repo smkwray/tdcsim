@@ -18,6 +18,11 @@ import pandas as pd
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from ._schema import validate_schema
+from .campaign_store import (
+    CampaignStoreError,
+    locate_source_run_catalog,
+    resolve_source_run,
+)
 
 
 PAIR_SCHEMA_VERSION = "tdcsim_cbo_marginal_tdc_pair_v1"
@@ -106,6 +111,7 @@ def assemble_marginal_tdc_pair(
     *,
     baseline_package: str | Path | None = None,
     attestation: str | Path | None = None,
+    source_run_catalog: str | Path | None = None,
     require_source_verification: bool = True,
 ) -> MarginalPairResult:
     """Assemble RateWall marginal TDC files from two ordinary CBO run directories.
@@ -121,19 +127,22 @@ def assemble_marginal_tdc_pair(
     if out.exists() and any(out.iterdir()):
         raise MarginalTdcPairError(f"marginal pair output directory is not empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
+    catalog_path = _source_run_catalog_path(source_run_catalog, out)
 
     baseline = _load_run(
         "baseline",
-        spec["baseline_run_dir"],
+        spec["baseline_run_id"],
         baseline_package=baseline_package,
         attestation=attestation,
+        source_run_catalog=catalog_path,
         require_source_verification=require_source_verification,
     )
     shock = _load_run(
         "shock",
-        spec["shock_run_dir"],
+        spec["shock_run_id"],
         baseline_package=baseline_package,
         attestation=attestation,
+        source_run_catalog=catalog_path,
         require_source_verification=require_source_verification,
     )
     checks = _validate_pair_inputs(spec, baseline, shock)
@@ -162,6 +171,7 @@ def assemble_marginal_tdc_pair(
         out,
         baseline_package=baseline_package,
         attestation=attestation,
+        source_run_catalog=catalog_path,
         require_source_verification=require_source_verification,
     )
     return MarginalPairResult(out, summary_path, components_path, route_metadata_path, state_manifest_path, manifest_path)
@@ -172,6 +182,7 @@ def verify_marginal_tdc_pair(
     *,
     baseline_package: str | Path | None = None,
     attestation: str | Path | None = None,
+    source_run_catalog: str | Path | None = None,
     require_source_verification: bool | None = None,
 ) -> dict[str, Any]:
     """Verify a written marginal TDC pair package and fail closed on identity drift.
@@ -181,6 +192,7 @@ def verify_marginal_tdc_pair(
     """
 
     root = Path(pair_dir).expanduser().resolve()
+    catalog_path = _source_run_catalog_path(source_run_catalog, root)
     manifest = _read_pair_manifest(root / MANIFEST_FILE)
     _verify_pair_files(root, manifest)
     spec = manifest.get("pair_spec", {})
@@ -192,16 +204,18 @@ def verify_marginal_tdc_pair(
         raise MarginalTdcPairError("pair manifest pair_spec must be an object")
     baseline = _load_run(
         "baseline",
-        spec["baseline_run_dir"],
+        spec["baseline_run_id"],
         baseline_package=baseline_package,
         attestation=attestation,
+        source_run_catalog=catalog_path,
         require_source_verification=require_source_verification,
     )
     shock = _load_run(
         "shock",
-        spec["shock_run_dir"],
+        spec["shock_run_id"],
         baseline_package=baseline_package,
         attestation=attestation,
+        source_run_catalog=catalog_path,
         require_source_verification=require_source_verification,
     )
     checks = _validate_pair_inputs(spec, baseline, shock)
@@ -216,6 +230,17 @@ def verify_marginal_tdc_pair(
     _verify_components(components, summary)
     _verify_route_metadata(route_metadata, baseline.manifest["run_id"], shock.manifest["run_id"])
     return {"status": "pass", "pair_id": spec["pair_id"], "rows": int(len(summary))}
+
+
+def _source_run_catalog_path(explicit: str | Path | None, start: Path) -> Path:
+    try:
+        return (
+            Path(explicit).expanduser().resolve()
+            if explicit is not None
+            else locate_source_run_catalog(start)
+        )
+    except CampaignStoreError as exc:
+        raise MarginalTdcPairError(str(exc)) from exc
 
 
 def _load_pair_spec(pair_spec: str | Path | Mapping[str, Any]) -> dict[str, Any]:
@@ -247,19 +272,26 @@ class _RunBundle:
 
 def _load_run(
     role: str,
-    run_dir: str | Path,
+    run_id: str,
     *,
+    source_run_catalog: str | Path,
     baseline_package: str | Path | None = None,
     attestation: str | Path | None = None,
     require_source_verification: bool = True,
 ) -> _RunBundle:
-    root = Path(run_dir).expanduser().resolve()
+    try:
+        source = resolve_source_run(source_run_catalog, str(run_id))
+    except CampaignStoreError as exc:
+        raise MarginalTdcPairError(f"{role} source run cannot be resolved: {exc}") from exc
+    root = source.root
     manifest_path = root / "tdcsim_cbo_run_manifest.json"
     if not manifest_path.exists():
         raise MarginalTdcPairError(f"{role} run manifest is missing")
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict):
         raise MarginalTdcPairError(f"{role} run manifest must be an object")
+    if manifest.get("run_id") != run_id:
+        raise MarginalTdcPairError(f"{role} source run ID does not match catalog lookup")
     scenario_rel = Path(str(manifest.get("scenario", {}).get("relative_path") or "scenario.json"))
     scenario_path = root / scenario_rel
     if not scenario_path.exists():
@@ -274,9 +306,12 @@ def _load_run(
     # passing status would imply nothing about the runs beneath it.
     verification = None
     if require_source_verification:
+        if baseline_package is None and attestation is None:
+            baseline_package = source.baseline_package
+            attestation = source.attestation
         if baseline_package is None or attestation is None:
             raise MarginalTdcPairError(
-                "replay-grade source verification requires baseline_package and attestation"
+                "replay-grade source verification requires cataloged baseline_package and attestation"
             )
         from .verifier import VerificationError, verify_scenario_run
 
@@ -1181,6 +1216,7 @@ def _build_pair_manifest(
         "claim_boundary": CLAIM_BOUNDARY,
     }
     manifest["pair_manifest_config_sha256"] = canonical_json_sha256({k: v for k, v in manifest.items() if k != "pair_manifest_config_sha256"})
+    _reject_absolute_paths(manifest)
     with files("tdcsim_cbo").joinpath("schemas/cbo-marginal-tdc-manifest-v1.schema.json").open(
         "r",
         encoding="utf-8",
@@ -1195,12 +1231,29 @@ def _read_pair_manifest(path: Path) -> dict[str, Any]:
     manifest = read_json(path)
     if not isinstance(manifest, dict):
         raise MarginalTdcPairError("marginal TDC pair manifest must be an object")
+    _reject_absolute_paths(manifest)
+    expected_config_sha = canonical_json_sha256(
+        {key: value for key, value in manifest.items() if key != "pair_manifest_config_sha256"}
+    )
+    if manifest.get("pair_manifest_config_sha256") != expected_config_sha:
+        raise MarginalTdcPairError("marginal pair manifest config hash mismatch")
     with files("tdcsim_cbo").joinpath("schemas/cbo-marginal-tdc-manifest-v1.schema.json").open(
         "r",
         encoding="utf-8",
     ) as handle:
         validate_schema(manifest, json.load(handle), label="marginal_pair_manifest")
     return manifest
+
+
+def _reject_absolute_paths(value: Any, *, location: str = "pair manifest") -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _reject_absolute_paths(child, location=f"{location}/{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_absolute_paths(child, location=f"{location}/{index}")
+    elif isinstance(value, str) and Path(value).is_absolute():
+        raise MarginalTdcPairError(f"{location} contains a host-absolute path")
 
 
 def _verify_pair_files(root: Path, manifest: Mapping[str, Any]) -> None:
@@ -1694,10 +1747,7 @@ def _source_run_block(run: _RunBundle) -> dict[str, Any]:
     manifest_path = run.root / "tdcsim_cbo_run_manifest.json"
     return {
         "run_id": run.manifest["run_id"],
-        # Identity, not location. A host-absolute run_dir made a retained pair unverifiable
-        # once its campaign root moved, against the project's package-relative rule; the
-        # run_id plus manifest hash identify the source run wherever it now sits.
-        "run_dir_basename": run.root.name,
+        # Identity, not location. The campaign catalog resolves this stable run ID.
         "manifest_sha256": sha256_file(manifest_path),
         "compiled_inputs_digest": run.manifest.get("compiled_inputs_digest", ""),
         # The pair's own status is only as good as its sources'. Binding the verification

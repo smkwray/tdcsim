@@ -7,7 +7,7 @@
       "format": "date",
       "type": "string"
     },
-    "baseline_run_dir": {
+    "baseline_run_id": {
       "minLength": 1,
       "type": "string"
     },
@@ -237,7 +237,7 @@
         "fiscal_injection_2028_v1"
       ]
     },
-    "shock_run_dir": {
+    "shock_run_id": {
       "minLength": 1,
       "type": "string"
     },
@@ -302,8 +302,8 @@
     "horizon_start_date",
     "horizon_end_date",
     "horizon",
-    "baseline_run_dir",
-    "shock_run_dir",
+    "baseline_run_id",
+    "shock_run_id",
     "baseline_scenario_id",
     "shock_scenario_id",
     "object_id",
