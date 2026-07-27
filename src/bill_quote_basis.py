@@ -12,6 +12,9 @@ Formulas are Treasury's own (31 CFR 356 Appendix B).
 
 from __future__ import annotations
 
+# CBO's 3-month bill forecast is a 13-week quote; 91 days is its actual term.
+CBO_3M_BILL_DAYS = 91.0
+
 # Treasury quotes bill discount rates on a 360-day year and converts to an investment
 # (bond-equivalent) rate on a 365-day year.
 _DISCOUNT_YEAR_DAYS = 360.0
@@ -73,4 +76,8 @@ def discount_price_ratio(discount_rate: float, days_to_maturity: float) -> float
     return ratio
 
 
-__all__ = ["discount_rate_to_investment_rate", "discount_price_ratio"]
+__all__ = [
+    "CBO_3M_BILL_DAYS",
+    "discount_rate_to_investment_rate",
+    "discount_price_ratio",
+]

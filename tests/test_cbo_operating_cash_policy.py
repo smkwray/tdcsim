@@ -6,7 +6,12 @@ from forecast_bundle_builders import (
     tga_closing_balance_bil_from_dts_row,
 )
 from forecast_input_builder import write_forecast_rows_csv
-from forecast_paths import load_cash_reconciliation_residual, load_operating_cash_path
+from forecast_paths import (
+    OPERATING_CASH_COMPARISON_ROLE,
+    OPERATING_CASH_OPENING_STATE_ROLE,
+    load_cash_reconciliation_residual,
+    load_operating_cash_path,
+)
 from simulation_calendar import build_simulation_calendar
 
 
@@ -38,6 +43,11 @@ def test_operating_cash_path_supports_tga_only_real_and_nominal_modes(tmp_path):
     assert real_rows[-1]["operating_cash_target_bil"] == pytest.approx(824.0)
     assert {row["operating_cash_definition"] for row in real_rows + nominal_rows} == {"tga_only"}
     assert {row["reserve_settlement_component"] for row in real_rows + nominal_rows} == {"tga"}
+    expected_roles = [OPERATING_CASH_OPENING_STATE_ROLE] + [
+        OPERATING_CASH_COMPARISON_ROLE
+    ] * (len(periods) - 1)
+    assert [row["runtime_role"] for row in real_rows] == expected_roles
+    assert [row["runtime_role"] for row in nominal_rows] == expected_roles
     assert {row["operating_cash_target_bil"] for row in nominal_rows} == {800.0}
 
     for row in real_rows + nominal_rows:

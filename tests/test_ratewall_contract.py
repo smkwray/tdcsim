@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import ratewall_input_builder as rib
+from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
 from ratewall_contract import export_ratewall_bundle
 from ratewall_input_builder import (
     RATEWALL_SCENARIO_REGISTRY,
@@ -1041,6 +1042,48 @@ def test_worker_count_respects_config_env_and_upper_bound(monkeypatch):
         )
         == 3
     )
+
+
+def test_ratewall_yield_surface_converts_cbo_discount_quote_to_investment_basis(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rib,
+        "_latest_treasury_curve",
+        lambda: (
+            "2026-02-20",
+            {
+                0.25: 0.04,
+                0.5: 0.041,
+                1.0: 0.042,
+                2.0: 0.043,
+                5.0: 0.044,
+                10.0: 0.045,
+                20.0: 0.046,
+                30.0: 0.047,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        rib,
+        "_cbo_rate_values",
+        lambda _path: {2026: {"cbo_3m_pct": 4.5, "cbo_10y_pct": 5.0}},
+    )
+
+    frame, _ = build_yield_curve_surface(
+        tmp_path / "curve.csv",
+        cbo_economic_path=tmp_path / "unused.xlsx",
+    )
+
+    baseline_3m = frame[
+        (frame["scenario_id"] == "cbo_shape_preserving_baseline")
+        & (frame["curve_date"] == "2026-01-01")
+        & (frame["tenor_years"].astype(float) == 0.25)
+    ]
+    expected_3m = discount_rate_to_investment_rate(0.045, CBO_3M_BILL_DAYS)
+    assert float(baseline_3m.iloc[0]["nominal_rate"]) == pytest.approx(expected_3m)
+    assert (expected_3m - 0.045) * 10_000 == pytest.approx(11.4999, abs=1e-3)
 
 
 def test_ratewall_source_backed_yield_surface_has_curve_scenarios(tmp_path):
