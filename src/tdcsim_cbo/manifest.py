@@ -130,6 +130,22 @@ def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
             else "fail",
             "observed": ",".join(str(value) for value in boundary_checks.get("cash_residual_affects_issuance_size", [])),
         },
+        *cash_closure_validation_invariants(boundary_checks),
+    ]
+    return {
+        "status": "pass"
+        if all(item["status"] == "pass" for item in gates)
+        and all(item["status"] == "pass" for item in invariants)
+        else "fail",
+        "gates": gates,
+        "invariants": invariants,
+    }
+
+
+def cash_closure_validation_invariants(boundary_checks: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Render the cash-chain validation claims from independently measurable values."""
+
+    return [
         # The modeled Treasury cash chain must actually close. A negative TGA is an
         # unmodeled overdraft; a cash residual booked to the TGA alone creates cash
         # with no counterparty. Either one makes the run's TDC an open-chain figure,
@@ -171,14 +187,6 @@ def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
             ),
         },
     ]
-    return {
-        "status": "pass"
-        if all(item["status"] == "pass" for item in gates)
-        and all(item["status"] == "pass" for item in invariants)
-        else "fail",
-        "gates": gates,
-        "invariants": invariants,
-    }
 
 
 def _normalized_bool_set(values: Any) -> set[bool]:
