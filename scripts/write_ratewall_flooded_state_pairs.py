@@ -198,7 +198,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             exports[year],
             work_root,
             force=args.force,
-            injection_paths=injection_paths if year == 2028 else None,
+            # Every flooded year needs the injection paths, not just 2028. The 2029 and 2031
+            # states are exported from the injection run, so their opening portfolios already
+            # carry the injected debt. Handing those runs the unmodified CBO debt target told
+            # them to spend the injection and then pretend it never happened: the only way to
+            # hit that target was to stop borrowing and pay maturities out of the TGA, which
+            # drove it to -2,032bn for 365 periods and failed the cash-closure gate.
+            injection_paths=injection_paths,
         )
         register_source_run(
             output_root,
@@ -478,12 +484,25 @@ def _run_plus100_pair_sources(
     start = export_start(export)
     end = export_end(export)
     local_injection_paths = _copy_injection_files(injection_paths, scenario_dir) if injection_paths is not None else None
-    if local_injection_paths is not None:
-        overrides = _injection_overrides(local_injection_paths)
-    elif year in {2029, 2031}:
-        overrides = {"issuance_mix": _default_issuance_mix(negative_issuance_action="retire_shortest_public_marketable")}
+    if local_injection_paths is None:
+        overrides: dict[str, Any] = {}
     else:
-        overrides = {}
+        # Two separable concerns, previously conflated into one year-gated branch.
+        #
+        # The injection's raised debt, deficit, and Fed paths belong to *every* flooded year:
+        # 2029 and 2031 are exported from the injection run, so their opening portfolios
+        # already hold the injected debt. Giving them the unmodified CBO debt target made the
+        # scenario self-contradictory and drained the TGA to -2,032bn.
+        overrides = _injection_overrides(local_injection_paths)
+        # Issuance behaviour is per-year and is not part of that fix. 2028 issues into the
+        # injection itself, so a negative required issuance is a real error there. 2029 and
+        # 2031 open on a debt stock that steps back down as the injection matures, so a
+        # negative requirement is expected and is met by retiring the shortest paper rather
+        # than failing the run.
+        if year in {2029, 2031}:
+            overrides["issuance_mix"] = _default_issuance_mix(
+                negative_issuance_action="retire_shortest_public_marketable"
+            )
     baseline_scenario = _scenario(
         baseline,
         scenario_id=f"flooded_state_{year}_baseline_v1",
