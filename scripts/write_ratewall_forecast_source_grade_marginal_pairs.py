@@ -31,6 +31,7 @@ from tdcsim_cbo._json import canonical_json_sha256, read_json, sha256_file, writ
 from tdcsim_cbo.campaign_store import register_source_run  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     DENOMINATOR_EQUIVALENCE_KEY,
+    beta_case_from_retained_spec,
     OBJECT_ID,
     SHOCK_PATH_ID,
     assemble_marginal_tdc_pair,
@@ -214,7 +215,7 @@ def _process_year(
         baseline_scenario_id=baseline_scenario["scenario_id"],
         shock_scenario_id=shock_scenario["scenario_id"],
         beta_case=(
-            _beta_case_from_retained_spec(spec_root, year)
+            beta_case_from_retained_spec(spec_root, f"*forecast_cbo_baseline_{year}_*.json")
             if spec_root is not None
             else _load_beta_case(
                 beta_schedule_path=beta_schedule_path,
@@ -512,50 +513,6 @@ def _pair_spec(
         "one_named_rate_shock_only": True,
         "demand_conversion_cases": [beta_case],
     }
-
-
-BETA_CASE_FIELDS = (
-    "demand_conversion_case",
-    "beta",
-    "beta_assumption_id",
-    "beta_source_status",
-    "chi",
-    "chi_assumption_id",
-    "chi_source_status",
-)
-
-
-def _beta_case_from_retained_spec(spec_root: Path, year: int) -> dict[str, Any]:
-    """Reuse the beta/chi selection a retained pair spec already recorded.
-
-    Regenerating a retained campaign must reproduce beta exactly. It is not confined to the
-    retired diagnostic: ``delta_tdc_ex_overlap_non_interest_admissible_bil * beta`` is
-    asserted equal to ``tdc_materialized_deposit_stock_admissible_bil``, which the downstream
-    consumer selects. Re-deriving beta from a rebuilt schedule could move a consumed value
-    without anything failing, so the recorded selection is the authority.
-    """
-
-    root = Path(spec_root).expanduser().resolve()
-    matches = sorted(root.glob(f"*forecast_cbo_baseline_{year}_*.json"))
-    if len(matches) != 1:
-        raise SystemExit(
-            f"expected exactly one retained forecast pair spec for {year} under {root}, found {len(matches)}"
-        )
-    spec = read_json(matches[0])
-    if not isinstance(spec, Mapping):
-        raise SystemExit(f"retained pair spec must be an object: {matches[0]}")
-    cases = [
-        case
-        for case in spec.get("demand_conversion_cases", [])
-        if isinstance(case, Mapping) and case.get("demand_conversion_case") == "central"
-    ]
-    if len(cases) != 1:
-        raise SystemExit(f"retained pair spec must carry exactly one central case: {matches[0]}")
-    case = cases[0]
-    missing = [field for field in BETA_CASE_FIELDS if field not in case]
-    if missing:
-        raise SystemExit(f"retained beta case is missing required fields {missing}: {matches[0]}")
-    return {field: case[field] for field in BETA_CASE_FIELDS}
 
 
 def _load_beta_case(
