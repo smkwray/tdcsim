@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -18,7 +17,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tdcsim_cbo._json import read_json, write_json  # noqa: E402
-from tdcsim_cbo.consumer_challenge import build_ingest_challenge  # noqa: E402
+from tdcsim_cbo.consumer_challenge import (  # noqa: E402
+    build_handoff_package_manifest,
+    build_ingest_challenge,
+    collect_release_identity,
+)
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
     MANIFEST_FILE,
     SUMMARY_FILE,
@@ -32,11 +35,14 @@ FLOODED_ROOT = PROJECT_ROOT / "output" / "flooded_state_scenario_20260707"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output" / "ratewall_split_pairs_20260707"
 CUMULATIVE_SPLIT_FILE = "tdcsim_ratewall_cumulative_split_input.csv"
 CHALLENGE_FILE = "tdcsim_ratewall_ingest_challenge.json"
+PACKAGE_MANIFEST_FILE = "tdcsim_ratewall_handoff_package_manifest.json"
 PAIR_INDEX_FILE = "tdcsim_ratewall_split_pair_index.csv"
+CURRENT_SPLIT_PAIR_ID = "current_state_2026_plus_100bp_year_source_grade"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    producer_identity = collect_release_identity(PROJECT_ROOT)
     output_root = args.output_root.expanduser().resolve()
     if output_root.exists() and args.force:
         shutil.rmtree(output_root)
@@ -83,39 +89,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             if group == "source_grade_cumulative_input":
                 cumulative_frames.append(pd.read_csv(result.summary_path))
 
+    index_path = output_root / PAIR_INDEX_FILE
     index = pd.DataFrame(index_rows)
-    index.to_csv(output_root / PAIR_INDEX_FILE, index=False)
+    index.to_csv(index_path, index=False)
+    cumulative_path = output_root / CUMULATIVE_SPLIT_FILE
     cumulative = _cumulative_split_table(cumulative_frames)
-    cumulative.to_csv(output_root / CUMULATIVE_SPLIT_FILE, index=False)
-    # Producer half of the export-boundary claim: state exactly what was published and which
-    # field the consumer is expected to select, so its receipt can be compared field by field
-    # rather than taken on trust.
+    cumulative.to_csv(cumulative_path, index=False)
+
+    generated_pair_dirs = _pair_dir_map(output_root)
+    current_pair_dir = generated_pair_dirs.get(CURRENT_SPLIT_PAIR_ID)
+    if current_pair_dir is None:
+        raise SystemExit(f"missing current split pair for handoff: {CURRENT_SPLIT_PAIR_ID}")
+    current_summary_path = current_pair_dir / SUMMARY_FILE
+    pair_manifest_paths = sorted(output_root.glob(f"*/{MANIFEST_FILE}"))
+    package_manifest_path = output_root / PACKAGE_MANIFEST_FILE
+    write_json(
+        package_manifest_path,
+        build_handoff_package_manifest(
+            output_root,
+            campaign_id=args.campaign_id,
+            pair_index_path=index_path,
+            pair_manifest_paths=pair_manifest_paths,
+            cumulative_csv=cumulative_path,
+            current_summary_csv=current_summary_path,
+            producer_identity=producer_identity,
+        ),
+    )
+    # The challenge binds both files that the consumer hash-pins, the exact admitted projection,
+    # and the package manifest carrying all pair/run lineage.
     write_json(
         output_root / CHALLENGE_FILE,
         build_ingest_challenge(
-            output_root / CUMULATIVE_SPLIT_FILE,
-            pair_id="tdcsim_ratewall_cumulative_split_input",
-            runtime_release_sha=_runtime_release_sha(),
+            cumulative_path,
+            current_summary_path,
+            package_manifest_path=package_manifest_path,
         ),
     )
     print(f"wrote {output_root}")
     return 0
-
-
-def _runtime_release_sha() -> str:
-    """The commit that produced these bytes, or an explicit marker when it cannot be read."""
-
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=PROJECT_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
-        return "unknown_no_git_identity"
-    return result.stdout.strip() or "unknown_empty_git_identity"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -123,6 +134,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-grade-root", default=SOURCE_GRADE_ROOT, type=Path)
     parser.add_argument("--flooded-root", default=FLOODED_ROOT, type=Path)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, type=Path)
+    parser.add_argument("--campaign-id", required=True)
     parser.add_argument("--force", action="store_true")
     return parser
 
