@@ -62,9 +62,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     work_root.mkdir(parents=True, exist_ok=True)
     pair_spec_dir.mkdir(parents=True, exist_ok=True)
 
-    beta_schedule = args.beta_schedule_path.expanduser().resolve()
-    if not beta_schedule.exists():
-        raise SystemExit(f"RateWall beta schedule missing: {beta_schedule}")
+    # No beta-schedule gate here. These pairs are emitted pre-beta on purpose:
+    # `_pre_beta_case` sets beta=chi=1.0 with source status
+    # `not_applied_in_tdcsim_pair_artifact`, deferring the demand conversion to the consumer
+    # side. The schedule's contents were never read -- only its existence was checked -- so the
+    # gate blocked the build on a file whose values it would not have used. The schedule's
+    # producer has since been retired downstream, which turned a dead gate into a hard stop.
     source_pair_root = args.source_grade_pair_root.expanduser().resolve()
     _verify_prereq_pairs(source_pair_root)
 
@@ -245,17 +248,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--years", default="2028,2029,2031")
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--work-root", required=True, type=Path)
-    parser.add_argument(
-        "--beta-schedule-path",
-        default=PROJECT_ROOT
-        / ".."
-        / "ratewall"
-        / "var"
-        / "preliminary_scenario_results"
-        / "marginal_tdcsim"
-        / "ratewall_marginal_tdc_beta_schedule.csv",
-        type=Path,
-    )
     parser.add_argument(
         "--source-grade-pair-root",
         default=PROJECT_ROOT / "output" / "ratewall_source_grade_marginal_pairs_20260706",
