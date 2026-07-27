@@ -730,6 +730,7 @@ def _pair_spec(
     one_named_rate_shock_only: bool,
 ) -> dict[str, Any]:
     baseline_manifest = read_json(baseline_run_dir / "tdcsim_cbo_run_manifest.json")
+    shock_manifest = read_json(shock_run_dir / "tdcsim_cbo_run_manifest.json")
     route = pd.read_csv(baseline_run_dir / "outputs" / "tdcsim_tdc_principal_route_stock_closure.csv.gz")
     stock_total = float(route["opening_route_stock_bil"].sum())
     by_holder = route.groupby("route_holder_sector")["opening_route_stock_bil"].sum().to_dict()
