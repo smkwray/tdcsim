@@ -515,8 +515,56 @@ def _verify_recomputed_cash_claims(manifest: dict[str, Any], recomputed: dict[st
         actual = by_id.get(invariant_id)
         if actual is None:
             raise VerificationError(f"cash closure validation invariant is missing: {invariant_id}")
-        if actual.get("status") != expected.get("status") or actual.get("observed") != expected.get("observed"):
+        if actual.get("status") != expected.get("status"):
+            raise VerificationError(f"validation invariant {invariant_id} status disagrees with recomputed results")
+        _compare_observation(invariant_id, actual.get("observed"), expected.get("observed"))
+
+
+def _compare_observation(invariant_id: str, actual: Any, expected: Any) -> None:
+    """Compare a ``key=value;...`` observation, numerically where the value is a number.
+
+    The observed strings embed floats, so an exact string comparison rejects a faithful run
+    over a last-digit repr difference: reading results back from CSV can return
+    ``85.13373083354395`` where the producer wrote ``85.13373083354418``. That is
+    representation noise, not a changed claim. Keys, ordering, and every non-numeric value
+    still have to match exactly, so a tampered status or a substituted magnitude is caught.
+    """
+
+    actual_fields = _observation_fields(actual)
+    expected_fields = _observation_fields(expected)
+    if actual_fields is None or expected_fields is None or list(actual_fields) != list(expected_fields):
+        if actual != expected:
             raise VerificationError(f"validation invariant {invariant_id} disagrees with recomputed results")
+        return
+    for key, expected_value in expected_fields.items():
+        actual_value = actual_fields[key]
+        if actual_value == expected_value:
+            continue
+        try:
+            if math.isclose(float(actual_value), float(expected_value), rel_tol=1e-9, abs_tol=1e-9):
+                continue
+        except (TypeError, ValueError):
+            pass
+        raise VerificationError(
+            f"validation invariant {invariant_id} disagrees with recomputed results on {key}: "
+            f"manifest={actual_value!r}, actual={expected_value!r}"
+        )
+
+
+def _observation_fields(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, str) or "=" not in value:
+        return None
+    fields: dict[str, str] = {}
+    for part in value.split(";"):
+        if not part:
+            continue
+        key, sep, item = part.partition("=")
+        if not sep:
+            return None
+        if key in fields:
+            return None
+        fields[key] = item
+    return fields or None
 
 
 def _compare_recomputed_value(label: str, actual: Any, expected: Any) -> None:
