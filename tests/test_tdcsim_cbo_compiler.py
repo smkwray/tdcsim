@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from forecast_paths import OPERATING_CASH_COMPARISON_ROLE, OPERATING_CASH_OPENING_STATE_ROLE
 from tdcsim_cbo import CboBaselinePackage, CboScenarioCompiler, CboScenarioSpec
 from tdcsim_cbo._json import sha256_file, write_json
 from tdcsim_cbo.compiler import CompilerError, HOLDER_PREFERENCE_EVENTS_FILE, ISSUANCE_MIX_FILE, digest_input_tree
@@ -332,7 +333,7 @@ def test_file_backed_fiscal_replacements_overwrite_claim_labels(tmp_path: Path) 
     assert {row["claim_boundary"] for row in rows} == {"primary_deficit_scenario_transform_no_plug"}
 
 
-def test_file_backed_operating_cash_replacements_overwrite_runtime_role(tmp_path: Path) -> None:
+def test_file_backed_operating_cash_replacements_assign_faithful_runtime_roles(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
     replacement = tmp_path / "cash.csv"
     _write_csv(
@@ -356,7 +357,10 @@ def test_file_backed_operating_cash_replacements_overwrite_runtime_role(tmp_path
 
     rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_operating_cash_path.csv")
     assert {row["source_role"] for row in rows} == {"scenario_assumption"}
-    assert {row["runtime_role"] for row in rows} == {"hard_target"}
+    assert [row["runtime_role"] for row in rows] == [
+        OPERATING_CASH_OPENING_STATE_ROLE,
+        OPERATING_CASH_COMPARISON_ROLE,
+    ]
     assert {row["claim_boundary"] for row in rows} == {"operating_cash_proxy_not_debt_target_or_issuance_supply"}
 
 
