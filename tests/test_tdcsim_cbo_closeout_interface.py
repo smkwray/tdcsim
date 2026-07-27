@@ -82,8 +82,16 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     assert run.run_manifest["boundary_checks"]["net_interest_role"] == "diagnostic_nonbinding"
     assert run.run_manifest["boundary_checks"]["fed_target_holder_allocation_only"] is True
     assert verify_compiled_scenario(run.compiled.compiled_dir)["status"] == "pass"
-    assert verify_scenario_run(run.output_dir)["status"] == "pass"
-    assert verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)["status"] == "pass"
+    local_verification = verify_scenario_run(run.output_dir)
+    replay_verification = verify_scenario_run(
+        run.output_dir,
+        baseline_package=baseline.package_path,
+        attestation=baseline.attestation.path,
+    )
+    assert local_verification["status"] == "pass"
+    assert local_verification["verification_grade"] == "local"
+    assert replay_verification["status"] == "pass"
+    assert replay_verification["verification_grade"] == "replay"
     params = build_runtime_params(
         run.compiled.forecast_inputs_dir,
         actuals_available_as_of=run.run_manifest["output_manifest"]["row_metadata"]["actuals_available_as_of"],

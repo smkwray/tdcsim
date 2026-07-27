@@ -156,8 +156,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     pair_spec_path = pair_spec_dir / f"{pair_spec['pair_id']}.json"
     write_json(pair_spec_path, pair_spec)
-    result = assemble_marginal_tdc_pair(pair_spec_path, pair_dir)
-    verified = verify_marginal_tdc_pair(result.output_dir)
+    result = assemble_marginal_tdc_pair(
+        pair_spec_path,
+        pair_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
+    verified = verify_marginal_tdc_pair(
+        result.output_dir,
+        baseline_package=baseline_package.package_path,
+        attestation=baseline_package.attestation.path,
+    )
     print(result.output_dir)
     print(verified["status"])
     return 0

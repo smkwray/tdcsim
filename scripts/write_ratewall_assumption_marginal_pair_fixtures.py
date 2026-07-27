@@ -44,7 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec_path = spec_dir / f"{fixture['pair_id']}.json"
         write_json(spec_path, spec)
         pair_dir = output_root / str(fixture["pair_dir_name"])
-        result = assemble_marginal_tdc_pair(spec, pair_dir)
+        result = assemble_marginal_tdc_pair(spec, pair_dir, require_source_verification=False)
         written.append(result.output_dir)
 
     for path in written:

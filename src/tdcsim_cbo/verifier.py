@@ -96,10 +96,12 @@ def verify_scenario_run(
     _verify_manifest_artifacts(root, manifest.get("outputs"), base=root)
     _verify_manifest_artifacts(root, manifest.get("compiled_inputs"), base=root)
     _verify_scenario_copy(root, manifest)
+    verification_grade = "local"
     if baseline_package is not None or attestation is not None:
         if baseline_package is None or attestation is None:
             raise VerificationError("baseline_package and attestation must be supplied together")
         _verify_recompile(root, manifest, baseline_package, attestation)
+        verification_grade = "replay"
     boundaries = manifest.get("boundary_checks")
     if not isinstance(boundaries, dict):
         raise VerificationError("run manifest boundary_checks must be an object")
@@ -112,6 +114,7 @@ def verify_scenario_run(
     recomputed = _verify_output_invariants(root, manifest)
     return {
         "status": "pass",
+        "verification_grade": verification_grade,
         "compiled": compiled,
         "output_count": len(manifest.get("output_hashes") or []),
         "recomputed": recomputed,
