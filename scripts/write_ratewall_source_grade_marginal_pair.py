@@ -23,6 +23,7 @@ from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario  # 
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
 from tdcsim_cbo.campaign_store import register_source_run  # noqa: E402
 from tdcsim_cbo.marginal_tdc import (  # noqa: E402
+    beta_case_from_retained_spec,
     DENOMINATOR_EQUIVALENCE_KEY,
     OBJECT_ID,
     SHOCK_PATH_ID,
@@ -137,9 +138,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     baseline_scenario = _read_json(baseline_scenario_path)
     shock_scenario = _read_json(shock_scenario_path)
-    marker = beta_schedule_path.parent / "BETA_SCHEDULE_READY"
-    if not marker.exists():
-        raise SystemExit(f"RateWall beta schedule readiness marker absent at assembly: {marker}")
+    spec_root = getattr(args, "beta_case_from_spec_root", None)
+    if spec_root is None:
+        marker = beta_schedule_path.parent / "BETA_SCHEDULE_READY"
+        if not marker.exists():
+            raise SystemExit(f"RateWall beta schedule readiness marker absent at assembly: {marker}")
     register_source_run(
         output_root,
         baseline_run_dir,
@@ -157,14 +160,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         shock_run_dir=shock_run_dir,
         baseline_scenario_id=baseline_scenario["scenario_id"],
         shock_scenario_id=shock_scenario["scenario_id"],
-        beta_case=_load_beta_case(
-            beta_schedule_path=beta_schedule_path,
-            period_object="current",
-            period="2026",
-            state_id="current_state::2026",
-            state_kind="current_state",
-            horizon="annual_h1_100bp_year",
-            shock_path_id=SHOCK_PATH_ID,
+        beta_case=(
+            beta_case_from_retained_spec(spec_root, "*current_2026*.json")
+            if spec_root is not None
+            else _load_beta_case(
+                beta_schedule_path=beta_schedule_path,
+                period_object="current",
+                period="2026",
+                state_id="current_state::2026",
+                state_kind="current_state",
+                horizon="annual_h1_100bp_year",
+                shock_path_id=SHOCK_PATH_ID,
+            )
         ),
     )
     pair_spec_path = pair_spec_dir / f"{pair_spec['pair_id']}.json"
@@ -193,6 +200,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--work-root", required=True, type=Path)
     parser.add_argument("--beta-schedule-path", default=None, type=Path)
+    # Reuse the retained specs' recorded beta/chi rather than a rebuilt schedule; beta is
+    # claim-relevant and must stay byte-exact. See marginal_tdc.beta_case_from_retained_spec.
+    parser.add_argument("--beta-case-from-spec-root", default=None, type=Path)
     parser.add_argument("--pair-spec-root", default=None, type=Path)
     parser.add_argument("--phase", choices=("compute", "assemble", "all"), default="all")
     parser.add_argument("--force", action="store_true")

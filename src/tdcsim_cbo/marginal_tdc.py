@@ -29,6 +29,56 @@ PAIR_SCHEMA_VERSION = "tdcsim_cbo_marginal_tdc_pair_v1"
 MANIFEST_SCHEMA_VERSION = "tdcsim_cbo_marginal_tdc_manifest_v1"
 OBJECT_ID = "RW_M_PLUS_100BP_YEAR"
 SHOCK_PATH_ID = "plus_100bp_year"
+
+BETA_CASE_FIELDS = (
+    "demand_conversion_case",
+    "beta",
+    "beta_assumption_id",
+    "beta_source_status",
+    "chi",
+    "chi_assumption_id",
+    "chi_source_status",
+)
+
+
+class BetaCaseError(ValueError):
+    """A retained beta/chi selection could not be resolved."""
+
+
+def beta_case_from_retained_spec(spec_root: str | Path, spec_glob: str) -> dict[str, Any]:
+    """Reuse the beta/chi selection a retained pair spec already recorded.
+
+    Regenerating a retained campaign must reproduce beta exactly. Beta is not confined to the
+    retired diagnostic: ``delta_tdc_ex_overlap_non_interest_admissible_bil * beta`` is asserted
+    equal to ``tdc_materialized_deposit_stock_admissible_bil``, which the downstream consumer
+    selects. Re-deriving beta from a rebuilt schedule could move a consumed value without
+    anything failing, so the recorded selection is the authority.
+
+    The upstream schedule's producer was retired downstream and its output is not recoverable,
+    so this is the only route that keeps beta byte-exact.
+    """
+
+    root = Path(spec_root).expanduser().resolve()
+    matches = sorted(root.glob(spec_glob))
+    if len(matches) != 1:
+        raise BetaCaseError(
+            f"expected exactly one retained pair spec matching {spec_glob!r} under {root}, found {len(matches)}"
+        )
+    spec = read_json(matches[0])
+    if not isinstance(spec, Mapping):
+        raise BetaCaseError(f"retained pair spec must be an object: {matches[0]}")
+    cases = [
+        case
+        for case in spec.get("demand_conversion_cases", [])
+        if isinstance(case, Mapping) and case.get("demand_conversion_case") == "central"
+    ]
+    if len(cases) != 1:
+        raise BetaCaseError(f"retained pair spec must carry exactly one central case: {matches[0]}")
+    case = cases[0]
+    missing = [field for field in BETA_CASE_FIELDS if field not in case]
+    if missing:
+        raise BetaCaseError(f"retained beta case is missing required fields {missing}: {matches[0]}")
+    return {field: case[field] for field in BETA_CASE_FIELDS}
 FISCAL_INJECTION_OBJECT_ID = "TDC_FISCAL_INJECTION_2028"
 FISCAL_INJECTION_SHOCK_PATH_ID = "fiscal_injection_2028_v1"
 DENOMINATOR_EQUIVALENCE_KEY = "ratewall_D_conv_plus_100bp_year_v1"
