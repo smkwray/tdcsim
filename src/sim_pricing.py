@@ -139,7 +139,11 @@ def value_treasury_security(
     projected_adjusted_principal_at_maturity=None,
     nominal_discount_yield=None,
 ):
-    """Value one Treasury security at a settlement date. The single owner of that question.
+    """Value one Treasury security at a settlement date, for callers using this kernel.
+
+    Not the only valuation path in the project: ordinary preference trading still prices
+    through ``calculate_bond_market_price``, which discounts TIPS at a nominal yield. That
+    path is disabled in the CBO runner. Do not describe this function as project-wide.
 
     Discounts the *dated* remaining cash flows at the semiannual bond-equivalent convention
     of 31 CFR 356 Appendix B, including its fractional stub exponent v**(r/s) for a
