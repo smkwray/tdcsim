@@ -24,6 +24,7 @@ from zipfile import ZipFile
 import pandas as pd
 import yaml
 
+from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
 from tdc_shared import (
     MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
     MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
@@ -1178,10 +1179,13 @@ def build_yield_curve_surface(output_path: Path, *, cbo_economic_path: Path) -> 
         for year, rates in sorted(cbo_rates.items()):
             if year < 2026:
                 continue
+            cbo_3m_investment_rate = discount_rate_to_investment_rate(
+                rates["cbo_3m_pct"] / 100.0,
+                CBO_3M_BILL_DAYS,
+            )
             curve = _shape_preserving_curve(
                 current_curve,
-                cbo_3m=rates["cbo_3m_pct"] / 100.0
-                + float(scenario["short_shift"]),
+                cbo_3m=cbo_3m_investment_rate + float(scenario["short_shift"]),
                 cbo_10y=rates["cbo_10y_pct"] / 100.0
                 + float(scenario["long_shift"]),
             )
