@@ -4210,6 +4210,13 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     allocated_sum = sum((allocations_by_holder_item_ref[h].get(current_item_ref_id, 0.0) for h in HOLDER_TYPES))
                     if abs(allocated_sum - item_face_amount) > 1e-06:
                         raise ValueError(f'[{scenario_name}@{current_date.date()}] Issuance allocation under- or over-shot face supply for {item_type} {item_maturity}Y. Allocated {allocated_sum:.6f} vs required {item_face_amount:.6f}.')
+            # Secondary transfers can split a holding into a newly identified
+            # tranche after the prior period's auction. Reconcile the auction
+            # counter to the live portfolio before assigning the next IDs.
+            bond_id_counter = max(
+                bond_id_counter,
+                _next_portfolio_bond_id(bond_portfolio),
+            )
             next_bond_id_to_assign = bond_id_counter
             for holder, items_allocated_to_holder in allocations_by_holder_item_ref.items():
                 for item_ref, face_value_issued_to_holder in items_allocated_to_holder.items():
