@@ -547,6 +547,207 @@ def test_verifier_rejects_missing_principal_bridge_even_with_fresh_hashes(tmp_pa
         verify_scenario_run(run.output_dir)
 
 
+@pytest.mark.parametrize("mutation", ["delete", "duplicate"])
+def test_verifier_rejects_deleted_or_duplicated_accounting_leg_with_fresh_hashes(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    journal_path = run.output_dir / "outputs" / "tdcsim_accounting_journal.csv"
+    journal = pd.read_csv(journal_path)
+    target_index = journal.index[journal["event_type"].eq("issuance")][0]
+    if mutation == "delete":
+        journal = journal.drop(index=target_index).reset_index(drop=True)
+    else:
+        duplicate = journal.loc[[target_index]].copy()
+        duplicate.loc[:, "journal_id"] = (
+            duplicate["journal_id"].astype(str) + "|duplicate"
+        )
+        journal = pd.concat([journal, duplicate], ignore_index=True)
+    journal.to_csv(journal_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_manifest_artifact(
+        run.output_dir,
+        manifest,
+        "outputs/tdcsim_accounting_journal.csv",
+    )
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(
+        VerificationError,
+        match=r"accounting closure does not match journal|route stock closure fails",
+    ):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_empty_accounting_evidence_for_multi_period_run(
+    tmp_path: Path,
+) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    targets = [
+        run.output_dir / "outputs" / "tdcsim_accounting_journal.csv",
+        run.output_dir / "outputs" / "tdcsim_accounting_closure.csv",
+    ]
+    for target in targets:
+        pd.read_csv(target).iloc[0:0].to_csv(target, index=False)
+    manifest = read_json(run.manifest_path)
+    for target in targets:
+        _refresh_manifest_artifact(
+            run.output_dir,
+            manifest,
+            f"outputs/{target.name}",
+        )
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(
+        VerificationError,
+        match="multi-period run is missing accounting journal and closure evidence",
+    ):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_accounting_leg_outside_results_period_set(
+    tmp_path: Path,
+) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    journal_path = run.output_dir / "outputs" / "tdcsim_accounting_journal.csv"
+    journal = pd.read_csv(journal_path)
+    extra = journal.iloc[[0]].copy()
+    extra.loc[:, "journal_id"] = extra["journal_id"].astype(str) + "|extra-period"
+    extra.loc[:, "period_start"] = "2099-01-01"
+    extra.loc[:, "period_end"] = "2099-01-02"
+    amount_columns = [
+        "face_stock_change_bil",
+        "adjusted_principal_change_bil",
+        "route_face_stock_change_bil",
+        "route_adjusted_principal_change_bil",
+        "treasury_cash_change_bil",
+        "reserve_change_bil",
+        "deposit_change_bil",
+    ]
+    extra.loc[:, amount_columns] = 0.0
+    extra.loc[:, "treasury_cash_change_bil"] = 123.0
+    pd.concat([journal, extra], ignore_index=True).to_csv(journal_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_manifest_artifact(
+        run.output_dir,
+        manifest,
+        "outputs/tdcsim_accounting_journal.csv",
+    )
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(
+        VerificationError,
+        match="accounting journal, closure, and results period sets must match exactly",
+    ):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_coordinated_debt_total_tamper_against_stock_groups(
+    tmp_path: Path,
+) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    results = pd.read_csv(run.results_path)
+    final_index = results.index[-1]
+    holder_column = next(
+        column
+        for column in results.columns
+        if column.startswith("DebtHeld_")
+        and float(results.loc[final_index, column]) > 0.0
+    )
+    instrument_column = next(
+        column
+        for column in results.columns
+        if column.startswith("DebtHeldByType_")
+        and float(results.loc[final_index, column]) > 0.0
+    )
+    for column in (holder_column, instrument_column, "TotalDebt_Agg"):
+        results.loc[final_index, column] = (
+            float(results.loc[final_index, column]) + 123.0
+        )
+    results.to_csv(run.results_path, index=False)
+    closure_path = run.output_dir / "outputs" / "tdcsim_accounting_closure.csv"
+    closure = pd.read_csv(closure_path)
+    closure_index = closure.index[-1]
+    for column in (
+        "holder_debt_total_bil",
+        "instrument_debt_total_bil",
+        "aggregate_debt_bil",
+    ):
+        closure.loc[closure_index, column] = (
+            float(closure.loc[closure_index, column]) + 123.0
+        )
+    closure.to_csv(closure_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_result_hashes(run.output_dir, manifest)
+    _refresh_manifest_artifact(
+        run.output_dir,
+        manifest,
+        "outputs/tdcsim_accounting_closure.csv",
+    )
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(
+        VerificationError,
+        match="accounting closure disagrees with independent snapshot",
+    ):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_malformed_holder_stock_numeric_with_fresh_hashes(
+    tmp_path: Path,
+) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    stocks_path = run.output_dir / "outputs" / "tdcsim_holder_stocks.csv"
+    stocks = pd.read_csv(stocks_path)
+    stocks["debt_held_bil"] = stocks["debt_held_bil"].astype(object)
+    stocks.loc[stocks.index[0], "debt_held_bil"] = "not-a-number"
+    stocks.to_csv(stocks_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_manifest_artifact(
+        run.output_dir,
+        manifest,
+        "outputs/tdcsim_holder_stocks.csv",
+    )
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(
+        VerificationError,
+        match="tdcsim_holder_stocks has malformed or nonfinite numeric values",
+    ):
+        verify_scenario_run(run.output_dir)
+
+
 def test_verifier_rejects_compiled_digest_split_even_with_updated_compiled_manifest(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
@@ -1376,9 +1577,40 @@ def _write_runner_package(
             {"schema_version": "fixture", "scenario_id": "baseline", "holder_type": "Private", "holder_subbucket": "mmf_cash_fund_route", "source_role": "scenario_assumption", "runtime_role": "memo_only", "claim_boundary": "fixture", "bills_pct": "", "notes_pct": "", "bonds_pct": "", "tips_pct": "", "frn_pct": "", "bills_route_share": 0.25, "notes_route_share": 0.1, "bonds_route_share": 0.05, "tips_route_share": 0.05, "frn_route_share": 0.2},
         ],
     )
+    if opening_portfolio is None:
+        opening_portfolio = _opening_controlled_portfolio(1_000.0)
+    opening_cb = opening_portfolio[
+        opening_portfolio["HolderType"].astype(str).eq("CB")
+        & opening_portfolio["Status"].astype(str).eq("Active")
+    ].copy()
+    opening_cb_stock = float(
+        pd.to_numeric(
+            opening_cb["AdjustedPrincipal"].where(
+                opening_cb["SecurityType"].astype(str).eq("TIPS"),
+                opening_cb["FaceValue"],
+            ),
+            errors="coerce",
+        ).fillna(0.0).sum()
+    )
     _write_csv(
         inputs / "tdcsim_fed_holdings_path.csv",
         [
+            {
+                "schema_version": "tdcsim_fed_holdings_path_v1",
+                "scenario_id": "baseline",
+                "period_end": "2026-09-20",
+                "holder_type": "CB",
+                "cbo_fed_holdings_target_bil": opening_cb_stock,
+                "interpolation_method": "opening_state_identity",
+                "source_fiscal_year": 2026,
+                "source_role": "scenario_assumption",
+                "runtime_role": "hard_target",
+                "observation_date": "2026-09-20",
+                "available_date": "2026-09-20",
+                "source_status": "opening_fed_stock_target_identity",
+                "claim_boundary": "fed_holdings_path_guides_holder_allocation_not_total_issuance",
+            },
+            *[
             {
                 "schema_version": "tdcsim_fed_holdings_path_v1",
                 "scenario_id": "baseline",
@@ -1395,10 +1627,9 @@ def _write_runner_package(
                 "claim_boundary": "fed_holdings_path_guides_holder_allocation_not_total_issuance",
             }
             for period in periods
+            ],
         ],
     )
-    if opening_portfolio is None:
-        opening_portfolio = _opening_controlled_portfolio(1_000.0)
     opening_portfolio.to_csv(inputs / "tdcsim_opening_portfolio.csv", index=False)
     write_json(inputs / "tdcsim_opening_portfolio_metadata.json", {"schema_version": "fixture"})
     _write_csv(inputs / "tdcsim_opening_frn_indexation_diagnostics.csv", [{"schema_version": "fixture"}])

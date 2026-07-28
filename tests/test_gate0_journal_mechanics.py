@@ -5,8 +5,15 @@ import copy
 import pandas as pd
 import pytest
 
-from sim_engine import run_simulation
-from tdcsim_cbo.output import _route_stock_closure_handoff_tables
+from sim_engine import (
+    _handoff_append_principal,
+    _retire_public_marketable_debt_to_target,
+    run_simulation,
+)
+from tdcsim_cbo.output import (
+    _accounting_closure_handoff_tables,
+    _route_stock_closure_handoff_tables,
+)
 from test_cbo_engine_integration import (
     _minimal_cash_mode_params,
     _opening_controlled_portfolio,
@@ -81,6 +88,66 @@ def test_route_stock_closure_fails_when_a_named_leg_is_deleted_or_doubled(
     # It cannot be copied into an unrestricted residual and subtracted back out.
     assert row["route_stock_residual_or_indexation_bil"] == pytest.approx(0.0)
     assert abs(row["closure_identity_error_bil"]) > 1e-9
+
+
+@pytest.mark.parametrize("mutation", ["delete", "duplicate"])
+def test_production_journal_mutation_fails_against_independent_state_snapshots(
+    mutation: str,
+) -> None:
+    results, _ = run_simulation(
+        _minimal_cash_mode_params(),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name=f"journal_{mutation}",
+    )
+    raw = copy.deepcopy(results.attrs["handoff_tables"])
+    balanced = pd.DataFrame(
+        _accounting_closure_handoff_tables(results, raw)[
+            "tdcsim_accounting_closure"
+        ]
+    )
+    assert balanced["unexplained_residual_bil"].eq(0.0).all()
+    assert balanced[
+        [
+            "face_stock_closure_error_bil",
+            "adjusted_principal_closure_error_bil",
+            "treasury_cash_closure_error_bil",
+            "reserve_closure_error_bil",
+            "deposit_closure_error_bil",
+            "holder_total_error_bil",
+            "instrument_total_error_bil",
+        ]
+    ].abs().to_numpy().max() <= 1e-9
+
+    journal = raw["tdcsim_accounting_journal"]
+    issuance_index = next(
+        index
+        for index, leg in enumerate(journal)
+        if leg["event_type"] == "issuance"
+    )
+    if mutation == "delete":
+        journal.pop(issuance_index)
+    else:
+        duplicated = copy.deepcopy(journal[issuance_index])
+        duplicated["journal_id"] = f"{duplicated['journal_id']}|duplicate"
+        journal.append(duplicated)
+
+    mutated = pd.DataFrame(
+        _accounting_closure_handoff_tables(results, raw)[
+            "tdcsim_accounting_closure"
+        ]
+    )
+    assert mutated["unexplained_residual_bil"].eq(0.0).all()
+    assert mutated["face_stock_closure_error_bil"].abs().max() > 1e-9
+    assert mutated["treasury_cash_closure_error_bil"].abs().max() > 1e-9
+    route = pd.DataFrame(
+        _route_stock_closure_handoff_tables(raw)[
+            "tdcsim_tdc_principal_route_stock_closure"
+        ]
+    )
+    assert route["route_stock_residual_or_indexation_bil"].eq(0.0).all()
+    assert route["closure_identity_error_bil"].abs().max() > 1e-9
 
 
 def test_trust_fund_issuance_cannot_raise_tga_without_a_named_payer_leg() -> None:
@@ -204,3 +271,44 @@ def test_final_nonmarketable_capitalization_precedes_same_day_maturity_once() ->
     assert results["PrincipalPaid_Bonds"].sum() == pytest.approx(105.0)
     assert len(principal) == 1
     assert principal[0]["cash_paid_bil"] == pytest.approx(105.0)
+
+
+def test_partial_tips_buyback_separates_face_adjusted_principal_and_cash() -> None:
+    portfolio = _opening_tips_portfolio(100.0, 100.0)
+    portfolio.loc[:, "AdjustedPrincipal"] = 120.0
+    portfolio.loc[:, "IndexRatio"] = 1.2
+
+    updated, retired, _, _, events = _retire_public_marketable_debt_to_target(
+        portfolio,
+        60.0,
+        pd.Timestamp("2026-09-30"),
+    )
+
+    assert retired == pytest.approx(60.0)
+    assert updated.iloc[0]["FaceValue"] == pytest.approx(50.0)
+    assert updated.iloc[0]["AdjustedPrincipal"] == pytest.approx(60.0)
+    assert len(events) == 1
+    event = events[0]
+    assert event["RetiredFaceValue"] == pytest.approx(50.0)
+    assert event["RetiredAdjustedPrincipal"] == pytest.approx(60.0)
+    assert event["RetiredCashPaid"] == pytest.approx(60.0)
+
+    handoff = {
+        "tdcsim_accounting_journal": [],
+        "tdcsim_period_principal_flows": [],
+    }
+    _handoff_append_principal(
+        handoff,
+        "2026-09-20",
+        "2026-09-30",
+        event,
+        redemption_type="explicit_retirement_at_par",
+        face_redeemed=event["RetiredFaceValue"],
+        principal_redeemed=event["RetiredCashPaid"],
+        cash_paid=event["RetiredCashPaid"],
+        adjusted_principal_stock_removed=event["RetiredAdjustedPrincipal"],
+    )
+    leg = handoff["tdcsim_accounting_journal"][0]
+    assert leg["face_stock_change_bil"] == pytest.approx(-50.0)
+    assert leg["adjusted_principal_change_bil"] == pytest.approx(-60.0)
+    assert leg["treasury_cash_change_bil"] == pytest.approx(-60.0)

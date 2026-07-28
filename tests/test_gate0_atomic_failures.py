@@ -311,32 +311,17 @@ def test_opening_fed_mismatch_is_rejected_or_restatement_is_nonsettling(
         observation_date="2026-09-20",
         available_date="2026-09-20",
     )
+    fed_rows[0]["cbo_fed_holdings_target_bil"] = 50.0
     paths["fed_holdings_path_file"] = cbo_engine_fixtures._write_csv(
         tmp_path / "tdcsim_fed_holdings_path.csv",
         fed_rows,
     )
 
-    try:
-        results, _ = sim_engine.run_simulation(
+    with pytest.raises((ValueError, RuntimeError), match=r"(?i)opening.*fed"):
+        sim_engine.run_simulation(
             cbo_engine_fixtures._minimal_engine_params(paths),
             "2026-09-20",
             "2026-09-30",
             freq="10D",
             scenario_name="baseline",
         )
-    except (ValueError, RuntimeError) as exc:
-        message = str(exc).lower()
-        assert "opening" in message and "fed" in message
-        return
-
-    opening = results.iloc[0]
-    period = results.iloc[-1]
-    scope = str(opening["CBOFedSettlementScope"]).lower().replace("-", "").replace("_", "")
-    assert "prestart" in scope and "nonsettling" in scope and "restatement" in scope
-    assert opening["CBOFedHoldingsTarget"] == pytest.approx(50.0)
-    assert opening["CBOFedHoldingsTargetError"] == pytest.approx(0.0)
-    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(0.0)
-    assert period["CBOFedSecondaryPurchaseCash"] == pytest.approx(0.0)
-    assert period["CBOFedSecondaryPurchaseReserveEffect"] == pytest.approx(0.0)
-    assert period["CBOFedSecondaryPurchaseDepositEffect"] == pytest.approx(0.0)
-    assert period["TDC_SecondaryTrades"] == pytest.approx(0.0)

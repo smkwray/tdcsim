@@ -21,7 +21,11 @@ from .baseline import CboBaselinePackage
 from .compiler import CboScenarioCompiler, digest_input_tree
 from .contract import CboScenarioSpec
 from .manifest import RUN_CLAIM_BOUNDARY, RUN_UNSUPPORTED_COMPONENTS, cash_closure_validation_invariants
-from .output import hash_output_tree, write_scenario_outputs
+from .output import (
+    _route_stock_closure_handoff_tables,
+    hash_output_tree,
+    write_scenario_outputs,
+)
 from .runtime_identity import distribution_identity, wheel_file_digest
 from . import runner as runner_module
 from ._schema import validate_schema
@@ -599,11 +603,20 @@ def _output_artifact_path(root: Path, manifest: dict[str, Any], logical_name_ste
 
 
 def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
+    results = _read_results(_result_artifact_path(root, manifest))
     summary = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_summary"))
     components = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_tdc_components"))
+    issuance = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_issuance_flows"))
     principal = _read_results(_output_artifact_path(root, manifest, "tdcsim_period_principal_flows"))
+    holder_stocks = _read_results(_output_artifact_path(root, manifest, "tdcsim_holder_stocks"))
     route_stocks = _read_results(_output_artifact_path(root, manifest, "tdcsim_tdc_principal_route_stocks"))
     route_closure = _read_results(_output_artifact_path(root, manifest, "tdcsim_tdc_principal_route_stock_closure"))
+    accounting_journal = _read_results(
+        _output_artifact_path(root, manifest, "tdcsim_accounting_journal")
+    )
+    accounting_closure = _read_results(
+        _output_artifact_path(root, manifest, "tdcsim_accounting_closure")
+    )
     _require_columns(
         summary,
         (
@@ -713,6 +726,36 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
         raise VerificationError("route closure has unexpected route_stock_basis")
     if _numeric(route_closure, "closure_identity_error_bil").abs().max() > 1e-7:
         raise VerificationError("route stock closure identity failed")
+    _verify_accounting_journal_outputs(
+        results,
+        holder_stocks,
+        accounting_journal,
+        accounting_closure,
+    )
+    recomputed_route = pd.DataFrame(
+        _route_stock_closure_handoff_tables(
+            {
+                "tdcsim_accounting_journal": accounting_journal.to_dict("records"),
+                "tdcsim_period_issuance_flows": issuance.to_dict("records"),
+                "tdcsim_period_principal_flows": principal.to_dict("records"),
+                "tdcsim_tdc_principal_route_stocks": route_stocks.to_dict("records"),
+            }
+        )["tdcsim_tdc_principal_route_stock_closure"]
+    )
+    if recomputed_route.empty:
+        raise VerificationError("route stock closure could not be independently recomputed")
+    if (
+        pd.to_numeric(
+            recomputed_route["closure_identity_error_bil"], errors="coerce"
+        )
+        .fillna(0.0)
+        .abs()
+        .max()
+        > 1e-7
+    ):
+        raise VerificationError(
+            "route stock closure fails against independently read journal and snapshots"
+        )
     identity = (
         _numeric(summary, "tdc_fiscal_flow_bil")
         + _numeric(summary, "tdc_debt_service_bil")
@@ -823,6 +866,352 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
                 raise VerificationError(f"TDC principal bridge does not match summary field: {summary_col}")
 
 
+def _verify_accounting_journal_outputs(
+    results: pd.DataFrame,
+    holder_stocks: pd.DataFrame,
+    journal: pd.DataFrame,
+    closure: pd.DataFrame,
+) -> None:
+    journal_columns = (
+        "period_start",
+        "period_end",
+        "journal_id",
+        "event_type",
+        "leg_type",
+        "holder_sector",
+        "instrument_type",
+        "accounting_basis",
+        "face_stock_change_bil",
+        "adjusted_principal_change_bil",
+        "route_face_stock_change_bil",
+        "route_adjusted_principal_change_bil",
+        "treasury_cash_change_bil",
+        "reserve_change_bil",
+        "deposit_change_bil",
+    )
+    closure_columns = (
+        "period_start",
+        "period_end",
+        "opening_face_stock_bil",
+        "journal_face_stock_change_bil",
+        "closing_face_stock_bil",
+        "face_stock_closure_error_bil",
+        "opening_adjusted_principal_stock_bil",
+        "journal_adjusted_principal_change_bil",
+        "closing_adjusted_principal_stock_bil",
+        "adjusted_principal_closure_error_bil",
+        "opening_treasury_cash_bil",
+        "journal_treasury_cash_change_bil",
+        "closing_treasury_cash_bil",
+        "treasury_cash_closure_error_bil",
+        "journal_reserve_change_bil",
+        "reported_reserve_change_bil",
+        "reserve_closure_error_bil",
+        "journal_deposit_change_bil",
+        "reported_deposit_change_bil",
+        "deposit_closure_error_bil",
+        "holder_debt_total_bil",
+        "instrument_debt_total_bil",
+        "aggregate_debt_bil",
+        "holder_total_error_bil",
+        "instrument_total_error_bil",
+        "closure_basis",
+        "unexplained_residual_bil",
+    )
+    _require_columns(journal, journal_columns, label="tdcsim_accounting_journal")
+    _require_columns(closure, closure_columns, label="tdcsim_accounting_closure")
+    if journal.empty and closure.empty:
+        result_dates = pd.to_datetime(
+            results.get("Date", pd.Series(dtype=object)),
+            errors="coerce",
+        )
+        if result_dates.notna().sum() > 1:
+            raise VerificationError(
+                "multi-period run is missing accounting journal and closure evidence"
+            )
+        return
+    if journal.empty or closure.empty:
+        raise VerificationError(
+            "accounting journal and independent closure must both contain evidence"
+        )
+    journal_ids = journal["journal_id"].fillna("").astype(str)
+    if journal_ids.eq("").any() or journal_ids.duplicated().any():
+        raise VerificationError("accounting journal IDs must be nonempty and unique")
+    for column in ("event_type", "leg_type", "accounting_basis"):
+        if journal[column].fillna("").astype(str).str.strip().eq("").any():
+            raise VerificationError(f"accounting journal has blank {column}")
+    amount_columns = [
+        "face_stock_change_bil",
+        "adjusted_principal_change_bil",
+        "route_face_stock_change_bil",
+        "route_adjusted_principal_change_bil",
+        "treasury_cash_change_bil",
+        "reserve_change_bil",
+        "deposit_change_bil",
+    ]
+    numeric_journal = journal.copy()
+    for column in amount_columns:
+        numeric_journal[column] = _strict_numeric(
+            numeric_journal,
+            column,
+            label="tdcsim_accounting_journal",
+        )
+    closure_numeric_columns = [
+        column
+        for column in closure_columns
+        if column
+        not in {"period_start", "period_end", "closure_basis"}
+    ]
+    for column in closure_numeric_columns:
+        _strict_numeric(
+            closure,
+            column,
+            label="tdcsim_accounting_closure",
+        )
+    result_dates = pd.to_datetime(
+        results.get("Date", pd.Series(dtype=object)),
+        errors="coerce",
+    )
+    if (
+        len(result_dates) <= 1
+        or result_dates.isna().any()
+        or result_dates.duplicated().any()
+    ):
+        raise VerificationError(
+            "results must provide unique finite dates for accounting periods"
+        )
+    ordered_dates = sorted(pd.Timestamp(value).normalize() for value in result_dates)
+    result_periods = {
+        (str(start.date()), str(end.date()))
+        for start, end in zip(ordered_dates, ordered_dates[1:])
+    }
+
+    def period_set(frame: pd.DataFrame, *, label: str) -> set[tuple[str, str]]:
+        starts = pd.to_datetime(frame["period_start"], errors="coerce")
+        ends = pd.to_datetime(frame["period_end"], errors="coerce")
+        if starts.isna().any() or ends.isna().any() or (ends <= starts).any():
+            raise VerificationError(
+                f"{label} has malformed or non-increasing accounting periods"
+            )
+        return {
+            (
+                str(pd.Timestamp(start).normalize().date()),
+                str(pd.Timestamp(end).normalize().date()),
+            )
+            for start, end in zip(starts, ends)
+        }
+
+    journal_periods = period_set(
+        numeric_journal,
+        label="tdcsim_accounting_journal",
+    )
+    closure_periods = period_set(
+        closure,
+        label="tdcsim_accounting_closure",
+    )
+    if (
+        journal_periods != result_periods
+        or closure_periods != result_periods
+        or len(closure) != len(result_periods)
+    ):
+        raise VerificationError(
+            "accounting journal, closure, and results period sets must match exactly"
+        )
+    if numeric_journal[amount_columns].abs().max(axis=1).le(1e-12).any():
+        raise VerificationError("accounting journal contains a zero-value leg")
+    if _numeric(closure, "unexplained_residual_bil").abs().max() > 1e-12:
+        raise VerificationError(
+            "unexplained residual cannot enter the accounting closure"
+        )
+    if set(closure["closure_basis"].astype(str).unique()) != {
+        "independent_opening_and_closing_state_snapshots"
+    }:
+        raise VerificationError("accounting closure has unexpected closure_basis")
+    key_columns = ["period_start", "period_end"]
+    journal_grouped = numeric_journal.groupby(
+        key_columns, dropna=False
+    )[
+        [
+            "face_stock_change_bil",
+            "adjusted_principal_change_bil",
+            "treasury_cash_change_bil",
+            "reserve_change_bil",
+            "deposit_change_bil",
+        ]
+    ].sum()
+    closure_indexed = closure.set_index(key_columns, drop=False)
+    journal_checks = {
+        "face_stock_change_bil": "journal_face_stock_change_bil",
+        "adjusted_principal_change_bil": "journal_adjusted_principal_change_bil",
+        "treasury_cash_change_bil": "journal_treasury_cash_change_bil",
+        "reserve_change_bil": "journal_reserve_change_bil",
+        "deposit_change_bil": "journal_deposit_change_bil",
+    }
+    for journal_column, closure_column in journal_checks.items():
+        actual = journal_grouped[journal_column].reindex(
+            closure_indexed.index, fill_value=0.0
+        )
+        if (actual - _numeric(closure_indexed, closure_column)).abs().max() > 1e-7:
+            raise VerificationError(
+                f"accounting closure does not match journal: {journal_column}"
+            )
+    stored_error_checks = {
+        "face_stock_closure_error_bil": (
+            _numeric(closure, "closing_face_stock_bil")
+            - _numeric(closure, "opening_face_stock_bil")
+            - _numeric(closure, "journal_face_stock_change_bil")
+        ),
+        "adjusted_principal_closure_error_bil": (
+            _numeric(closure, "closing_adjusted_principal_stock_bil")
+            - _numeric(closure, "opening_adjusted_principal_stock_bil")
+            - _numeric(closure, "journal_adjusted_principal_change_bil")
+        ),
+        "treasury_cash_closure_error_bil": (
+            _numeric(closure, "closing_treasury_cash_bil")
+            - _numeric(closure, "opening_treasury_cash_bil")
+            - _numeric(closure, "journal_treasury_cash_change_bil")
+        ),
+        "reserve_closure_error_bil": (
+            _numeric(closure, "reported_reserve_change_bil")
+            - _numeric(closure, "journal_reserve_change_bil")
+        ),
+        "deposit_closure_error_bil": (
+            _numeric(closure, "reported_deposit_change_bil")
+            - _numeric(closure, "journal_deposit_change_bil")
+        ),
+        "holder_total_error_bil": (
+            _numeric(closure, "holder_debt_total_bil")
+            - _numeric(closure, "aggregate_debt_bil")
+        ),
+        "instrument_total_error_bil": (
+            _numeric(closure, "instrument_debt_total_bil")
+            - _numeric(closure, "aggregate_debt_bil")
+        ),
+    }
+    for error_column, recomputed in stored_error_checks.items():
+        if recomputed.abs().max() > 1e-7:
+            raise VerificationError(f"accounting identity failed: {error_column}")
+        if (_numeric(closure, error_column) - recomputed).abs().max() > 1e-7:
+            raise VerificationError(
+                f"accounting closure error is stale: {error_column}"
+            )
+    _verify_accounting_closure_snapshots(results, holder_stocks, closure)
+
+
+def _verify_accounting_closure_snapshots(
+    results: pd.DataFrame,
+    holder_stocks: pd.DataFrame,
+    closure: pd.DataFrame,
+) -> None:
+    _require_columns(
+        results,
+        ("Date", "TGA", "Reserves", "TDC_Level", "TotalDebt_Agg"),
+        label="results",
+    )
+    _require_columns(
+        holder_stocks,
+        (
+            "date",
+            "debt_scope",
+            "holder_sector",
+            "holder_subsector",
+            "instrument_type",
+            "maturity_bucket",
+            "debt_held_bil",
+            "face_stock_bil",
+            "adjusted_principal_stock_bil",
+        ),
+        label="tdcsim_holder_stocks",
+    )
+    result_rows = results.copy()
+    result_rows["_date"] = pd.to_datetime(result_rows["Date"], errors="coerce")
+    result_rows = result_rows[result_rows["_date"].notna()].set_index("_date")
+    stocks = holder_stocks.copy()
+    for column in (
+        "debt_held_bil",
+        "face_stock_bil",
+        "adjusted_principal_stock_bil",
+    ):
+        stocks[column] = _strict_numeric(
+            stocks,
+            column,
+            label="tdcsim_holder_stocks",
+        )
+    for column in ("TGA", "Reserves", "TDC_Level", "TotalDebt_Agg"):
+        result_rows[column] = _strict_numeric(
+            result_rows,
+            column,
+            label="results",
+        )
+    stocks["_date"] = pd.to_datetime(stocks["date"], errors="coerce")
+    stocks = stocks[
+        stocks["_date"].notna()
+        & stocks["debt_scope"].astype(str).eq("all_active_treasury")
+    ]
+    for _, row in closure.iterrows():
+        opening_date = pd.Timestamp(row["period_start"])
+        closing_date = pd.Timestamp(row["period_end"])
+        if opening_date not in result_rows.index or closing_date not in result_rows.index:
+            raise VerificationError(
+                "accounting closure period is absent from results snapshots"
+            )
+        opening_result = result_rows.loc[opening_date]
+        closing_result = result_rows.loc[closing_date]
+        if isinstance(opening_result, pd.DataFrame) or isinstance(
+            closing_result, pd.DataFrame
+        ):
+            raise VerificationError("results contain duplicate accounting snapshot dates")
+        opening_stocks = stocks[stocks["_date"].eq(opening_date)]
+        closing_stocks = stocks[stocks["_date"].eq(closing_date)]
+
+        def stock_sum(frame: pd.DataFrame, column: str) -> float:
+            return float(frame[column].sum())
+
+        holder_total = float(
+            closing_stocks.groupby(
+                ["holder_sector", "holder_subsector"],
+                dropna=False,
+            )["debt_held_bil"].sum().sum()
+        )
+        instrument_total = float(
+            closing_stocks.groupby(
+                ["instrument_type", "maturity_bucket"],
+                dropna=False,
+            )["debt_held_bil"].sum().sum()
+        )
+
+        expected = {
+            "opening_face_stock_bil": stock_sum(
+                opening_stocks, "face_stock_bil"
+            ),
+            "closing_face_stock_bil": stock_sum(
+                closing_stocks, "face_stock_bil"
+            ),
+            "opening_adjusted_principal_stock_bil": stock_sum(
+                opening_stocks, "adjusted_principal_stock_bil"
+            ),
+            "closing_adjusted_principal_stock_bil": stock_sum(
+                closing_stocks, "adjusted_principal_stock_bil"
+            ),
+            "opening_treasury_cash_bil": float(opening_result["TGA"]),
+            "closing_treasury_cash_bil": float(closing_result["TGA"]),
+            "reported_reserve_change_bil": float(closing_result["Reserves"])
+            - float(opening_result["Reserves"]),
+            "reported_deposit_change_bil": float(closing_result["TDC_Level"])
+            - float(opening_result["TDC_Level"]),
+            "holder_debt_total_bil": holder_total,
+            "instrument_debt_total_bil": instrument_total,
+            "aggregate_debt_bil": float(closing_result["TotalDebt_Agg"]),
+        }
+        for column, value in expected.items():
+            observed = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+            if pd.isna(observed) or abs(float(observed) - value) > 1e-7:
+                raise VerificationError(
+                    "accounting closure disagrees with independent snapshot: "
+                    f"{column}; closure={observed!r}, snapshot={value!r}"
+                )
+
+
 def _read_results(path: Path) -> pd.DataFrame:
     if path.suffix == ".gz":
         with gzip.open(path, "rt", encoding="utf-8") as handle:
@@ -843,6 +1232,23 @@ def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame.columns:
         raise VerificationError(f"required numeric column is missing: {column}")
     return pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+
+
+def _strict_numeric(
+    frame: pd.DataFrame,
+    column: str,
+    *,
+    label: str,
+) -> pd.Series:
+    if column not in frame.columns:
+        raise VerificationError(f"{label} missing required numeric column: {column}")
+    values = pd.to_numeric(frame[column], errors="coerce")
+    invalid = values.isna() | ~values.map(math.isfinite)
+    if invalid.any():
+        raise VerificationError(
+            f"{label} has malformed or nonfinite numeric values: {column}"
+        )
+    return values.astype(float)
 
 
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
