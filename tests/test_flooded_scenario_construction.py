@@ -137,20 +137,55 @@ def test_injection_files_are_trimmed_to_the_consuming_window(flooded, tmp_path: 
     untrimmed = flooded._copy_injection_files({"debt_target": source}, untrimmed_dir)
     assert len(pd.read_csv(untrimmed["debt_target"])) == len(dates)
 
+    window = [d.strftime("%Y-%m-%d") for d in dates if d >= pd.Timestamp("2029-01-01")]
     trimmed_dir = tmp_path / "trimmed"
     trimmed_dir.mkdir()
     trimmed = flooded._copy_injection_files(
-        {"debt_target": source}, trimmed_dir, opening_state_date="2029-01-01"
+        {"debt_target": source}, trimmed_dir, baseline_windows={"debt_target": window}
     )
     frame = pd.read_csv(trimmed["debt_target"])
     assert frame["period_end"].iloc[0] == "2029-01-01"
-    assert len(frame) == int((dates >= pd.Timestamp("2029-01-01")).sum())
+    assert len(frame) == len(window)
     # The retained values must be untouched -- trimming drops rows, never rescales them.
     assert set(frame["cbo_federal_debt_held_public_target_bil"]) == {1.0}
 
 
-def test_injection_trim_fails_closed_on_an_empty_window(flooded, tmp_path: Path) -> None:
-    """Trimming past the end of the file must raise, not silently emit an empty override."""
+def test_each_injection_input_trims_to_its_own_window(flooded, tmp_path: Path) -> None:
+    """The three overridden inputs do not share a period window.
+
+    At the 2029 state the debt-stock and Fed-holdings paths open on 2029-01-01 with 2,830
+    rows, while the primary-deficit path opens on 2029-01-02 with 2,829: a deficit is a flow
+    accrued over a period, so it has no row for the opening instant the stock paths carry.
+    Trimming all three to one shared date produced 2,830 deficit rows against a 2,829-row
+    baseline and failed the compiler's coverage check by exactly one.
+    """
+
+    import pandas as pd
+
+    dates = pd.date_range("2028-01-01", "2030-12-31", freq="D")
+    sources = {}
+    for key in ("primary_deficit", "debt_target"):
+        path = tmp_path / f"{key}.csv"
+        pd.DataFrame({"period_end": dates.strftime("%Y-%m-%d"), "v": 1.0}).to_csv(path, index=False)
+        sources[key] = path
+
+    stock_window = [d.strftime("%Y-%m-%d") for d in dates if d >= pd.Timestamp("2029-01-01")]
+    flow_window = [d.strftime("%Y-%m-%d") for d in dates if d >= pd.Timestamp("2029-01-02")]
+    assert len(flow_window) == len(stock_window) - 1
+
+    out = tmp_path / "out"
+    out.mkdir()
+    copied = flooded._copy_injection_files(
+        sources, out, baseline_windows={"debt_target": stock_window, "primary_deficit": flow_window}
+    )
+
+    assert len(pd.read_csv(copied["debt_target"])) == len(stock_window)
+    assert len(pd.read_csv(copied["primary_deficit"])) == len(flow_window)
+    assert pd.read_csv(copied["primary_deficit"])["period_end"].iloc[0] == "2029-01-02"
+
+
+def test_injection_trim_fails_closed_when_a_baseline_period_is_absent(flooded, tmp_path: Path) -> None:
+    """A window the injection file cannot cover must raise, not emit a short override."""
 
     import pandas as pd
 
@@ -159,8 +194,10 @@ def test_injection_trim_fails_closed_on_an_empty_window(flooded, tmp_path: Path)
     out = tmp_path / "out"
     out.mkdir()
 
-    with pytest.raises(SystemExit, match="no rows on or after"):
-        flooded._copy_injection_files({"debt_target": source}, out, opening_state_date="2035-01-01")
+    with pytest.raises(SystemExit, match="missing 1 baseline period"):
+        flooded._copy_injection_files(
+            {"debt_target": source}, out, baseline_windows={"debt_target": ["2035-01-01"]}
+        )
 
 
 def test_injection_total_is_stated_once(flooded) -> None:

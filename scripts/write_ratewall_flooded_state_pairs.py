@@ -484,7 +484,11 @@ def _run_plus100_pair_sources(
     start = export_start(export)
     end = export_end(export)
     local_injection_paths = (
-        _copy_injection_files(injection_paths, scenario_dir, opening_state_date=start)
+        _copy_injection_files(
+            injection_paths,
+            scenario_dir,
+            baseline_windows=_baseline_injection_windows(baseline),
+        )
         if injection_paths is not None
         else None
     )
@@ -590,37 +594,67 @@ def _copy_injection_files(
     paths: Mapping[str, Path],
     scenario_dir: Path,
     *,
-    opening_state_date: str | None = None,
+    baseline_windows: Mapping[str, list[str]] | None = None,
 ) -> dict[str, Path]:
-    """Copy the injection paths, trimmed to the consuming run's own period window.
+    """Copy the injection paths, trimmed to each consuming input's own period window.
 
     The injection files are built once from the 2028 state and span 2028-01-01 to 2036-09-30.
-    A later flooded state opens on a shorter window -- 2029 covers 2,829 rows against the
-    injection file's 3,195 -- and the compiler requires an ``absolute_path_file`` replacement
-    to match its baseline's coverage exactly, so handing the untrimmed file to 2029 or 2031
-    raises ``CompilerError``. Trimming preserves the injected *levels*, which are cumulative
-    by date: dropping leading rows removes periods the later state does not model without
-    changing the value carried on any retained row.
+    A later flooded state models a shorter window, and the compiler requires an
+    ``absolute_path_file`` replacement to match its baseline's coverage exactly, so the
+    untrimmed file raises ``CompilerError``.
+
+    Trimming must be **per input**, not to one shared opening date. The three overridden files
+    do not share a window: at the 2029 state the debt-stock and Fed-holdings paths open on
+    2029-01-01 with 2,830 rows, while the primary-deficit path opens on 2029-01-02 with 2,829.
+    A deficit is a flow accrued over a period, so it carries no row for the opening instant
+    that the stock paths do. Trimming all three to one date produced 2,830 deficit rows against
+    a 2,829-row baseline -- right idea, off by one.
+
+    Matching each replacement to its own baseline's exact period keys is also stricter than
+    matching counts, and is what the compiler ultimately checks.
     """
 
     copied: dict[str, Path] = {}
     for key, source in paths.items():
         target = scenario_dir / source.name
-        if opening_state_date is None:
+        window = None if baseline_windows is None else baseline_windows.get(key)
+        if not window:
             shutil.copy2(source, target)
         else:
             frame = pd.read_csv(source)
             if "period_end" not in frame.columns:
                 raise SystemExit(f"injection file has no period_end to trim on: {source}")
-            keep = pd.to_datetime(frame["period_end"], errors="coerce") >= pd.Timestamp(opening_state_date)
+            wanted = set(window)
+            keep = frame["period_end"].astype(str).isin(wanted)
             trimmed = frame.loc[keep]
-            if trimmed.empty:
+            missing = wanted - set(trimmed["period_end"].astype(str))
+            if missing:
                 raise SystemExit(
-                    f"injection file {source.name} has no rows on or after {opening_state_date}"
+                    f"injection file {source.name} is missing {len(missing)} baseline period(s), "
+                    f"first {sorted(missing)[0]}"
                 )
             trimmed.to_csv(target, index=False)
         copied[key] = target
     return copied
+
+
+def _baseline_injection_windows(baseline: CboBaselinePackage) -> dict[str, list[str]]:
+    """Read the exact period keys each injection-overridden input covers in this state."""
+
+    names = {
+        "primary_deficit": "tdcsim_primary_deficit_path.csv",
+        "debt_target": "tdcsim_debt_stock_path.csv",
+        "fed_holdings": "tdcsim_fed_holdings_path.csv",
+    }
+    windows: dict[str, list[str]] = {}
+    with tempfile.TemporaryDirectory(prefix="tdcsim-flooded-window-") as tmp_name:
+        inputs = baseline.materialize(Path(tmp_name) / "package") / "forecast_inputs"
+        for key, filename in names.items():
+            frame = pd.read_csv(inputs / filename)
+            if "period_end" not in frame.columns:
+                raise SystemExit(f"baseline input has no period_end: {filename}")
+            windows[key] = frame["period_end"].astype(str).tolist()
+    return windows
 
 
 def _scenario(
