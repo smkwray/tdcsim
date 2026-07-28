@@ -483,7 +483,11 @@ def _run_plus100_pair_sources(
     scenario_dir.mkdir(parents=True, exist_ok=True)
     start = export_start(export)
     end = export_end(export)
-    local_injection_paths = _copy_injection_files(injection_paths, scenario_dir) if injection_paths is not None else None
+    local_injection_paths = (
+        _copy_injection_files(injection_paths, scenario_dir, opening_state_date=start)
+        if injection_paths is not None
+        else None
+    )
     if local_injection_paths is None:
         overrides: dict[str, Any] = {}
     else:
@@ -582,11 +586,39 @@ def _run_rolloff_bridge(
     return output_dir
 
 
-def _copy_injection_files(paths: Mapping[str, Path], scenario_dir: Path) -> dict[str, Path]:
+def _copy_injection_files(
+    paths: Mapping[str, Path],
+    scenario_dir: Path,
+    *,
+    opening_state_date: str | None = None,
+) -> dict[str, Path]:
+    """Copy the injection paths, trimmed to the consuming run's own period window.
+
+    The injection files are built once from the 2028 state and span 2028-01-01 to 2036-09-30.
+    A later flooded state opens on a shorter window -- 2029 covers 2,829 rows against the
+    injection file's 3,195 -- and the compiler requires an ``absolute_path_file`` replacement
+    to match its baseline's coverage exactly, so handing the untrimmed file to 2029 or 2031
+    raises ``CompilerError``. Trimming preserves the injected *levels*, which are cumulative
+    by date: dropping leading rows removes periods the later state does not model without
+    changing the value carried on any retained row.
+    """
+
     copied: dict[str, Path] = {}
     for key, source in paths.items():
         target = scenario_dir / source.name
-        shutil.copy2(source, target)
+        if opening_state_date is None:
+            shutil.copy2(source, target)
+        else:
+            frame = pd.read_csv(source)
+            if "period_end" not in frame.columns:
+                raise SystemExit(f"injection file has no period_end to trim on: {source}")
+            keep = pd.to_datetime(frame["period_end"], errors="coerce") >= pd.Timestamp(opening_state_date)
+            trimmed = frame.loc[keep]
+            if trimmed.empty:
+                raise SystemExit(
+                    f"injection file {source.name} has no rows on or after {opening_state_date}"
+                )
+            trimmed.to_csv(target, index=False)
         copied[key] = target
     return copied
 
