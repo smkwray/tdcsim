@@ -88,6 +88,7 @@ def test_transformed_rollforward_export_carries_one_verified_world(tmp_path: Pat
     final_portfolio = pd.read_csv(
         run.output_dir / "outputs" / "final_portfolio_compact.csv.gz"
     )
+    assert final_portfolio["BondID"].is_unique
     final_fed_stock = float(
         final_portfolio.loc[
             final_portfolio["Status"].eq("Active")
