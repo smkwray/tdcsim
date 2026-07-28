@@ -32,8 +32,9 @@ from forecast_paths import load_yield_curve_surface
 WORKBOOKS_PRESENT = DEFAULT_BUDGET_WORKBOOK.exists() and DEFAULT_ECONOMIC_WORKBOOK.exists()
 
 
-@pytest.mark.skipif(not WORKBOOKS_PRESENT, reason="optional local CBO workbook fixtures are not present")
+@pytest.mark.integration
 def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: Path) -> None:
+    assert WORKBOOKS_PRESENT, "CBO forecast-runner integration workbooks are missing"
     del tmp_path
     bundle = build_forecast_bundle(PROJECT_ROOT / "output" / "pytest_cbo_runner_manifest", clean=True)
 

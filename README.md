@@ -10,6 +10,7 @@ The simulator is designed for scenario analysis, not forecasting. It makes the T
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
+pip install -e .
 pytest -q          # run the test suite
 python run.py      # run all scenario groups
 python run.py tdc_config_optional.yaml  # run the optional-feature example config
@@ -19,7 +20,8 @@ By default, the project uses the shipped `tdc_config.yaml` and generates a synth
 
 ## CBO baseline scenario runner
 
-The release-bound CBO lane has a simple downstream workflow:
+The CBO scenario lane accepts a locally generated or supplied, verified baseline package.
+Its outputs are scenario-analysis artifacts, not forecasts or release claims:
 
 1. Use a locally generated or supplied CBO baseline package, such as `output/cbo_forecast_release_bound_package.zip`.
 2. Generate example scenario files with `scripts/write_cbo_example_scenarios.py`.
@@ -333,7 +335,7 @@ output/                  generated portfolios and plots (gitignored)
 
 ## Testing
 
-The repo includes 123 automated tests covering:
+The automated suite covers:
 
 - Coupon scheduling and accrual calculations
 - Yield curve interpolation
@@ -349,7 +351,11 @@ The repo includes 123 automated tests covering:
 ```bash
 # Run tests (install dev dependencies first)
 pip install -r requirements-dev.txt
+pip install -e .
 pytest -q
+
+# Explicit raw/generated-artifact lane. Missing declared inputs fail; they do not skip.
+pytest -q -m integration
 ```
 
 ---
