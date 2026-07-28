@@ -687,6 +687,8 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
             "instrument_type",
             "maturity_bucket",
             "route_debt_held_bil",
+            "route_face_stock_bil",
+            "route_adjusted_principal_stock_bil",
             "debt_scope",
             "route_stock_basis",
         ),
@@ -705,10 +707,13 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
             "opening_route_stock_bil",
             "route_face_issued_bil",
             "route_face_redeemed_bil",
+            "route_journal_face_change_bil",
+            "route_journal_adjusted_principal_change_bil",
             "route_stock_residual_or_indexation_bil",
             "closing_route_stock_bil",
             "closure_identity_error_bil",
             "route_stock_basis",
+            "residual_basis",
         ),
         label="tdcsim_tdc_principal_route_stock_closure",
     )
@@ -720,11 +725,16 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
         raise VerificationError("tdcsim_tdc_principal_route_stocks must contain route stock rows")
     if route_closure.empty:
         raise VerificationError("tdcsim_tdc_principal_route_stock_closure must contain period rows")
+    route_stocks = _strict_route_stock_rows(route_stocks)
+    route_closure = _strict_route_closure_rows(
+        route_closure,
+        label="tdcsim_tdc_principal_route_stock_closure",
+    )
     if set(route_stocks["route_stock_basis"].astype(str).unique()) != {"tdc_principal_settlement_route"}:
         raise VerificationError("route stocks have unexpected route_stock_basis")
     if set(route_closure["route_stock_basis"].astype(str).unique()) != {"tdc_principal_settlement_route"}:
         raise VerificationError("route closure has unexpected route_stock_basis")
-    if _numeric(route_closure, "closure_identity_error_bil").abs().max() > 1e-7:
+    if route_closure["closure_identity_error_bil"].abs().max() > 1e-7:
         raise VerificationError("route stock closure identity failed")
     _verify_accounting_journal_outputs(
         results,
@@ -744,18 +754,15 @@ def _verify_tdc_handoff_outputs(root: Path, manifest: dict[str, Any]) -> None:
     )
     if recomputed_route.empty:
         raise VerificationError("route stock closure could not be independently recomputed")
-    if (
-        pd.to_numeric(
-            recomputed_route["closure_identity_error_bil"], errors="coerce"
-        )
-        .fillna(0.0)
-        .abs()
-        .max()
-        > 1e-7
-    ):
+    recomputed_route = _strict_route_closure_rows(
+        recomputed_route,
+        label="recomputed route stock closure",
+    )
+    if recomputed_route["closure_identity_error_bil"].abs().max() > 1e-7:
         raise VerificationError(
             "route stock closure fails against independently read journal and snapshots"
         )
+    _compare_stored_route_closure(route_closure, recomputed_route)
     identity = (
         _numeric(summary, "tdc_fiscal_flow_bil")
         + _numeric(summary, "tdc_debt_service_bil")
@@ -1096,6 +1103,116 @@ def _verify_accounting_journal_outputs(
                 f"accounting closure error is stale: {error_column}"
             )
     _verify_accounting_closure_snapshots(results, holder_stocks, closure)
+
+
+_ROUTE_KEY_COLUMNS = (
+    "period_start",
+    "period_end",
+    "route_holder_sector",
+    "route_holder_subsector",
+    "instrument_type",
+    "maturity_bucket",
+    "debt_scope",
+)
+
+_ROUTE_CLOSURE_NUMERIC_COLUMNS = (
+    "opening_route_stock_bil",
+    "route_face_issued_bil",
+    "route_face_redeemed_bil",
+    "route_journal_face_change_bil",
+    "route_journal_adjusted_principal_change_bil",
+    "route_stock_residual_or_indexation_bil",
+    "closing_route_stock_bil",
+    "closure_identity_error_bil",
+)
+
+
+def _strict_route_stock_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    checked = frame.copy()
+    dates = pd.to_datetime(checked["date"], errors="coerce")
+    if dates.isna().any():
+        raise VerificationError(
+            "tdcsim_tdc_principal_route_stocks has malformed dates"
+        )
+    checked["date"] = dates.map(lambda value: str(pd.Timestamp(value).date()))
+    for column in (
+        "route_debt_held_bil",
+        "route_face_stock_bil",
+        "route_adjusted_principal_stock_bil",
+    ):
+        checked[column] = _strict_numeric(
+            checked,
+            column,
+            label="tdcsim_tdc_principal_route_stocks",
+        )
+    key_columns = (
+        "date",
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "debt_scope",
+    )
+    for column in key_columns[1:]:
+        checked[column] = checked[column].fillna("").astype(str)
+    if checked.duplicated(list(key_columns)).any():
+        raise VerificationError(
+            "tdcsim_tdc_principal_route_stocks has duplicate route keys"
+        )
+    return checked
+
+
+def _strict_route_closure_rows(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+) -> pd.DataFrame:
+    checked = frame.copy()
+    starts = pd.to_datetime(checked["period_start"], errors="coerce")
+    ends = pd.to_datetime(checked["period_end"], errors="coerce")
+    if starts.isna().any() or ends.isna().any() or (ends <= starts).any():
+        raise VerificationError(f"{label} has malformed or non-increasing periods")
+    checked["period_start"] = starts.map(
+        lambda value: str(pd.Timestamp(value).date())
+    )
+    checked["period_end"] = ends.map(
+        lambda value: str(pd.Timestamp(value).date())
+    )
+    for column in _ROUTE_KEY_COLUMNS[2:]:
+        checked[column] = checked[column].fillna("").astype(str)
+    for column in _ROUTE_CLOSURE_NUMERIC_COLUMNS:
+        checked[column] = _strict_numeric(checked, column, label=label)
+    if checked.duplicated(list(_ROUTE_KEY_COLUMNS)).any():
+        raise VerificationError(f"{label} has duplicate route-period keys")
+    return checked
+
+
+def _compare_stored_route_closure(
+    stored: pd.DataFrame,
+    recomputed: pd.DataFrame,
+) -> None:
+    stored_indexed = stored.set_index(list(_ROUTE_KEY_COLUMNS)).sort_index()
+    recomputed_indexed = recomputed.set_index(
+        list(_ROUTE_KEY_COLUMNS)
+    ).sort_index()
+    if not stored_indexed.index.equals(recomputed_indexed.index):
+        raise VerificationError(
+            "stored and recomputed route closure key sets do not match"
+        )
+    for column in _ROUTE_CLOSURE_NUMERIC_COLUMNS:
+        if (
+            stored_indexed[column] - recomputed_indexed[column]
+        ).abs().max() > 1e-7:
+            raise VerificationError(
+                f"stored route closure disagrees with recomputation: {column}"
+            )
+    for column in ("route_stock_basis", "residual_basis"):
+        stored_values = stored_indexed[column].fillna("").astype(str)
+        recomputed_values = recomputed_indexed[column].fillna("").astype(str)
+        if not stored_values.equals(recomputed_values):
+            raise VerificationError(
+                f"stored route closure disagrees with recomputation: {column}"
+            )
 
 
 def _verify_accounting_closure_snapshots(
