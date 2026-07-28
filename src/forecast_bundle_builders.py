@@ -449,8 +449,28 @@ def build_fed_holdings_path_rows(
     sorted_anchors = sorted(anchors.items())
     if sorted_anchors[0][0] != opening:
         raise ValueError("opening_state_date must be the first Fed holdings interpolation anchor")
+    if periods[0].period_start != opening:
+        raise ValueError(
+            "opening_state_date must equal the first simulation period start"
+        )
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = [
+        {
+            "schema_version": FED_HOLDINGS_PATH_SCHEMA_VERSION,
+            "scenario_id": scenario_id,
+            "period_end": opening.isoformat(),
+            "holder_type": "CB",
+            "cbo_fed_holdings_target_bil": float(opening_cb_holdings_bil),
+            "interpolation_method": "opening_state_identity",
+            "source_fiscal_year": federal_fiscal_year(opening),
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_target",
+            "observation_date": observed.isoformat(),
+            "available_date": available.isoformat(),
+            "source_status": "opening_fed_stock_target_identity",
+            "claim_boundary": claim_boundary,
+        }
+    ]
     for period in periods:
         period_end = period.period_end
         target = _linear_interpolated_anchor_value(period_end, sorted_anchors)

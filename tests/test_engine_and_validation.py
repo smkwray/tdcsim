@@ -855,6 +855,8 @@ class TestTrancheSplitProration:
             [0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
             [0.04, 0.041, 0.042, 0.043, 0.045, 0.05],
             prefs, base_issuance_profile(), 'tips_split_test',
+            tips_real_curve_years=[0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+            tips_real_curve_rates=[0.015, 0.016, 0.017, 0.018, 0.02, 0.022],
         )
 
         # Check that OriginalPrincipal is conserved across split pieces

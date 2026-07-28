@@ -23,6 +23,7 @@ from sim_pricing import (
     calculate_bond_market_price,
     get_security_category_for_prefs,
     get_yield_for_maturity,
+    value_treasury_security,
 )
 
 
@@ -36,7 +37,15 @@ def _zero_private_routes() -> dict[str, float]:
     return {route: 0.0 for route in PRIVATE_SUBBUCKETS}
 
 
-def calculate_portfolio_value_and_composition(portfolio_df, current_date, yield_curve_years, yield_curve_rates):
+def calculate_portfolio_value_and_composition(
+    portfolio_df,
+    current_date,
+    yield_curve_years,
+    yield_curve_rates,
+    *,
+    tips_real_curve_years=None,
+    tips_real_curve_rates=None,
+):
     """
     Calculates total dirty market value and composition by holder and security type.
     """
@@ -65,6 +74,41 @@ def calculate_portfolio_value_and_composition(portfolio_df, current_date, yield_
         def calculate_row_prices(row):
             security_type = row['SecurityType']
             frequency = 4 if security_type == 'FRN' else 2
+            if (
+                security_type == 'TIPS'
+                and tips_real_curve_years
+                and tips_real_curve_rates
+            ):
+                real_yield = get_yield_for_maturity(
+                    row['TimeToMaturity'],
+                    tips_real_curve_years,
+                    tips_real_curve_rates,
+                    method='pchip',
+                    floor_zero=False,
+                )
+                priced = value_treasury_security(
+                    settlement_date=current_date,
+                    maturity_date=row['MaturityDate'],
+                    coupon_rate=row['CouponRate'],
+                    discount_yield=real_yield,
+                    security_type='TIPS',
+                    face_value=row['FaceValue'],
+                    adjusted_principal=row.get('AdjustedPrincipal'),
+                    original_principal=row.get('OriginalPrincipal'),
+                    issue_date=row.get('IssueDate'),
+                    first_interest_payment_date=row.get('FirstInterestPaymentDate'),
+                    frequency=frequency,
+                    projected_adjusted_principal_at_maturity=row.get('AdjustedPrincipal'),
+                    nominal_discount_yield=row['DiscountYield'],
+                )
+                return pd.Series(
+                    [
+                        priced['clean'],
+                        priced['accrued'],
+                        priced['dirty'],
+                        priced['dirty'] / row['FaceValue'],
+                    ]
+                )
             discounted_cash_flow_value = calculate_bond_market_price(
                 row['FaceValue'],
                 row['CouponRate'],
@@ -138,7 +182,18 @@ def calculate_portfolio_value_and_composition(portfolio_df, current_date, yield_
         pass
     return (value_by_holder, composition_by_holder, value_by_type)
 
-def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, yield_curve_rates, sector_target_prefs, issuance_profile, scenario_name):
+def execute_preference_trades(
+    bond_portfolio,
+    current_date,
+    yield_curve_years,
+    yield_curve_rates,
+    sector_target_prefs,
+    issuance_profile,
+    scenario_name,
+    *,
+    tips_real_curve_years=None,
+    tips_real_curve_rates=None,
+):
     """
     Executes secondary market trades between holders based on deviations from their target portfolio preferences.
     Uses CURRENT sector_target_prefs passed in.
@@ -146,6 +201,11 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
     tradeable_mask = (bond_portfolio['SecurityType'] != 'NonMarketable') & (bond_portfolio['Status'] == 'Active')
     if not tradeable_mask.any():
         return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0, 'deposit_change_private_deposit_funded': 0.0, 'deposit_change_private_mmf': 0.0})
+    if (
+        (tradeable_mask & bond_portfolio['SecurityType'].eq('TIPS')).any()
+        and (not tips_real_curve_years or not tips_real_curve_rates)
+    ):
+        raise ValueError('TIPS preference trading requires an explicit real yield curve.')
     try:
         bond_portfolio = bond_portfolio.astype(PORTFOLIO_DTYPES, errors='ignore')
     except Exception:
@@ -156,7 +216,14 @@ def execute_preference_trades(bond_portfolio, current_date, yield_curve_years, y
     bond_portfolio.loc[private_mask, 'HolderSubBucket'] = bond_portfolio.loc[private_mask, 'HolderSubBucket'].apply(_private_subbucket)
     bond_portfolio.loc[~private_mask, 'HolderSubBucket'] = ''
     tradeable_portfolio = bond_portfolio[tradeable_mask].copy()
-    calculate_portfolio_value_and_composition(tradeable_portfolio, current_date, yield_curve_years, yield_curve_rates)
+    calculate_portfolio_value_and_composition(
+        tradeable_portfolio,
+        current_date,
+        yield_curve_years,
+        yield_curve_rates,
+        tips_real_curve_years=tips_real_curve_years,
+        tips_real_curve_rates=tips_real_curve_rates,
+    )
     if 'DirtyValue' not in tradeable_portfolio.columns or tradeable_portfolio['DirtyValue'].isnull().any():
         return (bond_portfolio, {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0, 'deposit_change_private_deposit_funded': 0.0, 'deposit_change_private_mmf': 0.0})
     value_by_holder_tradeable = tradeable_portfolio.groupby('HolderType')['DirtyValue'].sum().to_dict()

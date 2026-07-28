@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from budget_interest import build_net_interest_diagnostic
-from bill_quote_basis import discount_rate_to_investment_rate
+from bill_quote_basis import discount_price_ratio, discount_rate_to_investment_rate
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from cbo_policy_bundle import (
     allocate_signed_primary_flow,
@@ -467,7 +467,7 @@ def _write_tips_forward_paths(tmp_path: Path) -> dict[str, Path]:
         {
             "schema_version": "tdcsim_tips_real_yield_path_v1",
             "scenario_id": "baseline",
-            "curve_date": "2026-09-30",
+            "curve_date": "2026-09-20",
             "tenor_years": 10.0,
             "nominal_rate_decimal": 0.015,
             "expected_inflation_decimal": 0.03,
@@ -914,7 +914,9 @@ def test_cbo_dynamic_yield_surface_prices_bills_with_decimal_runtime_rates(tmp_p
 
     expected_3m = discount_rate_to_investment_rate(0.037, 91.0)
     assert issued["IssueYieldAtIssue"] == pytest.approx(expected_3m)
-    assert issued["IssuePriceRatio"] == pytest.approx(1.0 / ((1.0 + expected_3m) ** 0.25))
+    assert issued["IssuePriceRatio"] == pytest.approx(
+        discount_price_ratio(0.037, 91.0)
+    )
     assert issued["IssuePriceRatio"] > 0.99
 
 

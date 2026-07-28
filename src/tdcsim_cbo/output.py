@@ -27,6 +27,8 @@ SUMMARY_COLUMNS = [
     "AuctionProceeds",
     "PrimaryDeficit",
     "TGA",
+    "Reserves",
+    "TDC_Level",
     "CBOOperatingCashTarget",
     "CBOCashReconciliationResidual",
     "CBOCashResidualStatus",
@@ -57,9 +59,9 @@ SUMMARY_COLUMNS = [
     "CBONetInterestBridgeRows",
     "NetInterestDiagnosticStatus",
     "DebtHeld_Banks",
-    "DebtHeld_CB",
+    "DebtHeld_CentralBank",
     "DebtHeld_Foreign",
-    "DebtHeld_Private",
+    "DebtHeld_DomesticNonBanks",
     "DebtHeldByType_Fixed",
     "DebtHeldByType_TIPS",
     "DebtHeldByType_FRN",
@@ -91,6 +93,61 @@ COMMON_METADATA_COLUMNS = [
 ]
 
 HANDOFF_TABLE_COLUMNS = {
+    "tdcsim_accounting_journal": [
+        "period_start",
+        "period_end",
+        "journal_id",
+        "event_type",
+        "leg_type",
+        "security_id",
+        "holder_sector",
+        "holder_subsector",
+        "counterparty_sector",
+        "counterparty_subsector",
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "accounting_basis",
+        "face_stock_change_bil",
+        "adjusted_principal_change_bil",
+        "route_face_stock_change_bil",
+        "route_adjusted_principal_change_bil",
+        "treasury_cash_change_bil",
+        "reserve_change_bil",
+        "deposit_change_bil",
+        "settlement_scope",
+        "is_intragovernmental",
+    ],
+    "tdcsim_accounting_closure": [
+        "period_start",
+        "period_end",
+        "opening_face_stock_bil",
+        "journal_face_stock_change_bil",
+        "closing_face_stock_bil",
+        "face_stock_closure_error_bil",
+        "opening_adjusted_principal_stock_bil",
+        "journal_adjusted_principal_change_bil",
+        "closing_adjusted_principal_stock_bil",
+        "adjusted_principal_closure_error_bil",
+        "opening_treasury_cash_bil",
+        "journal_treasury_cash_change_bil",
+        "closing_treasury_cash_bil",
+        "treasury_cash_closure_error_bil",
+        "journal_reserve_change_bil",
+        "reported_reserve_change_bil",
+        "reserve_closure_error_bil",
+        "journal_deposit_change_bil",
+        "reported_deposit_change_bil",
+        "deposit_closure_error_bil",
+        "holder_debt_total_bil",
+        "instrument_debt_total_bil",
+        "aggregate_debt_bil",
+        "holder_total_error_bil",
+        "instrument_total_error_bil",
+        "closure_basis",
+        "unexplained_residual_bil",
+    ],
     "tdcsim_period_issuance_flows": [
         "period_start",
         "period_end",
@@ -122,6 +179,7 @@ HANDOFF_TABLE_COLUMNS = {
         "face_redeemed_bil",
         "principal_redeemed_bil",
         "cash_paid_bil",
+        "adjusted_principal_stock_removed_bil",
         "tdc_principal_recipient_sector",
         "tdc_principal_recipient_subsector",
         "tdc_principal_cash_paid_to_du_bil",
@@ -155,6 +213,8 @@ HANDOFF_TABLE_COLUMNS = {
         "instrument_type",
         "maturity_bucket",
         "debt_held_bil",
+        "face_stock_bil",
+        "adjusted_principal_stock_bil",
         "valuation_basis",
         "debt_scope",
         "allocation_method",
@@ -166,6 +226,8 @@ HANDOFF_TABLE_COLUMNS = {
         "instrument_type",
         "maturity_bucket",
         "route_debt_held_bil",
+        "route_face_stock_bil",
+        "route_adjusted_principal_stock_bil",
         "valuation_basis",
         "debt_scope",
         "allocation_method",
@@ -182,6 +244,8 @@ HANDOFF_TABLE_COLUMNS = {
         "opening_route_stock_bil",
         "route_face_issued_bil",
         "route_face_redeemed_bil",
+        "route_journal_face_change_bil",
+        "route_journal_adjusted_principal_change_bil",
         "route_stock_residual_or_indexation_bil",
         "closing_route_stock_bil",
         "closure_identity_error_bil",
@@ -614,6 +678,7 @@ def _handoff_tables(results: pd.DataFrame, metadata: Mapping[str, Any]) -> dict[
         raw = {}
     derived = _tdc_handoff_tables(results)
     derived.update(_route_stock_closure_handoff_tables(raw))
+    derived.update(_accounting_closure_handoff_tables(results, raw))
     tables: dict[str, pd.DataFrame] = {}
     for name, columns in HANDOFF_TABLE_COLUMNS.items():
         rows = derived.get(name, raw.get(name, []))
@@ -732,13 +797,23 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
         return {"tdcsim_tdc_principal_route_stock_closure": []}
     issuance = pd.DataFrame(raw.get("tdcsim_period_issuance_flows", []))
     principal = pd.DataFrame(raw.get("tdcsim_period_principal_flows", []))
+    journal = pd.DataFrame(raw.get("tdcsim_accounting_journal", []))
     rows: list[dict[str, Any]] = []
     stocks = stocks.copy()
     stocks["date"] = pd.to_datetime(stocks["date"], errors="coerce")
     stocks = stocks[stocks["date"].notna()]
     if stocks.empty:
         return {"tdcsim_tdc_principal_route_stock_closure": []}
-    dates = sorted(stocks["date"].unique())
+    date_values = set(stocks["date"].dropna().tolist())
+    for flow_frame in (journal, issuance, principal):
+        if flow_frame.empty:
+            continue
+        for column in ("period_start", "period_end"):
+            if column not in flow_frame.columns:
+                continue
+            parsed = pd.to_datetime(flow_frame[column], errors="coerce")
+            date_values.update(parsed[parsed.notna()].tolist())
+    dates = sorted(date_values)
     for start, end in zip(dates, dates[1:]):
         period_start = str(pd.Timestamp(start).date())
         period_end = str(pd.Timestamp(end).date())
@@ -746,12 +821,34 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
         closing = _route_stock_map(stocks[stocks["date"].eq(end)])
         issued = _route_issuance_map(issuance, period_start=period_start, period_end=period_end)
         redeemed = _route_redemption_map(principal, period_start=period_start, period_end=period_end)
-        for key in sorted(set(opening) | set(closing) | set(issued) | set(redeemed)):
+        journal_face, journal_adjusted, journal_debt = _route_journal_change_maps(
+            journal,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        journal_mode = bool(journal_face or journal_adjusted or journal_debt)
+        keys = (
+            set(opening)
+            | set(closing)
+            | set(issued)
+            | set(redeemed)
+            | set(journal_face)
+            | set(journal_adjusted)
+            | set(journal_debt)
+        )
+        for key in sorted(keys):
             open_value = opening.get(key, 0.0)
             issued_value = issued.get(key, 0.0)
             redeemed_value = redeemed.get(key, 0.0)
             close_value = closing.get(key, 0.0)
-            residual = close_value - open_value - issued_value + redeemed_value
+            if journal_mode:
+                identity_error = (
+                    close_value - open_value - journal_debt.get(key, 0.0)
+                )
+            else:
+                identity_error = (
+                    close_value - open_value - issued_value + redeemed_value
+                )
             route_holder, route_subbucket, instrument_type, maturity_bucket, debt_scope = key
             rows.append(
                 {
@@ -765,19 +862,258 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
                     "opening_route_stock_bil": open_value,
                     "route_face_issued_bil": issued_value,
                     "route_face_redeemed_bil": redeemed_value,
-                    "route_stock_residual_or_indexation_bil": residual,
+                    "route_journal_face_change_bil": journal_face.get(key, 0.0),
+                    "route_journal_adjusted_principal_change_bil": journal_adjusted.get(
+                        key, 0.0
+                    ),
+                    "route_stock_residual_or_indexation_bil": 0.0,
                     "closing_route_stock_bil": close_value,
-                    "closure_identity_error_bil": (
-                        close_value - open_value - issued_value + redeemed_value - residual
-                    ),
+                    "closure_identity_error_bil": identity_error,
                     "route_stock_basis": "tdc_principal_settlement_route",
-                    "residual_basis": (
-                        "closing_minus_opening_less_issuance_plus_redemption;"
-                        "captures_beneficial_holder_reallocation_rounding_and_tips_indexation"
-                    ),
+                    "residual_basis": "none_fail_closed_no_unrestricted_residual",
                 }
             )
     return {"tdcsim_tdc_principal_route_stock_closure": rows}
+
+
+def _route_journal_change_maps(
+    frame: pd.DataFrame,
+    *,
+    period_start: str,
+    period_end: str,
+) -> tuple[
+    dict[tuple[str, str, str, str, str], float],
+    dict[tuple[str, str, str, str, str], float],
+    dict[tuple[str, str, str, str, str], float],
+]:
+    if frame.empty:
+        return {}, {}, {}
+    work = frame[
+        frame.get("period_start", pd.Series("", index=frame.index)).astype(str).eq(period_start)
+        & frame.get("period_end", pd.Series("", index=frame.index)).astype(str).eq(period_end)
+    ].copy()
+    if work.empty:
+        return {}, {}, {}
+    for column in (
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+    ):
+        if column not in work.columns:
+            work[column] = ""
+        work[column] = work[column].fillna("").astype(str)
+    work["_face"] = pd.to_numeric(
+        work.get(
+            "route_face_stock_change_bil",
+            pd.Series(0.0, index=work.index),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
+    work["_adjusted"] = pd.to_numeric(
+        work.get(
+            "route_adjusted_principal_change_bil",
+            pd.Series(0.0, index=work.index),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
+    work["_debt"] = work["_face"].where(
+        ~work["instrument_type"].eq("TIPS"), work["_adjusted"]
+    )
+    work["_intragov"] = work.get(
+        "is_intragovernmental", pd.Series(False, index=work.index)
+    ).fillna(False).astype(str).str.lower().isin({"true", "1"})
+    scopes: list[pd.DataFrame] = []
+    all_active = work.copy()
+    all_active["debt_scope"] = "all_active_treasury"
+    scopes.append(all_active)
+    controlled = work[
+        work["instrument_type"].isin(["Fixed", "TIPS", "FRN"])
+        & ~work["_intragov"]
+    ].copy()
+    controlled["debt_scope"] = "controlled_public_marketable"
+    scopes.append(controlled)
+    expanded = pd.concat(scopes, ignore_index=True)
+    keys = [
+        "route_holder_sector",
+        "route_holder_subsector",
+        "instrument_type",
+        "maturity_bucket",
+        "debt_scope",
+    ]
+
+    def grouped(column: str) -> dict[tuple[str, str, str, str, str], float]:
+        values = expanded.groupby(keys, dropna=False)[column].sum()
+        return {
+            tuple(key): float(value)
+            for key, value in values.items()
+            if abs(float(value)) > 1e-12
+        }
+
+    return grouped("_face"), grouped("_adjusted"), grouped("_debt")
+
+
+def _accounting_closure_handoff_tables(
+    results: pd.DataFrame,
+    raw: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    journal = pd.DataFrame(raw.get("tdcsim_accounting_journal", []))
+    if journal.empty:
+        return {"tdcsim_accounting_closure": []}
+    result_rows = _ensure_date_column(results).copy()
+    result_rows["Date"] = pd.to_datetime(result_rows["Date"], errors="coerce")
+    result_rows = (
+        result_rows[result_rows["Date"].notna()]
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    if len(result_rows) <= 1:
+        return {"tdcsim_accounting_closure": []}
+    stocks = pd.DataFrame(raw.get("tdcsim_holder_stocks", []))
+    if not stocks.empty:
+        stocks = stocks.copy()
+        stocks["date"] = pd.to_datetime(stocks["date"], errors="coerce")
+        stocks = stocks[
+            stocks["date"].notna()
+            & stocks.get(
+                "debt_scope",
+                pd.Series("", index=stocks.index),
+            ).astype(str).eq("all_active_treasury")
+        ].copy()
+    journal = journal.copy()
+
+    def strict_numeric(frame: pd.DataFrame, column: str) -> pd.Series:
+        if column not in frame.columns:
+            raise ValueError(f"accounting source is missing numeric column: {column}")
+        values = pd.to_numeric(frame[column], errors="raise")
+        if values.isna().any() or not values.map(
+            lambda value: pd.notna(value) and float("-inf") < float(value) < float("inf")
+        ).all():
+            raise ValueError(
+                f"accounting source has malformed or nonfinite values: {column}"
+            )
+        return values.astype(float)
+
+    for column in (
+        "face_stock_change_bil",
+        "adjusted_principal_change_bil",
+        "treasury_cash_change_bil",
+        "reserve_change_bil",
+        "deposit_change_bil",
+    ):
+        journal[column] = strict_numeric(journal, column)
+    rows: list[dict[str, Any]] = []
+    for index in range(1, len(result_rows)):
+        opening = result_rows.iloc[index - 1]
+        closing = result_rows.iloc[index]
+        period_start = str(pd.Timestamp(opening["Date"]).date())
+        period_end = str(pd.Timestamp(closing["Date"]).date())
+        period_journal = journal[
+            journal.get(
+                "period_start", pd.Series("", index=journal.index)
+            ).astype(str).eq(period_start)
+            & journal.get(
+                "period_end", pd.Series("", index=journal.index)
+            ).astype(str).eq(period_end)
+        ]
+        opening_stocks = (
+            stocks[stocks["date"].eq(opening["Date"])]
+            if not stocks.empty
+            else stocks
+        )
+        closing_stocks = (
+            stocks[stocks["date"].eq(closing["Date"])]
+            if not stocks.empty
+            else stocks
+        )
+
+        def stock_total(frame: pd.DataFrame, column: str) -> float:
+            if frame.empty:
+                return 0.0
+            return float(strict_numeric(frame, column).sum())
+
+        opening_face = stock_total(opening_stocks, "face_stock_bil")
+        closing_face = stock_total(closing_stocks, "face_stock_bil")
+        opening_adjusted = stock_total(
+            opening_stocks, "adjusted_principal_stock_bil"
+        )
+        closing_adjusted = stock_total(
+            closing_stocks, "adjusted_principal_stock_bil"
+        )
+        journal_face = float(period_journal["face_stock_change_bil"].sum())
+        journal_adjusted = float(
+            period_journal["adjusted_principal_change_bil"].sum()
+        )
+        journal_cash = float(period_journal["treasury_cash_change_bil"].sum())
+        journal_reserve = float(period_journal["reserve_change_bil"].sum())
+        journal_deposit = float(period_journal["deposit_change_bil"].sum())
+        opening_cash = _number(opening, "TGA")
+        closing_cash = _number(closing, "TGA")
+        reported_reserve = _number(closing, "Reserves") - _number(
+            opening, "Reserves"
+        )
+        reported_deposit = _number(closing, "TDC_Level") - _number(
+            opening, "TDC_Level"
+        )
+        if closing_stocks.empty:
+            holder_total = 0.0
+            instrument_total = 0.0
+        else:
+            closing_stocks = closing_stocks.copy()
+            closing_stocks["_debt_held"] = strict_numeric(
+                closing_stocks, "debt_held_bil"
+            )
+            holder_total = float(
+                closing_stocks.groupby(
+                    ["holder_sector", "holder_subsector"],
+                    dropna=False,
+                )["_debt_held"].sum().sum()
+            )
+            instrument_total = float(
+                closing_stocks.groupby(
+                    ["instrument_type", "maturity_bucket"],
+                    dropna=False,
+                )["_debt_held"].sum().sum()
+            )
+        aggregate_debt = _number(closing, "TotalDebt_Agg")
+        rows.append(
+            {
+                "period_start": period_start,
+                "period_end": period_end,
+                "opening_face_stock_bil": opening_face,
+                "journal_face_stock_change_bil": journal_face,
+                "closing_face_stock_bil": closing_face,
+                "face_stock_closure_error_bil": closing_face
+                - opening_face
+                - journal_face,
+                "opening_adjusted_principal_stock_bil": opening_adjusted,
+                "journal_adjusted_principal_change_bil": journal_adjusted,
+                "closing_adjusted_principal_stock_bil": closing_adjusted,
+                "adjusted_principal_closure_error_bil": closing_adjusted
+                - opening_adjusted
+                - journal_adjusted,
+                "opening_treasury_cash_bil": opening_cash,
+                "journal_treasury_cash_change_bil": journal_cash,
+                "closing_treasury_cash_bil": closing_cash,
+                "treasury_cash_closure_error_bil": closing_cash
+                - opening_cash
+                - journal_cash,
+                "journal_reserve_change_bil": journal_reserve,
+                "reported_reserve_change_bil": reported_reserve,
+                "reserve_closure_error_bil": reported_reserve - journal_reserve,
+                "journal_deposit_change_bil": journal_deposit,
+                "reported_deposit_change_bil": reported_deposit,
+                "deposit_closure_error_bil": reported_deposit - journal_deposit,
+                "holder_debt_total_bil": holder_total,
+                "instrument_debt_total_bil": instrument_total,
+                "aggregate_debt_bil": aggregate_debt,
+                "holder_total_error_bil": holder_total - aggregate_debt,
+                "instrument_total_error_bil": instrument_total - aggregate_debt,
+                "closure_basis": "independent_opening_and_closing_state_snapshots",
+                "unexplained_residual_bil": 0.0,
+            }
+        )
+    return {"tdcsim_accounting_closure": rows}
 
 
 def _route_stock_map(frame: pd.DataFrame) -> dict[tuple[str, str, str, str, str], float]:
