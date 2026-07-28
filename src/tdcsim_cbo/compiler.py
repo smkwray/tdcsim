@@ -47,7 +47,6 @@ ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
 HOLDER_PREFERENCE_EVENTS_FILE = "tdcsim_holder_preference_events.json"
 RUNTIME_ASSUMPTIONS_FILE = "tdcsim_runtime_assumptions.json"
 OPENING_RUNTIME_STATE_FILE = "tdcsim_opening_runtime_state.json"
-DEFAULT_FISCAL_INCIDENCE_POLICY_ID = "baseline_central_99du_1ru"
 _SOURCE_BASELINE_OPENING_DEFAULTS = {
     "reserves": 3000.0,
     "tdc_level": 0.0,
@@ -416,6 +415,9 @@ def _materialize_required_adapter_assumptions(
         runtime_payload = _read_runtime_assumptions_for_merge(runtime_path)
     else:
         runtime_payload = _runtime_assumptions_payload(
+            fiscal_incidence_policy_id=_configured_default_fiscal_incidence_policy_id(
+                forecast_inputs_dir
+            ),
             mmf_deposit_pass_through=MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
             mmf_deposit_pass_through_status="configured_default",
             fiscal_incidence_policy_status="configured_default",
@@ -447,18 +449,37 @@ def _materialize_required_adapter_assumptions(
         )
         materialized.add(OPENING_RUNTIME_STATE_FILE)
         changed.add(OPENING_RUNTIME_STATE_FILE)
+    if _ensure_opening_fed_target_identity(
+        forecast_inputs_dir,
+        opening_state_date=_source_baseline_opening_state_date(
+            baseline,
+            forecast_inputs_dir=forecast_inputs_dir,
+        ),
+        actuals_available_as_of=str(
+            baseline.manifest.get("date_range", {}).get(
+                "actuals_available_as_of",
+                "",
+            )
+        ),
+        baseline_scenario_id=str(
+            baseline.manifest.get("scenario_id") or ""
+        ),
+        fed_override_active="fed_holdings" in overrides,
+    ):
+        changed.add(INPUT_FILES["fed_holdings"])
     return materialized, changed
 
 
 def _runtime_assumptions_payload(
     *,
+    fiscal_incidence_policy_id: str,
     mmf_deposit_pass_through: float,
     mmf_deposit_pass_through_status: str,
     fiscal_incidence_policy_status: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": "tdcsim_cbo_runtime_assumptions_v1",
-        "fiscal_incidence_policy_id": DEFAULT_FISCAL_INCIDENCE_POLICY_ID,
+        "fiscal_incidence_policy_id": fiscal_incidence_policy_id,
         "fiscal_incidence_policy_status": fiscal_incidence_policy_status,
         "mmf_deposit_pass_through": mmf_deposit_pass_through,
         "mmf_deposit_pass_through_status": mmf_deposit_pass_through_status,
@@ -469,6 +490,29 @@ def _runtime_assumptions_payload(
             "deposit_plumbing_not_debt_or_issuance"
         ),
     }
+
+
+def _configured_default_fiscal_incidence_policy_id(
+    forecast_inputs_dir: Path,
+) -> str:
+    rows, _ = _read_csv(
+        forecast_inputs_dir / INPUT_FILES["fiscal_incidence"]
+    )
+    candidates = [
+        str(row.get("policy_id") or "").strip()
+        for row in rows
+        if str(row.get("policy_id") or "").strip() == "central"
+        or str(row.get("policy_id") or "").strip().endswith(
+            "_central_99du_1ru"
+        )
+    ]
+    if len(candidates) != 1:
+        raise CompilerError(
+            "fiscal incidence inputs require exactly one configured-default "
+            "central policy ID; "
+            f"found {candidates}"
+        )
+    return candidates[0]
 
 
 def _read_runtime_assumptions_for_merge(path: Path) -> dict[str, Any]:
@@ -584,6 +628,138 @@ def _source_baseline_opening_state_date(
     raise CompilerError(
         "source baseline opening runtime state requires an explicit opening_state_date"
     )
+
+
+def _ensure_opening_fed_target_identity(
+    forecast_inputs_dir: Path,
+    *,
+    opening_state_date: str,
+    actuals_available_as_of: str,
+    baseline_scenario_id: str,
+    fed_override_active: bool,
+) -> bool:
+    fed_path = forecast_inputs_dir / INPUT_FILES["fed_holdings"]
+    rows, header = _read_csv(fed_path)
+    opening_rows = [
+        row
+        for row in rows
+        if str(row.get("period_end") or "") == opening_state_date
+        and str(row.get("holder_type") or "") == "CB"
+    ]
+    if len(opening_rows) > 1:
+        raise CompilerError(
+            "Fed holdings path has duplicate opening CB target rows"
+        )
+    portfolio_path = forecast_inputs_dir / "tdcsim_opening_portfolio.csv"
+    if not portfolio_path.exists():
+        if opening_rows:
+            return False
+        raise CompilerError(
+            "opening Fed target identity requires tdcsim_opening_portfolio.csv"
+        )
+    opening_cb_stock = _opening_cb_stock(portfolio_path)
+    if opening_rows:
+        try:
+            opening_target = float(
+                opening_rows[0]["cbo_fed_holdings_target_bil"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CompilerError(
+                "opening Fed target must be numeric"
+            ) from exc
+        if not math.isfinite(opening_target):
+            raise CompilerError("opening Fed target must be finite")
+        if abs(opening_target - opening_cb_stock) <= 1e-6:
+            return False
+        if not fed_override_active:
+            raise CompilerError(
+                "opening Fed target does not match opening CB Treasury stock"
+            )
+        opening_row = opening_rows[0]
+    else:
+        scenario_ids = {
+            str(row.get("scenario_id") or "").strip()
+            for row in rows
+            if str(row.get("scenario_id") or "").strip()
+        }
+        if not scenario_ids and baseline_scenario_id:
+            scenario_ids = {baseline_scenario_id}
+        if len(scenario_ids) != 1:
+            raise CompilerError(
+                "Fed holdings path requires exactly one scenario_id"
+            )
+        opening_row = {
+            "schema_version": "tdcsim_fed_holdings_path_v1",
+            "scenario_id": next(iter(scenario_ids)),
+            "period_end": opening_state_date,
+            "holder_type": "CB",
+        }
+        rows.append(opening_row)
+    metadata_path = (
+        forecast_inputs_dir / "tdcsim_opening_portfolio_metadata.json"
+    )
+    observation_date = opening_state_date
+    if metadata_path.exists():
+        metadata = read_json(metadata_path)
+        if isinstance(metadata, Mapping):
+            observation_date = str(
+                metadata.get("record_date") or opening_state_date
+            )
+    opening_row.update(
+        {
+            "cbo_fed_holdings_target_bil": opening_cb_stock,
+            "interpolation_method": "opening_state_identity",
+            "source_fiscal_year": int(opening_state_date[:4]),
+            "source_role": "identity_check",
+            "runtime_role": "hard_target",
+            "observation_date": observation_date,
+            "available_date": (
+                actuals_available_as_of or observation_date
+            ),
+            "source_status": (
+                "compiler_materialized_opening_fed_stock_target_identity"
+            ),
+            "claim_boundary": (
+                "opening_portfolio_stock_identity_nonsettling_"
+                "not_observed_fed_target_growth"
+            ),
+            "scenario_transform": (
+                "opening_state_identity_not_shocked"
+                if fed_override_active
+                else "configured_opening_state_identity"
+            ),
+        }
+    )
+    rows.sort(key=lambda row: str(row.get("period_end") or ""))
+    _write_csv(fed_path, rows, preferred_header=header)
+    return True
+
+
+def _opening_cb_stock(path: Path) -> float:
+    rows, _ = _read_csv(path)
+    total = 0.0
+    for row in rows:
+        if str(row.get("Status") or "") != "Active":
+            continue
+        if str(row.get("HolderType") or "") != "CB":
+            continue
+        column = (
+            "AdjustedPrincipal"
+            if str(row.get("SecurityType") or "") == "TIPS"
+            else "FaceValue"
+        )
+        try:
+            value = float(row[column])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CompilerError(
+                f"opening CB portfolio requires numeric {column}"
+            ) from exc
+        if not math.isfinite(value) or value < 0.0:
+            raise CompilerError(
+                f"opening CB portfolio {column} must be finite and nonnegative"
+            )
+        total += value
+    return total
 
 
 def _validate_override_coupling(overrides: Mapping[str, Any], coupling: Mapping[str, Any]) -> None:
