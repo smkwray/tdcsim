@@ -11,6 +11,9 @@ from tdcsim_cbo._json import write_json
 from tdcsim_cbo.consumer_challenge import (
     CHALLENGE_SCHEMA_VERSION,
     CHALLENGE_SCHEMA_VERSION_V1,
+    AUDIT_ONLY_NON_SELECTED_FIELDS,
+    CURRENT_SUMMARY_AUDIT_ONLY_FIELDS,
+    CURRENT_SUMMARY_PROJECTION_FIELDS,
     EXPECTED_ABSENT_FIELDS,
     SELECTED_FIELD,
     build_handoff_package_manifest,
@@ -43,6 +46,7 @@ CURRENT_HEADER = [
     "tdc_income_addendum_admission_status",
     "tdc_income_addendum_collision_status",
     "delta_tdc_ex_overlap_bil",
+    "legacy_chi_support_diagnostic_bil",
 ]
 
 
@@ -80,6 +84,7 @@ def _current_rows():
             "tdc_income_addendum_admission_status": "admitted_split_non_interest_bucket",
             "tdc_income_addendum_collision_status": "pass_split_collision_excluded",
             "delta_tdc_ex_overlap_bil": "5.344736",
+            "legacy_chi_support_diagnostic_bil": "0.198432",
         }
     ]
 
@@ -215,6 +220,36 @@ def test_expected_absent_and_audit_only_fields_are_distinct_invariants(tmp_path)
     header_without_audit = [field for field in CUMULATIVE_HEADER if field != "delta_tdc_ex_overlap_bil"]
     with pytest.raises(ValueError, match="missing required fields.*delta_tdc_ex_overlap_bil"):
         _challenge(tmp_path / "second", cumulative_header=header_without_audit)
+
+
+def test_retired_diagnostic_is_audit_only_not_required_absent(tmp_path):
+    """The retired beta-chi diagnostic ships deliberately; requiring it absent destroys evidence.
+
+    `legacy_chi_support_diagnostic_bil` was originally classified as required-absent, which
+    failed the real campaign: the per-pair summary the fallback reads does carry it, exported
+    under an explicitly retired name and paired with
+    `legacy_chi_support_eligible_for_main_ratio=False` that the contract validator enforces.
+    That pairing is what makes the retirement auditable rather than silent, and the consumer's
+    parser references neither name. What must stay absent is the *neutral* name a consumer
+    could mistake for the headline figure.
+
+    The two consumed files also differ: the cumulative table is rebuilt from a fixed column
+    list that omits the diagnostic, so the requirement is per file.
+    """
+
+    assert "marginal_tdc_support_bil" in EXPECTED_ABSENT_FIELDS
+    assert "legacy_chi_support_diagnostic_bil" not in EXPECTED_ABSENT_FIELDS
+    assert "legacy_chi_support_diagnostic_bil" in CURRENT_SUMMARY_AUDIT_ONLY_FIELDS
+    assert "legacy_chi_support_diagnostic_bil" not in AUDIT_ONLY_NON_SELECTED_FIELDS
+
+    # It is never selectable, whichever list it sits in.
+    assert "legacy_chi_support_diagnostic_bil" != SELECTED_FIELD
+    assert "legacy_chi_support_diagnostic_bil" not in CURRENT_SUMMARY_PROJECTION_FIELDS
+
+    # Dropping it from the fallback file must fail: its presence is the retirement evidence.
+    header = [f for f in CURRENT_HEADER if f != "legacy_chi_support_diagnostic_bil"]
+    with pytest.raises(ValueError, match="missing required fields.*legacy_chi_support_diagnostic_bil"):
+        _challenge(tmp_path, current_header=header)
 
 
 def test_digest_is_over_original_decimal_strings_not_parsed_floats(tmp_path):

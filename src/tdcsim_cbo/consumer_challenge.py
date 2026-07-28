@@ -35,11 +35,26 @@ CURRENT_SUMMARY_GATE_FIELDS = (
     "tdc_income_addendum_collision_status",
     "delta_tdc_ex_overlap_split_remainder_bil",
 )
-EXPECTED_ABSENT_FIELDS = (
-    "legacy_chi_support_diagnostic_bil",
-    "marginal_tdc_support_bil",
-)
+# Names the retired beta-chi construction must never ship under again. These are the neutral
+# names that would let a consumer pick the retired quantity up believing it was the headline
+# figure, which is the specific risk the retirement was about.
+EXPECTED_ABSENT_FIELDS = ("marginal_tdc_support_bil",)
+
+# Present in the file, never selected. The two consumed files do not carry the same audit set,
+# so the requirement is per file rather than shared.
+#
+# `legacy_chi_support_diagnostic_bil` is audit-only rather than required-absent: the retired
+# diagnostic is exported deliberately, under an explicitly retired name and paired with
+# `legacy_chi_support_eligible_for_main_ratio=False`, which the contract validator enforces.
+# That makes the exclusion a validated field rather than a silent omission, and the consumer's
+# parser references neither name. Requiring it absent would delete the evidence that the
+# retirement holds. It ships in the per-pair summary the fallback reads, but the cumulative
+# table is rebuilt from a fixed column list that does not carry it.
 AUDIT_ONLY_NON_SELECTED_FIELDS = ("delta_tdc_ex_overlap_bil",)
+CURRENT_SUMMARY_AUDIT_ONLY_FIELDS = (
+    "delta_tdc_ex_overlap_bil",
+    "legacy_chi_support_diagnostic_bil",
+)
 # Backward-compatible name for code reading v1 declarations. V2 separates the two semantics.
 EXCLUDED_FIELDS = EXPECTED_ABSENT_FIELDS + AUDIT_ONLY_NON_SELECTED_FIELDS
 CANONICAL_ROW_KEY = "period"
@@ -357,7 +372,7 @@ def _cumulative_projection(path: Path) -> dict[str, Any]:
 
 def _current_summary_projection(path: Path) -> dict[str, Any]:
     header, rows = _read_csv(path)
-    required = (*CURRENT_SUMMARY_PROJECTION_FIELDS, *AUDIT_ONLY_NON_SELECTED_FIELDS)
+    required = (*CURRENT_SUMMARY_PROJECTION_FIELDS, *CURRENT_SUMMARY_AUDIT_ONLY_FIELDS)
     _validate_header(path, header, required)
     admitted = []
     for row_number, row in enumerate(rows, start=2):
@@ -583,6 +598,7 @@ def _json_file_bytes(value: Any) -> bytes:
 
 __all__ = [
     "AUDIT_ONLY_NON_SELECTED_FIELDS",
+    "CURRENT_SUMMARY_AUDIT_ONLY_FIELDS",
     "CANONICAL_ROW_KEY",
     "CHALLENGE_SCHEMA_VERSION",
     "CHALLENGE_SCHEMA_VERSION_V1",
