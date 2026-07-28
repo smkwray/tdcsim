@@ -102,9 +102,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     cumulative = _cumulative_split_table(cumulative_frames)
     cumulative.to_csv(cumulative_path, index=False)
 
-    generated_pair_dirs = _pair_dir_map(output_root)
-    current_pair_dir = generated_pair_dirs.get(CURRENT_SPLIT_PAIR_ID)
-    if current_pair_dir is None:
+    # CURRENT_SPLIT_PAIR_ID is a *directory* name, not a pair_id: the consumer opens the
+    # fallback summary at a fixed relative path ending in this directory, while the pair's own
+    # pair_id is ratewall_current_2026_plus100bp_year_source_grade_pair_v1. Looking it up in
+    # _pair_dir_map, which keys by pair_id, could never match and failed the handoff after the
+    # whole campaign had been assembled.
+    current_pair_dir = output_root / CURRENT_SPLIT_PAIR_ID
+    if not (current_pair_dir / MANIFEST_FILE).exists():
         raise SystemExit(f"missing current split pair for handoff: {CURRENT_SPLIT_PAIR_ID}")
     current_summary_path = current_pair_dir / SUMMARY_FILE
     pair_manifest_paths = sorted(output_root.glob(f"*/{MANIFEST_FILE}"))
