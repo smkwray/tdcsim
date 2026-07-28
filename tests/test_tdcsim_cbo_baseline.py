@@ -69,12 +69,14 @@ def test_baseline_materialize_extracts_verified_zip(tmp_path: Path) -> None:
     assert (materialized / "forecast_inputs" / "source_contract_smoke.json").exists()
 
 
+@pytest.mark.integration
 def test_real_release_bound_package_opens_when_local_artifact_exists() -> None:
     root = Path(__file__).resolve().parents[1]
     package = root / "output" / "cbo_forecast_release_bound_package.zip"
     attestation = root / "output" / "cbo_forecast_release_bound_attestation.json"
-    if not package.exists() or not attestation.exists():
-        pytest.skip("local release-bound CBO artifacts are ignored and not present")
+    assert package.is_file() and attestation.is_file(), (
+        "release-bound package integration artifacts are missing"
+    )
 
     baseline = CboBaselinePackage.open(package, attestation_path=attestation)
 

@@ -29,6 +29,20 @@ from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yi
 RUN_ROWS = 3755
 BUDGET_WORKBOOK = PROJECT_ROOT_FOR_IMPORT.parent / "ratewall" / "data" / "raw" / "cbo" / "51118-2026-02-Budget-Projections.xlsx"
 ECONOMIC_WORKBOOK = PROJECT_ROOT_FOR_IMPORT.parent / "ratewall" / "data" / "raw" / "cbo" / "51135-2026-02-Economic-Projections.xlsx"
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_cbo_workbooks() -> None:
+    missing = [path for path in (BUDGET_WORKBOOK, ECONOMIC_WORKBOOK) if not path.is_file()]
+    if missing:
+        pytest.fail(
+            "CBO package-verifier integration inputs are missing: "
+            + ", ".join(path.name for path in missing),
+            pytrace=False,
+        )
+
+
 RESULT_COLUMNS = [
     "Date",
     "TotalDebt_Agg",
@@ -820,7 +834,7 @@ def _write_auxiliary_required_files(package: Path) -> None:
 
 def _write_cbo_source_fixtures(package: Path) -> None:
     if not BUDGET_WORKBOOK.exists() or not ECONOMIC_WORKBOOK.exists():
-        pytest.skip("optional local CBO workbook fixtures are not present")
+        raise AssertionError("CBO package-verifier integration workbooks are missing")
     budget_rows = parse_cbo_budget_source_contract(BUDGET_WORKBOOK).fixture_rows()
     economic_rows = parse_cbo_economic_quarterly_source_contract(ECONOMIC_WORKBOOK).fixture_rows()
     rows = budget_rows + economic_rows
@@ -1023,7 +1037,7 @@ def _write_source_package(package: Path) -> dict:
     source_entries = {}
     for rel, source in files.items():
         if not source.exists():
-            pytest.skip("optional local CBO workbook fixtures are not present")
+            raise AssertionError("CBO package-verifier integration workbooks are missing")
         path = package / "sources" / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(source.read_bytes())

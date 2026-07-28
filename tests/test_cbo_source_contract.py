@@ -27,10 +27,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BUDGET_WORKBOOK = PROJECT_ROOT / "ratewall/data/raw/cbo/51118-2026-02-Budget-Projections.xlsx"
 ECONOMIC_WORKBOOK = PROJECT_ROOT / "ratewall/data/raw/cbo/51135-2026-02-Economic-Projections.xlsx"
 
-pytestmark = pytest.mark.skipif(
-    not BUDGET_WORKBOOK.exists() or not ECONOMIC_WORKBOOK.exists(),
-    reason="optional local CBO workbook fixtures are not present",
-)
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_cbo_workbooks() -> None:
+    missing = [path for path in (BUDGET_WORKBOOK, ECONOMIC_WORKBOOK) if not path.is_file()]
+    if missing:
+        pytest.fail(
+            "CBO source-contract integration inputs are missing: "
+            + ", ".join(path.name for path in missing),
+            pytrace=False,
+        )
 
 
 def test_cbo_workbook_hashes_match_source_contract():
