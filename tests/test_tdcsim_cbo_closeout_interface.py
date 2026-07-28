@@ -547,6 +547,45 @@ def test_verifier_rejects_missing_principal_bridge_even_with_fresh_hashes(tmp_pa
         verify_scenario_run(run.output_dir)
 
 
+def test_verifier_rejects_malformed_route_closure_with_fresh_hashes(
+    tmp_path: Path,
+) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    closure_path = (
+        run.output_dir
+        / "outputs"
+        / "tdcsim_tdc_principal_route_stock_closure.csv"
+    )
+    closure = pd.read_csv(closure_path)
+    closure["closure_identity_error_bil"] = closure[
+        "closure_identity_error_bil"
+    ].astype(object)
+    closure.loc[closure.index[0], "closure_identity_error_bil"] = "not-a-number"
+    closure.to_csv(closure_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_manifest_artifact(
+        run.output_dir,
+        manifest,
+        "outputs/tdcsim_tdc_principal_route_stock_closure.csv",
+    )
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(
+        VerificationError,
+        match=(
+            "tdcsim_tdc_principal_route_stock_closure has malformed "
+            "or nonfinite numeric values"
+        ),
+    ):
+        verify_scenario_run(run.output_dir)
+
+
 @pytest.mark.parametrize("mutation", ["delete", "duplicate"])
 def test_verifier_rejects_deleted_or_duplicated_accounting_leg_with_fresh_hashes(
     tmp_path: Path,
