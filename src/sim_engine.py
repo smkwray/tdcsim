@@ -1963,13 +1963,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             .to_dict()
         )
     except Exception as e:
-        print(f'ERROR [{scenario_name}]: Failed to create date range: {e}')
-        return (pd.DataFrame(), pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
+        raise ValueError(f'[{scenario_name}] Failed to create simulation date range: {e}') from e
     if num_periods <= 1:
-        print(f'WARNING [{scenario_name}]: Simulation period results in <= 1 time step. Skipping.')
-        results_cols_on_skip = ['TGA', 'Reserves', 'TDC_Level']
-        empty_results = pd.DataFrame(index=dates, columns=results_cols_on_skip, dtype=float).fillna(0.0)
-        return (empty_results, pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES))
+        raise ValueError(
+            f'[{scenario_name}] Simulation period must contain at least one running period '
+            f'after the opening date; received {num_periods} time step(s).'
+        )
     print(f'--- Starting Simulation: {scenario_name} ---')
     results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_TreasuryInterestCashReceived', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBOFedSecondarySaleCash', 'CBOFedSecondarySaleReserveEffect', 'CBOFedSecondarySaleDepositEffect', 'CBOFedPrivateMaturityTDC', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
@@ -3514,8 +3513,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         bond_portfolio = new_bonds_df
                     else:
                         bond_portfolio = pd.concat([bond_portfolio, new_bonds_df], ignore_index=True)
-                except Exception as concat_err:
-                    print(f'ERROR [{scenario_name}@{current_date.date()}]: Concatenation failed: {concat_err}')
+                except Exception:
+                    raise
         results.loc[current_date, 'NewDebtIssued'] = actual_issued_amount
         results.loc[current_date, 'AuctionProceeds'] = actual_auction_proceeds
         if cbo_funding_mode:
@@ -3705,10 +3704,8 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 deposit_change_period += pref_trade_monetary_impact.get('deposit_change', 0.0)
                 tga_change_period += pref_trade_monetary_impact.get('tga_change', 0.0)
                 tga_change_period -= pref_trade_monetary_impact.get('tga_drain', 0.0)
-            except Exception as e:
-                print(f'ERROR [{scenario_name}@{current_date.date()}]: Preference trading failed: {e}')
-                traceback.print_exc()
-                pref_trade_monetary_impact = {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0}
+            except Exception:
+                raise
         active_bonds_final = bond_portfolio[bond_portfolio['Status'] == 'Active'].copy()
         if not active_bonds_final.empty:
             active_bonds_final['DebtBase'] = np.where(active_bonds_final['SecurityType'] == 'TIPS', active_bonds_final['AdjustedPrincipal'].fillna(active_bonds_final['FaceValue']), active_bonds_final['FaceValue'])
