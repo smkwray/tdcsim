@@ -8,19 +8,60 @@ import pytest
 from forecast_paths import OPERATING_CASH_COMPARISON_ROLE, OPERATING_CASH_OPENING_STATE_ROLE
 from tdcsim_cbo import CboBaselinePackage, CboScenarioCompiler, CboScenarioSpec
 from tdcsim_cbo._json import sha256_file, write_json
-from tdcsim_cbo.compiler import CompilerError, HOLDER_PREFERENCE_EVENTS_FILE, ISSUANCE_MIX_FILE, digest_input_tree
+from tdcsim_cbo.compiler import (
+    OPENING_RUNTIME_STATE_FILE,
+    RUNTIME_ASSUMPTIONS_FILE,
+    CompilerError,
+    HOLDER_PREFERENCE_EVENTS_FILE,
+    ISSUANCE_MIX_FILE,
+    digest_input_tree,
+)
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
 
 
-def test_noop_compile_preserves_input_digest_and_does_not_mark_rows(tmp_path: Path) -> None:
+def test_noop_compile_materializes_explicit_defaults_without_marking_csv_rows(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
     spec = CboScenarioSpec.from_mapping(_scenario_mapping(baseline))
 
     compiled = CboScenarioCompiler().compile(baseline, spec, tmp_path / "work")
 
-    assert compiled.changed_inputs == ()
-    assert compiled.compiled_inputs_digest == compiled.baseline_forecast_inputs_digest
-    assert compiled.compiled_inputs_digest == digest_input_tree(compiled.baseline_dir / "forecast_inputs")
+    expected_defaults = (
+        ISSUANCE_MIX_FILE,
+        OPENING_RUNTIME_STATE_FILE,
+        RUNTIME_ASSUMPTIONS_FILE,
+    )
+    assert compiled.changed_inputs == tuple(sorted(expected_defaults))
+    assert compiled.compiled_inputs_digest != compiled.baseline_forecast_inputs_digest
+    assert compiled.baseline_forecast_inputs_digest == digest_input_tree(compiled.baseline_dir / "forecast_inputs")
+    assert compiled.manifest["materialized_defaults"] == sorted(expected_defaults)
+    assert compiled.manifest["materialized_default_count"] == 3
+    issuance = json.loads(
+        (compiled.forecast_inputs_dir / ISSUANCE_MIX_FILE).read_text(encoding="utf-8")
+    )
+    runtime = json.loads(
+        (compiled.forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE).read_text(encoding="utf-8")
+    )
+    opening = json.loads(
+        (compiled.forecast_inputs_dir / OPENING_RUNTIME_STATE_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert issuance["selection_status"] == "configured_default"
+    assert issuance["negative_issuance_action"] == "error"
+    assert sum(issuance["security_shares"].values()) == pytest.approx(1.0)
+    assert runtime["fiscal_incidence_policy_id"] == "baseline_central_99du_1ru"
+    assert runtime["fiscal_incidence_policy_status"] == "configured_default"
+    assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.97)
+    assert runtime["mmf_deposit_pass_through_status"] == "configured_default"
+    assert opening["initial_values"] == pytest.approx(
+        {"reserves": 3000.0, "tdc_level": 0.0, "tga": 100.0}
+    )
+    assert opening["initial_value_statuses"] == {
+        "reserves": "configured_default",
+        "tdc_level": "configured_default",
+        "tga": "source_opening_cash",
+    }
+    assert opening["configured_default_count"] == 2
     header = _csv_header(compiled.forecast_inputs_dir / "tdcsim_yield_curve_surface.csv")
     assert "scenario_transform" not in header
     assert sha256_file(baseline.package_path) == baseline.package_sha256
@@ -427,7 +468,82 @@ def test_issuance_mix_override_materializes_hashed_compiled_artifact(tmp_path: P
     assert ISSUANCE_MIX_FILE in compiled.changed_inputs
     assert any(item["path"] == ISSUANCE_MIX_FILE for item in compiled.manifest["input_hashes"])
     assert payload["mode"] == "replace_shares"
+    assert payload["selection_status"] == "scenario_override"
     assert payload["security_shares"]["tips"] == pytest.approx(0.08)
+    assert compiled.manifest["materialized_defaults"] == sorted(
+        (OPENING_RUNTIME_STATE_FILE, RUNTIME_ASSUMPTIONS_FILE)
+    )
+    assert compiled.manifest["materialized_default_count"] == 2
+
+
+def test_derived_mmf_override_preserves_inherited_fiscal_selector_and_status(
+    tmp_path: Path,
+) -> None:
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        derived_package=True,
+        carry_opening_runtime_state=True,
+        carry_runtime_assumptions=True,
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "mmf_deposit_pass_through": {"mode": "fixed_fraction", "value": 0.82}
+    }
+
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(scenario),
+        tmp_path / "work",
+    )
+    runtime = json.loads(
+        (compiled.forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert runtime["fiscal_incidence_policy_id"] == "central"
+    assert runtime["fiscal_incidence_policy_status"] == "configured_default"
+    assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.82)
+    assert runtime["mmf_deposit_pass_through_status"] == "scenario_override"
+
+
+def test_derived_fiscal_override_updates_status_without_resetting_inherited_mmf(
+    tmp_path: Path,
+) -> None:
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        derived_package=True,
+        carry_opening_runtime_state=True,
+        carry_runtime_assumptions=True,
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {
+        "fiscal_incidence": {
+            "mode": "static_shares",
+            "domestic_ultimate_share": 0.50,
+            "rest_of_world_share": 0.25,
+            "foreign_official_share": 0.25,
+            "other_share": 0.0,
+        }
+    }
+
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(scenario),
+        tmp_path / "work",
+    )
+    runtime = json.loads(
+        (compiled.forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert runtime["fiscal_incidence_policy_id"] == "central"
+    assert runtime["fiscal_incidence_policy_status"] == "scenario_override"
+    assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.73)
+    assert runtime["mmf_deposit_pass_through_status"] == "configured_default"
 
 
 def test_compiler_rejects_directory_baseline_without_package_digest(tmp_path: Path) -> None:
@@ -440,6 +556,20 @@ def test_compiler_rejects_directory_baseline_without_package_digest(tmp_path: Pa
 
     with pytest.raises(CompilerError, match="zip baseline"):
         CboScenarioCompiler().compile(baseline_dir, spec, tmp_path / "work")
+
+
+def test_compiler_rejects_derived_package_missing_carried_opening_state(
+    tmp_path: Path,
+) -> None:
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        derived_package=True,
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    spec = CboScenarioSpec.from_mapping(_scenario_mapping(baseline))
+
+    with pytest.raises(CompilerError, match="requires carried tdcsim_opening_runtime_state.json"):
+        CboScenarioCompiler().compile(baseline, spec, tmp_path / "work")
 
 
 def _compiler_baseline(tmp_path: Path) -> CboBaselinePackage:
@@ -504,7 +634,13 @@ def _issuance_mix_override() -> dict:
     }
 
 
-def _write_compiler_package(tmp_path: Path) -> tuple[Path, Path]:
+def _write_compiler_package(
+    tmp_path: Path,
+    *,
+    derived_package: bool = False,
+    carry_opening_runtime_state: bool = False,
+    carry_runtime_assumptions: bool = False,
+) -> tuple[Path, Path]:
     package_dir = tmp_path / "compiler_pkg"
     inputs = package_dir / "forecast_inputs"
     inputs.mkdir(parents=True)
@@ -586,10 +722,42 @@ def _write_compiler_package(tmp_path: Path) -> tuple[Path, Path]:
             {"holder_type": "CB", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
         ],
     )
+    if carry_opening_runtime_state:
+        write_json(
+            inputs / OPENING_RUNTIME_STATE_FILE,
+            {
+                "schema_version": "tdcsim_cbo_opening_runtime_state_v1",
+                "opening_state_date": "2027-01-01",
+                "initial_values": {
+                    "reserves": 2800.0,
+                    "tdc_level": 15.0,
+                    "tga": 100.0,
+                },
+                "claim_boundary": "carried_derived_state_fixture",
+            },
+        )
+    if carry_runtime_assumptions:
+        write_json(
+            inputs / RUNTIME_ASSUMPTIONS_FILE,
+            {
+                "schema_version": "tdcsim_cbo_runtime_assumptions_v1",
+                "fiscal_incidence_policy_id": "central",
+                "fiscal_incidence_policy_status": "configured_default",
+                "mmf_deposit_pass_through": 0.73,
+                "mmf_deposit_pass_through_status": "configured_default",
+                "source_role": "carried_derived_state_fixture",
+                "runtime_role": "fiscal_selector_and_deposit_channel_parameters",
+                "claim_boundary": "fixture",
+            },
+        )
 
     manifest = {
         "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v1",
         "scenario_id": "compiler_fixture",
+        "date_range": {
+            "opening_state_date": "2027-01-01",
+            "actuals_available_as_of": "2027-01-01",
+        },
         "trust_anchor": {
             "schema_version": "tdcsim_cbo_package_trust_anchor_v1",
             "code_revision": RELEASE_SHA,
@@ -598,6 +766,11 @@ def _write_compiler_package(tmp_path: Path) -> tuple[Path, Path]:
             "verifier_sha256": VERIFIER_SHA,
         },
     }
+    if derived_package:
+        manifest["derived_forecast_state"] = {
+            "method": "baseline_rollforward_export_v1",
+            "opening_state_date": "2027-01-01",
+        }
     write_json(package_dir / "manifest.json", manifest)
     write_json(inputs / "source_contract_smoke.json", manifest)
 

@@ -21,17 +21,26 @@ from sim_engine import run_simulation
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
+    MATURITY_CATEGORIES,
     PORTFOLIO_DTYPES,
     PRIVATE_SUBBUCKETS,
+    SECURITY_TYPES,
 )
 from tdc_validation import validate_events
 
 from ._json import read_json, sha256_file, write_json
 from ._schema import validate_schema
 from .baseline import CboBaselinePackage
-from .compiler import CboCompiledScenario, CboScenarioCompiler, HOLDER_PREFERENCE_EVENTS_FILE, RUNTIME_ASSUMPTIONS_FILE
+from .compiler import (
+    ISSUANCE_MIX_FILE,
+    OPENING_RUNTIME_STATE_FILE,
+    CboCompiledScenario,
+    CboScenarioCompiler,
+    HOLDER_PREFERENCE_EVENTS_FILE,
+    RUNTIME_ASSUMPTIONS_FILE,
+)
 from .contract import CboScenarioSpec
-from .manifest import build_run_manifest
+from .manifest import build_run_manifest, validation_from_boundary_checks
 from .output import hash_output_tree, write_scenario_outputs
 from .runtime_identity import distribution_identity
 
@@ -39,6 +48,40 @@ from .runtime_identity import distribution_identity
 # Cash-closure checks compare accumulated stock balances, so the tolerance absorbs
 # float accumulation over a long horizon without admitting an economically real gap.
 CASH_CLOSURE_TOLERANCE = 1e-6
+_OPENING_REQUIRED_COLUMNS = (
+    "BondID",
+    "SecurityType",
+    "IssueDate",
+    "MaturityDate",
+    "OriginalMaturityYears",
+    "FaceValue",
+    "CouponRate",
+    "HolderType",
+    "Status",
+)
+_PORTFOLIO_DATE_COLUMNS = tuple(
+    column for column, dtype in PORTFOLIO_DTYPES.items() if dtype == "datetime64[ns]"
+)
+_PORTFOLIO_NUMERIC_COLUMNS = tuple(
+    column
+    for column, dtype in PORTFOLIO_DTYPES.items()
+    if dtype in {"Int64", "float64"}
+)
+_BOUNDARY_NUMERIC_COLUMNS = (
+    "CBOFedAuctionShare",
+    "CBOFedAuctionRolloverAddons",
+    "TGA",
+    "CBOOperatingCashTarget",
+    "CBOCashReconciliationResidual",
+)
+_CASH_RESIDUAL_BOUNDARY_FLAGS = (
+    "affects_primary_deficit",
+    "affects_net_interest",
+    "affects_total_deficit",
+    "affects_debt_target",
+    "affects_issuance_size",
+    "affects_tdc_fiscal_flow",
+)
 
 
 class RunnerError(ValueError):
@@ -78,14 +121,18 @@ def run_cbo_scenario(
     source_metadata = _source_metadata(baseline, inputs)
     _validate_opening_alignment(start, source_metadata, inputs)
     params = build_runtime_params(inputs, actuals_available_as_of=source_metadata["actuals_available_as_of"])
+    assumption_statuses = _adapter_assumption_statuses(inputs)
+    engine_params = _engine_runtime_params(params)
     engine_scenario_id = _compiled_scenario_id(inputs)
     results, final_portfolio = run_simulation(
-        params,
+        engine_params,
         start,
         end,
         freq="D",
         scenario_name=engine_scenario_id,
     )
+    boundaries = validate_run_boundaries(results, inputs)
+    _assert_hard_boundaries_pass(boundaries)
     output_cfg = spec.data.get("output", {})
     if not isinstance(output_cfg, Mapping):
         output_cfg = {}
@@ -101,13 +148,15 @@ def run_cbo_scenario(
         "scenario_config_sha256": spec.canonical_sha256(),
         "compiled_inputs_digest": compiled.compiled_inputs_digest,
         "mmf_deposit_pass_through": params["private_mmf_split"]["mmf_deposit_pass_through"],
-        "mmf_deposit_pass_through_status": "scenario_runtime_assumption",
-        "fiscal_incidence_policy_id": "compiled_policy",
-        "fiscal_incidence_basis": params["fiscal_incidence_policy"].get("incidence_basis", "signed_net_primary_proxy"),
-        "fiscal_incidence_du_share": params["fiscal_incidence_policy"].get("du_share", 0.0),
-        "fiscal_incidence_ru_share": params["fiscal_incidence_policy"].get("ru_share", 0.0),
-        "fiscal_incidence_foreign_share": params["fiscal_incidence_policy"].get("foreign_share", 0.0),
-        "fiscal_incidence_other_share": params["fiscal_incidence_policy"].get("other_share", 0.0),
+        "mmf_deposit_pass_through_status": assumption_statuses["mmf_deposit_pass_through_status"],
+        "fiscal_incidence_policy_id": params["fiscal_incidence_policy"]["policy_id"],
+        "fiscal_incidence_policy_status": assumption_statuses["fiscal_incidence_policy_status"],
+        "fiscal_incidence_basis": params["fiscal_incidence_policy"]["incidence_basis"],
+        "fiscal_incidence_du_share": params["fiscal_incidence_policy"]["du_share"],
+        "fiscal_incidence_ru_share": params["fiscal_incidence_policy"]["ru_share"],
+        "fiscal_incidence_foreign_share": params["fiscal_incidence_policy"]["foreign_share"],
+        "fiscal_incidence_other_share": params["fiscal_incidence_policy"]["other_share"],
+        "issuance_profile_status": assumption_statuses["issuance_profile_status"],
     }
     outputs = write_scenario_outputs(
         results,
@@ -118,7 +167,6 @@ def run_cbo_scenario(
         catalog_sqlite=bool(output_cfg.get("catalog_sqlite", False)),
         metadata=output_metadata,
     )
-    boundaries = validate_run_boundaries(results, inputs)
     run_manifest = build_run_manifest(
         scenario_id=spec.scenario_id,
         scenario_sha256=spec.canonical_sha256(),
@@ -131,6 +179,7 @@ def run_cbo_scenario(
         scenario_referenced_files=scenario_referenced_files,
         start_date=start,
         end_date=end,
+        fiscal_incidence_policy_id=params["fiscal_incidence_policy"]["policy_id"],
         outputs=outputs,
         output_hashes=hash_output_tree(out / "outputs"),
         boundary_checks=boundaries,
@@ -161,11 +210,12 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
 
     inputs = Path(inputs_dir)
     initial_portfolio = _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv")
-    operating_cash = pd.read_csv(inputs / "tdcsim_operating_cash_path.csv")
-    base_tga = float(operating_cash.iloc[0].get("operating_cash_target_bil", 0.0))
+    base_tga = _opening_operating_cash_target(inputs / "tdcsim_operating_cash_path.csv")
     initial_values = _opening_runtime_initial_values(inputs, base_tga=base_tga)
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
     holder_events = _holder_preference_events(inputs / HOLDER_PREFERENCE_EVENTS_FILE)
+    issuance_profile = _issuance_profile(inputs)
+    fiscal_incidence_policy = _fiscal_incidence_policy(inputs)
     if _fed_target_active(inputs / "tdcsim_fed_holdings_path.csv"):
         _assert_no_cb_auction_preferences(holder_preferences)
     return {
@@ -178,7 +228,7 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
             "tax_growth_qtr": 0.0,
         },
         "other_flows": {"reserve_transfer": 0.0, "cb_net_expense": 0.0, "money_minting_transfers": 0.0},
-        "treasury_issuance_profile": _issuance_profile(inputs),
+        "treasury_issuance_profile": issuance_profile,
         "yield_curve": {
             "use_static": True,
             "years": [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0],
@@ -221,27 +271,49 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
             "actuals_available_as_of": actuals_available_as_of or _max_available_date(inputs) or "1900-01-01",
             "allow_lookahead": False,
         },
-        "fiscal_incidence_policy": _fiscal_incidence_policy(inputs / "tdcsim_fiscal_incidence_policy.csv"),
+        "fiscal_incidence_policy": fiscal_incidence_policy,
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
     }
+
+
+def _engine_runtime_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove adapter identity metadata that is not part of the generic engine schema."""
+
+    engine_params = dict(params)
+    policy = params.get("fiscal_incidence_policy")
+    if not isinstance(policy, Mapping) or not policy.get("policy_id"):
+        raise RunnerError("runtime fiscal incidence policy must carry a selected policy_id")
+    engine_params["fiscal_incidence_policy"] = {
+        key: value for key, value in policy.items() if key != "policy_id"
+    }
+    return engine_params
 
 
 def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> dict[str, Any]:
     """Compute hard boundary checks for CBO scenario runs."""
 
+    _validate_boundary_result_evidence(results)
     inputs = Path(inputs_dir)
-    residual = pd.read_csv(inputs / "tdcsim_cash_reconciliation_residual.csv")
+    residual_path = inputs / "tdcsim_cash_reconciliation_residual.csv"
+    try:
+        residual = pd.read_csv(residual_path)
+    except (FileNotFoundError, pd.errors.EmptyDataError) as exc:
+        raise RunnerError(
+            f"required cash-reconciliation boundary evidence is missing: {residual_path.name}"
+        ) from exc
+    if residual.empty:
+        raise RunnerError(f"cash-reconciliation boundary evidence is empty: {residual_path.name}")
     residual_flags = {}
-    for col in (
-        "affects_primary_deficit",
-        "affects_net_interest",
-        "affects_total_deficit",
-        "affects_debt_target",
-        "affects_issuance_size",
-        "affects_tdc_fiscal_flow",
-    ):
-        if col in residual.columns:
-            residual_flags[col] = sorted(str(value) for value in residual[col].dropna().unique())
+    missing_flags = [column for column in _CASH_RESIDUAL_BOUNDARY_FLAGS if column not in residual.columns]
+    if missing_flags:
+        raise RunnerError(
+            f"cash-reconciliation boundary evidence is missing required flags: {missing_flags}"
+        )
+    for col in _CASH_RESIDUAL_BOUNDARY_FLAGS:
+        values = [_strict_bool(value, label=f"{residual_path.name}.{col}") for value in residual[col]]
+        if not values:
+            raise RunnerError(f"cash-reconciliation boundary flag has no evidence: {col}")
+        residual_flags[col] = sorted(set(values))
     fed_auction_share_max = _max_abs(results, "CBOFedAuctionShare")
     fed_auction_face_max = _max_abs(results, "CBOFedAuctionRolloverAddons")
     fed_auction_face_sum = _sum_abs(results, "CBOFedAuctionRolloverAddons")
@@ -260,6 +332,40 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
         **cash_closure,
         **omf,
     }
+
+
+def _assert_hard_boundaries_pass(boundary_checks: Mapping[str, Any]) -> None:
+    validation = validation_from_boundary_checks(boundary_checks)
+    if validation.get("status") == "pass":
+        return
+    failed = [
+        str(item.get("id"))
+        for section in ("gates", "invariants")
+        for item in validation.get(section, [])
+        if isinstance(item, Mapping) and item.get("status") == "fail"
+    ]
+    raise RunnerError(f"hard run boundary failed: {', '.join(failed) or 'unknown boundary'}")
+
+
+def _validate_boundary_result_evidence(results: pd.DataFrame) -> None:
+    if not isinstance(results, pd.DataFrame) or results.empty:
+        raise RunnerError("simulation returned no boundary evidence")
+    for column in _BOUNDARY_NUMERIC_COLUMNS:
+        _numeric_column(results, column)
+    if "CBOCashResidualStatus" not in results.columns:
+        raise RunnerError("simulation results are missing boundary evidence column: CBOCashResidualStatus")
+    if len(results) > 1:
+        statuses = results.iloc[1:]["CBOCashResidualStatus"].astype("string")
+        if statuses.isna().any() or statuses.str.strip().eq("").any():
+            raise RunnerError("simulation results contain missing CBOCashResidualStatus evidence")
+        unexpected = sorted(
+            set(statuses.astype(str))
+            - {"operating_cash_target_loaded", "operating_cash_path_not_configured"}
+        )
+        if unexpected:
+            raise RunnerError(
+                f"simulation results contain unknown CBOCashResidualStatus values: {unexpected}"
+            )
 
 
 def _cash_closure_checks(results: pd.DataFrame) -> dict[str, Any]:
@@ -362,8 +468,13 @@ def omf_reconciliation(results: pd.DataFrame, inputs_dir: str | Path) -> dict[st
 
 def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame.columns:
-        return pd.Series(dtype="float64")
-    return pd.to_numeric(frame[column], errors="coerce").dropna()
+        raise RunnerError(f"simulation results are missing boundary evidence column: {column}")
+    values = pd.to_numeric(frame[column], errors="coerce")
+    if values.isna().any():
+        raise RunnerError(f"simulation results contain missing or malformed {column} evidence")
+    if not values.map(math.isfinite).all():
+        raise RunnerError(f"simulation results contain nonfinite {column} evidence")
+    return values.astype(float)
 
 
 def _simulation_dates(spec: CboScenarioSpec, inputs_dir: Path) -> tuple[str, str]:
@@ -430,18 +541,35 @@ def _validate_opening_alignment(start_date: str, source_metadata: Mapping[str, s
         )
 
 
+def _opening_operating_cash_target(path: Path) -> float:
+    try:
+        frame = pd.read_csv(path)
+    except (FileNotFoundError, pd.errors.EmptyDataError) as exc:
+        raise RunnerError(f"required opening operating-cash input is missing: {path.name}") from exc
+    if frame.empty or "operating_cash_target_bil" not in frame.columns:
+        raise RunnerError(f"{path.name} must contain operating_cash_target_bil evidence")
+    raw = frame.iloc[0]["operating_cash_target_bil"]
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(f"{path.name} opening operating_cash_target_bil must be numeric") from exc
+    if not math.isfinite(value):
+        raise RunnerError(f"{path.name} opening operating_cash_target_bil must be finite")
+    return value
+
+
 def _opening_runtime_initial_values(inputs: Path, *, base_tga: float) -> dict[str, float]:
-    manifest_path = inputs.parent.parent / "baseline" / "manifest.json"
-    runtime_state_path = inputs / "tdcsim_opening_runtime_state.json"
-    if manifest_path.exists():
-        manifest = read_json(manifest_path)
-        if isinstance(manifest, Mapping) and isinstance(manifest.get("derived_forecast_state"), Mapping) and not runtime_state_path.exists():
-            raise RunnerError("derived forecast-state package requires tdcsim_opening_runtime_state.json")
+    runtime_state_path = inputs / OPENING_RUNTIME_STATE_FILE
     if not runtime_state_path.exists():
-        return {"reserves": 3000.0, "tdc_level": 0.0, "tga": base_tga}
-    payload = read_json(runtime_state_path)
+        raise RunnerError(f"required opening runtime state is missing: {runtime_state_path.name}")
+    try:
+        payload = read_json(runtime_state_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"opening runtime state is unreadable: {runtime_state_path.name}") from exc
     if not isinstance(payload, Mapping):
         raise RunnerError("tdcsim_opening_runtime_state.json must be an object")
+    if payload.get("schema_version") != "tdcsim_cbo_opening_runtime_state_v1":
+        raise RunnerError("tdcsim_opening_runtime_state.json has an unsupported schema_version")
     opening = str(payload.get("opening_state_date") or "")
     expected_opening = _opening_state_date(inputs)
     if opening != str(expected_opening or ""):
@@ -449,10 +577,13 @@ def _opening_runtime_initial_values(inputs: Path, *, base_tga: float) -> dict[st
     raw = payload.get("initial_values")
     if not isinstance(raw, Mapping):
         raise RunnerError("opening runtime state initial_values must be an object")
+    missing = [key for key in ("reserves", "tdc_level", "tga") if key not in raw]
+    if missing:
+        raise RunnerError(f"opening runtime state initial_values is missing required keys: {missing}")
     try:
         values = {
-            "reserves": float(raw.get("reserves", 3000.0)),
-            "tdc_level": float(raw.get("tdc_level", 0.0)),
+            "reserves": float(raw["reserves"]),
+            "tdc_level": float(raw["tdc_level"]),
             "tga": float(raw["tga"]),
         }
     except (KeyError, TypeError, ValueError) as exc:
@@ -461,6 +592,20 @@ def _opening_runtime_initial_values(inputs: Path, *, base_tga: float) -> dict[st
         raise RunnerError("opening runtime state TGA does not match operating cash opening target")
     if not all(math.isfinite(value) for value in values.values()):
         raise RunnerError("opening runtime state initial_values must be finite")
+    if payload.get("state_kind") == "source_baseline_configured_defaults":
+        expected_statuses = {
+            "reserves": "configured_default",
+            "tdc_level": "configured_default",
+            "tga": "source_opening_cash",
+        }
+        if payload.get("initial_value_statuses") != expected_statuses:
+            raise RunnerError(
+                "source baseline opening runtime state has invalid initial_value_statuses"
+            )
+        if payload.get("configured_default_count") != 2:
+            raise RunnerError(
+                "source baseline opening runtime state configured_default_count must be 2"
+            )
     return values
 
 
@@ -497,14 +642,105 @@ def _max_available_date(inputs_dir: Path) -> str | None:
 
 
 def _load_opening_portfolio(path: Path) -> pd.DataFrame:
-    frame = pd.read_csv(path)
+    try:
+        frame = pd.read_csv(path)
+    except (FileNotFoundError, pd.errors.EmptyDataError) as exc:
+        raise RunnerError(f"required opening portfolio is missing or empty: {path.name}") from exc
+    missing_columns = [column for column in _OPENING_REQUIRED_COLUMNS if column not in frame.columns]
+    if missing_columns:
+        raise RunnerError(f"opening portfolio is missing required columns: {missing_columns}")
+
+    for column in _OPENING_REQUIRED_COLUMNS:
+        if not _present_values(frame[column]).all():
+            raise RunnerError(f"opening portfolio required column {column} contains missing values")
+
+    for column in _PORTFOLIO_DATE_COLUMNS:
+        if column not in frame.columns:
+            continue
+        present = _present_values(frame[column])
+        parsed = pd.to_datetime(frame[column], errors="coerce")
+        if parsed[present].isna().any():
+            raise RunnerError(f"opening portfolio column {column} contains malformed dates")
+        frame[column] = parsed
+
+    for column in _PORTFOLIO_NUMERIC_COLUMNS:
+        if column not in frame.columns:
+            continue
+        present = _present_values(frame[column])
+        parsed = pd.to_numeric(frame[column], errors="coerce")
+        if parsed[present].isna().any():
+            raise RunnerError(f"opening portfolio column {column} contains malformed numerics")
+        if not parsed[present].map(math.isfinite).all():
+            raise RunnerError(f"opening portfolio column {column} contains nonfinite numerics")
+        frame[column] = parsed
+
+    bond_ids = frame["BondID"]
+    if not bond_ids.map(lambda value: float(value).is_integer()).all():
+        raise RunnerError("opening portfolio BondID values must be integers")
+    if bond_ids.duplicated().any():
+        raise RunnerError("opening portfolio BondID values must be unique")
+    unknown_security = sorted(set(frame["SecurityType"].astype(str)) - set(SECURITY_TYPES))
+    if unknown_security:
+        raise RunnerError(f"opening portfolio contains unknown SecurityType values: {unknown_security}")
+    unknown_holder = sorted(set(frame["HolderType"].astype(str)) - set(HOLDER_TYPES))
+    if unknown_holder:
+        raise RunnerError(f"opening portfolio contains unknown HolderType values: {unknown_holder}")
+    invalid_status = sorted(set(frame["Status"].astype(str)) - {"Active"})
+    if invalid_status:
+        raise RunnerError(f"opening portfolio contains unsupported Status values: {invalid_status}")
+    if (frame["FaceValue"] < 0.0).any():
+        raise RunnerError("opening portfolio FaceValue must be nonnegative")
+    if (frame["OriginalMaturityYears"] <= 0.0).any():
+        raise RunnerError("opening portfolio OriginalMaturityYears must be positive")
+    if (frame["CouponRate"] < 0.0).any():
+        raise RunnerError("opening portfolio CouponRate must be nonnegative")
+    if (frame["IssueDate"] >= frame["MaturityDate"]).any():
+        raise RunnerError("opening portfolio IssueDate must precede MaturityDate")
+
+    fixed = frame["SecurityType"].astype(str).eq("Fixed")
+    if fixed.any():
+        if "MaturityCategory" not in frame.columns:
+            raise RunnerError("opening Fixed securities require MaturityCategory")
+        fixed_categories = frame.loc[fixed, "MaturityCategory"]
+        if not _present_values(fixed_categories).all():
+            raise RunnerError("opening Fixed securities require a named MaturityCategory")
+        invalid_categories = sorted(set(fixed_categories.astype(str)) - set(MATURITY_CATEGORIES))
+        if invalid_categories:
+            raise RunnerError(
+                f"opening Fixed securities contain unknown MaturityCategory values: {invalid_categories}"
+            )
+
+    tips = frame["SecurityType"].astype(str).eq("TIPS")
+    for column in ("OriginalPrincipal", "AdjustedPrincipal", "ReferenceCPI_Issue", "IndexRatio"):
+        if tips.any() and (column not in frame.columns or not _present_values(frame.loc[tips, column]).all()):
+            raise RunnerError(f"opening TIPS securities require {column}")
+    if tips.any():
+        if (frame.loc[tips, ["OriginalPrincipal", "AdjustedPrincipal"]] < 0.0).any().any():
+            raise RunnerError("opening TIPS principal stocks must be nonnegative")
+        if (frame.loc[tips, ["ReferenceCPI_Issue", "IndexRatio"]] <= 0.0).any().any():
+            raise RunnerError("opening TIPS reference CPI and index ratio must be positive")
+
+    frn = frame["SecurityType"].astype(str).eq("FRN")
+    if frn.any():
+        if "FixedSpread" not in frame.columns or not _present_values(
+            frame.loc[frn, "FixedSpread"]
+        ).all():
+            raise RunnerError("opening FRN securities require finite FixedSpread")
+        if not frame.loc[frn, "FixedSpread"].map(math.isfinite).all():
+            raise RunnerError("opening FRN securities require finite FixedSpread")
+
     for col in BOND_PORTFOLIO_COLS:
         if col not in frame.columns:
-            frame[col] = pd.NA
-    for col in ("IssueDate", "MaturityDate", "DatedDate", "OriginalDatedDate", "FirstInterestPaymentDate", "LastAccrualDate"):
-        if col in frame.columns:
-            frame[col] = pd.to_datetime(frame[col], errors="coerce")
-    return frame[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES, errors="ignore")
+            dtype = PORTFOLIO_DTYPES[col]
+            frame[col] = pd.NaT if dtype == "datetime64[ns]" else (float("nan") if dtype == "float64" else pd.NA)
+    try:
+        return frame[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("opening portfolio could not be converted to the runtime schema") from exc
+
+
+def _present_values(values: pd.Series) -> pd.Series:
+    return values.notna() & values.astype("string").str.strip().ne("")
 
 
 def _compiled_scenario_id(inputs: Path) -> str:
@@ -588,6 +824,18 @@ def _finite_share(value: Any, *, label: str) -> float:
     return number
 
 
+def _strict_bool(value: Any, *, label: str) -> bool:
+    if isinstance(value, bool) or pd.api.types.is_bool(value):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise RunnerError(f"{label} must contain only explicit boolean values")
+
+
 def _assert_holder_preference_sums(prefs: Mapping[str, Mapping[str, float]]) -> None:
     for pref_key in ("bills_pct", "notes_pct", "bonds_pct", "tips_pct", "frn_pct"):
         total = sum(float(prefs.get(holder, {}).get(pref_key, 0.0)) for holder in HOLDER_TYPES)
@@ -611,40 +859,48 @@ def _holder_preference_events(path: Path) -> list[dict[str, Any]]:
 
 
 def _issuance_profile(inputs: Path) -> dict[str, Any]:
-    path = inputs / "tdcsim_issuance_mix_assumptions.json"
-    if not path.exists():
-        return _default_issuance_profile()
-    payload = read_json(path)
-    if not isinstance(payload, Mapping):
-        raise RunnerError("compiled issuance mix assumptions must be a JSON object")
-    if payload.get("mode") != "replace_shares":
-        return _default_issuance_profile()
-    shares = payload["security_shares"]
-    maturity = payload["maturity_distributions"]
-    fixed_total = float(shares["bills"]) + float(shares["notes"]) + float(shares["bonds"])
+    payload = _issuance_assumptions(inputs)
+    mode = payload.get("mode")
+    if mode not in {"default_tdcsim_cbo_runner_profile", "replace_shares"}:
+        raise RunnerError(f"unsupported compiled issuance mix mode: {mode!r}")
+    shares = payload.get("security_shares")
+    maturity = payload.get("maturity_distributions")
+    if not isinstance(shares, Mapping):
+        raise RunnerError("compiled issuance mix security_shares must be an object")
+    if not isinstance(maturity, Mapping):
+        raise RunnerError("compiled issuance mix maturity_distributions must be an object")
+    categories = ("bills", "notes", "bonds", "tips", "frn")
+    missing_shares = [category for category in categories if category not in shares]
+    missing_maturity = [category for category in categories if category not in maturity]
+    if missing_shares:
+        raise RunnerError(f"compiled issuance mix is missing security shares: {missing_shares}")
+    if missing_maturity:
+        raise RunnerError(f"compiled issuance mix is missing maturity distributions: {missing_maturity}")
+    normalized_shares = {
+        category: _finite_nonnegative_number(
+            shares[category],
+            label=f"issuance security_shares.{category}",
+        )
+        for category in categories
+    }
+    share_total = sum(normalized_shares.values())
+    if abs(share_total - 1.0) > 1e-9:
+        raise RunnerError(f"compiled issuance security shares must sum to 1.0, got {share_total}")
+    normalized_maturity = {
+        category: _strict_maturity_distribution(maturity[category], category=category)
+        for category in categories
+    }
+    fixed_total = sum(normalized_shares[category] for category in MATURITY_CATEGORIES)
     fixed = {
-        "bills": 0.0 if fixed_total == 0 else float(shares["bills"]) / fixed_total,
-        "notes": 0.0 if fixed_total == 0 else float(shares["notes"]) / fixed_total,
-        "bonds": 0.0 if fixed_total == 0 else float(shares["bonds"]) / fixed_total,
+        category: 0.0 if fixed_total == 0 else normalized_shares[category] / fixed_total
+        for category in MATURITY_CATEGORIES
     }
     return {
-        "bills": _fixed_profile(float(fixed["bills"]), maturity["bills"], cutoff=1.0),
-        "notes": _fixed_profile(float(fixed["notes"]), maturity["notes"], cutoff=10.0),
-        "bonds": _fixed_profile(float(fixed["bonds"]), maturity["bonds"], cutoff=999.0),
-        "TIPS": _special_profile(float(shares["tips"]), maturity["tips"]),
-        "FRN": _special_profile(float(shares["frn"]), maturity["frn"]),
-        "NonMarketable": {"target_percentage": 0.0, "maturities": [30.0], "maturity_distribution": [1.0]},
-        "remainder_maturity_years": 1.0,
-    }
-
-
-def _default_issuance_profile() -> dict[str, Any]:
-    return {
-        "bills": _fixed_profile(0.25, [{"maturity_years": 0.5, "share": 1.0}], cutoff=1.0),
-        "notes": _fixed_profile(0.55, [{"maturity_years": 5.0, "share": 1.0}], cutoff=10.0),
-        "bonds": _fixed_profile(0.20, [{"maturity_years": 20.0, "share": 1.0}], cutoff=999.0),
-        "TIPS": _special_profile(0.06, [{"maturity_years": 10.0, "share": 1.0}]),
-        "FRN": _special_profile(0.04, [{"maturity_years": 2.0, "share": 1.0}]),
+        "bills": _fixed_profile(fixed["bills"], normalized_maturity["bills"], cutoff=1.0),
+        "notes": _fixed_profile(fixed["notes"], normalized_maturity["notes"], cutoff=10.0),
+        "bonds": _fixed_profile(fixed["bonds"], normalized_maturity["bonds"], cutoff=999.0),
+        "TIPS": _special_profile(normalized_shares["tips"], normalized_maturity["tips"]),
+        "FRN": _special_profile(normalized_shares["frn"], normalized_maturity["frn"]),
         "NonMarketable": {"target_percentage": 0.0, "maturities": [30.0], "maturity_distribution": [1.0]},
         "remainder_maturity_years": 1.0,
     }
@@ -667,44 +923,213 @@ def _special_profile(share: float, rows: list[Mapping[str, Any]]) -> dict[str, A
     }
 
 
+def _strict_maturity_distribution(value: Any, *, category: str) -> list[dict[str, float]]:
+    if not isinstance(value, list) or not value:
+        raise RunnerError(f"issuance maturity distribution {category} must be a nonempty array")
+    rows: list[dict[str, float]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise RunnerError(f"issuance maturity distribution {category}[{index}] must be an object")
+        if "maturity_years" not in item or "share" not in item:
+            raise RunnerError(
+                f"issuance maturity distribution {category}[{index}] requires maturity_years and share"
+            )
+        maturity_years = _finite_nonnegative_number(
+            item["maturity_years"],
+            label=f"issuance maturity_distributions.{category}[{index}].maturity_years",
+        )
+        if maturity_years <= 0.0:
+            raise RunnerError(f"issuance maturity {category}[{index}] must be positive")
+        share = _finite_nonnegative_number(
+            item["share"],
+            label=f"issuance maturity_distributions.{category}[{index}].share",
+        )
+        rows.append({"maturity_years": maturity_years, "share": share})
+    total = sum(row["share"] for row in rows)
+    if abs(total - 1.0) > 1e-9:
+        raise RunnerError(f"issuance maturity distribution {category} must sum to 1.0, got {total}")
+    return rows
+
+
+def _finite_nonnegative_number(value: Any, *, label: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(f"{label} must be numeric") from exc
+    if not math.isfinite(number) or number < 0.0:
+        raise RunnerError(f"{label} must be finite and nonnegative")
+    return number
+
+
 def _negative_issuance_action(inputs: Path) -> str:
-    path = inputs / "tdcsim_issuance_mix_assumptions.json"
-    if path.exists():
-        payload = read_json(path)
-        if isinstance(payload, Mapping) and payload.get("negative_issuance_action"):
-            return str(payload["negative_issuance_action"])
-    return "error"
+    payload = _issuance_assumptions(inputs)
+    action = payload.get("negative_issuance_action")
+    if action not in {"error", "retire_shortest_public_marketable"}:
+        raise RunnerError(f"unsupported negative_issuance_action: {action!r}")
+    return str(action)
 
 
 def _mmf_deposit_pass_through(inputs: Path) -> float:
-    path = inputs / RUNTIME_ASSUMPTIONS_FILE
-    if not path.exists():
-        return 0.97
-    payload = read_json(path)
-    if not isinstance(payload, Mapping):
-        raise RunnerError("compiled runtime assumptions must be a JSON object")
+    payload = _runtime_assumptions(inputs)
     try:
-        value = float(payload.get("mmf_deposit_pass_through", 0.97))
-    except (TypeError, ValueError) as exc:
+        value = float(payload["mmf_deposit_pass_through"])
+    except (KeyError, TypeError, ValueError) as exc:
         raise RunnerError("mmf_deposit_pass_through must be numeric") from exc
     if not math.isfinite(value) or value < 0.0 or value > 1.0:
         raise RunnerError("mmf_deposit_pass_through must be between 0.0 and 1.0")
     return value
 
 
-def _fiscal_incidence_policy(path: Path) -> dict[str, Any]:
-    frame = pd.read_csv(path)
+def _runtime_assumptions(inputs: Path) -> Mapping[str, Any]:
+    path = inputs / RUNTIME_ASSUMPTIONS_FILE
+    if not path.exists():
+        raise RunnerError(f"required compiled runtime assumptions are missing: {path.name}")
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"compiled runtime assumptions are unreadable: {path.name}") from exc
+    if not isinstance(payload, Mapping):
+        raise RunnerError("compiled runtime assumptions must be a JSON object")
+    if payload.get("schema_version") != "tdcsim_cbo_runtime_assumptions_v1":
+        raise RunnerError("compiled runtime assumptions has an unsupported schema_version")
+    required = {
+        "fiscal_incidence_policy_id",
+        "fiscal_incidence_policy_status",
+        "mmf_deposit_pass_through",
+        "mmf_deposit_pass_through_status",
+        "source_role",
+        "runtime_role",
+        "claim_boundary",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise RunnerError(f"compiled runtime assumptions are missing required keys: {missing}")
+    _assumption_status(
+        payload["fiscal_incidence_policy_status"],
+        label="fiscal_incidence_policy_status",
+    )
+    _assumption_status(
+        payload["mmf_deposit_pass_through_status"],
+        label="mmf_deposit_pass_through_status",
+    )
+    return payload
+
+
+def _issuance_assumptions(inputs: Path) -> Mapping[str, Any]:
+    path = inputs / ISSUANCE_MIX_FILE
+    if not path.exists():
+        raise RunnerError(f"required compiled issuance mix assumptions are missing: {path.name}")
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"compiled issuance mix assumptions are unreadable: {path.name}") from exc
+    if not isinstance(payload, Mapping):
+        raise RunnerError("compiled issuance mix assumptions must be a JSON object")
+    if payload.get("schema_version") != "tdcsim_cbo_issuance_mix_assumptions_v1":
+        raise RunnerError("compiled issuance mix assumptions has an unsupported schema_version")
+    mode = payload.get("mode")
+    expected_status = {
+        "default_tdcsim_cbo_runner_profile": "configured_default",
+        "replace_shares": "scenario_override",
+    }.get(mode)
+    if expected_status is None:
+        raise RunnerError(f"unsupported compiled issuance mix mode: {mode!r}")
+    status = _assumption_status(payload.get("selection_status"), label="issuance selection_status")
+    if status != expected_status:
+        raise RunnerError(
+            f"compiled issuance mix mode {mode!r} requires selection_status={expected_status!r}"
+        )
+    return payload
+
+
+def _assumption_status(value: Any, *, label: str) -> str:
+    if value not in {"configured_default", "scenario_override"}:
+        raise RunnerError(f"{label} must be configured_default or scenario_override")
+    return str(value)
+
+
+def _adapter_assumption_statuses(inputs: Path) -> dict[str, str]:
+    runtime = _runtime_assumptions(inputs)
+    issuance = _issuance_assumptions(inputs)
+    return {
+        "fiscal_incidence_policy_status": _assumption_status(
+            runtime["fiscal_incidence_policy_status"],
+            label="fiscal_incidence_policy_status",
+        ),
+        "mmf_deposit_pass_through_status": _assumption_status(
+            runtime["mmf_deposit_pass_through_status"],
+            label="mmf_deposit_pass_through_status",
+        ),
+        "issuance_profile_status": _assumption_status(
+            issuance["selection_status"],
+            label="issuance selection_status",
+        ),
+    }
+
+
+def _fiscal_incidence_policy(inputs: Path) -> dict[str, Any]:
+    path = inputs / "tdcsim_fiscal_incidence_policy.csv"
+    try:
+        frame = pd.read_csv(path)
+    except (FileNotFoundError, pd.errors.EmptyDataError) as exc:
+        raise RunnerError(f"required fiscal incidence policy is missing: {path.name}") from exc
     if frame.empty:
         raise RunnerError("compiled fiscal incidence policy is empty")
-    row = frame.iloc[0]
-    return {
-        "mode": "explicit_scenario_assumption",
-        "incidence_basis": "signed_net_primary_proxy",
-        "du_share": float(row.get("du_share", 0.0) or 0.0),
-        "ru_share": float(row.get("ru_share", 0.0) or 0.0),
-        "foreign_share": float(row.get("foreign_share", 0.0) or 0.0),
-        "other_share": float(row.get("other_share", 0.0) or 0.0),
+    required = {
+        "policy_id",
+        "policy_mode",
+        "incidence_basis",
+        "du_share",
+        "ru_share",
+        "foreign_share",
+        "other_share",
     }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise RunnerError(f"compiled fiscal incidence policy is missing columns: {missing}")
+    policy_ids = frame["policy_id"].astype("string")
+    if policy_ids.isna().any() or policy_ids.str.strip().eq("").any():
+        raise RunnerError("compiled fiscal incidence policy contains a missing policy_id")
+    assumptions = _runtime_assumptions(inputs)
+    selected_id = assumptions["fiscal_incidence_policy_id"]
+    if not isinstance(selected_id, str) or not selected_id.strip():
+        raise RunnerError("fiscal_incidence_policy_id must be a nonempty string")
+    selected_id = selected_id.strip()
+    selected = frame.loc[policy_ids.eq(selected_id)]
+    if selected.empty:
+        raise RunnerError(f"unknown fiscal_incidence_policy_id: {selected_id}")
+    if len(selected) != 1:
+        raise RunnerError(f"fiscal_incidence_policy_id must select exactly one row: {selected_id}")
+    row = selected.iloc[0]
+    mode = str(row["policy_mode"])
+    basis = str(row["incidence_basis"])
+    if mode != "explicit_scenario_assumption":
+        raise RunnerError(f"unsupported fiscal incidence policy_mode: {mode}")
+    if basis != "signed_net_primary_proxy":
+        raise RunnerError(f"unsupported fiscal incidence basis: {basis}")
+    shares = {
+        key: _finite_policy_share(row[key], label=f"{selected_id}.{key}")
+        for key in ("du_share", "ru_share", "foreign_share", "other_share")
+    }
+    total = sum(shares.values())
+    if abs(total - 1.0) > 1e-9:
+        raise RunnerError(f"fiscal incidence policy shares must sum to 1.0, got {total}")
+    return {
+        "policy_id": selected_id,
+        "mode": mode,
+        "incidence_basis": basis,
+        **shares,
+    }
+
+
+def _finite_policy_share(value: Any, *, label: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(f"fiscal incidence policy {label} must be numeric") from exc
+    if not math.isfinite(number) or number < 0.0 or number > 1.0:
+        raise RunnerError(f"fiscal incidence policy {label} must be between 0.0 and 1.0")
+    return number
 
 
 def _fed_target_active(path: Path) -> bool:
@@ -732,15 +1157,17 @@ def _opening_tips_reference_cpi(portfolio: pd.DataFrame) -> float:
 
 
 def _max_abs(frame: pd.DataFrame, column: str) -> float:
-    if column not in frame.columns:
-        return 0.0
-    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().max())
+    values = _numeric_column(frame, column)
+    if values.empty:
+        raise RunnerError(f"simulation results contain no {column} boundary evidence")
+    return float(values.abs().max())
 
 
 def _sum_abs(frame: pd.DataFrame, column: str) -> float:
-    if column not in frame.columns:
-        return 0.0
-    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().sum())
+    values = _numeric_column(frame, column)
+    if values.empty:
+        raise RunnerError(f"simulation results contain no {column} boundary evidence")
+    return float(values.abs().sum())
 
 
 def _copy_scenario_referenced_files(spec: CboScenarioSpec, run_root: Path) -> list[dict[str, Any]]:

@@ -19,6 +19,7 @@
     "compiled_inputs_digest",
     "compiled_inputs",
     "simulation",
+    "fiscal_incidence_policy_id",
     "outputs",
     "output_manifest",
     "output_hashes",
@@ -290,6 +291,10 @@
           "const": "daily"
         }
       }
+    },
+    "fiscal_incidence_policy_id": {
+      "type": "string",
+      "minLength": 1
     },
     "outputs": {
       "type": "array",

@@ -9,11 +9,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import tdcsim_cbo.runner as runner_module
 from forecast_paths import compiled_forecast_input_paths
 from sim_engine import _handoff_append_payment
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
 from tdcsim_cbo._json import read_json, sha256_file, write_json
-from tdcsim_cbo.compiler import digest_input_tree, input_tree_hashes
+from tdcsim_cbo.compiler import CboScenarioCompiler, digest_input_tree, input_tree_hashes
 from tdcsim_cbo.output import hash_output_tree, write_scenario_outputs
 from tdcsim_cbo.runner import RunnerError, build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
@@ -29,6 +30,13 @@ from test_cbo_engine_integration import (
     _write_tips_forward_paths,
 )
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
+
+
+def _assert_no_reusable_run(run_dir: Path) -> None:
+    manifest_path = run_dir / "tdcsim_cbo_run_manifest.json"
+    if manifest_path.exists():
+        assert read_json(manifest_path).get("status") != "complete"
+    assert not (run_dir / "outputs").exists()
 
 
 def test_handoff_payment_flow_id_distinguishes_same_security_different_holders() -> None:
@@ -97,6 +105,11 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
         actuals_available_as_of=run.run_manifest["output_manifest"]["row_metadata"]["actuals_available_as_of"],
     )
     assert params["funding_rule"]["negative_required_issuance_action"] == "error"
+    row_metadata = run.run_manifest["output_manifest"]["row_metadata"]
+    assert row_metadata["mmf_deposit_pass_through_status"] == "configured_default"
+    assert row_metadata["fiscal_incidence_policy_status"] == "configured_default"
+    assert row_metadata["issuance_profile_status"] == "configured_default"
+    assert run.compiled.manifest["materialized_default_count"] == 3
 
     required_tables = [
         "tdcsim_period_issuance_flows.csv",
@@ -281,18 +294,40 @@ def test_run_cbo_scenario_supports_mmf_and_operating_cash_beta_knobs(tmp_path: P
     )
 
     assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.82)
+    assert runtime["mmf_deposit_pass_through_status"] == "scenario_override"
+    assert runtime["fiscal_incidence_policy_status"] == "configured_default"
+    assert (
+        run.run_manifest["output_manifest"]["row_metadata"]["mmf_deposit_pass_through_status"]
+        == "scenario_override"
+    )
     assert params["private_mmf_split"]["mmf_deposit_pass_through"] == pytest.approx(0.82)
     assert set(cash["construction_mode"]) == {"scenario_inflation_beta"}
     assert set(cash["inflation_beta"]) == {0.5}
 
 
-def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(tmp_path: Path) -> None:
+def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
 
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
-    cash = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run-cash")
+    captured: dict[str, pd.DataFrame] = {}
+    production_run_simulation = runner_module.run_simulation
+
+    def capture_failed_results(*args, **kwargs):
+        results, portfolio = production_run_simulation(*args, **kwargs)
+        captured["results"] = results.copy()
+        return results, portfolio
+
+    monkeypatch.setattr(runner_module, "run_simulation", capture_failed_results)
+    cash_dir = tmp_path / "run-cash"
+    with pytest.raises(RunnerError, match="cash_residual_fully_booked"):
+        run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), cash_dir)
+    _assert_no_reusable_run(cash_dir)
+
     noop_results = pd.read_csv(noop.results_path)
-    cash_results = pd.read_csv(cash.results_path)
+    cash_results = captured["results"]
 
     for col in ("CBORequiredFaceIssuance", "NewDebtIssued", "AuctionProceeds", "CBOControlledDebtPostIssuance"):
         assert cash_results[col].tolist() == pytest.approx(noop_results[col].tolist())
@@ -304,25 +339,20 @@ def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(tmp_path: Path) -> 
 def test_file_backed_run_package_is_self_contained_for_baseline_recompile(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
 
-    cash = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run-cash")
+    cash_dir = tmp_path / "run-cash"
+    with pytest.raises(RunnerError, match="cash_residual_fully_booked"):
+        run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), cash_dir)
+    _assert_no_reusable_run(cash_dir)
     source_scenario = scenarios["cash"]
     source_override = tmp_path / "cash_residual_override.csv"
     source_scenario.unlink()
     source_override.unlink()
 
-    scenario_block = cash.run_manifest["scenario"]
-    assert scenario_block["referenced_files"][0]["relative_path"] == "cash_residual_override.csv"
-    assert (cash.output_dir / "cash_residual_override.csv").exists()
-    # The cash fixture books a reconciliation residual to the TGA with no counterparty,
-    # so it deliberately fails the cash-closure invariant. Self-containment is a
-    # packaging property and is asserted here independently of that economic verdict.
-    assert _invariant_status(cash.run_manifest, "cash_residual_fully_booked") == "fail"
-    with pytest.raises(VerificationError, match="validation.status must be pass"):
-        verify_scenario_run(
-            cash.output_dir,
-            baseline_package=baseline.package_path,
-            attestation=baseline.attestation.path,
-        )
+    assert (cash_dir / "cash_residual_override.csv").exists()
+    copied_spec = CboScenarioSpec.from_file(cash_dir / "scenario.json")
+    recompiled = CboScenarioCompiler().compile(baseline, copied_spec, tmp_path / "recompile")
+    assert (recompiled.forecast_inputs_dir / "tdcsim_cash_reconciliation_residual.csv").exists()
+
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop-selfcontained")
     assert verify_scenario_run(
         noop.output_dir,
@@ -564,7 +594,7 @@ def test_verifier_rejects_failing_manifest_validation(tmp_path: Path) -> None:
 
 def test_verifier_rejects_cash_residual_true_even_if_validation_claims_pass(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run")
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
     manifest = read_json(run.manifest_path)
     manifest["boundary_checks"]["cash_residual_affects_issuance_size"] = ["False", "True"]
     manifest["boundary_checks"]["cash_residual_nonfunding_flags"]["affects_issuance_size"] = ["False", "True"]
@@ -580,20 +610,33 @@ def test_verifier_rejects_cash_residual_true_even_if_validation_claims_pass(tmp_
         verify_scenario_run(run.output_dir)
 
 
-def test_cash_closure_invariants_fail_an_unbooked_residual(tmp_path: Path) -> None:
+def test_cash_closure_invariants_fail_an_unbooked_residual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A residual booked to the TGA alone creates cash with no counterparty."""
 
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
-    cash = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), tmp_path / "run-cash")
-
     assert _invariant_status(noop.run_manifest, "cash_residual_fully_booked") == "pass"
     assert _invariant_status(noop.run_manifest, "tga_nonnegative") == "pass"
     assert noop.run_manifest["validation"]["status"] == "pass"
 
-    assert _invariant_status(cash.run_manifest, "cash_residual_fully_booked") == "fail"
-    assert cash.run_manifest["validation"]["status"] == "fail"
-    assert float(cash.run_manifest["boundary_checks"]["sum_abs_unbooked_cash_residual"]) > 0.0
+    captured: dict[str, object] = {}
+    production_validate = runner_module.validate_run_boundaries
+
+    def capture_boundaries(results, inputs_dir):
+        boundaries = production_validate(results, inputs_dir)
+        captured.update(boundaries)
+        return boundaries
+
+    monkeypatch.setattr(runner_module, "validate_run_boundaries", capture_boundaries)
+    cash_dir = tmp_path / "run-cash"
+    with pytest.raises(RunnerError, match="cash_residual_fully_booked"):
+        run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), cash_dir)
+    _assert_no_reusable_run(cash_dir)
+    assert captured["cash_residual_fully_booked"] is False
+    assert float(captured["sum_abs_unbooked_cash_residual"]) > 0.0
 
 
 def test_cash_closure_invariant_fails_a_negative_tga(tmp_path: Path) -> None:
@@ -618,6 +661,34 @@ def test_cash_closure_invariant_fails_a_negative_tga(tmp_path: Path) -> None:
     assert breached["tga_nonnegative"] is False
     assert breached["negative_tga_periods"] == 1
     assert breached["min_tga"] == pytest.approx(-1_500.0)
+
+
+def test_run_boundary_validation_rejects_missing_or_malformed_evidence(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(
+        baseline,
+        CboScenarioSpec.from_file(scenarios["noop"]),
+        tmp_path / "run",
+    )
+    results = pd.read_csv(run.results_path)
+    inputs_dir = run.compiled.forecast_inputs_dir
+
+    for column in (
+        "TGA",
+        "CBOCashReconciliationResidual",
+        "CBOFedAuctionShare",
+        "CBOFedAuctionRolloverAddons",
+    ):
+        with pytest.raises(RunnerError, match=column):
+            runner_module.validate_run_boundaries(
+                results.drop(columns=[column]),
+                inputs_dir,
+            )
+    malformed = results.copy()
+    malformed["TGA"] = malformed["TGA"].astype(object)
+    malformed.loc[malformed.index[-1], "TGA"] = "not-a-number"
+    with pytest.raises(RunnerError, match="malformed TGA"):
+        runner_module.validate_run_boundaries(malformed, inputs_dir)
 
 
 @pytest.mark.parametrize(
@@ -902,10 +973,16 @@ def test_runtime_params_use_compiled_fiscal_incidence_policy(tmp_path: Path) -> 
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-fiscal")
 
     policy = build_runtime_params(run.compiled.forecast_inputs_dir)["fiscal_incidence_policy"]
+    runtime = read_json(run.compiled.forecast_inputs_dir / "tdcsim_runtime_assumptions.json")
 
     assert policy["du_share"] == pytest.approx(0.50)
     assert policy["ru_share"] == pytest.approx(0.25)
     assert policy["foreign_share"] == pytest.approx(0.25)
+    assert runtime["fiscal_incidence_policy_status"] == "scenario_override"
+    assert (
+        run.run_manifest["output_manifest"]["row_metadata"]["fiscal_incidence_policy_status"]
+        == "scenario_override"
+    )
 
 
 def test_runtime_params_use_compiled_issuance_mix_artifact(tmp_path: Path) -> None:
@@ -923,6 +1000,7 @@ def test_runtime_params_use_compiled_issuance_mix_artifact(tmp_path: Path) -> No
     assert params["treasury_issuance_profile"]["TIPS"]["target_percentage"] == pytest.approx(0.08)
     assert params["treasury_issuance_profile"]["FRN"]["target_percentage"] == pytest.approx(0.04)
     assert params["funding_rule"]["negative_required_issuance_action"] == "retire_shortest_public_marketable"
+    assert run.run_manifest["output_manifest"]["row_metadata"]["issuance_profile_status"] == "scenario_override"
 
 
 def test_dated_holder_preferences_change_future_auction_allocation(tmp_path: Path) -> None:
@@ -1022,9 +1100,9 @@ def test_dated_holder_preferences_before_run_start_apply_at_first_issuance(tmp_p
 
 def test_runtime_params_ignore_private_route_rows_for_auction_preferences(tmp_path: Path) -> None:
     baseline, _ = _runner_baseline_and_scenarios(tmp_path)
-    materialized = baseline.materialize(tmp_path / "materialized")
+    inputs = _compiled_noop_inputs(baseline, tmp_path, label="private-routes")
     _write_csv(
-        materialized / "forecast_inputs" / "tdcsim_holder_profile_assumptions.csv",
+        inputs / "tdcsim_holder_profile_assumptions.csv",
         [
             {"holder_type": "Banks", "holder_subbucket": "", "bills_pct": 0.2, "notes_pct": 0.2, "bonds_pct": 0.1, "tips_pct": 0.1, "frn_pct": 0.3},
             {"holder_type": "CB", "holder_subbucket": "", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
@@ -1037,7 +1115,7 @@ def test_runtime_params_ignore_private_route_rows_for_auction_preferences(tmp_pa
         ],
     )
 
-    params = build_runtime_params(materialized / "forecast_inputs")
+    params = build_runtime_params(inputs)
 
     assert params["sector_preferences"]["Private"]["bills_pct"] == pytest.approx(0.5)
     assert params["sector_preferences"]["Private"]["frn_pct"] == pytest.approx(0.5)
@@ -1054,28 +1132,28 @@ def test_runtime_params_ignore_private_route_rows_for_auction_preferences(tmp_pa
 
 def test_runtime_params_reject_nonfinite_holder_preferences(tmp_path: Path) -> None:
     baseline, _ = _runner_baseline_and_scenarios(tmp_path)
-    materialized = baseline.materialize(tmp_path / "materialized")
+    inputs = _compiled_noop_inputs(baseline, tmp_path, label="nonfinite-holders")
     _write_csv(
-        materialized / "forecast_inputs" / "tdcsim_holder_profile_assumptions.csv",
+        inputs / "tdcsim_holder_profile_assumptions.csv",
         [
             {"holder_type": "Private", "holder_subbucket": "", "bills_pct": "", "notes_pct": 1.0, "bonds_pct": 1.0, "tips_pct": 1.0, "frn_pct": 1.0},
         ],
     )
 
     with pytest.raises(RunnerError, match="Private.bills_pct"):
-        build_runtime_params(materialized / "forecast_inputs")
+        build_runtime_params(inputs)
 
 
 def test_runtime_params_reject_malformed_compiled_holder_events(tmp_path: Path) -> None:
     baseline, _ = _runner_baseline_and_scenarios(tmp_path)
-    materialized = baseline.materialize(tmp_path / "materialized")
+    inputs = _compiled_noop_inputs(baseline, tmp_path, label="malformed-holder-events")
     write_json(
-        materialized / "forecast_inputs" / "tdcsim_holder_preference_events.json",
+        inputs / "tdcsim_holder_preference_events.json",
         {"schema_version": "tdcsim_holder_preference_events_v1", "events": [{"date": "2026-09-25", "actions": []}]},
     )
 
     with pytest.raises(RunnerError, match="actions"):
-        build_runtime_params(materialized / "forecast_inputs")
+        build_runtime_params(inputs)
 
 
 def test_cb_auction_preferences_rejected_with_baseline_fed_target(tmp_path: Path) -> None:
@@ -1187,6 +1265,20 @@ def _runner_baseline_and_scenarios(tmp_path: Path) -> tuple[CboBaselinePackage, 
         ),
     }
     return baseline, scenarios
+
+
+def _compiled_noop_inputs(
+    baseline: CboBaselinePackage,
+    tmp_path: Path,
+    *,
+    label: str,
+) -> Path:
+    scenario = _write_scenario(tmp_path / f"{label}.json", baseline, overrides={})
+    return CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_file(scenario),
+        tmp_path / f"{label}-compile",
+    ).forecast_inputs_dir
 
 
 def _write_cash_residual_override(path: Path) -> Path:

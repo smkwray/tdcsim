@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._json import canonical_json_sha256, sha256_file, write_json
+from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT
+
+from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
 from .contract import CboScenarioSpec
 from .transforms.fiscal import (
@@ -44,6 +46,27 @@ COMPILED_MANIFEST = "tdcsim_cbo_compiled_manifest.json"
 ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
 HOLDER_PREFERENCE_EVENTS_FILE = "tdcsim_holder_preference_events.json"
 RUNTIME_ASSUMPTIONS_FILE = "tdcsim_runtime_assumptions.json"
+OPENING_RUNTIME_STATE_FILE = "tdcsim_opening_runtime_state.json"
+DEFAULT_FISCAL_INCIDENCE_POLICY_ID = "baseline_central_99du_1ru"
+_SOURCE_BASELINE_OPENING_DEFAULTS = {
+    "reserves": 3000.0,
+    "tdc_level": 0.0,
+}
+
+_DEFAULT_ISSUANCE_SECURITY_SHARES = {
+    "bills": 0.225,
+    "notes": 0.495,
+    "bonds": 0.18,
+    "tips": 0.06,
+    "frn": 0.04,
+}
+_DEFAULT_ISSUANCE_MATURITY_DISTRIBUTIONS = {
+    "bills": [{"maturity_years": 0.5, "share": 1.0}],
+    "notes": [{"maturity_years": 5.0, "share": 1.0}],
+    "bonds": [{"maturity_years": 20.0, "share": 1.0}],
+    "tips": [{"maturity_years": 10.0, "share": 1.0}],
+    "frn": [{"maturity_years": 2.0, "share": 1.0}],
+}
 
 INPUT_FILES = {
     "nominal_yield_curve": "tdcsim_yield_curve_surface.csv",
@@ -109,6 +132,12 @@ class CboScenarioCompiler:
 
         baseline_digest = digest_input_tree(materialized / FORECAST_INPUTS)
         changed = _apply_overrides(forecast_inputs_dir, spec, overrides, coupling)
+        materialized_defaults, adapter_changes = _materialize_required_adapter_assumptions(
+            forecast_inputs_dir,
+            baseline=baseline,
+            overrides=overrides,
+        )
+        changed.update(adapter_changes)
         compiled_digest = digest_input_tree(forecast_inputs_dir)
         if original_package_sha is not None and sha256_file(baseline.package_path) != original_package_sha:
             raise CompilerError("baseline package bytes changed during compilation")
@@ -126,6 +155,8 @@ class CboScenarioCompiler:
             "baseline_forecast_inputs_digest": baseline_digest,
             "compiled_inputs_digest": compiled_digest,
             "changed_inputs": sorted(changed),
+            "materialized_defaults": sorted(materialized_defaults),
+            "materialized_default_count": len(materialized_defaults),
             "overrides_applied": sorted(overrides),
             "coupling": dict(coupling),
             "claim_boundary": {
@@ -347,15 +378,6 @@ def _apply_overrides(
         _write_issuance_mix(forecast_inputs_dir / ISSUANCE_MIX_FILE, issuance_mix)
         changed.add(ISSUANCE_MIX_FILE)
 
-    if "mmf_deposit_pass_through" in overrides:
-        _write_runtime_assumptions(
-            forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE,
-            mmf_deposit_pass_through=_mmf_deposit_pass_through_override(
-                _override_mapping(overrides["mmf_deposit_pass_through"])
-            ),
-        )
-        changed.add(RUNTIME_ASSUMPTIONS_FILE)
-
     if "net_interest_comparator" in overrides:
         net_interest = _override_mapping(overrides["net_interest_comparator"])
         if net_interest.get("role") != "diagnostic_nonbinding":
@@ -376,16 +398,191 @@ def _mmf_deposit_pass_through_override(override: Mapping[str, Any]) -> float:
     return value
 
 
-def _write_runtime_assumptions(path: Path, *, mmf_deposit_pass_through: float) -> None:
+def _materialize_required_adapter_assumptions(
+    forecast_inputs_dir: Path,
+    *,
+    baseline: CboBaselinePackage,
+    overrides: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    materialized: set[str] = set()
+    changed: set[str] = set()
+    issuance_path = forecast_inputs_dir / ISSUANCE_MIX_FILE
+    if not issuance_path.exists():
+        _write_issuance_mix(issuance_path, None)
+        materialized.add(ISSUANCE_MIX_FILE)
+        changed.add(ISSUANCE_MIX_FILE)
+    runtime_path = forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE
+    if runtime_path.exists():
+        runtime_payload = _read_runtime_assumptions_for_merge(runtime_path)
+    else:
+        runtime_payload = _runtime_assumptions_payload(
+            mmf_deposit_pass_through=MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
+            mmf_deposit_pass_through_status="configured_default",
+            fiscal_incidence_policy_status="configured_default",
+        )
+        materialized.add(RUNTIME_ASSUMPTIONS_FILE)
+    runtime_changed = not runtime_path.exists()
+    if "mmf_deposit_pass_through" in overrides:
+        runtime_payload["mmf_deposit_pass_through"] = _mmf_deposit_pass_through_override(
+            _override_mapping(overrides["mmf_deposit_pass_through"])
+        )
+        runtime_payload["mmf_deposit_pass_through_status"] = "scenario_override"
+        runtime_changed = True
+    if "fiscal_incidence" in overrides:
+        runtime_payload["fiscal_incidence_policy_status"] = "scenario_override"
+        runtime_changed = True
+    if runtime_changed:
+        write_json(runtime_path, runtime_payload)
+        changed.add(RUNTIME_ASSUMPTIONS_FILE)
+    opening_state_path = forecast_inputs_dir / OPENING_RUNTIME_STATE_FILE
+    if not opening_state_path.exists():
+        if isinstance(baseline.manifest.get("derived_forecast_state"), Mapping):
+            raise CompilerError(
+                f"derived forecast-state package requires carried {OPENING_RUNTIME_STATE_FILE}"
+            )
+        _write_source_baseline_opening_runtime_state(
+            opening_state_path,
+            baseline=baseline,
+            forecast_inputs_dir=forecast_inputs_dir,
+        )
+        materialized.add(OPENING_RUNTIME_STATE_FILE)
+        changed.add(OPENING_RUNTIME_STATE_FILE)
+    return materialized, changed
+
+
+def _runtime_assumptions_payload(
+    *,
+    mmf_deposit_pass_through: float,
+    mmf_deposit_pass_through_status: str,
+    fiscal_incidence_policy_status: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "tdcsim_cbo_runtime_assumptions_v1",
+        "fiscal_incidence_policy_id": DEFAULT_FISCAL_INCIDENCE_POLICY_ID,
+        "fiscal_incidence_policy_status": fiscal_incidence_policy_status,
+        "mmf_deposit_pass_through": mmf_deposit_pass_through,
+        "mmf_deposit_pass_through_status": mmf_deposit_pass_through_status,
+        "source_role": "compiled_adapter_assumption",
+        "runtime_role": "fiscal_selector_and_deposit_channel_parameters",
+        "claim_boundary": (
+            "fiscal_selector_routes_signed_primary_flow_and_mmf_pass_through_changes_"
+            "deposit_plumbing_not_debt_or_issuance"
+        ),
+    }
+
+
+def _read_runtime_assumptions_for_merge(path: Path) -> dict[str, Any]:
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise CompilerError(f"compiled runtime assumptions are unreadable: {path.name}") from exc
+    if not isinstance(payload, Mapping):
+        raise CompilerError("compiled runtime assumptions must be a JSON object")
+    if payload.get("schema_version") != "tdcsim_cbo_runtime_assumptions_v1":
+        raise CompilerError("compiled runtime assumptions has an unsupported schema_version")
+    required = {
+        "fiscal_incidence_policy_id",
+        "fiscal_incidence_policy_status",
+        "mmf_deposit_pass_through",
+        "mmf_deposit_pass_through_status",
+        "source_role",
+        "runtime_role",
+        "claim_boundary",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise CompilerError(f"compiled runtime assumptions are missing required keys: {missing}")
+    if not isinstance(payload["fiscal_incidence_policy_id"], str) or not str(
+        payload["fiscal_incidence_policy_id"]
+    ).strip():
+        raise CompilerError("compiled runtime assumptions fiscal_incidence_policy_id is invalid")
+    for key in ("fiscal_incidence_policy_status", "mmf_deposit_pass_through_status"):
+        if payload[key] not in {"configured_default", "scenario_override"}:
+            raise CompilerError(
+                f"compiled runtime assumptions {key} must be configured_default or scenario_override"
+            )
+    try:
+        mmf_value = float(payload["mmf_deposit_pass_through"])
+    except (TypeError, ValueError) as exc:
+        raise CompilerError(
+            "compiled runtime assumptions mmf_deposit_pass_through must be numeric"
+        ) from exc
+    if not math.isfinite(mmf_value) or not 0.0 <= mmf_value <= 1.0:
+        raise CompilerError(
+            "compiled runtime assumptions mmf_deposit_pass_through must be between 0.0 and 1.0"
+        )
+    return dict(payload)
+
+
+def _write_source_baseline_opening_runtime_state(
+    path: Path,
+    *,
+    baseline: CboBaselinePackage,
+    forecast_inputs_dir: Path,
+) -> None:
+    opening_state_date = _source_baseline_opening_state_date(
+        baseline,
+        forecast_inputs_dir=forecast_inputs_dir,
+    )
+    rows, _ = _read_csv(forecast_inputs_dir / INPUT_FILES["operating_cash"])
+    if not rows or "operating_cash_target_bil" not in rows[0]:
+        raise CompilerError(
+            f"{INPUT_FILES['operating_cash']} must contain opening operating_cash_target_bil"
+        )
+    try:
+        tga = float(rows[0]["operating_cash_target_bil"])
+    except (TypeError, ValueError) as exc:
+        raise CompilerError(
+            f"{INPUT_FILES['operating_cash']} opening operating_cash_target_bil must be numeric"
+        ) from exc
+    if not math.isfinite(tga):
+        raise CompilerError(
+            f"{INPUT_FILES['operating_cash']} opening operating_cash_target_bil must be finite"
+        )
     write_json(
         path,
         {
-            "schema_version": "tdcsim_cbo_runtime_assumptions_v1",
-            "source_role": "scenario_assumption",
-            "runtime_role": "deposit_channel_parameter",
-            "claim_boundary": "mmf_pass_through_changes_deposit_plumbing_not_debt_or_issuance",
-            "mmf_deposit_pass_through": mmf_deposit_pass_through,
+            "schema_version": "tdcsim_cbo_opening_runtime_state_v1",
+            "state_kind": "source_baseline_configured_defaults",
+            "opening_state_date": opening_state_date,
+            "initial_values": {
+                **_SOURCE_BASELINE_OPENING_DEFAULTS,
+                "tga": tga,
+            },
+            "initial_value_statuses": {
+                "reserves": "configured_default",
+                "tdc_level": "configured_default",
+                "tga": "source_opening_cash",
+            },
+            "configured_default_count": len(_SOURCE_BASELINE_OPENING_DEFAULTS),
+            "source_role": "compiler_materialized_source_baseline_opening_state",
+            "runtime_role": "opening_stock_state",
+            "claim_boundary": "source_baseline_defaults_not_carried_transformed_state",
         },
+    )
+
+
+def _source_baseline_opening_state_date(
+    baseline: CboBaselinePackage,
+    *,
+    forecast_inputs_dir: Path,
+) -> str:
+    date_range = baseline.manifest.get("date_range")
+    if isinstance(date_range, Mapping) and date_range.get("opening_state_date"):
+        return str(date_range["opening_state_date"])
+    metadata_path = forecast_inputs_dir / "tdcsim_opening_portfolio_metadata.json"
+    if metadata_path.exists():
+        payload = read_json(metadata_path)
+        if isinstance(payload, Mapping):
+            for key in ("opening_state_date", "simulation_start_date", "opening_date"):
+                if payload.get(key):
+                    return str(payload[key])
+    rows, _ = _read_csv(forecast_inputs_dir / INPUT_FILES["primary_deficit"])
+    starts = sorted(str(row["period_start"]) for row in rows if row.get("period_start"))
+    if starts:
+        return starts[0]
+    raise CompilerError(
+        "source baseline opening runtime state requires an explicit opening_state_date"
     )
 
 
@@ -551,7 +748,15 @@ def _write_issuance_mix(path: Path, issuance_mix: Any) -> None:
         payload = {
             "schema_version": "tdcsim_cbo_issuance_mix_assumptions_v1",
             "mode": "default_tdcsim_cbo_runner_profile",
-            "source_role": "scenario_assumption",
+            "selection_status": "configured_default",
+            "security_shares": dict(_DEFAULT_ISSUANCE_SECURITY_SHARES),
+            "maturity_distributions": {
+                key: [dict(item) for item in value]
+                for key, value in _DEFAULT_ISSUANCE_MATURITY_DISTRIBUTIONS.items()
+            },
+            "weighted_average_maturity_years": 6.8675,
+            "negative_issuance_action": "error",
+            "source_role": "compiler_configured_default",
             "runtime_role": "hard_target",
             "claim_boundary": "issuance_mix_is_tdcsim_scenario_assumption_not_cbo_prescription",
         }
@@ -559,6 +764,7 @@ def _write_issuance_mix(path: Path, issuance_mix: Any) -> None:
         payload = {
             "schema_version": "tdcsim_cbo_issuance_mix_assumptions_v1",
             "mode": "replace_shares",
+            "selection_status": "scenario_override",
             "security_shares": dict(issuance_mix.security_shares),
             "maturity_distributions": {
                 key: [dict(item) for item in value]
