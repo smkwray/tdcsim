@@ -38,6 +38,7 @@ def build_run_manifest(
     scenario_referenced_files: list[dict[str, Any]],
     start_date: str,
     end_date: str,
+    fiscal_incidence_policy_id: str,
     outputs: Mapping[str, Any],
     output_hashes: list[dict[str, Any]],
     boundary_checks: Mapping[str, Any],
@@ -46,7 +47,7 @@ def build_run_manifest(
 ) -> dict[str, Any]:
     """Build the public run manifest with explicit unsupported components."""
 
-    validation = _validation(boundary_checks)
+    validation = validation_from_boundary_checks(boundary_checks)
     return {
         "schema_version": "tdcsim_cbo_scenario_run_manifest_v1",
         "run_id": f"{scenario_id}-{scenario_sha256[:12]}",
@@ -83,6 +84,7 @@ def build_run_manifest(
             for item in compiled.manifest.get("input_hashes", [])
         ],
         "simulation": {"start_date": start_date, "end_date": end_date, "frequency": "daily"},
+        "fiscal_incidence_policy_id": fiscal_incidence_policy_id,
         "outputs": [
             {
                 "logical_name": item["path"],
@@ -101,7 +103,7 @@ def build_run_manifest(
     }
 
 
-def _validation(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
+def validation_from_boundary_checks(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
     cash_residual_affects_issuance_size = _normalized_bool_set(
         boundary_checks.get("cash_residual_affects_issuance_size", [])
     )
@@ -240,4 +242,9 @@ def _media_type(path: str) -> str:
     return "application/octet-stream"
 
 
-__all__ = ["RUN_CLAIM_BOUNDARY", "RUN_UNSUPPORTED_COMPONENTS", "build_run_manifest"]
+__all__ = [
+    "RUN_CLAIM_BOUNDARY",
+    "RUN_UNSUPPORTED_COMPONENTS",
+    "build_run_manifest",
+    "validation_from_boundary_checks",
+]

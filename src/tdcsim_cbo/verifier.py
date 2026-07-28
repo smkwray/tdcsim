@@ -417,6 +417,7 @@ def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path
         inputs_dir,
         actuals_available_as_of=str(row_metadata.get("actuals_available_as_of") or ""),
     )
+    params = runner_module._engine_runtime_params(params)
     engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
     results, final_portfolio = run_simulation(params, start, end, freq="D", scenario_name=engine_scenario_id)
     profile = str(output_manifest.get("profile") or "compact")
