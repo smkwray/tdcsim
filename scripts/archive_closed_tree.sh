@@ -3,7 +3,7 @@ set -euo pipefail
 
 # archive_closed_tree.sh — byte-exact archive of a closed run/evidence tree.
 #
-# Retention doctrine (AGENTS.md): a closed retained tree is stored once — in a verified
+# Project retention policy: a closed retained tree is stored once — in a verified
 # campaign container when it meets that contract, otherwise in a byte-exact compressed
 # archive with a recorded retention reason and verification status.
 #

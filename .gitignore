@@ -36,6 +36,7 @@ htmlcov/
 # Agent metadata
 .agent/
 .claude/
+.worktrees/
 do/
 
 # Local archives
