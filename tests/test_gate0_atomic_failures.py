@@ -291,3 +291,52 @@ def test_cbo_bill_issue_price_uses_treasury_discount_quote_identity(tmp_path: Pa
         issued_bill["FaceValue"] * expected_price_ratio,
         abs=1e-10,
     )
+
+
+def test_opening_fed_mismatch_is_rejected_or_restatement_is_nonsettling(
+    tmp_path: Path,
+) -> None:
+    """An opening stock mismatch must never become an in-period Fed purchase."""
+
+    paths = cbo_engine_fixtures._build_temp_forecast_inputs(
+        tmp_path,
+        cbo_public_debt_target_bil=1_250.0,
+    )
+    fed_rows = cbo_engine_fixtures.build_fed_holdings_path_rows(
+        scenario_id="baseline",
+        periods=cbo_engine_fixtures._single_period(),
+        opening_state_date="2026-09-20",
+        opening_cb_holdings_bil=0.0,
+        cbo_fy_end_fed_holdings_bil={2026: 50.0},
+        observation_date="2026-09-20",
+        available_date="2026-09-20",
+    )
+    paths["fed_holdings_path_file"] = cbo_engine_fixtures._write_csv(
+        tmp_path / "tdcsim_fed_holdings_path.csv",
+        fed_rows,
+    )
+
+    try:
+        results, _ = sim_engine.run_simulation(
+            cbo_engine_fixtures._minimal_engine_params(paths),
+            "2026-09-20",
+            "2026-09-30",
+            freq="10D",
+            scenario_name="baseline",
+        )
+    except (ValueError, RuntimeError) as exc:
+        message = str(exc).lower()
+        assert "opening" in message and "fed" in message
+        return
+
+    opening = results.iloc[0]
+    period = results.iloc[-1]
+    scope = str(opening["CBOFedSettlementScope"]).lower().replace("-", "").replace("_", "")
+    assert "prestart" in scope and "nonsettling" in scope and "restatement" in scope
+    assert opening["CBOFedHoldingsTarget"] == pytest.approx(50.0)
+    assert opening["CBOFedHoldingsTargetError"] == pytest.approx(0.0)
+    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(0.0)
+    assert period["CBOFedSecondaryPurchaseCash"] == pytest.approx(0.0)
+    assert period["CBOFedSecondaryPurchaseReserveEffect"] == pytest.approx(0.0)
+    assert period["CBOFedSecondaryPurchaseDepositEffect"] == pytest.approx(0.0)
+    assert period["TDC_SecondaryTrades"] == pytest.approx(0.0)
