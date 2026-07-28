@@ -49,7 +49,7 @@ def test_noop_compile_materializes_explicit_defaults_without_marking_csv_rows(tm
     assert issuance["selection_status"] == "configured_default"
     assert issuance["negative_issuance_action"] == "error"
     assert sum(issuance["security_shares"].values()) == pytest.approx(1.0)
-    assert runtime["fiscal_incidence_policy_id"] == "baseline_central_99du_1ru"
+    assert runtime["fiscal_incidence_policy_id"] == "central"
     assert runtime["fiscal_incidence_policy_status"] == "configured_default"
     assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.97)
     assert runtime["mmf_deposit_pass_through_status"] == "configured_default"
@@ -572,6 +572,89 @@ def test_compiler_rejects_derived_package_missing_carried_opening_state(
         CboScenarioCompiler().compile(baseline, spec, tmp_path / "work")
 
 
+def test_compiler_selects_governed_package_central_policy_id(
+    tmp_path: Path,
+) -> None:
+    scenario_id = "cbo_full_horizon_local_smoke_3m"
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        scenario_id=scenario_id,
+        fiscal_policy_ids=(
+            f"{scenario_id}_central_99du_1ru",
+            f"{scenario_id}_sensitivity_100du_0ru",
+            f"{scenario_id}_sensitivity_95du_5ru",
+        ),
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(_scenario_mapping(baseline)),
+        tmp_path / "work",
+    )
+    runtime = json.loads(
+        (compiled.forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert runtime["fiscal_incidence_policy_id"] == (
+        f"{scenario_id}_central_99du_1ru"
+    )
+
+
+def test_compiler_rejects_ambiguous_configured_default_policy(
+    tmp_path: Path,
+) -> None:
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        fiscal_policy_ids=(
+            "first_central_99du_1ru",
+            "second_central_99du_1ru",
+        ),
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+
+    with pytest.raises(
+        CompilerError,
+        match="exactly one configured-default central policy ID",
+    ):
+        CboScenarioCompiler().compile(
+            baseline,
+            CboScenarioSpec.from_mapping(_scenario_mapping(baseline)),
+            tmp_path / "work",
+        )
+
+
+def test_compiler_materializes_opening_fed_stock_identity(
+    tmp_path: Path,
+) -> None:
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        include_opening_fed_target=False,
+    )
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(_scenario_mapping(baseline)),
+        tmp_path / "work",
+    )
+    fed_rows = _read_csv(
+        compiled.forecast_inputs_dir / "tdcsim_fed_holdings_path.csv"
+    )
+    opening = [
+        row for row in fed_rows if row["period_end"] == "2027-01-01"
+    ]
+
+    assert len(opening) == 1
+    assert float(opening[0]["cbo_fed_holdings_target_bil"]) == pytest.approx(
+        100.0
+    )
+    assert opening[0]["source_status"] == (
+        "compiler_materialized_opening_fed_stock_target_identity"
+    )
+    assert "tdcsim_fed_holdings_path.csv" in compiled.changed_inputs
+
+
 def _compiler_baseline(tmp_path: Path) -> CboBaselinePackage:
     package, attestation = _write_compiler_package(tmp_path)
     return CboBaselinePackage.open(package, attestation_path=attestation)
@@ -640,6 +723,9 @@ def _write_compiler_package(
     derived_package: bool = False,
     carry_opening_runtime_state: bool = False,
     carry_runtime_assumptions: bool = False,
+    scenario_id: str = "compiler_fixture",
+    fiscal_policy_ids: tuple[str, ...] = ("central",),
+    include_opening_fed_target: bool = True,
 ) -> tuple[Path, Path]:
     package_dir = tmp_path / "compiler_pkg"
     inputs = package_dir / "forecast_inputs"
@@ -708,11 +794,20 @@ def _write_compiler_package(
         [
             {"period_end": "2027-01-01", "source_fiscal_year": 2027, "holder_type": "CB", "cbo_fed_holdings_target_bil": 100.0},
             {"period_end": "2027-01-02", "source_fiscal_year": 2028, "holder_type": "CB", "cbo_fed_holdings_target_bil": 100.0},
-        ],
+        ][0 if include_opening_fed_target else 1 :],
     )
     _write_csv(
         inputs / "tdcsim_fiscal_incidence_policy.csv",
-        [{"policy_id": "central", "du_share": 1.0, "ru_share": 0.0, "foreign_share": 0.0, "other_share": 0.0}],
+        [
+            {
+                "policy_id": policy_id,
+                "du_share": 1.0,
+                "ru_share": 0.0,
+                "foreign_share": 0.0,
+                "other_share": 0.0,
+            }
+            for policy_id in fiscal_policy_ids
+        ],
     )
     _write_csv(
         inputs / "tdcsim_holder_profile_assumptions.csv",
@@ -720,6 +815,19 @@ def _write_compiler_package(
             {"holder_type": "Banks", "bills_pct": 0.5, "notes_pct": 0.5, "bonds_pct": 0.5, "tips_pct": 0.5, "frn_pct": 0.5},
             {"holder_type": "Private", "bills_pct": 0.5, "notes_pct": 0.5, "bonds_pct": 0.5, "tips_pct": 0.5, "frn_pct": 0.5},
             {"holder_type": "CB", "bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0, "tips_pct": 0.0, "frn_pct": 0.0},
+        ],
+    )
+    _write_csv(
+        inputs / "tdcsim_opening_portfolio.csv",
+        [
+            {
+                "BondID": 1,
+                "SecurityType": "Fixed",
+                "FaceValue": 100.0,
+                "AdjustedPrincipal": 0.0,
+                "HolderType": "CB",
+                "Status": "Active",
+            }
         ],
     )
     if carry_opening_runtime_state:
@@ -753,7 +861,7 @@ def _write_compiler_package(
 
     manifest = {
         "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v1",
-        "scenario_id": "compiler_fixture",
+        "scenario_id": scenario_id,
         "date_range": {
             "opening_state_date": "2027-01-01",
             "actuals_available_as_of": "2027-01-01",
