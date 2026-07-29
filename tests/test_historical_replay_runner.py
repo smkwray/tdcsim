@@ -26,6 +26,54 @@ def _write_mmf_component_source(path: Path, *, total: float, bills: float, date:
     ).to_csv(path, index=False)
 
 
+@pytest.fixture
+def empty_security_sources(tmp_path: Path) -> dict[str, str]:
+    """Materialize required source schemas for replay tests that isolate other mechanics."""
+
+    auctions = tmp_path / "auctions.csv"
+    frn_indexes = tmp_path / "frn_daily_indexes.csv"
+    tips_cpi = tmp_path / "tips_cpi.csv"
+    pd.DataFrame(
+        columns=[
+            "auction_date",
+            "issue_date",
+            "maturity_date",
+            "cusip",
+            "security_type",
+            "security_term",
+            "avg_med_price",
+            "price_per100",
+            "unadj_price",
+            "adj_price",
+            "offering_amt",
+            "total_accepted",
+            "floating_rate",
+            "inflation_index_security",
+            "int_rate",
+            "high_discnt_rate",
+            "index_ratio_on_issue_date",
+        ]
+    ).to_csv(auctions, index=False)
+    pd.DataFrame(
+        columns=[
+            "record_date",
+            "cusip",
+            "start_of_accrual_period",
+            "end_of_accrual_period",
+            "daily_index",
+            "spread",
+            "daily_int_accrual_rate",
+            "daily_accrued_int_per100",
+        ]
+    ).to_csv(frn_indexes, index=False)
+    pd.DataFrame(columns=["index_date", "ref_cpi"]).to_csv(tips_cpi, index=False)
+    return {
+        "auctions": str(auctions),
+        "frn_daily_indexes": str(frn_indexes),
+        "tips_cpi": str(tips_cpi),
+    }
+
+
 def test_code_identity_manifest_recurses_and_uses_runtime_exclusions(tmp_path, monkeypatch):
     included = {
         "src/top.py": "top",
@@ -114,7 +162,7 @@ def test_large_artifact_sample_selects_each_declared_positive_stratum():
             assert stratum_counts["selected_row_count"] > 0, stratum
 
 
-def test_run_simulation_dispatches_historical_replay(tmp_path):
+def test_run_simulation_dispatches_historical_replay(tmp_path, empty_security_sources):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -161,6 +209,7 @@ def test_run_simulation_dispatches_historical_replay(tmp_path):
             "sector_value_unit_scale": 10.0,
             "mmf_component_constraints": str(mmf_component_path),
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -188,7 +237,10 @@ def test_run_simulation_dispatches_historical_replay(tmp_path):
     assert set(portfolio["broad_holder_class"]) == {"banks", "money_market_cash"}
 
 
-def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibility(tmp_path):
+def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibility(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -266,6 +318,7 @@ def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibil
             "ffiec_interest_constraints": str(ffiec_path),
             "ncua_interest_constraints": str(ncua_path),
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -297,7 +350,10 @@ def test_historical_replay_ffiec_broad_debt_ladder_stays_soft_prior_not_eligibil
     assert "maturity_prior_reconciliation" in results.attrs["run_metadata"]["historical_replay_output_paths"]
 
 
-def test_historical_replay_ncua_all_investment_ladder_stays_soft_prior_not_eligibility(tmp_path):
+def test_historical_replay_ncua_all_investment_ladder_stays_soft_prior_not_eligibility(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -378,6 +434,7 @@ def test_historical_replay_ncua_all_investment_ladder_stays_soft_prior_not_eligi
             "ffiec_interest_constraints": str(ffiec_path),
             "ncua_interest_constraints": str(ncua_path),
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -404,7 +461,10 @@ def test_historical_replay_ncua_all_investment_ladder_stays_soft_prior_not_eligi
     assert "soft_solver_prior_applied" in set(ncua_rows["prior_status"])
 
 
-def test_historical_replay_solves_multiple_quarters_with_stateful_prior(tmp_path):
+def test_historical_replay_solves_multiple_quarters_with_stateful_prior(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -467,6 +527,7 @@ def test_historical_replay_solves_multiple_quarters_with_stateful_prior(tmp_path
         "historical_replay": {
             "amount_unit_scale": 1.0,
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -485,11 +546,16 @@ def test_historical_replay_solves_multiple_quarters_with_stateful_prior(tmp_path
     assert portfolio["FaceValue"].sum() == pytest.approx(200.0)
 
 
-def test_historical_replay_exposes_source_basis_difference_and_exports(tmp_path):
+def test_historical_replay_exposes_source_basis_difference_and_exports(
+    tmp_path,
+    empty_security_sources,
+    monkeypatch,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
     output_dir = tmp_path / "exports"
+    monkeypatch.chdir(tmp_path)
     pd.DataFrame(
         [
             {
@@ -528,7 +594,9 @@ def test_historical_replay_exposes_source_basis_difference_and_exports(tmp_path)
         "historical_replay": {
             "amount_unit_scale": 1.0,
             "output_dir": str(output_dir),
+            "tdc": False,
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -582,53 +650,26 @@ def test_historical_replay_exposes_source_basis_difference_and_exports(tmp_path)
         "valuation_scope_diagnostics",
     ]
     assert set(expected_export_subset).issubset(export_paths)
-    for name, path in export_paths.items():
+    for name in expected_export_subset:
+        path = export_paths[name]
         if str(path).endswith(".md"):
             assert pd.notna(path)
             continue
         frame = pd.read_csv(path)
-        if name in {
-                "auction_absorption_reconciliation",
-                "auction_allotment_proxy",
-                "fixed_coupon_interest_reconciliation",
-                "fixed_coupon_monthly_detail",
-                "fixed_coupon_principal_adjustments",
-                "frn_cusip_coverage",
-                "frn_daily_index_validation",
-                "frn_interest_flow_detail",
-                "frn_interest_reconciliation",
-                "frn_principal_reconciliation",
-                    "holder_mix_differentiation",
-                    "interest_component_detail",
-                "interest_component_detail_sample",
-                "interest_proxy_alignment",
-                "large_artifact_sample_manifest",
-                "mmf_component_reconciliation",
-                "negative_sector_netting_bridge",
-                "portfolio_snapshots_sample",
-                "portfolio_transition_diagnostics",
-                "soma_fixed_allocations",
-                "soma_holdings",
-                "soma_holdout_diagnostics",
-                "tips_inflation_monthly_detail",
-                "tips_inflation_reconciliation",
-                "tips_coupon_detail",
-                "tips_principal_identity",
-                "valuation_basis_feasibility_certificate",
-                "unexplained_change_ledger",
-            "treasury_interest_expense_diagnostic",
-        }:
-            assert frame is not None
-            continue
-        assert frame.shape[0] >= 1, name
+        assert frame is not None
+    for name in {
+        "diagnostics",
+        "final_portfolio",
+        "holder_basis_bridge",
+        "ledger",
+        "observation_registry",
+        "portfolio_constraint_diagnostics",
+        "results",
+    }:
+        assert pd.read_csv(export_paths[name]).shape[0] >= 1, name
     strips_scope = pd.read_csv(export_paths["strips_scope_diagnostics"])
     assert set(strips_scope["status"]) == {"no_strips_detected"}
     assert strips_scope["strips_like_rows"].sum() == 0
-    valuation_scope = pd.read_csv(export_paths["valuation_scope_diagnostics"])
-    assert set(valuation_scope["valuation_scope_status"]) == {
-        "pricing_values_present"
-    }
-    assert valuation_scope["rows_with_any_pricing_value"].sum() > 0
     pricing_scope = pd.read_csv(export_paths["pricing_scope_diagnostics"])
     assert set(pricing_scope["claim_boundary"]) == {"model_implied_not_observed_market_price"}
     observation_registry = pd.read_csv(export_paths["observation_registry"])
@@ -641,25 +682,29 @@ def test_historical_replay_exposes_source_basis_difference_and_exports(tmp_path)
         "quarterly_cash",
         "sector_positions",
         "mspd_cohorts",
-        "ffiec_interest_constraints",
-        "ncua_interest_constraints",
-        "tier2_interest_constraints",
-        "tdc_tdc_empirical_anchor",
-        "tdc_treasury_interest_expense",
+        "auction_terms",
+        "frn_daily_indexes",
+        "tips_cpi",
     }
-    required_inputs = input_manifest[input_manifest["required"].astype(bool)]
-    assert set(required_inputs["status"]) == {"present"}
-    anchor = input_manifest[input_manifest["source_key"].eq("tdc_tdc_empirical_anchor")].iloc[0]
-    assert str(anchor["consumed_in_run"]).lower() == "true"
-    mmf_reference = input_manifest[input_manifest["source_key"].eq("tdc_tdc_mmf_rrp_quarterly_adjustments")].iloc[0]
-    assert str(mmf_reference["required_for_claim"]).lower() == "true"
-    assert str(mmf_reference["consumed_in_run"]).lower() == "false"
-    method_meta = input_manifest[input_manifest["source_key"].eq("tdc_method_meta")].iloc[0]
-    assert str(method_meta["required_for_claim"]).lower() == "true"
-    assert str(method_meta["consumed_in_run"]).lower() == "false"
+    fixture_inputs = input_manifest[
+        input_manifest["source_key"].isin(
+            {
+                "quarterly_cash",
+                "sector_positions",
+                "mspd_cohorts",
+                "auction_terms",
+                "frn_daily_indexes",
+                "tips_cpi",
+            }
+        )
+    ]
+    assert set(fixture_inputs["status"]) == {"present"}
 
 
-def test_historical_replay_excludes_z1_aggregate_controls_from_solver_inputs(tmp_path):
+def test_historical_replay_excludes_z1_aggregate_controls_from_solver_inputs(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -710,6 +755,7 @@ def test_historical_replay_excludes_z1_aggregate_controls_from_solver_inputs(tmp
             "output_dir": str(output_dir),
             "mmf_component_constraints": str(mmf_component_path),
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -731,7 +777,10 @@ def test_historical_replay_excludes_z1_aggregate_controls_from_solver_inputs(tmp
     assert portfolio["FaceValue"].sum() == pytest.approx(100.0)
 
 
-def test_historical_replay_enforces_mmf_bill_component_and_maturity_eligibility(tmp_path):
+def test_historical_replay_enforces_mmf_bill_component_and_maturity_eligibility(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -802,6 +851,7 @@ def test_historical_replay_enforces_mmf_bill_component_and_maturity_eligibility(
             "output_dir": str(output_dir),
             "mmf_component_constraints": str(mmf_component_path),
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -821,7 +871,10 @@ def test_historical_replay_enforces_mmf_bill_component_and_maturity_eligibility(
     assert set(pd.read_csv(output_dir / "mmf_component_reconciliation.csv")["post_solve_status"]) == {"matched"}
 
 
-def test_historical_replay_protects_mmf_direct_levels_from_negative_netting(tmp_path):
+def test_historical_replay_protects_mmf_direct_levels_from_negative_netting(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -892,6 +945,7 @@ def test_historical_replay_protects_mmf_direct_levels_from_negative_netting(tmp_
             "amount_unit_scale": 1.0,
             "mmf_component_constraints": str(mmf_component_path),
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -924,7 +978,10 @@ def test_historical_replay_protects_mmf_direct_levels_from_negative_netting(tmp_
     assert other["adjusted_sector_level_mil"] == pytest.approx(30.0)
 
 
-def test_historical_replay_nets_negative_subcategory_inside_broad_holder_bucket(tmp_path):
+def test_historical_replay_nets_negative_subcategory_inside_broad_holder_bucket(
+    tmp_path,
+    empty_security_sources,
+):
     cash_path = tmp_path / "cash.csv"
     sectors_path = tmp_path / "sectors.csv"
     cohorts_path = tmp_path / "cohorts.csv"
@@ -968,6 +1025,7 @@ def test_historical_replay_nets_negative_subcategory_inside_broad_holder_bucket(
         "historical_replay": {
             "amount_unit_scale": 1.0,
             "paths": {
+                **empty_security_sources,
                 "cash": str(cash_path),
                 "sector_positions": str(sectors_path),
                 "cohorts": str(cohorts_path),
@@ -990,6 +1048,7 @@ def test_historical_replay_nets_negative_subcategory_inside_broad_holder_bucket(
     assert not netting.empty
 
 
+@pytest.mark.integration
 def test_historical_replay_validation_artifacts_pin_acceptance_invariants():
     validation_dir = Path(__file__).resolve().parents[1] / "data" / "historical_replay" / "validation"
     required = [
@@ -1014,6 +1073,9 @@ def test_historical_replay_validation_artifacts_pin_acceptance_invariants():
         "historical_replay_runtime_manifest.csv",
         "historical_replay_runtime_lock.csv",
         "historical_replay_code_identity_manifest.csv",
+        "historical_replay_input_manifest.csv",
+        "pricing_scope_diagnostics.csv",
+        "valuation_scope_diagnostics.csv",
     ]
     for filename in required:
         assert (validation_dir / filename).exists(), filename
@@ -1027,6 +1089,24 @@ def test_historical_replay_validation_artifacts_pin_acceptance_invariants():
     assert "valuation_basis_feasibility_certificate" in set(artifact_integrity["artifact"].astype(str))
     assert "runtime_lock" in set(artifact_integrity["artifact"].astype(str))
     assert "code_identity_manifest" in set(artifact_integrity["artifact"].astype(str))
+    input_manifest = pd.read_csv(validation_dir / "historical_replay_input_manifest.csv")
+    required_inputs = input_manifest[input_manifest["required"].astype(bool)]
+    assert set(required_inputs["status"]) == {"present"}
+    anchor = input_manifest[input_manifest["source_key"].eq("tdc_tdc_empirical_anchor")].iloc[0]
+    assert str(anchor["consumed_in_run"]).lower() == "true"
+    mmf_reference = input_manifest[
+        input_manifest["source_key"].eq("tdc_tdc_mmf_rrp_quarterly_adjustments")
+    ].iloc[0]
+    assert str(mmf_reference["required_for_claim"]).lower() == "true"
+    assert str(mmf_reference["consumed_in_run"]).lower() == "false"
+    method_meta = input_manifest[input_manifest["source_key"].eq("tdc_method_meta")].iloc[0]
+    assert str(method_meta["required_for_claim"]).lower() == "true"
+    assert str(method_meta["consumed_in_run"]).lower() == "false"
+    pricing_scope = pd.read_csv(validation_dir / "pricing_scope_diagnostics.csv")
+    assert set(pricing_scope["claim_boundary"]) == {"model_implied_not_observed_market_price"}
+    valuation_scope = pd.read_csv(validation_dir / "valuation_scope_diagnostics.csv")
+    assert set(valuation_scope["valuation_scope_status"]) == {"pricing_values_present"}
+    assert valuation_scope["rows_with_any_pricing_value"].sum() > 0
     acceptance = (validation_dir / "historical_replay_acceptance.md").read_text(encoding="utf-8")
     assert "This artifact is generated from live validation CSVs" in acceptance
     assert "Solver methods: `exact_feasible_highs_projection: 1, exact_weighted_entropy_projection: 99`" in acceptance

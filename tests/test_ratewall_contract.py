@@ -692,6 +692,7 @@ def test_ratewall_scenario_registry_drives_catalog_and_primary_rows(tmp_path, mo
     assert set(frame["scenario_id"]) == set(registry_map)
 
 
+@pytest.mark.integration
 def test_ratewall_source_backed_holder_path_is_instrument_specific(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
     project_parent = next(

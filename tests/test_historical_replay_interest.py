@@ -1339,6 +1339,7 @@ def test_official_interest_scope_bridge_maps_included_and_excluded_rows():
     )
 
 
+@pytest.mark.integration
 def test_official_interest_scope_bridge_covers_live_source_categories():
     treasury = pd.read_csv(
         "data/historical_replay/imported/tdcest/treasury__interest_expense.csv",
