@@ -133,9 +133,10 @@ def build_historical_replay_observations(
     )
     if not mmf_components.empty:
         frames.append(mmf_components)
-    observations = pd.concat([frame for frame in frames if not frame.empty], ignore_index=True)
-    if observations.empty:
+    nonempty_frames = [frame for frame in frames if not frame.empty]
+    if not nonempty_frames:
         return pd.DataFrame(columns=OBSERVATION_REGISTRY_COLUMNS)
+    observations = pd.concat(nonempty_frames, ignore_index=True)
     observations = observations.loc[:, OBSERVATION_REGISTRY_COLUMNS].copy()
     observations["observation_id"] = [
         f"obs_{idx:09d}"

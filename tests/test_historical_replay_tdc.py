@@ -232,6 +232,7 @@ def test_apply_auction_absorption_to_tdc_panel_updates_signed_component_and_resi
     assert validation.loc[validation["component"] == "auction_absorption", "value_mil"].iloc[0] == pytest.approx(-30.0)
 
 
+@pytest.mark.integration
 def test_live_tdc_panel_has_expected_coverage_and_formula_match():
     panel, formula, manifest = build_historical_replay_tdc_panel(start_quarter="2002Q1", end_quarter="2025Q4")
 

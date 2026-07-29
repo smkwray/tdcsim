@@ -56,6 +56,7 @@ def test_observation_registry_preserves_z1_lm_fl_valuation_basis():
         ffiec_path=None,
         ncua_path=None,
         tier2_constraints_path=None,
+        quarterly_inputs_path=None,
     )
     basis_by_sector = observations.set_index("source_row_key")["valuation_basis"].to_dict()
 
@@ -85,12 +86,22 @@ def test_ffiec_broad_debt_scope_requires_explicit_source_kind(tmp_path):
     )
     frame.to_csv(ffiec_path, index=False)
     declared = build_historical_replay_observations(
-        pd.DataFrame(), pd.DataFrame(), ffiec_path=ffiec_path, ncua_path=None, tier2_constraints_path=None
+        pd.DataFrame(),
+        pd.DataFrame(),
+        ffiec_path=ffiec_path,
+        ncua_path=None,
+        tier2_constraints_path=None,
+        quarterly_inputs_path=None,
     )
 
     frame.drop(columns="constraint_source_kind").to_csv(ffiec_path, index=False)
     undeclared = build_historical_replay_observations(
-        pd.DataFrame(), pd.DataFrame(), ffiec_path=ffiec_path, ncua_path=None, tier2_constraints_path=None
+        pd.DataFrame(),
+        pd.DataFrame(),
+        ffiec_path=ffiec_path,
+        ncua_path=None,
+        tier2_constraints_path=None,
+        quarterly_inputs_path=None,
     )
 
     assert "ffiec_bank_broad_debt_maturity_prior" in set(declared["scope"])
@@ -100,6 +111,7 @@ def test_ffiec_broad_debt_scope_requires_explicit_source_kind(tmp_path):
 def test_observation_registry_includes_ncua_and_tier2_interest_constraints(tmp_path):
     ncua_path = tmp_path / "ncua.csv"
     tier2_path = tmp_path / "tier2.csv"
+    quarterly_inputs_path = tmp_path / "quarterly_inputs.csv"
     pd.DataFrame(
         [
             {
@@ -125,6 +137,15 @@ def test_observation_registry_includes_ncua_and_tier2_interest_constraints(tmp_p
             }
         ]
     ).to_csv(tier2_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "date": "2025-03-31",
+                "mmf_tsy_level": 5000.0,
+                "mmf_tsy_bills_level": 3000.0,
+            }
+        ]
+    ).to_csv(quarterly_inputs_path, index=False)
 
     observations = build_historical_replay_observations(
         pd.DataFrame(),
@@ -132,6 +153,7 @@ def test_observation_registry_includes_ncua_and_tier2_interest_constraints(tmp_p
         ffiec_path=None,
         ncua_path=ncua_path,
         tier2_constraints_path=tier2_path,
+        quarterly_inputs_path=quarterly_inputs_path,
         start_quarter="2025Q1",
         end_quarter="2025Q1",
     )

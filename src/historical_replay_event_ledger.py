@@ -106,9 +106,10 @@ def build_historical_replay_event_ledger(
             end_quarter=end_quarter,
         ),
     ]
-    ledger = pd.concat([frame for frame in frames if not frame.empty], ignore_index=True)
-    if ledger.empty:
+    nonempty_frames = [frame for frame in frames if not frame.empty]
+    if not nonempty_frames:
         return pd.DataFrame(columns=EVENT_LEDGER_COLUMNS)
+    ledger = pd.concat(nonempty_frames, ignore_index=True)
     ledger["event_id"] = [f"evt_{idx:09d}" for idx in range(1, len(ledger.index) + 1)]
     return ledger.loc[:, EVENT_LEDGER_COLUMNS].sort_values(
         ["quarter", "event_date", "event_type", "cohort_id", "source_row_key"],
