@@ -133,12 +133,13 @@ def _assert_readable_outputs(run_dir: Path) -> None:
     summary_path = run_dir / "outputs" / "summary.json"
     results_path = _output_csv(run_dir, "results_compact")
     portfolio_path = _output_csv(run_dir, "final_portfolio_compact")
-    catalog_path = run_dir / "outputs" / "catalog.sqlite"
 
     assert summary_path.exists()
     assert results_path.exists()
     assert portfolio_path.exists()
-    assert catalog_path.exists()
+    # Bounded production output is the canonical catalog; a duplicate SQLite
+    # database is intentionally not emitted.
+    assert not (run_dir / "outputs" / "catalog.sqlite").exists()
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["rows"] > 0

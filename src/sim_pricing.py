@@ -6,6 +6,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from scipy.interpolate import CubicSpline, PchipInterpolator
 
+from evaluated_nominal_curve import CurveContractError, EvaluatedNominalShock
 from tdc_shared import DAYS_PER_YEAR_ACTUAL, TGA_FLOOR_TOLERANCE
 
 # Appendix B counts coupon periods on a 365-day nominal year; actual/actual applies within.
@@ -435,6 +436,37 @@ def get_yield_for_maturity(
     except Exception as e:
         return np.nan
 
+
+def evaluate_nominal_yield(
+    maturity_years,
+    curve_years,
+    curve_rates,
+    *,
+    method,
+    floor_zero,
+    shock: EvaluatedNominalShock | None,
+):
+    """Evaluate the unchanged baseline nominal curve, then apply an optional shock."""
+
+    base = get_yield_for_maturity(
+        maturity_years,
+        curve_years,
+        curve_rates,
+        method=method,
+        floor_zero=floor_zero,
+    )
+    if shock is None:
+        return base
+    if not isinstance(shock, EvaluatedNominalShock):
+        raise CurveContractError("nominal curve shock must be an EvaluatedNominalShock")
+    if method != "pchip" or floor_zero is not False:
+        raise CurveContractError(
+            "evaluated additive shock requires baseline pchip with floor_zero=false"
+        )
+
+    return shock.apply_to_baseline(maturity_years, base)
+
+
 def calculate_coupon_rate(security_type, maturity_years, yield_at_issuance, tips_real_coupon):
     """
     Determines the nominal coupon rate at issuance based on security type and market yield.
@@ -732,6 +764,7 @@ __all__ = [
     'get_maturity_category',
     'get_security_category_for_prefs',
     'get_yield_for_maturity',
+    'evaluate_nominal_yield',
     'calculate_coupon_rate',
     'get_payment_date',
     'get_coupon_dates_in_period',

@@ -12,14 +12,28 @@ import math
 import shutil
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
+from evaluated_nominal_curve import (
+    NOMINAL_EVALUATED_SHOCK_FILE,
+    OPEN04_OUTPUT_CONTRACT,
+    build_evaluated_nominal_sidecar,
+    evaluated_nominal_contract_metadata,
+    normalize_open04_override,
+)
 from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
 from .contract import CboScenarioSpec
+from .open04_campaign import (
+    OPEN04_HOLDER_PROFILE_FILE,
+    open04_expected_change_perimeter,
+    parse_open04_campaign_marker,
+    requires_open04_strict_execution,
+)
 from .transforms.fiscal import (
     apply_cash_residual_override,
     apply_debt_target_override,
@@ -47,6 +61,13 @@ ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
 HOLDER_PREFERENCE_EVENTS_FILE = "tdcsim_holder_preference_events.json"
 RUNTIME_ASSUMPTIONS_FILE = "tdcsim_runtime_assumptions.json"
 OPENING_RUNTIME_STATE_FILE = "tdcsim_opening_runtime_state.json"
+OPEN04_ALLOWED_MATERIALIZED_DEFAULTS = frozenset(
+    {
+        ISSUANCE_MIX_FILE,
+        RUNTIME_ASSUMPTIONS_FILE,
+        OPENING_RUNTIME_STATE_FILE,
+    }
+)
 _SOURCE_BASELINE_OPENING_DEFAULTS = {
     "reserves": 3000.0,
     "tdc_level": 0.0,
@@ -79,6 +100,9 @@ INPUT_FILES = {
     "fed_holdings": "tdcsim_fed_holdings_path.csv",
     "fiscal_incidence": "tdcsim_fiscal_incidence_policy.csv",
 }
+OPEN04_ALLOWED_FIXED_ADAPTER_INPUTS = frozenset(
+    {INPUT_FILES["fed_holdings"]}
+)
 
 
 class CompilerError(ValueError):
@@ -117,6 +141,8 @@ class CboScenarioCompiler:
         overrides = _overrides(scenario)
         coupling = _coupling(scenario)
         _validate_override_coupling(overrides, coupling)
+        open04_marker = parse_open04_campaign_marker(scenario)
+        open04_active = requires_open04_strict_execution(scenario)
 
         root = Path(work_dir).expanduser().resolve()
         baseline_dir = root / "baseline"
@@ -130,13 +156,75 @@ class CboScenarioCompiler:
         shutil.copytree(materialized / FORECAST_INPUTS, forecast_inputs_dir)
 
         baseline_digest = digest_input_tree(materialized / FORECAST_INPUTS)
-        changed = _apply_overrides(forecast_inputs_dir, spec, overrides, coupling)
+        nominal_surface_path = forecast_inputs_dir / INPUT_FILES["nominal_yield_curve"]
+        baseline_nominal_surface_sha256 = sha256_file(
+            materialized / FORECAST_INPUTS / INPUT_FILES["nominal_yield_curve"]
+        )
+        scenario_changed = _apply_overrides(
+            forecast_inputs_dir,
+            spec,
+            overrides,
+            coupling,
+        )
+        changed = set(scenario_changed)
         materialized_defaults, adapter_changes = _materialize_required_adapter_assumptions(
             forecast_inputs_dir,
             baseline=baseline,
             overrides=overrides,
         )
         changed.update(adapter_changes)
+        fixed_adapter_inputs = (
+            set(adapter_changes)
+            - set(materialized_defaults)
+            - set(scenario_changed)
+        )
+        changed_inputs = sorted(changed)
+        evaluated_nominal_metadata: Mapping[str, Any] | None = None
+        open04_simulation_contract: Mapping[str, Any] | None = None
+        evaluated_nominal_active = _uses_evaluated_nominal_override(overrides)
+        if evaluated_nominal_active:
+            if open04_marker is None:
+                expected_scenario_changes = {
+                    ISSUANCE_MIX_FILE,
+                    NOMINAL_EVALUATED_SHOCK_FILE,
+                }
+            else:
+                _, physical_paths = open04_expected_change_perimeter(
+                    open04_marker.role
+                )
+                expected_scenario_changes = set(physical_paths)
+            if scenario_changed != expected_scenario_changes:
+                raise CompilerError(
+                    "evaluated nominal override changed an unexpected physical "
+                    f"input: observed={sorted(scenario_changed)}, "
+                    f"required={sorted(expected_scenario_changes)}"
+                )
+            if sha256_file(nominal_surface_path) != baseline_nominal_surface_sha256:
+                raise CompilerError(
+                    "evaluated nominal override changed the release-bound baseline surface"
+                )
+            evaluated_nominal_metadata = evaluated_nominal_contract_metadata(
+                forecast_inputs_dir / NOMINAL_EVALUATED_SHOCK_FILE,
+                nominal_surface_path,
+            )
+            open04_simulation_contract = _open04_simulation_contract(
+                forecast_inputs_dir,
+                scenario=spec.data,
+            )
+        elif open04_active:
+            if open04_marker is None or open04_marker.role != "baseline":
+                raise CompilerError(
+                    "OPEN-04 campaign candidates require the evaluated nominal "
+                    "curve sidecar"
+                )
+            if scenario_changed:
+                raise CompilerError(
+                    "OPEN-04 campaign baseline must not change physical scenario inputs"
+                )
+            open04_simulation_contract = _open04_simulation_contract(
+                forecast_inputs_dir,
+                scenario=spec.data,
+            )
         compiled_digest = digest_input_tree(forecast_inputs_dir)
         if original_package_sha is not None and sha256_file(baseline.package_path) != original_package_sha:
             raise CompilerError("baseline package bytes changed during compilation")
@@ -145,6 +233,7 @@ class CboScenarioCompiler:
             "schema_version": "tdcsim_cbo_compiled_scenario_manifest_v1",
             "scenario_id": spec.scenario_id,
             "scenario_sha256": spec.canonical_sha256(),
+            "scenario_contract": spec.data,
             "baseline": {
                 "package_id": baseline.package_id,
                 "package_sha256": baseline.package_sha256,
@@ -153,7 +242,7 @@ class CboScenarioCompiler:
             },
             "baseline_forecast_inputs_digest": baseline_digest,
             "compiled_inputs_digest": compiled_digest,
-            "changed_inputs": sorted(changed),
+            "changed_inputs": changed_inputs,
             "materialized_defaults": sorted(materialized_defaults),
             "materialized_default_count": len(materialized_defaults),
             "overrides_applied": sorted(overrides),
@@ -168,6 +257,43 @@ class CboScenarioCompiler:
             },
             "input_hashes": input_tree_hashes(forecast_inputs_dir),
         }
+        if open04_marker is not None:
+            manifest["open04_campaign"] = {
+                "contract_id": open04_marker.contract_id,
+                "role": open04_marker.role,
+                "funding_closure_mode": open04_marker.funding_closure_mode,
+            }
+        if open04_active:
+            if evaluated_nominal_metadata is not None:
+                manifest["evaluated_nominal_curve"] = dict(
+                    evaluated_nominal_metadata
+                )
+            manifest["open04_simulation_contract"] = dict(
+                open04_simulation_contract or {}
+            )
+            if open04_marker is None:
+                expected_physical_inputs = (
+                    None if evaluated_nominal_active else ()
+                )
+                economic_changed_paths = (
+                    None if evaluated_nominal_active else ()
+                )
+            else:
+                economic_changed_paths, expected_physical_inputs = (
+                    open04_expected_change_perimeter(open04_marker.role)
+                )
+            manifest["open04_change_perimeter"] = (
+                _open04_change_perimeter(
+                    materialized / FORECAST_INPUTS,
+                    forecast_inputs_dir,
+                    scenario_changed=scenario_changed,
+                    materialized_defaults=materialized_defaults,
+                    fixed_adapter_inputs=fixed_adapter_inputs,
+                    changed_inputs=changed_inputs,
+                    expected_physical_inputs=expected_physical_inputs,
+                    economic_changed_paths=economic_changed_paths,
+                )
+            )
         write_json(manifest_path, manifest)
         return CboCompiledScenario(
             work_dir=root,
@@ -178,7 +304,7 @@ class CboScenarioCompiler:
             baseline_forecast_inputs_digest=baseline_digest,
             compiled_inputs_digest=compiled_digest,
             scenario_sha256=spec.canonical_sha256(),
-            changed_inputs=tuple(sorted(changed)),
+            changed_inputs=tuple(changed_inputs),
             manifest=manifest,
         )
 
@@ -201,6 +327,331 @@ def input_tree_hashes(path: str | Path) -> list[dict[str, Any]]:
             }
         )
     return records
+
+
+def _open04_simulation_contract(
+    compiled_inputs: Path,
+    *,
+    scenario: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    primary_rows, _ = _read_csv(
+        compiled_inputs / INPUT_FILES["primary_deficit"]
+    )
+    dated_primary = [
+        row
+        for row in primary_rows
+        if row.get("period_start") and row.get("period_end")
+    ]
+    if dated_primary:
+        starts = sorted(
+            {
+                _canonical_date(
+                    row.get("period_start"),
+                    label=f"{INPUT_FILES['primary_deficit']}.period_start",
+                )
+                for row in dated_primary
+            }
+        )
+        ends = sorted(
+            {
+                _canonical_date(
+                    row.get("period_end"),
+                    label=f"{INPUT_FILES['primary_deficit']}.period_end",
+                )
+                for row in dated_primary
+            }
+        )
+    else:
+        debt_rows, _ = _read_csv(
+            compiled_inputs / INPUT_FILES["debt_target"]
+        )
+        debt_dates = sorted(
+            {
+                _canonical_date(
+                    row.get("period_end"),
+                    label=f"{INPUT_FILES['debt_target']}.period_end",
+                )
+                for row in debt_rows
+            }
+        )
+        starts = debt_dates
+        ends = debt_dates
+    if not starts or not ends or ends[-1] <= starts[0]:
+        raise CompilerError(
+            "OPEN-04 requires a nonempty full simulation horizon"
+        )
+    start = starts[0]
+    end = ends[-1]
+
+    if scenario is not None:
+        simulation = scenario.get("simulation")
+        if isinstance(simulation, Mapping) and simulation:
+            declared = {
+                "frequency": str(simulation.get("frequency") or ""),
+                "start_date": str(simulation.get("start_date") or ""),
+                "end_date": str(simulation.get("end_date") or ""),
+            }
+            required = {
+                "frequency": "daily",
+                "start_date": start,
+                "end_date": end,
+            }
+            if declared != required:
+                raise CompilerError(
+                    "OPEN-04 simulation dates must equal the full compiled-input "
+                    f"horizon: declared={declared}, required={required}"
+                )
+        output = scenario.get("output")
+        if (
+            not isinstance(output, Mapping)
+            or dict(output) != dict(OPEN04_OUTPUT_CONTRACT)
+        ):
+            raise CompilerError(
+                "OPEN-04 requires the compact gzip output contract"
+            )
+
+    surface_rows, _ = _read_csv(
+        compiled_inputs / INPUT_FILES["nominal_yield_curve"]
+    )
+    stored_dates = sorted(
+        {
+            _canonical_date(
+                row.get("curve_date"),
+                label=f"{INPUT_FILES['nominal_yield_curve']}.curve_date",
+            )
+            for row in surface_rows
+        }
+    )
+    prior = [value for value in stored_dates if value <= start]
+    if not prior:
+        raise CompilerError(
+            "OPEN-04 nominal surface has no curve date at or before its horizon"
+        )
+    selected_dates = [prior[-1]]
+    selected_dates.extend(
+        value for value in stored_dates if start < value <= end
+    )
+    return {
+        "schema_version": "tdcsim_open04_simulation_contract_v1",
+        "frequency": "daily",
+        "start_date": start,
+        "end_date": end,
+        "runtime_selected_curve_date_count": len(selected_dates),
+        "runtime_selected_curve_date_set_sha256": canonical_json_sha256(
+            selected_dates
+        ),
+        "output_profile": OPEN04_OUTPUT_CONTRACT["profile"],
+        "compression": OPEN04_OUTPUT_CONTRACT["compression"],
+    }
+
+
+def _canonical_date(value: Any, *, label: str) -> str:
+    text = str(value or "")
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise CompilerError(f"{label} must be a canonical ISO date") from exc
+    if parsed.isoformat() != text:
+        raise CompilerError(f"{label} must be a canonical ISO date")
+    return text
+
+
+def _open04_change_perimeter(
+    baseline_inputs: Path,
+    compiled_inputs: Path,
+    *,
+    scenario_changed: set[str],
+    materialized_defaults: set[str],
+    changed_inputs: Iterable[str],
+    fixed_adapter_inputs: Iterable[str] = (),
+    expected_physical_inputs: Iterable[str] | None = None,
+    economic_changed_paths: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    expected_physical = set(
+        expected_physical_inputs
+        if expected_physical_inputs is not None
+        else {
+            ISSUANCE_MIX_FILE,
+            NOMINAL_EVALUATED_SHOCK_FILE,
+        }
+    )
+    economic_paths = list(
+        economic_changed_paths
+        if economic_changed_paths is not None
+        else (
+            "issuance_mix",
+            "nominal_yield_curve_assumption",
+        )
+    )
+    if len(economic_paths) != len(set(economic_paths)) or not all(
+        isinstance(path, str) and path for path in economic_paths
+    ):
+        raise CompilerError(
+            "OPEN-04 economic changed paths must be unique nonempty strings"
+        )
+    if scenario_changed != expected_physical:
+        raise CompilerError(
+            "OPEN-04 physical changed-input set is outside its approved perimeter"
+        )
+    materialized = set(materialized_defaults)
+    if not materialized <= OPEN04_ALLOWED_MATERIALIZED_DEFAULTS:
+        raise CompilerError(
+            "OPEN-04 materialized-default set is outside its approved perimeter"
+        )
+    fixed_adapter = set(fixed_adapter_inputs)
+    if not fixed_adapter <= OPEN04_ALLOWED_FIXED_ADAPTER_INPUTS:
+        raise CompilerError(
+            "OPEN-04 fixed-adapter set is outside its approved perimeter"
+        )
+    if fixed_adapter & (expected_physical | materialized):
+        raise CompilerError(
+            "OPEN-04 fixed-adapter inputs must be disjoint from physical "
+            "and materialized-default inputs"
+        )
+    declared_changed = list(changed_inputs)
+    if not all(isinstance(path, str) and path for path in declared_changed):
+        raise CompilerError(
+            "OPEN-04 changed_inputs must contain only nonempty path strings"
+        )
+    declared_changed_set = set(declared_changed)
+    if len(declared_changed_set) != len(declared_changed):
+        raise CompilerError("OPEN-04 changed_inputs must be duplicate-free")
+    required_changed = expected_physical | materialized | fixed_adapter
+    if declared_changed_set != required_changed:
+        raise CompilerError(
+            "OPEN-04 changed_inputs must equal physical_changed_inputs union "
+            "materialized_default_inputs union fixed_adapter_inputs: "
+            f"observed={sorted(declared_changed_set)}, "
+            f"required={sorted(required_changed)}"
+        )
+    baseline_records = {
+        item["path"]: item for item in input_tree_hashes(baseline_inputs)
+    }
+    compiled_records = {
+        item["path"]: item for item in input_tree_hashes(compiled_inputs)
+    }
+    baseline_paths = set(baseline_records)
+    compiled_paths = set(compiled_records)
+    if NOMINAL_EVALUATED_SHOCK_FILE in baseline_paths:
+        raise CompilerError(
+            "OPEN-04 baseline input tree must not contain a scenario curve sidecar"
+        )
+    materialized_already_present = materialized & baseline_paths
+    if materialized_already_present:
+        raise CompilerError(
+            "OPEN-04 materialized defaults were already present in the baseline: "
+            f"{sorted(materialized_already_present)}"
+        )
+    fixed_adapter_not_common = fixed_adapter - (
+        baseline_paths & compiled_paths
+    )
+    if fixed_adapter_not_common:
+        raise CompilerError(
+            "OPEN-04 fixed-adapter inputs must exist in both baseline and "
+            f"compiled trees: {sorted(fixed_adapter_not_common)}"
+        )
+    missing_baseline = sorted(baseline_paths - compiled_paths)
+    if missing_baseline:
+        raise CompilerError(
+            "OPEN-04 compiled tree removed fixed baseline inputs: "
+            f"{missing_baseline[:10]}"
+        )
+    approved_added = (expected_physical | materialized) - baseline_paths
+    actual_added = compiled_paths - baseline_paths
+    if actual_added != approved_added:
+        raise CompilerError(
+            "OPEN-04 compiled tree added inputs outside its approved perimeter: "
+            f"observed={sorted(actual_added)}, approved={sorted(approved_added)}"
+        )
+    changed_common = {
+        path
+        for path in baseline_paths & compiled_paths
+        if (
+            baseline_records[path]["sha256"]
+            != compiled_records[path]["sha256"]
+            or baseline_records[path]["bytes"]
+            != compiled_records[path]["bytes"]
+        )
+    }
+    actual_physical = (
+        actual_added - materialized
+    ) | (changed_common - fixed_adapter)
+    if actual_physical != expected_physical:
+        raise CompilerError(
+            "OPEN-04 physical byte changes do not match its approved perimeter: "
+            f"observed={sorted(actual_physical)}, "
+            f"approved={sorted(expected_physical)}"
+        )
+    common_fixed = sorted(
+        (baseline_paths & compiled_paths) - expected_physical
+    )
+    mismatches = [
+        path
+        for path in common_fixed
+        if baseline_records[path]["sha256"]
+        != compiled_records[path]["sha256"]
+        or baseline_records[path]["bytes"]
+        != compiled_records[path]["bytes"]
+    ]
+    unapproved_mismatches = [
+        path for path in mismatches if path not in fixed_adapter
+    ]
+    if unapproved_mismatches:
+        raise CompilerError(
+            "OPEN-04 changed fixed baseline inputs: "
+            f"{unapproved_mismatches[:10]}"
+        )
+    if set(mismatches) != fixed_adapter:
+        raise CompilerError(
+            "OPEN-04 fixed-adapter declarations do not equal the fixed "
+            f"common-input changes: observed={sorted(mismatches)}, "
+            f"declared={sorted(fixed_adapter)}"
+        )
+    fixed_records = [
+        {
+            "path": path,
+            "sha256": compiled_records[path]["sha256"],
+            "bytes": compiled_records[path]["bytes"],
+        }
+        for path in common_fixed
+    ]
+    added_records = [
+        {
+            "path": path,
+            "sha256": compiled_records[path]["sha256"],
+            "bytes": compiled_records[path]["bytes"],
+        }
+        for path in sorted(actual_added)
+    ]
+    fixed_adapter_records = [
+        {
+            "path": path,
+            "baseline_sha256": baseline_records[path]["sha256"],
+            "baseline_bytes": baseline_records[path]["bytes"],
+            "compiled_sha256": compiled_records[path]["sha256"],
+            "compiled_bytes": compiled_records[path]["bytes"],
+        }
+        for path in sorted(fixed_adapter)
+    ]
+    return {
+        "schema_version": "tdcsim_open04_change_perimeter_v3",
+        "economic_changed_paths": economic_paths,
+        "physical_changed_inputs": sorted(expected_physical),
+        "materialized_default_inputs": sorted(materialized),
+        "fixed_adapter_inputs": sorted(fixed_adapter),
+        "fixed_adapter_input_records_sha256": canonical_json_sha256(
+            fixed_adapter_records
+        ),
+        "baseline_input_count": len(baseline_records),
+        "compiled_input_count": len(compiled_records),
+        "approved_added_input_count": len(added_records),
+        "approved_added_input_records_sha256": canonical_json_sha256(
+            added_records
+        ),
+        "fixed_common_input_count": len(fixed_records),
+        "fixed_input_comparison_status": "pass",
+        "fixed_input_records_sha256": canonical_json_sha256(fixed_records),
+    }
 
 
 def _prepare_work_dir(root: Path, baseline_dir: Path, compiled_dir: Path) -> None:
@@ -248,11 +699,24 @@ def _apply_overrides(
 
     if "nominal_yield_curve" in overrides:
         override = _override_mapping(overrides["nominal_yield_curve"])
-        rows, header = _read_csv(forecast_inputs_dir / INPUT_FILES["nominal_yield_curve"])
-        replacement = _csv_file_override_rows(spec, override, baseline_rows=rows)
-        nominal_rows = apply_nominal_yield_curve_override(rows, override, replacement_rows=replacement)
-        _write_csv(forecast_inputs_dir / INPUT_FILES["nominal_yield_curve"], nominal_rows, preferred_header=header)
-        changed.add(INPUT_FILES["nominal_yield_curve"])
+        nominal_surface_path = forecast_inputs_dir / INPUT_FILES["nominal_yield_curve"]
+        if override.get("mode") == "evaluated_additive_key_rate_bp":
+            normalized = normalize_open04_override(override)
+            sidecar = build_evaluated_nominal_sidecar(
+                normalized,
+                nominal_surface_path,
+            )
+            write_json(
+                forecast_inputs_dir / NOMINAL_EVALUATED_SHOCK_FILE,
+                sidecar,
+            )
+            changed.add(NOMINAL_EVALUATED_SHOCK_FILE)
+        else:
+            rows, header = _read_csv(nominal_surface_path)
+            replacement = _csv_file_override_rows(spec, override, baseline_rows=rows)
+            nominal_rows = apply_nominal_yield_curve_override(rows, override, replacement_rows=replacement)
+            _write_csv(nominal_surface_path, nominal_rows, preferred_header=header)
+            changed.add(INPUT_FILES["nominal_yield_curve"])
     elif _needs_nominal_rows(overrides, coupling):
         nominal_rows, _ = _read_csv(forecast_inputs_dir / INPUT_FILES["nominal_yield_curve"])
 
@@ -367,10 +831,16 @@ def _apply_overrides(
             )
             changed.add(HOLDER_PREFERENCE_EVENTS_FILE)
         else:
-            rows, header = _read_csv(forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv")
+            rows, header = _read_csv(
+                forecast_inputs_dir / OPEN04_HOLDER_PROFILE_FILE
+            )
             output = _compile_holder_preferences(rows, header, override, fed_stock_target_active=fed_active)
-            _write_csv(forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv", output, preferred_header=header)
-            changed.add("tdcsim_holder_profile_assumptions.csv")
+            _write_csv(
+                forecast_inputs_dir / OPEN04_HOLDER_PROFILE_FILE,
+                output,
+                preferred_header=header,
+            )
+            changed.add(OPEN04_HOLDER_PROFILE_FILE)
 
     if "issuance_mix" in overrides:
         issuance_mix = compile_issuance_mix_override(_override_mapping(overrides["issuance_mix"]))
@@ -813,6 +1283,14 @@ def _needs_nominal_rows(overrides: Mapping[str, Any], coupling: Mapping[str, Any
     )
 
 
+def _uses_evaluated_nominal_override(overrides: Mapping[str, Any]) -> bool:
+    nominal = overrides.get("nominal_yield_curve")
+    return (
+        isinstance(nominal, Mapping)
+        and nominal.get("mode") == "evaluated_additive_key_rate_bp"
+    )
+
+
 def _override_mapping(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise CompilerError("override value must be a mapping")
@@ -1007,18 +1485,27 @@ def _compile_holder_preferences(
     for row in baseline_rows:
         holder = str(row.get("holder_type") or "")
         new = dict(row)
-        if holder in share_by_holder:
-            new.update(share_by_holder[holder])
+        subbucket = str(row.get("holder_subbucket") or "").strip()
+        if not subbucket and holder in share_by_holder:
+            for column, share in share_by_holder[holder].items():
+                original = str(row.get(column) or "")
+                try:
+                    unchanged = float(original) == share
+                except ValueError:
+                    unchanged = False
+                if not unchanged:
+                    new[column] = repr(share)
             seen_holders.add(holder)
-        new["source_role"] = "scenario_assumption"
-        new["runtime_role"] = "memo_only"
-        new["claim_boundary"] = "holder preference profile not exact holder ownership"
-        new["scenario_transform"] = "static_shares"
         output.append(new)
     for holder in sorted(set(share_by_holder) - seen_holders):
         new = {field: "" for field in header}
         new["holder_type"] = holder
-        new.update(share_by_holder[holder])
+        new.update(
+            {
+                column: repr(share)
+                for column, share in share_by_holder[holder].items()
+            }
+        )
         new["source_role"] = "scenario_assumption"
         new["runtime_role"] = "memo_only"
         new["claim_boundary"] = "holder preference profile not exact holder ownership"

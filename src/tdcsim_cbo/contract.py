@@ -8,9 +8,19 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Mapping
 
+from evaluated_nominal_curve import (
+    OPEN04_FIXED_COUPLING,
+    OPEN04_OUTPUT_CONTRACT,
+    normalize_open04_override,
+)
+
 from ._json import canonical_json_sha256, canonical_json_text, read_json, sha256_file
 from ._schema import SchemaValidationError, validate_schema
 from .baseline import CboBaselinePackage
+from .open04_campaign import (
+    parse_open04_campaign_marker,
+    validate_open04_scenario_contract,
+)
 
 
 SCENARIO_SCHEMA_RESOURCE = "schemas/cbo-scenario-v1.schema.json"
@@ -39,7 +49,25 @@ class CboScenarioSpec:
         _validate_no_compatible_baseline(data)
         _validate_file_references(data)
         _validate_mode_specific_overrides(data)
-        return cls(path=Path(path).resolve() if path is not None else None, data=dict(data))
+        canonical_data = dict(data)
+        overrides = data.get("overrides")
+        if isinstance(overrides, Mapping):
+            nominal = overrides.get("nominal_yield_curve")
+            if (
+                isinstance(nominal, Mapping)
+                and nominal.get("mode") == "evaluated_additive_key_rate_bp"
+            ):
+                canonical_overrides = dict(overrides)
+                canonical_overrides["nominal_yield_curve"] = (
+                    normalize_open04_override(nominal)
+                )
+                canonical_data["overrides"] = canonical_overrides
+        if parse_open04_campaign_marker(canonical_data) is not None:
+            validate_open04_scenario_contract(canonical_data)
+        return cls(
+            path=Path(path).resolve() if path is not None else None,
+            data=canonical_data,
+        )
 
     @property
     def scenario_id(self) -> str:
@@ -142,14 +170,80 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
             _validate_by_mode(name, override, mode, {"official_cbo_baseline": (("role",), ())})
         elif name == "mmf_deposit_pass_through":
             _validate_by_mode(name, override, mode, {"fixed_fraction": (("value",), ())})
+    _validate_open04_evaluated_nominal_contract(data, overrides)
 
 
 def _nominal_curve_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
     return {
         "parallel_bp": (("shock_bp",), ()),
         "key_rate_bp": (("shocks",), ("interpolation",)),
+        "evaluated_additive_key_rate_bp": (
+            (
+                "application",
+                "interpolation",
+                "lower_endpoint",
+                "upper_endpoint",
+                "time_profile",
+                "compounding",
+                "shocks",
+            ),
+            (),
+        ),
         "full_surface_file": (("file",), ()),
     }
+
+
+def _validate_open04_evaluated_nominal_contract(
+    data: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+) -> None:
+    nominal = overrides.get("nominal_yield_curve")
+    if not isinstance(nominal, Mapping) or nominal.get("mode") != "evaluated_additive_key_rate_bp":
+        return
+
+    expected_overrides = {"issuance_mix", "nominal_yield_curve"}
+    marker = parse_open04_campaign_marker(data)
+    if marker is not None and marker.role == "candidate_a":
+        expected_overrides.add("holder_preferences")
+    actual_overrides = set(overrides)
+    if actual_overrides != expected_overrides:
+        raise ValueError(
+            "OPEN-04 evaluated nominal scenario overrides must be exactly "
+            f"{sorted(expected_overrides)}; got {sorted(actual_overrides)}"
+        )
+
+    coupling = data.get("coupling")
+    if (
+        not isinstance(coupling, Mapping)
+        or dict(coupling) != dict(OPEN04_FIXED_COUPLING)
+    ):
+        raise ValueError(
+            "OPEN-04 evaluated nominal scenario requires the fixed independent "
+            "FRN/TIPS-real, baseline-CPI, no-plug coupling contract"
+        )
+
+    output = data.get("output")
+    if (
+        not isinstance(output, Mapping)
+        or dict(output) != dict(OPEN04_OUTPUT_CONTRACT)
+    ):
+        raise ValueError(
+            "OPEN-04 evaluated nominal scenario requires compact gzip output"
+        )
+
+    simulation = data.get("simulation")
+    if simulation is not None:
+        if (
+            not isinstance(simulation, Mapping)
+            or set(simulation) != {"frequency", "start_date", "end_date"}
+            or simulation.get("frequency") != "daily"
+        ):
+            raise ValueError(
+                "OPEN-04 simulation, when declared, must contain exactly "
+                "daily frequency plus start_date and end_date"
+            )
+
+    normalize_open04_override(nominal)
 
 
 def _frn_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:

@@ -264,7 +264,7 @@ scenario_groups:
           sector_preferences: *sector_preferences_banks_pref_notes
           yield_curve: *yield_curve_default
 
-  # --- Thesis Figure: TDC rises while debt-service costs fall ---
+  # --- Illustrative Figure: TDC rises while debt-service costs fall ---
   - group_name: "TDC vs Debt Management"
     group_output_settings:
       save_plot_filename: "output/tdc_vs_cost"

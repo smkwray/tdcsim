@@ -25,6 +25,99 @@ RUN_UNSUPPORTED_COMPONENTS = [
 ]
 
 
+def record_parent_watchdog_acceptance(
+    manifest: Mapping[str, Any],
+    *,
+    child_pid: int,
+    child_returncode: int,
+    action: str,
+    peak_rss_bytes: int,
+    worker_peak_rss_bytes: int,
+    acceptance_peak_rss_bytes: int,
+    terminate_rss_bytes: int,
+    kill_rss_bytes: int,
+    poll_interval_seconds: float,
+) -> dict[str, Any]:
+    """Finalize a staged manifest with the parent's full-child RSS observation."""
+
+    if manifest.get("schema_version") != "tdcsim_cbo_scenario_run_manifest_v2":
+        raise ValueError("parent watchdog acceptance requires a bounded v2 manifest")
+    if manifest.get("status") != "pending_parent_watchdog_acceptance":
+        raise ValueError("manifest is not awaiting parent watchdog acceptance")
+    peak = int(peak_rss_bytes)
+    worker_peak = int(worker_peak_rss_bytes)
+    limit = int(acceptance_peak_rss_bytes)
+    effective_peak = max(peak, worker_peak)
+    if (
+        action != "completed"
+        or int(child_returncode) != 0
+        or peak < 0
+        or worker_peak < 0
+        or limit <= 0
+        or effective_peak > limit
+    ):
+        raise ValueError(
+            "parent watchdog result is not acceptable: "
+            f"action={action}, returncode={child_returncode}, "
+            f"parent_peak={peak}, worker_peak={worker_peak}, limit={limit}"
+        )
+    if int(terminate_rss_bytes) <= limit:
+        raise ValueError("parent terminate threshold must exceed acceptance threshold")
+    if int(kill_rss_bytes) <= int(terminate_rss_bytes):
+        raise ValueError("parent kill threshold must exceed terminate threshold")
+    interval = float(poll_interval_seconds)
+    if interval <= 0.0:
+        raise ValueError("parent watchdog poll interval must be positive")
+
+    bounded = manifest.get("bounded_evidence")
+    if not isinstance(bounded, Mapping):
+        raise ValueError("bounded evidence is missing from staged manifest")
+    thresholds = bounded.get("memory_thresholds")
+    if not isinstance(thresholds, Mapping):
+        raise ValueError("bounded memory thresholds are missing from staged manifest")
+    expected = {
+        "acceptance_peak_rss_bytes": limit,
+        "parent_graceful_stop_rss_bytes": int(terminate_rss_bytes),
+        "parent_kill_rss_bytes": int(kill_rss_bytes),
+    }
+    for key, value in expected.items():
+        if int(thresholds.get(key, -1)) != value:
+            raise ValueError(f"parent watchdog threshold disagrees with {key}")
+
+    finalized = dict(manifest)
+    finalized["status"] = "complete"
+    finalized["parent_watchdog"] = {
+        "status": "accepted",
+        "sampler": "parent_process_rss_poll_v1",
+        "child_pid": int(child_pid),
+        "child_returncode": int(child_returncode),
+        "action": action,
+        "peak_rss_bytes": peak,
+        "worker_peak_rss_bytes": worker_peak,
+        "effective_peak_rss_bytes": effective_peak,
+        "acceptance_peak_rss_bytes": limit,
+        "terminate_rss_bytes": int(terminate_rss_bytes),
+        "kill_rss_bytes": int(kill_rss_bytes),
+        "poll_interval_seconds": interval,
+    }
+    validation = dict(finalized.get("validation") or {})
+    invariants = list(validation.get("invariants") or [])
+    invariants.append(
+        {
+            "id": "parent_watchdog_peak_rss",
+            "status": "pass",
+            "observed": effective_peak,
+            "limit": limit,
+        }
+    )
+    validation["invariants"] = invariants
+    finalized["validation"] = validation
+    milestones = list(finalized.get("execution_milestones") or [])
+    milestones.append("parent_watchdog_accepted")
+    finalized["execution_milestones"] = milestones
+    return finalized
+
+
 def build_run_manifest(
     *,
     scenario_id: str,
@@ -44,15 +137,63 @@ def build_run_manifest(
     boundary_checks: Mapping[str, Any],
     code_environment: Mapping[str, Any],
     generated_at_utc: str,
+    bounded_evidence: Mapping[str, Any] | None = None,
+    evaluated_nominal_curve: Mapping[str, Any] | None = None,
+    execution_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the public run manifest with explicit unsupported components."""
 
     validation = validation_from_boundary_checks(boundary_checks)
-    return {
-        "schema_version": "tdcsim_cbo_scenario_run_manifest_v1",
+    bounded = dict(bounded_evidence or {})
+    if bounded:
+        if bounded.get("evidence_profile") != "bounded_period_closure_v1":
+            raise ValueError("unsupported bounded evidence profile")
+        if bounded.get("verification_grade") != "bounded_replay_v1":
+            raise ValueError("unsupported bounded verification grade")
+        validation = {
+            **validation,
+            "invariants": [
+                *validation["invariants"],
+                {
+                    "id": "bounded_period_closure",
+                    "status": "pass",
+                    "observed": f"periods={int(bounded.get('period_count', 0))}",
+                },
+                {
+                    "id": "portfolio_row_budget",
+                    "status": (
+                        "pass"
+                        if int(bounded.get("max_portfolio_rows", 0))
+                        <= int(bounded.get("portfolio_row_budget", 0))
+                        else "fail"
+                    ),
+                    "observed": int(bounded.get("max_portfolio_rows", 0)),
+                    "limit": int(bounded.get("portfolio_row_budget", 0)),
+                },
+                {
+                    "id": "key_cardinality_budget",
+                    "status": (
+                        "pass"
+                        if int(bounded.get("max_key_cardinality", 0))
+                        <= int(bounded.get("key_cardinality_budget", 0))
+                        else "fail"
+                    ),
+                    "observed": int(bounded.get("max_key_cardinality", 0)),
+                    "limit": int(bounded.get("key_cardinality_budget", 0)),
+                },
+            ],
+        }
+    manifest = {
+        "schema_version": (
+            "tdcsim_cbo_scenario_run_manifest_v2"
+            if bounded
+            else "tdcsim_cbo_scenario_run_manifest_v1"
+        ),
         "run_id": f"{scenario_id}-{scenario_sha256[:12]}",
         "status": "complete",
-        "verification_grade": "local",
+        "verification_grade": (
+            str(bounded["verification_grade"]) if bounded else "local"
+        ),
         "generated_at_utc": generated_at_utc,
         "baseline": {
             "package_id": baseline.package_id,
@@ -100,7 +241,64 @@ def build_run_manifest(
         "boundary_checks": dict(boundary_checks),
         "validation": validation,
         "unsupported_components": list(RUN_UNSUPPORTED_COMPONENTS),
+        "execution_contract": dict(execution_contract or {}),
     }
+    if bounded:
+        manifest.update(
+            {
+                "evidence_profile": str(bounded["evidence_profile"]),
+                "aggregation_clock": {
+                    "clock_id": "federal_fiscal_year_period_end_v1",
+                    "bucket_label_rule": "federal_fiscal_year_by_period_end",
+                    "opening_partial_policy": "unannualized_separate_partial_bucket",
+                    "snapshot_date_rule": "exact_september_30",
+                },
+                "bounded_evidence": {
+                    "event_schema_version": str(
+                        bounded["event_schema_version"]
+                    ),
+                    "event_count": int(bounded["event_count"]),
+                    "event_root_sha256": str(bounded["event_root_sha256"]),
+                    "final_state_sha256": str(bounded["final_state_sha256"]),
+                    "period_count": int(bounded["period_count"]),
+                    "portfolio_row_budget": int(
+                        bounded["portfolio_row_budget"]
+                    ),
+                    "max_portfolio_rows": int(bounded["max_portfolio_rows"]),
+                    "max_active_portfolio_rows": int(
+                        bounded["max_active_portfolio_rows"]
+                    ),
+                    "key_cardinality_budget": int(
+                        bounded["key_cardinality_budget"]
+                    ),
+                    "max_key_cardinality": int(
+                        bounded["max_key_cardinality"]
+                    ),
+                    "peak_rss_bytes": int(bounded["peak_rss_bytes"]),
+                    "memory_thresholds": dict(bounded["memory_thresholds"]),
+                    "deterministic_artifacts": dict(
+                        bounded["deterministic_artifacts"]
+                    ),
+                    "resource_artifact": dict(
+                        bounded["artifacts"]["resources"]
+                    ),
+                    "invariant_status": "pass",
+                },
+                "execution_milestones": [
+                    "compile_complete",
+                    "engine_started",
+                    "engine_complete",
+                    "source_evidence_finalized",
+                    "bounded_period_closure_passed",
+                    "run_manifest_finalized",
+                ],
+            }
+        )
+    if evaluated_nominal_curve is not None:
+        manifest["evaluated_nominal_curve"] = dict(
+            evaluated_nominal_curve
+        )
+    return manifest
 
 
 def validation_from_boundary_checks(boundary_checks: Mapping[str, Any]) -> dict[str, Any]:
@@ -246,5 +444,6 @@ __all__ = [
     "RUN_CLAIM_BOUNDARY",
     "RUN_UNSUPPORTED_COMPONENTS",
     "build_run_manifest",
+    "record_parent_watchdog_acceptance",
     "validation_from_boundary_checks",
 ]

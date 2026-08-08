@@ -11,6 +11,7 @@ from tdc_shared import (
     DAYS_PER_YEAR_ACTUAL,
     HOLDER_TYPES,
     INTRAGOV_HOLDERS,
+    MARKETABLE_PREFERENCE_CATEGORIES,
     PORTFOLIO_DTYPES,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
@@ -238,7 +239,9 @@ def execute_preference_trades(
         target_bonds_pct = target_prefs.get('bonds_pct', 0.0)
         target_tips_pct = target_prefs.get('tips_pct', 0.0)
         target_frn_pct = target_prefs.get('frn_pct', 0.0)
-        actual_values_by_cat = {cat: 0.0 for cat in ['bills', 'notes', 'bonds', 'tips', 'frn']}
+        actual_values_by_cat = {
+            cat: 0.0 for cat in MARKETABLE_PREFERENCE_CATEGORIES
+        }
         for _, row in holder_portfolio_subset.iterrows():
             cat_key = get_security_category_for_prefs(row['SecurityType'], row['OriginalMaturityYears'], issuance_profile)
             if cat_key in actual_values_by_cat:
@@ -255,7 +258,7 @@ def execute_preference_trades(
             holder_imbalances['tips'] = actual_tips_value - holder_total_value * target_tips_pct
             holder_imbalances['frn'] = actual_frn_value - holder_total_value * target_frn_pct
         else:
-            for cat in ['bills', 'notes', 'bonds', 'tips', 'frn']:
+            for cat in MARKETABLE_PREFERENCE_CATEGORIES:
                 holder_imbalances[cat] = 0.0
         imbalance_values[holder] = holder_imbalances
     potential_trades = []

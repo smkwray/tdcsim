@@ -6,7 +6,7 @@ import pandas.testing as pdt
 import pytest
 import yaml
 
-from csv_gen import generate_initial_portfolio
+from csv_gen import _build_config_derived_generation_context, generate_initial_portfolio
 from simulation_core import execute_preference_trades, run_simulation
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
 from tdc_validation import validate_config, validate_events, validate_sector_preferences
@@ -600,6 +600,18 @@ def test_config_derived_generated_portfolio_uses_config_curve_and_maturities():
     assert not df.empty
     assert set(df['OriginalMaturityYears'].astype(float).unique()) == {1.0}
     assert ((df['IssueYieldAtIssue'] - 0.05).abs() < 1e-6).all()
+
+
+def test_config_derived_portfolio_rejects_missing_positive_category_terms():
+    base_config = minimal_params()
+    base_config['treasury_issuance_profile'] = {
+        'bills': {'target_percentage_of_remainder': 1.0},
+        'notes': {'target_percentage_of_remainder': 0.0},
+        'bonds': {'target_percentage_of_remainder': 0.0},
+    }
+
+    with pytest.raises(ValueError, match='positive bills issuance'):
+        _build_config_derived_generation_context({}, base_config)
 
 
 def test_legacy_generator_ignores_optional_base_config_when_generation_method_legacy():

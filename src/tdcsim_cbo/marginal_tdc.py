@@ -18,6 +18,7 @@ import pandas as pd
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from ._schema import validate_schema
+from .bounded_output import VERIFICATION_GRADE as BOUNDED_VERIFICATION_GRADE
 from .campaign_store import (
     CampaignStoreError,
     locate_source_run_catalog,
@@ -374,8 +375,10 @@ def _load_run(
             )
         except VerificationError as exc:
             raise MarginalTdcPairError(f"{role} source run does not pass replay verification: {exc}") from exc
-        if verification.get("verification_grade") != "replay":
-            raise MarginalTdcPairError(f"{role} source run did not achieve replay verification grade")
+        if verification.get("verification_grade") != BOUNDED_VERIFICATION_GRADE:
+            raise MarginalTdcPairError(
+                f"{role} source run did not achieve bounded replay verification grade"
+            )
     return _RunBundle(
         role=role,
         root=root,
@@ -1174,7 +1177,11 @@ def _first_row_with_horizon_dates(
 def _assemble_route_metadata(spec: Mapping[str, Any], baseline: _RunBundle, shock: _RunBundle) -> pd.DataFrame:
     frames = []
     for role, run in (("baseline", baseline), ("shock", shock)):
-        frame = _load_output_frame(run, "tdcsim_tdc_principal_route_stock_closure")
+        try:
+            frame = _load_output_frame(run, "tdcsim_period_route_stock_closure")
+        except MarginalTdcPairError:
+            # Archived pre-bounded runs used the handoff-table name directly.
+            frame = _load_output_frame(run, "tdcsim_tdc_principal_route_stock_closure")
         if frame.empty:
             raise MarginalTdcPairError(f"{role} route metadata is empty")
         frame = frame.copy()

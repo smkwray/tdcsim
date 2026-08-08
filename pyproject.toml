@@ -26,6 +26,7 @@ tdcsim-cbo = "tdcsim_cbo.cli:main"
 package-dir = {"" = "src"}
 packages = ["tdcsim_cbo", "tdcsim_cbo.schemas", "tdcsim_cbo.transforms"]
 py-modules = [
+  "bill_quote_basis",
   "budget_interest",
   "cbo_policy_bundle",
   "cbo_portfolio_builder",
@@ -33,6 +34,7 @@ py-modules = [
   "contract_validation",
   "csv_gen",
   "debt_targeting",
+  "evaluated_nominal_curve",
   "forecast_bundle_builders",
   "forecast_input_builder",
   "forecast_paths",
