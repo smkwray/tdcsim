@@ -13,7 +13,13 @@ import numpy as np
 import os
 import yaml
 from sim_pricing import calculate_coupon_rate, get_yield_for_maturity
-from tdc_shared import BOND_PORTFOLIO_COLS, HOLDER_TYPES, ISSUANCE_PROFILE_CUTOFFS, TGA_FLOOR_TOLERANCE
+from tdc_shared import (
+    BOND_PORTFOLIO_COLS,
+    HOLDER_TYPES,
+    ISSUANCE_PROFILE_CUTOFFS,
+    MARKETABLE_PREFERENCE_CATEGORIES,
+    TGA_FLOOR_TOLERANCE,
+)
 
 # --- Constants ---
 SECTOR_PREFERENCES = {
@@ -71,12 +77,12 @@ NUM_TRANCHES_PER_TYPE = {
     'nonmarketable_federal': 50
 }
 
-CONFIG_DERIVED_CATEGORY_DEFAULTS = {
-    'bills': {'maturities': [0.25, 0.5, 1.0], 'weights': [0.40, 0.40, 0.20], 'security_type': 'Fixed'},
-    'notes': {'maturities': [2.0, 3.0, 5.0, 7.0, 10.0], 'weights': [0.25, 0.25, 0.30, 0.15, 0.05], 'security_type': 'Fixed'},
-    'bonds': {'maturities': [20.0, 30.0], 'weights': [0.70, 0.30], 'security_type': 'Fixed'},
-    'tips': {'maturities': [5.0, 10.0, 30.0], 'weights': [0.50, 0.30, 0.20], 'security_type': 'TIPS'},
-    'frn': {'maturities': [2.0], 'weights': [1.0], 'security_type': 'FRN'},
+CONFIG_DERIVED_SECURITY_TYPES = {
+    'bills': 'Fixed',
+    'notes': 'Fixed',
+    'bonds': 'Fixed',
+    'tips': 'TIPS',
+    'frn': 'FRN',
 }
 
 
@@ -177,21 +183,34 @@ def _build_config_derived_generation_context(gen_config, base_config):
             fallback = SECTOR_PREFERENCES.get(holder, {})
             normalized_mix = _normalize_mapping({
                 category: float(fallback.get(f'{category}_pct', 0.0) or 0.0)
-                for category in ['bills', 'notes', 'bonds', 'tips', 'frn']
+                for category in MARKETABLE_PREFERENCE_CATEGORIES
             })
         holder_mix_by_category[holder] = normalized_mix
 
     category_specs = {}
-    for category, defaults in CONFIG_DERIVED_CATEGORY_DEFAULTS.items():
+    for category, security_type in CONFIG_DERIVED_SECURITY_TYPES.items():
         source_key = category if category in ['bills', 'notes', 'bonds'] else category.upper()
         cfg = issuance_profile.get(source_key, {})
-        maturities = list(cfg.get('maturities', defaults['maturities']))
-        weights = _normalize_positive_weights(cfg.get('maturity_distribution', []), defaults['weights'])
-        if len(maturities) != len(weights) or not maturities:
-            maturities = list(defaults['maturities'])
-            weights = _normalize_positive_weights(defaults['weights'], defaults['weights'])
+        category_share = float(category_shares[category])
+        maturities = list(cfg.get('maturities', [])) if isinstance(cfg, dict) else []
+        raw_weights = list(cfg.get('maturity_distribution', [])) if isinstance(cfg, dict) else []
+        if category_share > TGA_FLOOR_TOLERANCE:
+            if not maturities or not raw_weights or len(maturities) != len(raw_weights):
+                raise ValueError(
+                    f"config_derived portfolio requires matching non-empty maturities and "
+                    f"maturity_distribution for positive {source_key} issuance"
+                )
+            weights = _normalize_positive_weights(raw_weights, [])
+            if len(weights) != len(maturities) or sum(weights) <= TGA_FLOOR_TOLERANCE:
+                raise ValueError(
+                    f"config_derived portfolio requires a positive maturity distribution "
+                    f"for {source_key}"
+                )
+        else:
+            maturities = []
+            weights = []
         category_specs[category] = {
-            'security_type': defaults['security_type'],
+            'security_type': security_type,
             'maturities': maturities,
             'weights': weights,
         }
@@ -216,7 +235,7 @@ def _build_config_derived_generation_context(gen_config, base_config):
 def _get_config_derived_issue_terms(category, maturity_years, context):
     yield_curve_years = context['yield_curve_years']
     yield_curve_rates = context['yield_curve_rates']
-    security_type = CONFIG_DERIVED_CATEGORY_DEFAULTS[category]['security_type']
+    security_type = CONFIG_DERIVED_SECURITY_TYPES[category]
     issue_yield = get_yield_for_maturity(maturity_years, yield_curve_years, yield_curve_rates)
     issue_yield = 0.0 if pd.isna(issue_yield) else float(issue_yield)
 

@@ -156,8 +156,7 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
             save_plots_to_file = False
     print(f'\n--- Processing Group {group_index + 1}/{total_groups}: {group_name} ({len(group_scenarios)} scenarios) ---')
     if not group_scenarios or not isinstance(group_scenarios, list):
-        print(f"Warning [Group {group_name}]: No valid 'scenarios' list found. Skipping group.")
-        return {'group_name': group_name, 'status': 'skipped', 'message': 'No scenarios found'}
+        raise ValueError(f"[{group_name}] A non-empty scenarios list is required.")
     scenario_configs_to_run_group = []
     scenario_names_ordered_group = []
     plot_config_group = copy.deepcopy(base_config_subset)
@@ -179,13 +178,15 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
             raise ValueError(f"[{group_name}] Group CBO override validation failed: {'; '.join(group_cbo_errors)}")
     for scen_index, scenario_def in enumerate(group_scenarios):
         if not isinstance(scenario_def, dict):
-            print(f'Warning [Group {group_name}]: Scenario definition {scen_index} is not a valid dictionary. Skipping.')
-            continue
+            raise ValueError(
+                f'[{group_name}] Scenario definition {scen_index} must be a mapping.'
+            )
         scenario_name = scenario_def.get('name', f'{group_name}_Scen_{scen_index + 1}')
         overrides = scenario_def.get('overrides', {})
         if not isinstance(overrides, dict):
-            print(f"Warning [Group {group_name}]: 'overrides' for scenario '{scenario_name}' is not a valid dictionary. Skipping scenario.")
-            continue
+            raise ValueError(
+                f"[{group_name}] Overrides for scenario '{scenario_name}' must be a mapping."
+            )
         unknown_override_keys = set(overrides.keys()) - VALID_OVERRIDE_KEYS
         if unknown_override_keys:
             raise ValueError(
@@ -206,8 +207,7 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
     group_results = {}
     num_scenarios_in_group = len(scenario_configs_to_run_group)
     if num_scenarios_in_group == 0:
-        print(f'[Group {group_name}] No valid scenarios prepared for execution. Skipping group.')
-        return {'group_name': group_name, 'status': 'skipped', 'message': 'No valid scenarios'}
+        raise ValueError(f'[{group_name}] No scenarios were prepared for execution.')
     try:
         cpu_count = os.cpu_count() or 1
     except NotImplementedError:
@@ -230,7 +230,6 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
     )
     print(f'[Group {group_name}] Running {num_scenarios_in_group} scenarios using up to {max_workers_inner} parallel processes...')
     inner_executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers_inner)
-    group_sim_success = True
     future_to_scenario = {}
     try:
         for s_info in scenario_configs_to_run_group:
@@ -246,20 +245,30 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
                 print(f"\n   !!! [Group {group_name}] Scenario '{scenario_name}' FAILED during execution !!!")
                 print(f'   Exception Type: {type(exc).__name__}: {exc}')
                 group_results[scenario_name] = pd.DataFrame()
-                group_sim_success = False
     finally:
         inner_executor.shutdown(wait=True)
     group_execution_time = time.time() - group_start_time
     print(f'[Group {group_name}] Scenario executions finished in {group_execution_time:.2f} seconds.')
     successful_scenario_results = {name: df for name, df in group_results.items() if isinstance(df, pd.DataFrame) and (not df.empty)}
     successful_scenario_names_group = [name for name in scenario_names_ordered_group if name in successful_scenario_results]
-    if not successful_scenario_names_group:
-        print(f'ERROR [Group {group_name}]: No scenarios completed successfully. Skipping results summary and plots.')
-        return {'group_name': group_name, 'status': 'failed', 'message': 'No successful simulations'}
+    failed_names = sorted(
+        name
+        for name in scenario_names_ordered_group
+        if name not in successful_scenario_results
+    )
+    if failed_names:
+        print(
+            f'ERROR [Group {group_name}]: Scenario failures prevent all group '
+            f'exports: {failed_names}'
+        )
+        return {
+            'group_name': group_name,
+            'status': 'failed',
+            'message': 'One or more scenarios failed or produced empty results',
+            'failed_scenarios': failed_names,
+            'execution_time': group_execution_time,
+        }
     else:
-        if len(successful_scenario_names_group) < len(scenario_names_ordered_group):
-            failed_names = sorted([name for name in scenario_names_ordered_group if name not in successful_scenario_names_group])
-            print(f'Warning [Group {group_name}]: The following scenarios failed or produced empty results: {failed_names}')
         print(f'\n--- [Group {group_name}] Final States (Sample) ---')
         try:
             pd.set_option('display.float_format', '{:,.1f}'.format)
@@ -315,8 +324,7 @@ def process_scenario_group(group_def, base_config_subset, initial_bonds_df_globa
             print(f'\nERROR [Group {group_name}]: Plotting failed: {e}')
             traceback.print_exc()
             return {'group_name': group_name, 'status': 'plotting_failed', 'message': str(e)}
-    status = 'completed_with_failures' if not group_sim_success else 'completed'
-    return {'group_name': group_name, 'status': status, 'execution_time': group_execution_time}
+    return {'group_name': group_name, 'status': 'completed', 'execution_time': group_execution_time}
 
 
 __all__ = ['process_scenario_group', 'resolve_worker_count', 'save_group_results_csv']

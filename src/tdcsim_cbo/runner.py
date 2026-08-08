@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import shutil
 import subprocess
+import tempfile
+import time
+import zipfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
-from forecast_paths import compiled_forecast_input_paths, load_cbo_fiscal_baseline
+import evaluated_nominal_curve
+import sim_pricing
+from evaluated_nominal_curve import OPEN04_OUTPUT_CONTRACT
+from forecast_paths import (
+    compiled_forecast_input_paths,
+    load_cbo_fiscal_baseline,
+    load_frn_rate_path,
+)
 from sim_engine import run_simulation
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
+    MARKETABLE_PREFERENCE_CATEGORIES,
     MATURITY_CATEGORIES,
     PORTFOLIO_DTYPES,
     PRIVATE_SUBBUCKETS,
@@ -31,6 +44,11 @@ from tdc_validation import validate_events
 from ._json import read_json, sha256_file, write_json
 from ._schema import validate_schema
 from .baseline import CboBaselinePackage
+from .bounded_output import (
+    BoundedResourceLimits,
+    BoundedScenarioEvidenceSink,
+    host_available_memory_bytes,
+)
 from .compiler import (
     ISSUANCE_MIX_FILE,
     OPENING_RUNTIME_STATE_FILE,
@@ -38,11 +56,37 @@ from .compiler import (
     CboScenarioCompiler,
     HOLDER_PREFERENCE_EVENTS_FILE,
     RUNTIME_ASSUMPTIONS_FILE,
+    _open04_simulation_contract,
 )
 from .contract import CboScenarioSpec
-from .manifest import build_run_manifest, validation_from_boundary_checks
-from .output import hash_output_tree, write_scenario_outputs
-from .runtime_identity import distribution_identity
+from .curve_runtime import (
+    EvaluatedNominalRuntimeError,
+    build_evaluated_nominal_runtime_binding,
+    load_compiled_evaluated_nominal_contract,
+)
+from .manifest import (
+    build_run_manifest,
+    record_parent_watchdog_acceptance,
+    validation_from_boundary_checks,
+)
+from .open04_campaign import (
+    parse_open04_campaign_marker,
+    requires_open04_strict_execution,
+)
+from .output import hash_output_tree, write_bounded_scenario_outputs
+from .process_watchdog import (
+    THREAD_LIMIT_ENVIRONMENT_VARIABLES,
+    WatchdogResult,
+    write_watchdog_failure_receipt,
+)
+from .runtime_identity import (
+    assert_loaded_distribution_modules,
+    distribution_identity,
+    installed_archive_sha256,
+    locked_environment_mismatches,
+    verify_wheel_against_git_commit,
+    wheel_file_digest,
+)
 
 
 # Cash-closure checks compare accumulated stock balances, so the tolerance absorbs
@@ -82,6 +126,33 @@ _CASH_RESIDUAL_BOUNDARY_FLAGS = (
     "affects_issuance_size",
     "affects_tdc_fiscal_flow",
 )
+_OPEN04_MEMORY_LIMIT_FIELDS = (
+    "minimum_available_bytes",
+    "acceptance_peak_rss_bytes",
+    "application_abort_rss_bytes",
+    "parent_graceful_stop_rss_bytes",
+    "parent_kill_rss_bytes",
+)
+_OPEN04_REQUIRED_RUNTIME_MODULES = {
+    "bill_quote_basis",
+    "evaluated_nominal_curve",
+    "forecast_paths",
+    "sim_engine",
+    "sim_pricing",
+    "tdc_shared",
+    "tdc_validation",
+    "yield_curve_path",
+    "tdcsim_cbo.compiler",
+    "tdcsim_cbo.contract",
+    "tdcsim_cbo.curve_runtime",
+    "tdcsim_cbo.manifest",
+    "tdcsim_cbo.open04_campaign",
+    "tdcsim_cbo.open04_export",
+    "tdcsim_cbo.output",
+    "tdcsim_cbo.process_watchdog",
+    "tdcsim_cbo.runner",
+    "tdcsim_cbo.runtime_identity",
+}
 
 
 class RunnerError(ValueError):
@@ -105,107 +176,602 @@ def run_cbo_scenario(
     output_dir: str | Path,
     *,
     output_profile: str | None = None,
+    resource_limits: BoundedResourceLimits | None = None,
+    watchdog_handoff: str | Path | None = None,
 ) -> CboScenarioRun:
-    """Compile and run one CBO scenario through the existing simulator."""
+    """Compile and run one CBO scenario with bounded evidence and atomic promotion."""
 
     out = Path(output_dir).expanduser().resolve()
     if out.exists():
         raise RunnerError(f"scenario output directory already exists: {out}")
-    out.mkdir(parents=True)
-    compiled = CboScenarioCompiler().compile(baseline, spec, out / "compile")
-    scenario_path = out / "scenario.json"
-    write_json(scenario_path, spec.data)
-    scenario_referenced_files = _copy_scenario_referenced_files(spec, out)
-    inputs = compiled.forecast_inputs_dir
-    start, end = _simulation_dates(spec, inputs)
-    source_metadata = _source_metadata(baseline, inputs)
-    _validate_opening_alignment(start, source_metadata, inputs)
-    params = build_runtime_params(inputs, actuals_available_as_of=source_metadata["actuals_available_as_of"])
-    assumption_statuses = _adapter_assumption_statuses(inputs)
-    engine_params = _engine_runtime_params(params)
-    engine_scenario_id = _compiled_scenario_id(inputs)
-    results, final_portfolio = run_simulation(
-        engine_params,
-        start,
-        end,
-        freq="D",
-        scenario_name=engine_scenario_id,
+    handoff_path = _watchdog_handoff_path(out, watchdog_handoff)
+    open04_marker = None
+    open04_active = False
+    release_source_identity: Mapping[str, Any] | None = None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    progress_path = _watchdog_progress_path(out, handoff_path)
+    claim_path = out.parent / ".tdcsim-cbo-bounded-writer.claim"
+    try:
+        claim_fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise RunnerError(
+            f"another bounded CBO scenario writer is already claimed: {claim_path}"
+        ) from exc
+    try:
+        claim_payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "scenario_id": spec.scenario_id,
+                "output_dir": out.name,
+                "claimed_at_utc": datetime.now(timezone.utc).isoformat(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        os.write(claim_fd, claim_payload)
+        os.fsync(claim_fd)
+    finally:
+        os.close(claim_fd)
+
+    staging = out.with_name(
+        f".{out.name}.staging-{os.getpid()}-{uuid4().hex[:10]}"
     )
-    boundaries = validate_run_boundaries(results, inputs)
-    _assert_hard_boundaries_pass(boundaries)
-    output_cfg = spec.data.get("output", {})
-    if not isinstance(output_cfg, Mapping):
-        output_cfg = {}
-    profile = output_profile or str(output_cfg.get("profile") or "compact")
-    compression = str(output_cfg.get("compression") or "gzip")
-    output_metadata = {
-        "schema_version": "tdcsim_cbo_handoff_v1",
-        "scenario_id": spec.scenario_id,
-        "run_id": f"{spec.scenario_id}-{spec.canonical_sha256()[:12]}",
-        "package_id": baseline.package_id,
-        "source_vintage": source_metadata["source_vintage"],
-        "actuals_available_as_of": source_metadata["actuals_available_as_of"],
-        "scenario_config_sha256": spec.canonical_sha256(),
-        "compiled_inputs_digest": compiled.compiled_inputs_digest,
-        "mmf_deposit_pass_through": params["private_mmf_split"]["mmf_deposit_pass_through"],
-        "mmf_deposit_pass_through_status": assumption_statuses["mmf_deposit_pass_through_status"],
-        "fiscal_incidence_policy_id": params["fiscal_incidence_policy"]["policy_id"],
-        "fiscal_incidence_policy_status": assumption_statuses["fiscal_incidence_policy_status"],
-        "fiscal_incidence_basis": params["fiscal_incidence_policy"]["incidence_basis"],
-        "fiscal_incidence_du_share": params["fiscal_incidence_policy"]["du_share"],
-        "fiscal_incidence_ru_share": params["fiscal_incidence_policy"]["ru_share"],
-        "fiscal_incidence_foreign_share": params["fiscal_incidence_policy"]["foreign_share"],
-        "fiscal_incidence_other_share": params["fiscal_incidence_policy"]["other_share"],
-        "issuance_profile_status": assumption_statuses["issuance_profile_status"],
+    sink: BoundedScenarioEvidenceSink | None = None
+    compiled: CboCompiledScenario | None = None
+    profile = "compact"
+    compression = "gzip"
+    preserve_claim_for_parent = False
+    try:
+        scenario_data = getattr(spec, "data", None)
+        if isinstance(scenario_data, Mapping):
+            open04_marker = parse_open04_campaign_marker(scenario_data)
+            open04_active = requires_open04_strict_execution(scenario_data)
+        if (
+            open04_active
+            and output_profile is not None
+            and output_profile != OPEN04_OUTPUT_CONTRACT["profile"]
+        ):
+            raise RunnerError(
+                "OPEN-04 runs forbid output-profile overrides "
+                "outside the compact gzip contract"
+            )
+        if open04_active:
+            if handoff_path is None:
+                raise RunnerError(
+                    "OPEN-04 runs require the parent RSS watchdog"
+                )
+            _assert_open04_memory_limits(
+                resource_limits or BoundedResourceLimits()
+            )
+            _assert_open04_thread_environment()
+            release_source_identity = _assert_open04_release_identity(
+                baseline
+            )
+            _assert_open04_campaign_root(out)
+    except Exception:
+        claim_path.unlink(missing_ok=True)
+        raise
+    try:
+        staging.mkdir()
+        base_limits = resource_limits or BoundedResourceLimits()
+        available = host_available_memory_bytes()
+        if (
+            base_limits.minimum_available_bytes
+            and available < base_limits.minimum_available_bytes
+        ):
+            raise RunnerError(
+                "bounded run admission failed before compilation: "
+                f"available={available}, required={base_limits.minimum_available_bytes}"
+            )
+        if progress_path is not None:
+            _write_watchdog_progress(
+                progress_path,
+                out=out,
+                staging=staging,
+                claim_path=claim_path,
+                progress={
+                    "progress_state": "admission",
+                    "admission_date": None,
+                    "last_completed_period": None,
+                    "period_count": 0,
+                    "event_count": 0,
+                    "event_root_sha256": hashlib.sha256().hexdigest(),
+                    "peak_rss_bytes": 0,
+                    "failure_invariant": None,
+                    "failure_key": None,
+                    "last_events": [],
+                },
+            )
+        compiled = CboScenarioCompiler().compile(
+            baseline, spec, staging / "compile"
+        )
+        scenario_path = staging / "scenario.json"
+        write_json(scenario_path, spec.data)
+        scenario_referenced_files = _copy_scenario_referenced_files(spec, staging)
+        inputs = compiled.forecast_inputs_dir
+        start, end = _simulation_dates(spec, inputs)
+        source_metadata = _source_metadata(baseline, inputs)
+        _validate_opening_alignment(start, source_metadata, inputs)
+        engine_scenario_id = _compiled_scenario_id(inputs)
+        params = build_runtime_params(
+            inputs,
+            actuals_available_as_of=source_metadata["actuals_available_as_of"],
+            simulation_start_date=start,
+            simulation_end_date=end,
+            scenario_id=engine_scenario_id,
+            funding_closure_mode=(
+                open04_marker.funding_closure_mode
+                if open04_marker is not None
+                else "cbo_public_debt_target"
+            ),
+        )
+        evaluated_nominal_runtime = build_evaluated_nominal_runtime_binding(
+            inputs,
+            start_date=start,
+            end_date=end,
+        )
+        assumption_statuses = _adapter_assumption_statuses(inputs)
+        engine_params = _engine_runtime_params(params)
+        if resource_limits is None:
+            limits = replace(
+                base_limits,
+                portfolio_row_budget=_portfolio_row_budget(
+                    engine_params, start=start, end=end
+                ),
+            )
+        else:
+            limits = base_limits
+        output_cfg = spec.data.get("output", {})
+        if not isinstance(output_cfg, Mapping):
+            output_cfg = {}
+        if bool(output_cfg.get("catalog_sqlite", False)):
+            raise RunnerError(
+                "bounded production output does not support a duplicate SQLite catalog"
+            )
+        profile = output_profile or str(output_cfg.get("profile") or "compact")
+        compression = str(output_cfg.get("compression") or "gzip")
+        if open04_active and (
+            profile != OPEN04_OUTPUT_CONTRACT["profile"]
+            or compression != OPEN04_OUTPUT_CONTRACT["compression"]
+        ):
+            raise RunnerError(
+                "OPEN-04 run output must remain compact gzip"
+            )
+        output_metadata = {
+            "schema_version": "tdcsim_cbo_bounded_handoff_v1",
+            "scenario_id": spec.scenario_id,
+            "run_id": f"{spec.scenario_id}-{spec.canonical_sha256()[:12]}",
+            "package_id": baseline.package_id,
+            "source_vintage": source_metadata["source_vintage"],
+            "actuals_available_as_of": source_metadata["actuals_available_as_of"],
+            "scenario_config_sha256": spec.canonical_sha256(),
+            "compiled_inputs_digest": compiled.compiled_inputs_digest,
+            "mmf_deposit_pass_through": params["private_mmf_split"][
+                "mmf_deposit_pass_through"
+            ],
+            "mmf_deposit_pass_through_status": assumption_statuses[
+                "mmf_deposit_pass_through_status"
+            ],
+            "fiscal_incidence_policy_id": params["fiscal_incidence_policy"][
+                "policy_id"
+            ],
+            "fiscal_incidence_policy_status": assumption_statuses[
+                "fiscal_incidence_policy_status"
+            ],
+            "fiscal_incidence_basis": params["fiscal_incidence_policy"][
+                "incidence_basis"
+            ],
+            "fiscal_incidence_du_share": params["fiscal_incidence_policy"][
+                "du_share"
+            ],
+            "fiscal_incidence_ru_share": params["fiscal_incidence_policy"][
+                "ru_share"
+            ],
+            "fiscal_incidence_foreign_share": params["fiscal_incidence_policy"][
+                "foreign_share"
+            ],
+            "fiscal_incidence_other_share": params["fiscal_incidence_policy"][
+                "other_share"
+            ],
+            "issuance_profile_status": assumption_statuses[
+                "issuance_profile_status"
+            ],
+        }
+        sink = BoundedScenarioEvidenceSink(
+            staging / "outputs",
+            limits=limits,
+            progress_callback=(
+                (
+                    lambda progress: _record_watchdog_progress(
+                        progress_path,
+                        out=out,
+                        staging=staging,
+                        claim_path=claim_path,
+                        progress=progress,
+                    )
+                )
+                if progress_path is not None
+                else None
+            ),
+        )
+        results, final_portfolio = run_simulation(
+            engine_params,
+            start,
+            end,
+            freq="D",
+            scenario_name=engine_scenario_id,
+            handoff_sink=sink,
+            require_bounded_handoff=True,
+        )
+        bounded_summary = results.attrs.get("bounded_handoff_summary")
+        if not isinstance(bounded_summary, Mapping):
+            raise RunnerError("bounded engine did not return its finalization summary")
+        boundaries = validate_run_boundaries(results, inputs)
+        _assert_hard_boundaries_pass(boundaries)
+        outputs = write_bounded_scenario_outputs(
+            results,
+            final_portfolio,
+            staging / "outputs",
+            bounded_summary=bounded_summary,
+            profile=profile,
+            compression=compression,
+            metadata=output_metadata,
+        )
+        run_manifest = build_run_manifest(
+            scenario_id=spec.scenario_id,
+            scenario_sha256=spec.canonical_sha256(),
+            compiled=compiled,
+            compiled_manifest_relpath=compiled.manifest_path.relative_to(
+                staging
+            ).as_posix(),
+            baseline=baseline,
+            scenario=spec,
+            scenario_relpath=scenario_path.relative_to(staging).as_posix(),
+            scenario_file_sha256=sha256_file(scenario_path),
+            scenario_referenced_files=scenario_referenced_files,
+            start_date=start,
+            end_date=end,
+            fiscal_incidence_policy_id=params["fiscal_incidence_policy"][
+                "policy_id"
+            ],
+            outputs=outputs,
+            output_hashes=hash_output_tree(staging / "outputs"),
+            boundary_checks=boundaries,
+            code_environment=_code_environment(
+                baseline,
+                staging,
+                require_release_identity=open04_active,
+                release_source_identity=release_source_identity,
+            ),
+            generated_at_utc=datetime.now(timezone.utc).isoformat(),
+            bounded_evidence=bounded_summary,
+            evaluated_nominal_curve=evaluated_nominal_runtime,
+            execution_contract=_execution_contract(
+                parent_watchdog_required=handoff_path is not None,
+                claim_file_name=claim_path.name,
+                open04_scope_id=(
+                    f"{open04_marker.contract_id}.{open04_marker.role}"
+                    if open04_marker is not None
+                    else None
+                ),
+            ),
+        )
+        if open04_marker is not None:
+            run_manifest["open04_campaign"] = {
+                "contract_id": open04_marker.contract_id,
+                "role": open04_marker.role,
+                "funding_closure_mode": open04_marker.funding_closure_mode,
+            }
+        manifest_path = staging / "tdcsim_cbo_run_manifest.json"
+        with files("tdcsim_cbo").joinpath(
+            "schemas/cbo-run-manifest-v2.schema.json"
+        ).open("r", encoding="utf-8") as handle:
+            run_manifest_schema = json.load(handle)
+        validate_schema(run_manifest, run_manifest_schema, label="run_manifest")
+        if handoff_path is not None:
+            pending_manifest = dict(run_manifest)
+            pending_manifest["status"] = "pending_parent_watchdog_acceptance"
+            pending_path = staging / "tdcsim_cbo_run_manifest.pending.json"
+            write_json(pending_path, pending_manifest)
+            _fsync_run_tree(staging)
+            _write_json_atomic(
+                handoff_path,
+                {
+                    "schema_version": "tdcsim_cbo_watchdog_handoff_v1",
+                    "state": "prepared",
+                    "worker_pid": os.getpid(),
+                    "output_dir_name": out.name,
+                    "staging_dir_name": staging.name,
+                    "claim_file_name": claim_path.name,
+                    "progress_file_name": (
+                        progress_path.name if progress_path is not None else ""
+                    ),
+                    "pending_manifest_relative_path": pending_path.relative_to(
+                        staging
+                    ).as_posix(),
+                    "pending_manifest_sha256": sha256_file(pending_path),
+                },
+            )
+            preserve_claim_for_parent = True
+            result_path = staging / "outputs" / (
+                f"results_{profile}{'.csv.gz' if compression == 'gzip' else '.csv'}"
+            )
+            return CboScenarioRun(
+                output_dir=staging,
+                compiled=compiled,
+                results_path=result_path,
+                manifest_path=pending_path,
+                run_manifest=pending_manifest,
+            )
+        write_json(manifest_path, run_manifest)
+        _fsync_run_tree(staging)
+        staging.rename(out)
+        compiled = _rebase_compiled(compiled, staging, out)
+        final_manifest = out / "tdcsim_cbo_run_manifest.json"
+        result_path = out / "outputs" / (
+            f"results_{profile}{'.csv.gz' if compression == 'gzip' else '.csv'}"
+        )
+        return CboScenarioRun(
+            output_dir=out,
+            compiled=compiled,
+            results_path=result_path,
+            manifest_path=final_manifest,
+            run_manifest=run_manifest,
+        )
+    except Exception as exc:
+        failure = (
+            sink.abort(exc)
+            if sink is not None
+            else {
+                "status": "failed",
+                "exception_class": type(exc).__name__,
+                "exception_message": str(exc),
+            }
+        )
+        failure.update(
+            {
+                "scenario_id": spec.scenario_id,
+                "output_dir_name": out.name,
+                "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "promotable": False,
+            }
+        )
+        _remove_staging_tree(staging, expected_parent=out.parent)
+        failure["failure_invariant"] = _exception_detail(
+            exc, "invariant_id", "invariant", "invariant_key"
+        )
+        failure["failure_key"] = _exception_detail(
+            exc, "failure_key", "key", "constraint_key"
+        )
+        failure["last_completed_period"] = (
+            failure.get("last_completed_period") or None
+        )
+        if handoff_path is not None:
+            _write_json_atomic(
+                handoff_path,
+                {
+                    "schema_version": "tdcsim_cbo_watchdog_handoff_v1",
+                    "state": "failed",
+                    "worker_pid": os.getpid(),
+                    "output_dir_name": out.name,
+                    "claim_file_name": claim_path.name,
+                    "progress_file_name": (
+                        progress_path.name if progress_path is not None else ""
+                    ),
+                    "failure": failure,
+                },
+            )
+        else:
+            failure_path = out.with_name(
+                f"{out.name}.failure-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
+            )
+            write_json(failure_path, failure)
+        raise
+    finally:
+        if not preserve_claim_for_parent:
+            try:
+                claim_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _assert_open04_memory_limits(limits: BoundedResourceLimits) -> None:
+    expected = BoundedResourceLimits()
+    mismatches = {
+        field: {
+            "observed": int(getattr(limits, field)),
+            "required": int(getattr(expected, field)),
+        }
+        for field in _OPEN04_MEMORY_LIMIT_FIELDS
+        if int(getattr(limits, field)) != int(getattr(expected, field))
     }
-    outputs = write_scenario_outputs(
-        results,
-        final_portfolio,
-        out / "outputs",
-        profile=profile,
-        compression=compression,
-        catalog_sqlite=bool(output_cfg.get("catalog_sqlite", False)),
-        metadata=output_metadata,
-    )
-    run_manifest = build_run_manifest(
-        scenario_id=spec.scenario_id,
-        scenario_sha256=spec.canonical_sha256(),
-        compiled=compiled,
-        compiled_manifest_relpath=compiled.manifest_path.relative_to(out).as_posix(),
-        baseline=baseline,
-        scenario=spec,
-        scenario_relpath=scenario_path.relative_to(out).as_posix(),
-        scenario_file_sha256=sha256_file(scenario_path),
-        scenario_referenced_files=scenario_referenced_files,
-        start_date=start,
-        end_date=end,
-        fiscal_incidence_policy_id=params["fiscal_incidence_policy"]["policy_id"],
-        outputs=outputs,
-        output_hashes=hash_output_tree(out / "outputs"),
-        boundary_checks=boundaries,
-        code_environment=_code_environment(baseline, out),
-        generated_at_utc=datetime.now(timezone.utc).isoformat(),
-    )
-    manifest_path = out / "tdcsim_cbo_run_manifest.json"
-    with files("tdcsim_cbo").joinpath("schemas/cbo-run-manifest-v1.schema.json").open("r", encoding="utf-8") as handle:
-        run_manifest_schema = json.load(handle)
-    validate_schema(
-        run_manifest,
-        run_manifest_schema,
-        label="run_manifest",
-    )
-    write_json(manifest_path, run_manifest)
-    result_path = out / "outputs" / f"results_{profile}{'.csv.gz' if compression == 'gzip' else '.csv'}"
-    return CboScenarioRun(
-        output_dir=out,
-        compiled=compiled,
-        results_path=result_path,
-        manifest_path=manifest_path,
-        run_manifest=run_manifest,
-    )
+    if mismatches:
+        raise RunnerError(
+            "OPEN-04 runs require the exact "
+            f"4/6/8/10/12 GiB memory envelope; mismatches={mismatches}"
+        )
 
 
-def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str | None = None) -> dict[str, Any]:
+def _assert_open04_thread_environment() -> None:
+    mismatches = {
+        name: os.environ.get(name)
+        for name in THREAD_LIMIT_ENVIRONMENT_VARIABLES
+        if os.environ.get(name) != "1"
+    }
+    if mismatches:
+        raise RunnerError(
+            "OPEN-04 runs require all numerical thread "
+            f"limits pinned to one; mismatches={mismatches}"
+        )
+
+
+def _assert_open04_release_identity(
+    baseline: CboBaselinePackage,
+) -> dict[str, Any]:
+    wheel_path_raw = os.environ.get("TDCSIM_CBO_WHEEL_PATH", "")
+    wheel_sha = os.environ.get("TDCSIM_CBO_WHEEL_SHA256", "")
+    commit = os.environ.get("TDCSIM_CBO_CODE_COMMIT_SHA", "")
+    attested_lock_sha = str(
+        baseline.attestation.data.get("requirements_lock_sha256") or ""
+    )
+    environment_lock_sha = os.environ.get(
+        "TDCSIM_CBO_REQUIREMENTS_LOCK_SHA256", ""
+    )
+    lock_sha = environment_lock_sha or attested_lock_sha
+    if not wheel_path_raw or not _is_sha256(wheel_sha):
+        raise RunnerError(
+            "OPEN-04 runs require a retained release wheel "
+            "and explicit TDCSIM_CBO_WHEEL_SHA256"
+        )
+    wheel_path = Path(wheel_path_raw).expanduser().resolve()
+    if not wheel_path.is_file() or sha256_file(wheel_path) != wheel_sha:
+        raise RunnerError(
+            "OPEN-04 release wheel path and SHA-256 do not identify the same bytes"
+        )
+    if not _is_commit_sha(commit) or commit == "0" * 40:
+        raise RunnerError(
+            "OPEN-04 runs require a release-bound code commit"
+        )
+    if _dirty_state(True):
+        raise RunnerError(
+            "OPEN-04 runs require TDCSIM_CBO_DIRTY_STATE=false"
+        )
+    if not _is_sha256(lock_sha) or lock_sha == "0" * 64:
+        raise RunnerError(
+            "OPEN-04 runs require a release-bound requirements lock"
+        )
+    if not _is_sha256(attested_lock_sha) or lock_sha != attested_lock_sha:
+        raise RunnerError(
+            "OPEN-04 runtime requirements lock must match the baseline attestation"
+        )
+    lock_payload = _baseline_requirements_lock_payload(baseline)
+    if hashlib.sha256(lock_payload).hexdigest() != lock_sha:
+        raise RunnerError(
+            "OPEN-04 baseline requirements lock bytes do not match the attestation"
+        )
+    try:
+        dependency_mismatches = locked_environment_mismatches(lock_payload)
+    except Exception as exc:
+        raise RunnerError(
+            "OPEN-04 requirements lock could not be checked against the runtime"
+        ) from exc
+    if dependency_mismatches:
+        raise RunnerError(
+            "OPEN-04 installed dependency versions do not match the "
+            f"requirements lock: {dependency_mismatches}"
+        )
+    try:
+        retained_digest = wheel_file_digest(wheel_path)
+    except Exception as exc:
+        raise RunnerError(
+            "OPEN-04 release wheel runtime digest could not be computed"
+        ) from exc
+    installed = distribution_identity()
+    if retained_digest != installed.get("file_digest"):
+        raise RunnerError(
+            "OPEN-04 release wheel does not match the installed runtime files"
+        )
+    source_repository = os.environ.get(
+        "TDCSIM_CBO_SOURCE_REPOSITORY", ""
+    )
+    if not source_repository:
+        raise RunnerError(
+            "OPEN-04 runs require a clean source-repository identity"
+        )
+    try:
+        from .consumer_challenge import collect_release_identity
+
+        source_identity = collect_release_identity(source_repository)
+        if source_identity.get("release_commit_sha") != commit:
+            raise ValueError(
+                "clean source repository HEAD does not match the declared commit"
+            )
+        wheel_git_binding = verify_wheel_against_git_commit(
+            wheel_path,
+            source_repository,
+            commit,
+        )
+        archive_sha = installed_archive_sha256()
+        if archive_sha != wheel_sha:
+            raise ValueError(
+                "installed distribution archive does not match retained wheel SHA-256"
+            )
+        loaded_modules = assert_loaded_distribution_modules(
+            _OPEN04_REQUIRED_RUNTIME_MODULES
+        )
+    except Exception as exc:
+        raise RunnerError(
+            "OPEN-04 release wheel/source qualification failed"
+        ) from exc
+    return {
+        "source_tree": source_identity,
+        "wheel_git_binding": wheel_git_binding,
+        "installed_archive_sha256": archive_sha,
+        "loaded_distribution_module_count": len(loaded_modules),
+    }
+
+
+def _assert_open04_campaign_root(out: Path) -> str:
+    root_raw = os.environ.get("TDCSIM_CBO_CAMPAIGN_ROOT", "")
+    campaign_id = os.environ.get("TDCSIM_CBO_CAMPAIGN_ID", "")
+    if not root_raw or not campaign_id:
+        raise RunnerError(
+            "OPEN-04 runs require one declared campaign root and ID"
+        )
+    root = Path(root_raw).expanduser().resolve()
+    try:
+        relative = out.relative_to(root)
+    except ValueError as exc:
+        raise RunnerError(
+            "OPEN-04 output must be inside the declared campaign root"
+        ) from exc
+    if len(relative.parts) != 2:
+        raise RunnerError(
+            "OPEN-04 output must use one isolated role parent below the campaign root"
+        )
+    if (
+        len(campaign_id) < 3
+        or len(campaign_id) > 160
+        or not campaign_id[0].isalnum()
+        or any(
+            char not in "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for char in campaign_id
+        )
+    ):
+        raise RunnerError("OPEN-04 campaign ID is invalid")
+    return campaign_id
+
+
+def _baseline_requirements_lock_payload(
+    baseline: CboBaselinePackage,
+) -> bytes:
+    if baseline.is_zip:
+        try:
+            with zipfile.ZipFile(baseline.package_path) as archive:
+                return archive.read("requirements.lock.txt")
+        except (KeyError, OSError, zipfile.BadZipFile) as exc:
+            raise RunnerError(
+                "OPEN-04 baseline package requirements lock is unreadable"
+            ) from exc
+    path = baseline.package_path / "requirements.lock.txt"
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise RunnerError(
+            "OPEN-04 baseline package requirements lock is unreadable"
+        ) from exc
+
+
+def build_runtime_params(
+    inputs_dir: str | Path,
+    *,
+    actuals_available_as_of: str | None = None,
+    simulation_start_date: str | None = None,
+    simulation_end_date: str | None = None,
+    scenario_id: str | None = None,
+    funding_closure_mode: str = "cbo_public_debt_target",
+) -> dict[str, Any]:
     """Build simulator params from compiled forecast inputs and scenario config."""
 
     inputs = Path(inputs_dir)
@@ -214,10 +780,48 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
     initial_values = _opening_runtime_initial_values(inputs, base_tga=base_tga)
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
     holder_events = _holder_preference_events(inputs / HOLDER_PREFERENCE_EVENTS_FILE)
+    try:
+        evaluated_nominal_shock, evaluated_nominal_contract = (
+            load_compiled_evaluated_nominal_contract(inputs)
+        )
+    except EvaluatedNominalRuntimeError as exc:
+        raise RunnerError(str(exc)) from exc
     issuance_profile = _issuance_profile(inputs)
     fiscal_incidence_policy = _fiscal_incidence_policy(inputs)
-    if _fed_target_active(inputs / "tdcsim_fed_holdings_path.csv"):
+    if (
+        _fed_target_active(inputs / "tdcsim_fed_holdings_path.csv")
+        or evaluated_nominal_shock is not None
+    ):
         _assert_no_cb_auction_preferences(holder_preferences)
+    if evaluated_nominal_shock is not None:
+        if holder_events:
+            raise RunnerError(
+                "evaluated nominal curve contract forbids holder-preference events"
+            )
+        if simulation_start_date is None or simulation_end_date is None:
+            raise RunnerError(
+                "evaluated nominal curve contract requires an explicit "
+                "simulation horizon for FRN coverage validation"
+            )
+        _assert_explicit_frn_path(
+            inputs / "tdcsim_frn_rate_path.csv",
+            scenario_id=scenario_id or _compiled_scenario_id(inputs),
+            start_date=simulation_start_date,
+            end_date=simulation_end_date,
+            actuals_available_as_of=actuals_available_as_of,
+        )
+    yield_curve_surface = {
+        "file": str(inputs / "tdcsim_yield_curve_surface.csv"),
+        "interpolation_method": "pchip",
+        "floor_zero": False,
+    }
+    if evaluated_nominal_shock is not None:
+        yield_curve_surface.update(
+            {
+                "evaluated_nominal_shock": evaluated_nominal_shock,
+                "evaluated_nominal_contract": evaluated_nominal_contract,
+            }
+        )
     return {
         "initial_values": initial_values,
         "tga_params": {"target_balance": base_tga, "floor": -1e15},
@@ -234,7 +838,7 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
             "years": [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0],
             "rates": [0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04],
         },
-        "yield_curve_surface": {"file": str(inputs / "tdcsim_yield_curve_surface.csv"), "interpolation_method": "pchip", "floor_zero": False},
+        "yield_curve_surface": yield_curve_surface,
         "sector_preferences": holder_preferences,
         "private_mmf_split": {
             "bills": 0.25,
@@ -254,13 +858,16 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
         "frn_params": {"benchmark_maturity_years": 0.25, "default_fixed_spread": 0.0013},
         "financing_cost_options": {"include_tips_inflation_accretion": True},
         "simulation_period": {"enable_preference_trading": False},
+        "rate_sensitive_demand": {"enabled": False},
         "initial_bonds_df": initial_portfolio,
         "events": holder_events,
         "funding_rule": {
-            "mode": "cbo_public_debt_target",
+            "mode": funding_closure_mode,
             "target_enforcement": "every_period",
             "negative_required_issuance_action": _negative_issuance_action(inputs),
             "target_tolerance_bil": 0.000001,
+            "cash_closure_target_bil": 0.0,
+            "validation_floor_bil": -0.000001,
             "fed_secondary_sale_buyer_mix": {
                 "type": "contemporaneous_non_cb_public_holder_mix",
                 "basis": "par_or_adjusted_principal_stock",
@@ -274,6 +881,115 @@ def build_runtime_params(inputs_dir: str | Path, *, actuals_available_as_of: str
         "fiscal_incidence_policy": fiscal_incidence_policy,
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
     }
+
+
+def _assert_explicit_frn_path(
+    path: Path,
+    *,
+    scenario_id: str,
+    start_date: str,
+    end_date: str,
+    actuals_available_as_of: str | None = None,
+) -> None:
+    loader_kwargs = (
+        {"actuals_available_as_of": actuals_available_as_of}
+        if actuals_available_as_of
+        else {}
+    )
+    try:
+        frame = load_frn_rate_path(path, **loader_kwargs)
+    except (FileNotFoundError, OSError, ValueError, pd.errors.EmptyDataError) as exc:
+        raise RunnerError(
+            "evaluated nominal curve contract requires a valid explicit FRN path"
+        ) from exc
+    if frame.empty:
+        raise RunnerError(
+            "evaluated nominal curve contract requires a nonempty explicit FRN path"
+        )
+
+    scenario_values = frame["scenario_id"].fillna("").astype(str)
+    selected = frame.iloc[0:0].copy()
+    selected_scenario = ""
+    candidates = list(
+        dict.fromkeys([str(scenario_id), "all", "default", ""])
+    )
+    for candidate in candidates:
+        matches = frame.loc[scenario_values.eq(candidate)].copy()
+        if not matches.empty:
+            selected = matches
+            selected_scenario = candidate
+            break
+    if selected.empty:
+        raise RunnerError(
+            "evaluated nominal curve explicit FRN path has no rows for "
+            f"scenario {scenario_id!r}"
+        )
+
+    starts = pd.to_datetime(
+        selected["period_start"], errors="coerce"
+    ).dt.normalize()
+    ends = pd.to_datetime(
+        selected["period_end"], errors="coerce"
+    ).dt.normalize()
+    if starts.isna().any() or ends.isna().any() or (starts >= ends).any():
+        raise RunnerError(
+            "evaluated nominal curve explicit FRN path has invalid periods"
+        )
+    for column, positive in (
+        ("benchmark_rate_decimal", False),
+        ("day_count_basis", True),
+        ("lockout_business_days", False),
+    ):
+        values = pd.to_numeric(selected[column], errors="coerce")
+        if (
+            values.isna().any()
+            or not values.map(math.isfinite).all()
+            or (positive and (values <= 0.0).any())
+            or (column == "lockout_business_days" and (values < 0.0).any())
+        ):
+            raise RunnerError(
+                "evaluated nominal curve explicit FRN path has invalid "
+                f"{column}"
+            )
+    benchmark = pd.to_numeric(
+        selected["benchmark_rate_decimal"], errors="raise"
+    )
+    if (benchmark.abs() > 1.0).any():
+        raise RunnerError(
+            "evaluated nominal curve explicit FRN benchmark rates must be decimal"
+        )
+
+    runtime_keys = pd.DataFrame(
+        {
+            "scenario_id": selected_scenario,
+            "period_end": ends,
+        }
+    )
+    if runtime_keys.duplicated(keep=False).any():
+        raise RunnerError(
+            "evaluated nominal curve explicit FRN path has duplicate "
+            "runtime (scenario_id, period_end) keys"
+        )
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end <= start:
+        raise RunnerError(
+            "evaluated nominal curve FRN coverage horizon must end after it starts"
+        )
+    required_dates = pd.date_range(
+        start + pd.Timedelta(days=1),
+        end,
+        freq="D",
+    )
+    for target in required_dates:
+        covering_count = int(((starts < target) & (target <= ends)).sum())
+        if covering_count != 1:
+            raise RunnerError(
+                "evaluated nominal curve explicit FRN path must have exactly "
+                f"one selected-scenario row covering {target.date()}; "
+                f"scenario={selected_scenario!r}, rows={covering_count}"
+            )
 
 
 def _engine_runtime_params(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -478,6 +1194,27 @@ def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
 
 
 def _simulation_dates(spec: CboScenarioSpec, inputs_dir: Path) -> tuple[str, str]:
+    if requires_open04_strict_execution(spec.data):
+        try:
+            contract = _open04_simulation_contract(
+                inputs_dir,
+                scenario=spec.data,
+            )
+        except ValueError as exc:
+            raise RunnerError(
+                f"OPEN-04 simulation contract is invalid: {exc}"
+            ) from exc
+        manifest_path = inputs_dir.parent / "tdcsim_cbo_compiled_manifest.json"
+        compiled_manifest = read_json(manifest_path)
+        if (
+            not isinstance(compiled_manifest, Mapping)
+            or compiled_manifest.get("open04_simulation_contract")
+            != contract
+        ):
+            raise RunnerError(
+                "OPEN-04 compiled simulation contract does not match inputs"
+            )
+        return str(contract["start_date"]), str(contract["end_date"])
     sim = spec.data.get("simulation", {})
     if isinstance(sim, Mapping) and sim.get("start_date") and sim.get("end_date"):
         return str(sim["start_date"]), str(sim["end_date"])
@@ -778,7 +1515,7 @@ def _holder_preferences(path: Path) -> dict[str, dict[str, float]]:
 
 
 def _private_subbucket_shares(frame: pd.DataFrame) -> dict[str, dict[str, float]]:
-    categories = ("bills", "notes", "bonds", "tips", "frn")
+    categories = MARKETABLE_PREFERENCE_CATEGORIES
     shares: dict[str, dict[str, float]] = {}
     if "holder_subbucket" not in frame.columns:
         return shares
@@ -869,7 +1606,7 @@ def _issuance_profile(inputs: Path) -> dict[str, Any]:
         raise RunnerError("compiled issuance mix security_shares must be an object")
     if not isinstance(maturity, Mapping):
         raise RunnerError("compiled issuance mix maturity_distributions must be an object")
-    categories = ("bills", "notes", "bonds", "tips", "frn")
+    categories = MARKETABLE_PREFERENCE_CATEGORIES
     missing_shares = [category for category in categories if category not in shares]
     missing_maturity = [category for category in categories if category not in maturity]
     if missing_shares:
@@ -1254,36 +1991,140 @@ def _media_type(path: str) -> str:
     return "application/octet-stream"
 
 
-def _code_environment(baseline: CboBaselinePackage, run_root: Path) -> dict[str, Any]:
+def _execution_contract(
+    *,
+    parent_watchdog_required: bool,
+    claim_file_name: str,
+    open04_scope_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "tdcsim_cbo_execution_contract_v1",
+        "single_writer_claim": True,
+        "writer_claim_file_name": claim_file_name,
+        "writer_claim_scope": "output_parent",
+        "writer_claim_scope_id": (
+            open04_scope_id or "library-output-parent"
+        ),
+        "one_scenario_per_worker": True,
+        "process_pool_enabled": False,
+        "parent_watchdog_required": bool(parent_watchdog_required),
+        "scenario_process_mode": (
+            "parent_watchdog_worker"
+            if parent_watchdog_required
+            else "library_call"
+        ),
+        "numerical_thread_environment": {
+            name: str(os.environ.get(name) or "")
+            for name in THREAD_LIMIT_ENVIRONMENT_VARIABLES
+        },
+    }
+
+
+def _code_environment(
+    baseline: CboBaselinePackage,
+    run_root: Path,
+    *,
+    require_release_identity: bool = False,
+    release_source_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     dist = distribution_identity()
     wheel_artifact = _copy_release_wheel(run_root)
     wheel_sha256 = str(wheel_artifact["sha256"]) if wheel_artifact else ""
     env_commit = os.environ.get("TDCSIM_CBO_CODE_COMMIT_SHA", "")
     git_commit = _module_git_value(["rev-parse", "HEAD"], default="")
     dirty_state = _dirty_state(wheel_artifact is not None)
-    if wheel_artifact is not None and not _is_commit_sha(env_commit):
+    attested_lock_sha = str(
+        baseline.attestation.data.get("requirements_lock_sha256") or ""
+    )
+    lock_sha = str(
+        os.environ.get("TDCSIM_CBO_REQUIREMENTS_LOCK_SHA256")
+        or attested_lock_sha
+        or "0" * 64
+    )
+    if (wheel_artifact is not None or require_release_identity) and not _is_commit_sha(
+        env_commit
+    ):
         raise RunnerError("release wheel runs require TDCSIM_CBO_CODE_COMMIT_SHA")
-    if wheel_artifact is not None and dirty_state:
+    if require_release_identity and env_commit == "0" * 40:
+        raise RunnerError("OPEN-04 release wheel commit may not be all zeroes")
+    if (wheel_artifact is not None or require_release_identity) and dirty_state:
         raise RunnerError("release wheel runs require TDCSIM_CBO_DIRTY_STATE=false")
+    if require_release_identity:
+        if wheel_artifact is None:
+            raise RunnerError(
+                "OPEN-04 runs require retained release wheel bytes"
+            )
+        if not _is_sha256(lock_sha) or lock_sha == "0" * 64:
+            raise RunnerError(
+                "OPEN-04 runs require a release-bound requirements lock"
+            )
+        if not _is_sha256(attested_lock_sha) or lock_sha != attested_lock_sha:
+            raise RunnerError(
+                "OPEN-04 runtime requirements lock must match the baseline attestation"
+            )
+        if wheel_file_digest(run_root / wheel_artifact["relative_path"]) != dist[
+            "file_digest"
+        ]:
+            raise RunnerError(
+                "OPEN-04 retained wheel does not match the installed runtime files"
+            )
+        if installed_archive_sha256() != wheel_sha256:
+            raise RunnerError(
+                "OPEN-04 installed archive does not match retained wheel bytes"
+            )
+        if not isinstance(release_source_identity, Mapping):
+            raise RunnerError(
+                "OPEN-04 release source qualification receipt is missing"
+            )
     return {
         "code_commit_sha": env_commit or git_commit or "0" * 40,
         "dirty_state": dirty_state,
-        "requirements_lock_sha256": str(
-            os.environ.get("TDCSIM_CBO_REQUIREMENTS_LOCK_SHA256")
-            or baseline.attestation.data.get("requirements_lock_sha256")
-            or "0" * 64
-        ),
+        "requirements_lock_sha256": lock_sha,
         "python_version": _python_version(),
         "runner_version": "tdcsim_cbo_runner_v1",
         "verifier_version": "tdcsim_cbo_verifier_v1",
         "runner_source_sha256": sha256_file(Path(__file__)),
         "sim_engine_source_sha256": sha256_file(Path(run_simulation.__code__.co_filename)),
+        **_open04_code_surface_hashes(),
         "package_name": dist["name"],
         "package_version": dist["version"],
         "distribution_file_digest": dist["file_digest"],
         "wheel_sha256": wheel_sha256,
         "wheel_artifact": wheel_artifact,
         "runtime_identity_source": dist["identity_source"],
+        "runtime_import_mode": (
+            "installed_distribution"
+            if require_release_identity
+            else "source_or_installed_library"
+        ),
+        "source_shadow_guard": bool(require_release_identity),
+        "producer_source_identity": (
+            dict(release_source_identity)
+            if isinstance(release_source_identity, Mapping)
+            else None
+        ),
+    }
+
+
+def _open04_code_surface_hashes() -> dict[str, str]:
+    package_root = Path(__file__).resolve().parent
+    files_by_field = {
+        "bounded_output_source_sha256": "bounded_output.py",
+        "output_source_sha256": "output.py",
+        "verifier_source_sha256": "verifier.py",
+        "compiler_source_sha256": "compiler.py",
+        "contract_source_sha256": "contract.py",
+        "manifest_source_sha256": "manifest.py",
+        "run_manifest_schema_sha256": (
+            "schemas/cbo-run-manifest-v2.schema.json"
+        ),
+        "scenario_schema_sha256": "schemas/cbo-scenario-v1.schema.json",
+        "scenario_writer_source_sha256": "open04_campaign.py",
+        "open04_exporter_source_sha256": "open04_export.py",
+    }
+    return {
+        field: sha256_file(package_root / relative_path)
+        for field, relative_path in files_by_field.items()
     }
 
 
@@ -1331,6 +2172,10 @@ def _is_commit_sha(value: str) -> bool:
     return len(value) == 40 and all(char in "0123456789abcdef" for char in value)
 
 
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
 def _module_git_value(args: list[str], *, default: str) -> str:
     git_root = _module_git_root()
     if git_root is None:
@@ -1361,4 +2206,589 @@ def _module_git_root() -> Path | None:
     return Path(root) if root else None
 
 
-__all__ = ["CboScenarioRun", "RunnerError", "build_runtime_params", "run_cbo_scenario", "validate_run_boundaries"]
+def _portfolio_row_budget(params: Mapping[str, Any], *, start: str, end: str) -> int:
+    """Compile a conservative hard cap from opening state and enabled issuance routes."""
+
+    opening = params.get("initial_bonds_df")
+    opening_rows = int(len(opening)) if isinstance(opening, pd.DataFrame) else 0
+    periods = max(0, len(pd.date_range(start, end, freq="D")) - 1)
+    profile = params.get("treasury_issuance_profile", {})
+    if not isinstance(profile, Mapping):
+        profile = {}
+    supply_rows = 0
+    for category in ("bills", "notes", "bonds"):
+        section = profile.get(category, {})
+        if isinstance(section, Mapping):
+            supply_rows += max(1, len(section.get("maturities", []) or []))
+    for category in ("TIPS", "FRN", "NonMarketable"):
+        section = profile.get(category, {})
+        if not isinstance(section, Mapping):
+            continue
+        if float(section.get("target_percentage", 0.0) or 0.0) <= 0.0:
+            continue
+        supply_rows += max(1, len(section.get("maturities", []) or []))
+    # Each supply item can allocate across all beneficial holders; Private can split
+    # across its two declared cash routes.  Fed target transfers are allowed a separate
+    # conservative 32-row split envelope per period.  The live cap is enforced before
+    # every issuance/Fed-transfer concat and is recorded in the run manifest.
+    issuance_routes = max(1, supply_rows) * (len(HOLDER_TYPES) + 1)
+    fed_transfer_split_rows = 32
+    safety_rows = 64
+    return (
+        opening_rows
+        + periods * (issuance_routes + fed_transfer_split_rows)
+        + safety_rows
+    )
+
+
+def _rebase_compiled(
+    compiled: CboCompiledScenario, old_root: Path, new_root: Path
+) -> CboCompiledScenario:
+    def rebase(path: Path) -> Path:
+        return new_root / path.relative_to(old_root)
+
+    return replace(
+        compiled,
+        work_dir=rebase(compiled.work_dir),
+        baseline_dir=rebase(compiled.baseline_dir),
+        compiled_dir=rebase(compiled.compiled_dir),
+        forecast_inputs_dir=rebase(compiled.forecast_inputs_dir),
+        manifest_path=rebase(compiled.manifest_path),
+    )
+
+
+def _fsync_run_tree(root: Path) -> None:
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        # Windows requires a writable file descriptor for FlushFileBuffers,
+        # which is the operation exposed by os.fsync.
+        with path.open("rb+") as handle:
+            os.fsync(handle.fileno())
+
+
+def _remove_staging_tree(staging: Path, *, expected_parent: Path) -> None:
+    if not staging.exists():
+        return
+    resolved = staging.resolve()
+    parent = expected_parent.resolve()
+    if resolved.parent != parent or ".staging-" not in resolved.name:
+        raise RunnerError(f"refusing to remove unexpected staging path: {resolved}")
+    shutil.rmtree(resolved)
+
+
+def finalize_watchdog_handoff(
+    output_dir: str | Path,
+    handoff_path: str | Path,
+    result: WatchdogResult,
+) -> Mapping[str, Any] | None:
+    """Accept or reject a fully staged worker run after full-lifetime RSS sampling."""
+
+    out = Path(output_dir).expanduser().resolve()
+    handoff = _watchdog_handoff_path(out, handoff_path, require_absent=False)
+    if handoff is None:
+        raise RunnerError("watchdog handoff path is required")
+    descriptor = read_json(handoff)
+    if not isinstance(descriptor, Mapping):
+        raise RunnerError("watchdog handoff descriptor must be an object")
+    if descriptor.get("schema_version") != "tdcsim_cbo_watchdog_handoff_v1":
+        raise RunnerError("watchdog handoff descriptor schema is unsupported")
+    if descriptor.get("state") != "prepared":
+        raise RunnerError("watchdog handoff is not a prepared run")
+    if int(descriptor.get("worker_pid", -1)) != result.child_pid:
+        raise RunnerError("watchdog handoff worker PID mismatch")
+    if str(descriptor.get("output_dir_name")) != out.name:
+        raise RunnerError("watchdog handoff output directory mismatch")
+    progress_path = _watchdog_progress_path(
+        out,
+        handoff,
+        require_absent=False,
+        require_present=False,
+    )
+    if progress_path is None or str(descriptor.get("progress_file_name")) != progress_path.name:
+        raise RunnerError("watchdog handoff progress file mismatch")
+
+    staging_name = str(descriptor.get("staging_dir_name") or "")
+    staging = (out.parent / staging_name).resolve()
+    if (
+        staging.parent != out.parent
+        or not staging.name.startswith(f".{out.name}.staging-")
+        or not staging.is_dir()
+    ):
+        raise RunnerError("watchdog handoff staging directory is invalid")
+    claim_path = _validated_claim_path(out, descriptor, result.child_pid)
+    pending_relpath = str(descriptor.get("pending_manifest_relative_path") or "")
+    if pending_relpath != "tdcsim_cbo_run_manifest.pending.json":
+        raise RunnerError("watchdog pending manifest path is invalid")
+    pending_path = staging / pending_relpath
+    if not pending_path.is_file():
+        raise RunnerError("watchdog pending manifest is missing")
+    if sha256_file(pending_path) != str(descriptor.get("pending_manifest_sha256")):
+        raise RunnerError("watchdog pending manifest hash mismatch")
+
+    pending = read_json(pending_path)
+    if not isinstance(pending, Mapping):
+        raise RunnerError("watchdog pending manifest must be an object")
+    bounded = pending.get("bounded_evidence")
+    thresholds = (
+        bounded.get("memory_thresholds")
+        if isinstance(bounded, Mapping)
+        else None
+    )
+    if not isinstance(thresholds, Mapping):
+        raise RunnerError("watchdog pending manifest lacks memory thresholds")
+    expected_limit = int(thresholds.get("acceptance_peak_rss_bytes", -1))
+    if expected_limit != result.acceptance_peak_rss_bytes:
+        raise RunnerError("parent and worker acceptance RSS thresholds disagree")
+
+    worker_peak = int(bounded.get("peak_rss_bytes", -1))
+    if worker_peak < 0:
+        raise RunnerError("watchdog pending manifest has invalid worker peak RSS")
+    effective_peak = max(result.peak_rss_bytes, worker_peak)
+    if (
+        result.action != "completed"
+        or result.returncode != 0
+        or effective_peak > result.acceptance_peak_rss_bytes
+    ):
+        _remove_staging_tree(staging, expected_parent=out.parent)
+        write_watchdog_failure_receipt(
+            out,
+            replace(
+                result,
+                action=(
+                    "reject_acceptance_peak"
+                    if effective_peak > result.acceptance_peak_rss_bytes
+                    else "reject_nonterminal_child_result"
+                ),
+            ),
+        )
+        handoff.unlink()
+        progress_path.unlink(missing_ok=True)
+        claim_path.unlink()
+        return None
+
+    finalized = record_parent_watchdog_acceptance(
+        pending,
+        child_pid=result.child_pid,
+        child_returncode=result.returncode,
+        action=result.action,
+        peak_rss_bytes=result.peak_rss_bytes,
+        worker_peak_rss_bytes=worker_peak,
+        acceptance_peak_rss_bytes=result.acceptance_peak_rss_bytes,
+        terminate_rss_bytes=result.terminate_rss_bytes,
+        kill_rss_bytes=result.kill_rss_bytes,
+        poll_interval_seconds=result.poll_interval_seconds,
+    )
+    with files("tdcsim_cbo").joinpath(
+        "schemas/cbo-run-manifest-v2.schema.json"
+    ).open("r", encoding="utf-8") as handle:
+        run_manifest_schema = json.load(handle)
+    validate_schema(finalized, run_manifest_schema, label="run_manifest")
+    manifest_path = staging / "tdcsim_cbo_run_manifest.json"
+    write_json(manifest_path, finalized)
+    pending_path.unlink()
+    _fsync_run_tree(staging)
+    if out.exists():
+        raise RunnerError(f"scenario output directory appeared before promotion: {out}")
+    staging.rename(out)
+    handoff.unlink()
+    progress_path.unlink(missing_ok=True)
+    claim_path.unlink()
+    return finalized
+
+
+def consume_watchdog_failure_handoff(
+    output_dir: str | Path,
+    handoff_path: str | Path,
+    result: WatchdogResult,
+) -> Mapping[str, Any]:
+    """Consume the worker's bounded failure sidecar for one parent receipt."""
+
+    out = Path(output_dir).expanduser().resolve()
+    handoff = _watchdog_handoff_path(out, handoff_path, require_absent=False)
+    if handoff is None:
+        raise RunnerError("watchdog handoff path is required")
+    descriptor = read_json(handoff)
+    if not isinstance(descriptor, Mapping):
+        raise RunnerError("watchdog failure handoff must be an object")
+    if descriptor.get("schema_version") != "tdcsim_cbo_watchdog_handoff_v1":
+        raise RunnerError("watchdog failure handoff schema is unsupported")
+    if descriptor.get("state") != "failed":
+        raise RunnerError("watchdog handoff does not contain worker failure progress")
+    if int(descriptor.get("worker_pid", -1)) != result.child_pid:
+        raise RunnerError("watchdog failure handoff worker PID mismatch")
+    if str(descriptor.get("output_dir_name")) != out.name:
+        raise RunnerError("watchdog failure handoff output directory mismatch")
+    progress_path = _watchdog_progress_path(
+        out,
+        handoff,
+        require_absent=False,
+        require_present=False,
+    )
+    if progress_path is None or str(descriptor.get("progress_file_name")) != progress_path.name:
+        raise RunnerError("watchdog failure handoff progress file mismatch")
+    failure = descriptor.get("failure")
+    if not isinstance(failure, Mapping):
+        raise RunnerError("watchdog failure handoff payload is missing")
+    handoff.unlink()
+    progress_path.unlink(missing_ok=True)
+    return dict(failure)
+
+
+def cleanup_watchdog_intervention(
+    output_dir: str | Path,
+    handoff_path: str | Path,
+    result: WatchdogResult,
+) -> Mapping[str, Any]:
+    """Clean only artifacts proven to belong to a stopped watchdog child."""
+
+    out = Path(output_dir).expanduser().resolve()
+    handoff = _watchdog_handoff_path(
+        out,
+        handoff_path,
+        require_absent=False,
+        require_present=False,
+    )
+    if handoff is None:
+        raise RunnerError("watchdog handoff path is required")
+    progress_path = _watchdog_progress_path(
+        out,
+        handoff,
+        require_absent=False,
+        require_present=False,
+    )
+    if progress_path is None:
+        raise RunnerError("watchdog progress path is required")
+
+    progress: dict[str, Any] | None = None
+    progress_staging: Path | None = None
+    progress_error: str | None = None
+    if progress_path.is_file():
+        try:
+            progress, progress_staging = _read_watchdog_progress(
+                out,
+                progress_path,
+                result.child_pid,
+            )
+        except Exception as exc:
+            progress_error = type(exc).__name__
+
+    claim_path = out.parent / ".tdcsim-cbo-bounded-writer.claim"
+    claim_owned = False
+    if claim_path.is_file():
+        try:
+            claim = read_json(claim_path)
+            claim_owned = (
+                isinstance(claim, Mapping)
+                and int(claim.get("pid", -1)) == result.child_pid
+                and str(claim.get("output_dir")) == out.name
+            )
+        except Exception:
+            claim_owned = False
+
+    owned = progress is not None or claim_owned
+    removed_staging: list[str] = []
+    if owned:
+        candidates = set(_owned_staging_dirs(out, result.child_pid))
+        if progress_staging is not None:
+            candidates.add(progress_staging)
+        for staging in sorted(candidates):
+            existed = staging.exists()
+            _remove_owned_staging_tree(
+                staging,
+                out=out,
+                child_pid=result.child_pid,
+            )
+            if existed:
+                removed_staging.append(staging.name)
+        if claim_owned:
+            claim_path.unlink()
+
+    if owned:
+        handoff.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
+        _remove_atomic_sidecar_temps(handoff)
+        _remove_atomic_sidecar_temps(progress_path)
+    details = dict(progress or {})
+    details["forced_cleanup"] = {
+        "ownership_proved": owned,
+        "claim_removed": claim_owned,
+        "staging_dirs_removed": removed_staging,
+        "progress_valid": progress is not None,
+    }
+    if progress_error is not None:
+        details["forced_cleanup"]["progress_error"] = progress_error
+    return details
+
+
+def _watchdog_handoff_path(
+    out: Path,
+    value: str | Path | None,
+    *,
+    require_absent: bool = True,
+    require_present: bool = True,
+) -> Path | None:
+    if value is None:
+        return None
+    handoff = Path(value).expanduser().resolve()
+    expected_prefix = f".{out.name}.watchdog-handoff-"
+    if (
+        handoff.parent != out.parent
+        or not handoff.name.startswith(expected_prefix)
+        or handoff.suffix != ".json"
+    ):
+        raise RunnerError(
+            "watchdog handoff must be a uniquely named sibling of the output directory"
+        )
+    if require_absent and handoff.exists():
+        raise RunnerError(f"watchdog handoff already exists: {handoff}")
+    if not require_absent and require_present and not handoff.is_file():
+        raise RunnerError(f"watchdog handoff is missing: {handoff}")
+    return handoff
+
+
+def _watchdog_progress_path(
+    out: Path,
+    handoff: Path | None,
+    *,
+    require_absent: bool = True,
+    require_present: bool = False,
+) -> Path | None:
+    if handoff is None:
+        return None
+    progress = handoff.with_name(f"{handoff.stem}.progress.json")
+    if progress.parent != out.parent:
+        raise RunnerError("watchdog progress sidecar must be an output sibling")
+    if require_absent and progress.exists():
+        raise RunnerError(f"watchdog progress sidecar already exists: {progress}")
+    if not require_absent and require_present and not progress.is_file():
+        raise RunnerError(f"watchdog progress sidecar is missing: {progress}")
+    return progress
+
+
+def _write_watchdog_progress(
+    progress_path: Path,
+    *,
+    out: Path,
+    staging: Path,
+    claim_path: Path,
+    progress: Mapping[str, Any],
+) -> None:
+    _write_json_atomic(
+        progress_path,
+        {
+            "schema_version": "tdcsim_cbo_watchdog_progress_v1",
+            "worker_pid": os.getpid(),
+            "output_dir_name": out.name,
+            "staging_dir_name": staging.name,
+            "claim_file_name": claim_path.name,
+            "progress": dict(progress),
+        },
+    )
+
+
+def _record_watchdog_progress(
+    progress_path: Path,
+    *,
+    out: Path,
+    staging: Path,
+    claim_path: Path,
+    progress: Mapping[str, Any],
+) -> None:
+    _write_watchdog_progress(
+        progress_path,
+        out=out,
+        staging=staging,
+        claim_path=claim_path,
+        progress=progress,
+    )
+    if progress.get("progress_state") != "period_complete":
+        return
+    period_count = int(progress.get("period_count", -1))
+    if period_count <= 0 or period_count % 30:
+        return
+    checkpoint = {
+        "event_count": int(progress.get("event_count", -1)),
+        "last_completed_period": progress.get("last_completed_period"),
+        "peak_rss_bytes": int(progress.get("peak_rss_bytes", -1)),
+        "period_count": period_count,
+    }
+    print(
+        "tdcsim: period_checkpoint "
+        + json.dumps(checkpoint, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
+
+
+def _read_watchdog_progress(
+    out: Path,
+    progress_path: Path,
+    child_pid: int,
+) -> tuple[dict[str, Any], Path]:
+    payload = read_json(progress_path)
+    if not isinstance(payload, Mapping):
+        raise RunnerError("watchdog progress sidecar must be an object")
+    if payload.get("schema_version") != "tdcsim_cbo_watchdog_progress_v1":
+        raise RunnerError("watchdog progress sidecar schema is unsupported")
+    if int(payload.get("worker_pid", -1)) != child_pid:
+        raise RunnerError("watchdog progress worker PID mismatch")
+    if str(payload.get("output_dir_name")) != out.name:
+        raise RunnerError("watchdog progress output mismatch")
+    if str(payload.get("claim_file_name")) != ".tdcsim-cbo-bounded-writer.claim":
+        raise RunnerError("watchdog progress claim name is invalid")
+    staging = (out.parent / str(payload.get("staging_dir_name") or "")).resolve()
+    _validate_owned_staging_path(staging, out=out, child_pid=child_pid)
+    progress = payload.get("progress")
+    if not isinstance(progress, Mapping):
+        raise RunnerError("watchdog bounded progress payload is missing")
+    event_count = int(progress.get("event_count", -1))
+    period_count = int(progress.get("period_count", -1))
+    root = str(progress.get("event_root_sha256") or "")
+    last_events = progress.get("last_events")
+    progress_state = str(progress.get("progress_state") or "")
+    last_completed = progress.get("last_completed_period")
+    peak = int(progress.get("peak_rss_bytes", -1))
+    if (
+        event_count < 0
+        or period_count < 0
+        or peak < 0
+        or progress_state not in {"admission", "period_complete"}
+        or (
+            progress_state == "period_complete"
+            and not isinstance(last_completed, str)
+        )
+        or len(root) != 64
+        or any(char not in "0123456789abcdef" for char in root)
+        or not isinstance(last_events, list)
+        or len(last_events) > 64
+        or any(not isinstance(item, Mapping) for item in last_events)
+    ):
+        raise RunnerError("watchdog bounded progress payload is malformed")
+    return dict(progress), staging
+
+
+def _owned_staging_dirs(out: Path, child_pid: int) -> list[Path]:
+    prefix = f".{out.name}.staging-{child_pid}-"
+    return [
+        path.resolve()
+        for path in out.parent.iterdir()
+        if path.is_dir()
+        and path.name.startswith(prefix)
+        and len(path.name.removeprefix(prefix)) == 10
+        and all(
+            char in "0123456789abcdef"
+            for char in path.name.removeprefix(prefix)
+        )
+    ]
+
+
+def _validate_owned_staging_path(
+    staging: Path,
+    *,
+    out: Path,
+    child_pid: int,
+) -> None:
+    prefix = f".{out.name}.staging-{child_pid}-"
+    suffix = staging.name.removeprefix(prefix)
+    if (
+        staging.parent != out.parent
+        or not staging.name.startswith(prefix)
+        or len(suffix) != 10
+        or any(char not in "0123456789abcdef" for char in suffix)
+    ):
+        raise RunnerError("watchdog staging path is not owned by the stopped child")
+
+
+def _remove_owned_staging_tree(
+    staging: Path,
+    *,
+    out: Path,
+    child_pid: int,
+) -> None:
+    _validate_owned_staging_path(staging, out=out, child_pid=child_pid)
+    if staging.exists():
+        shutil.rmtree(staging)
+
+
+def _remove_atomic_sidecar_temps(path: Path) -> None:
+    prefix = f".{path.name}."
+    for candidate in path.parent.iterdir():
+        if (
+            candidate.is_file()
+            and candidate.name.startswith(prefix)
+            and candidate.name.endswith(".tmp")
+        ):
+            candidate.unlink()
+
+
+def _validated_claim_path(
+    out: Path,
+    descriptor: Mapping[str, Any],
+    child_pid: int,
+) -> Path:
+    claim_name = str(descriptor.get("claim_file_name") or "")
+    if claim_name != ".tdcsim-cbo-bounded-writer.claim":
+        raise RunnerError("watchdog handoff claim file is invalid")
+    claim_path = out.parent / claim_name
+    claim = read_json(claim_path)
+    if not isinstance(claim, Mapping):
+        raise RunnerError("watchdog campaign claim must be an object")
+    if int(claim.get("pid", -1)) != child_pid:
+        raise RunnerError("watchdog campaign claim PID mismatch")
+    if str(claim.get("output_dir")) != out.name:
+        raise RunnerError("watchdog campaign claim output mismatch")
+    return claim_path
+
+
+_ATOMIC_REPLACE_MAX_ATTEMPTS = 51
+_ATOMIC_REPLACE_RETRY_DELAY_SECONDS = 0.1
+
+
+def _replace_atomic_with_bounded_retry(temporary: Path, path: Path) -> None:
+    # Windows sync/indexing readers can briefly hold the destination. Preserve
+    # atomic replacement while keeping a persistent conflict fail-closed.
+    for attempt in range(_ATOMIC_REPLACE_MAX_ATTEMPTS):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= _ATOMIC_REPLACE_MAX_ATTEMPTS:
+                raise
+            time.sleep(_ATOMIC_REPLACE_RETRY_DELAY_SECONDS)
+
+
+def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _replace_atomic_with_bounded_retry(temporary, path)
+
+
+def _exception_detail(exc: BaseException, *names: str) -> str | None:
+    for name in names:
+        value = getattr(exc, name, None)
+        if value is not None:
+            return str(value)
+    return None
+
+
+__all__ = [
+    "CboScenarioRun",
+    "RunnerError",
+    "build_runtime_params",
+    "cleanup_watchdog_intervention",
+    "consume_watchdog_failure_handoff",
+    "finalize_watchdog_handoff",
+    "run_cbo_scenario",
+    "validate_run_boundaries",
+]

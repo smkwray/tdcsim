@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from tdc_shared import HOLDER_EVENT_ORDER, HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES
 
-MARKETABLE_SECURITY_TYPES = ("bills", "notes", "bonds", "tips", "frn")
-HOLDER_TYPES = ("Banks", "CB", "Foreign", "Private", "TrustFunds", "FedInternal")
+MARKETABLE_SECURITY_TYPES = MARKETABLE_PREFERENCE_CATEGORIES
 SCENARIO_SOURCE_ROLE = "scenario_assumption"
 
 
@@ -216,7 +216,7 @@ def compile_holder_preference_events(
         event_date = str(row["effective_date"])
         pref_key = f"{row['security_type']}_pct"
         actions = actions_by_date.setdefault(event_date, [])
-        for holder in HOLDER_TYPES:
+        for holder in HOLDER_EVENT_ORDER:
             actions.append(
                 {
                     "parameter_path": f"sector_preferences.{holder}.{pref_key}",

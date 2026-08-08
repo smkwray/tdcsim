@@ -47,7 +47,7 @@
       "properties": {
         "run_id": {"type": "string", "minLength": 1},
         "source_run_verification_status": {"type": "string", "minLength": 1},
-        "source_run_verification_grade": {"enum": ["replay", "fixture_bypass"]},
+        "source_run_verification_grade": {"enum": ["bounded_replay_v1", "replay", "fixture_bypass"]},
         "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "compiled_inputs_digest": {"type": "string"}
       }

@@ -1,10 +1,30 @@
+import json
+import math
 from pathlib import Path
 
 import pytest
 
+from tdc_shared import HOLDER_TYPES, PREFERENCE_CATEGORIES
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec
 from tdcsim_cbo._json import write_json
 from test_tdcsim_cbo_baseline import _write_release_package
+
+
+def test_scenario_schema_taxonomy_matches_shared_registry() -> None:
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / 'src'
+        / 'tdcsim_cbo'
+        / 'schemas'
+        / 'cbo-scenario-v1.schema.json'
+    )
+    schema = json.loads(schema_path.read_text(encoding='utf-8'))
+    definitions = schema['$defs']
+
+    assert tuple(
+        definitions['holderPreferenceRow']['properties']['security_type']['enum']
+    ) == tuple(PREFERENCE_CATEGORIES)
+    assert set(definitions['holderShares']['properties']) == set(HOLDER_TYPES)
 
 
 def test_scenario_spec_canonical_hash_is_stable(tmp_path: Path) -> None:
@@ -113,6 +133,192 @@ def test_scenario_spec_allows_mode_specific_optional_controls(tmp_path: Path) ->
     }
 
     CboScenarioSpec.from_mapping(scenario)
+
+
+@pytest.mark.parametrize("shock_bp", [-25.0, 25.0])
+def test_scenario_spec_accepts_exact_open04_evaluated_nominal_contract(
+    tmp_path: Path,
+    shock_bp: float,
+) -> None:
+    baseline = _baseline(tmp_path)
+
+    spec = CboScenarioSpec.from_mapping(
+        _open04_scenario_mapping(baseline, shock_bp=shock_bp)
+    )
+
+    assert spec.data["overrides"]["nominal_yield_curve"]["shocks"] == [
+        {"tenor_years": 2.0, "shock_bp": 0.0},
+        {"tenor_years": 10.0, "shock_bp": shock_bp},
+    ]
+    short_shock = spec.data["overrides"]["nominal_yield_curve"]["shocks"][0][
+        "shock_bp"
+    ]
+    assert math.copysign(1.0, short_shock) == 1.0
+
+
+def test_scenario_spec_normalizes_open04_negative_zero_before_hashing(
+    tmp_path: Path,
+) -> None:
+    baseline = _baseline(tmp_path)
+    negative_zero = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    positive_zero = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    negative_zero["overrides"]["nominal_yield_curve"]["shocks"][0][
+        "shock_bp"
+    ] = -0.0
+    positive_zero["overrides"]["nominal_yield_curve"]["shocks"][0]["shock_bp"] = 0.0
+
+    negative_spec = CboScenarioSpec.from_mapping(negative_zero)
+    positive_spec = CboScenarioSpec.from_mapping(positive_zero)
+
+    assert negative_spec.canonical_json() == positive_spec.canonical_json()
+    assert negative_spec.canonical_sha256() == positive_spec.canonical_sha256()
+    assert "-0.0" not in negative_spec.canonical_json()
+    assert (
+        negative_zero["overrides"]["nominal_yield_curve"]["shocks"][0]["shock_bp"]
+        == -0.0
+    )
+    assert math.copysign(
+        1.0,
+        negative_zero["overrides"]["nominal_yield_curve"]["shocks"][0]["shock_bp"],
+    ) == -1.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("application", "at_stored_curve_knots"),
+        ("interpolation", "pchip_log_tenor"),
+        ("lower_endpoint", "zero_below_first_key"),
+        ("upper_endpoint", "extrapolate_above_last_key"),
+        ("time_profile", "compound_across_curve_dates"),
+        ("compounding", "annual"),
+    ],
+)
+def test_scenario_spec_rejects_open04_method_drift(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    scenario["overrides"]["nominal_yield_curve"][field] = value
+
+    with pytest.raises(ValueError):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_open04_missing_or_extra_control(
+    tmp_path: Path,
+) -> None:
+    baseline = _baseline(tmp_path)
+    missing = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    del missing["overrides"]["nominal_yield_curve"]["compounding"]
+    extra = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    extra["overrides"]["nominal_yield_curve"]["shock_bp"] = -25.0
+
+    with pytest.raises(ValueError, match="missing required fields.*compounding"):
+        CboScenarioSpec.from_mapping(missing)
+    with pytest.raises(ValueError, match="mode-inapplicable fields.*shock_bp"):
+        CboScenarioSpec.from_mapping(extra)
+
+
+@pytest.mark.parametrize(
+    "shocks",
+    [
+        [{"tenor_years": 2.0, "shock_bp": 0.0}],
+        [
+            {"tenor_years": 2.0, "shock_bp": 0.0},
+            {"tenor_years": 10.0, "shock_bp": -20.0},
+        ],
+        [
+            {"tenor_years": 1.0, "shock_bp": 0.0},
+            {"tenor_years": 10.0, "shock_bp": -25.0},
+        ],
+        [
+            {"tenor_years": 2.0, "shock_bp": 1.0},
+            {"tenor_years": 10.0, "shock_bp": -25.0},
+        ],
+        [
+            {"tenor_years": 2.0, "shock_bp": 0.0},
+            {"tenor_years": 10.0, "shock_bp": -25.0},
+            {"tenor_years": 20.0, "shock_bp": -25.0},
+        ],
+    ],
+)
+def test_scenario_spec_rejects_open04_key_rate_drift(
+    tmp_path: Path,
+    shocks: list[dict],
+) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    scenario["overrides"]["nominal_yield_curve"]["shocks"] = shocks
+
+    with pytest.raises(ValueError):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_open04_extra_or_missing_override(
+    tmp_path: Path,
+) -> None:
+    baseline = _baseline(tmp_path)
+    missing = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    del missing["overrides"]["issuance_mix"]
+    extra = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    extra["overrides"]["mmf_deposit_pass_through"] = {
+        "mode": "fixed_fraction",
+        "value": 0.5,
+    }
+
+    with pytest.raises(ValueError, match="overrides must be exactly"):
+        CboScenarioSpec.from_mapping(missing)
+    with pytest.raises(ValueError, match="overrides must be exactly"):
+        CboScenarioSpec.from_mapping(extra)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("frn_benchmark", "derive_from_scenario_nominal_curve"),
+        (
+            "tips_real_yield",
+            "recompute_from_nominal_and_scenario_inflation",
+        ),
+        ("operating_cash_inflation", "scenario_cpi"),
+    ],
+)
+def test_scenario_spec_rejects_open04_coupling_drift(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    scenario["coupling"][field] = value
+
+    with pytest.raises(ValueError, match="fixed independent"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_open04_noncompact_output(
+    tmp_path: Path,
+) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    scenario["output"]["compression"] = "none"
+
+    with pytest.raises(ValueError, match="compact gzip"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_rejects_partial_open04_simulation(
+    tmp_path: Path,
+) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    scenario["simulation"] = {"frequency": "daily"}
+
+    with pytest.raises(ValueError, match="must contain exactly"):
+        CboScenarioSpec.from_mapping(scenario)
 
 
 def test_scenario_spec_rejects_holder_temporal_or_file_surface(tmp_path: Path) -> None:
@@ -288,3 +494,56 @@ def _scenario_mapping(baseline: CboBaselinePackage) -> dict:
             "compression": "gzip",
         },
     }
+
+
+def _open04_scenario_mapping(
+    baseline: CboBaselinePackage,
+    *,
+    shock_bp: float,
+) -> dict:
+    scenario = _scenario_mapping(baseline)
+    scenario["scenario_id"] = (
+        "open04_low_cost_high_tdc_v1"
+        if shock_bp < 0.0
+        else "open04_low_tdc_high_cost_v1"
+    )
+    scenario["coupling"] = {
+        "frn_benchmark": "independent_explicit_path",
+        "tips_real_yield": "independent_explicit_path",
+        "operating_cash_inflation": "baseline_cpi",
+        "primary_deficit_to_debt_target": "independent_no_plug",
+    }
+    scenario["overrides"] = {
+        "issuance_mix": {
+            "mode": "replace_shares",
+            "tips_share": 0.08,
+            "frn_share": 0.04,
+            "fixed_remainder_shares": {
+                "bills": 0.30,
+                "notes": 0.50,
+                "bonds": 0.20,
+            },
+            "maturity_distributions": {
+                "bills": [{"maturity_years": 0.5, "share": 1.0}],
+                "notes": [{"maturity_years": 5.0, "share": 1.0}],
+                "bonds": [{"maturity_years": 20.0, "share": 1.0}],
+                "tips": [{"maturity_years": 10.0, "share": 1.0}],
+                "frn": [{"maturity_years": 2.0, "share": 1.0}],
+            },
+            "negative_issuance_action": "retire_shortest_public_marketable",
+        },
+        "nominal_yield_curve": {
+            "mode": "evaluated_additive_key_rate_bp",
+            "application": "post_baseline_evaluation",
+            "interpolation": "log_tenor_linear",
+            "lower_endpoint": "zero_at_or_below_first_key",
+            "upper_endpoint": "flat_at_or_above_last_key",
+            "time_profile": "constant_across_curve_dates",
+            "compounding": "none",
+            "shocks": [
+                {"tenor_years": 2.0, "shock_bp": 0.0},
+                {"tenor_years": 10.0, "shock_bp": shock_bp},
+            ],
+        },
+    }
+    return scenario

@@ -14,7 +14,6 @@ import yaml
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
-    PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKETS,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
@@ -75,10 +74,37 @@ def _load_base_config(config_file):
 
 def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
     if initial_bonds_df_global.empty:
-        print('Initial bonds file was loaded but contained no data.')
-        return initial_bonds_df_global
+        raise ValueError('Initial portfolio file contains no data rows.')
 
     print(f'Loaded initial portfolio ({len(initial_bonds_df_global)} rows). Processing...')
+
+    required_columns = (
+        'BondID',
+        'SecurityType',
+        'IssueDate',
+        'MaturityDate',
+        'OriginalMaturityYears',
+        'FaceValue',
+        'CouponRate',
+        'HolderType',
+        'Status',
+    )
+    missing_columns = [
+        column for column in required_columns if column not in initial_bonds_df_global
+    ]
+    if missing_columns:
+        raise ValueError(
+            f'Initial portfolio is missing required columns: {missing_columns}'
+        )
+    for column in required_columns:
+        present = (
+            initial_bonds_df_global[column].notna()
+            & initial_bonds_df_global[column].astype('string').str.strip().ne('')
+        )
+        if not present.all():
+            raise ValueError(
+                f'Initial portfolio required column {column} contains missing values.'
+            )
 
     for col in BOND_PORTFOLIO_COLS:
         if col not in initial_bonds_df_global.columns:
@@ -104,7 +130,7 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
                 'DirtyPriceRatio',
                 'InterestPaymentFrequency',
             ]:
-                initial_bonds_df_global[col] = 0.0
+                initial_bonds_df_global[col] = np.nan
             elif col in ['IssueDate', 'MaturityDate', 'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'LastAccrualDate']:
                 initial_bonds_df_global[col] = pd.NaT
             elif col == 'BondID':
@@ -113,7 +139,14 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
                 initial_bonds_df_global[col] = None
 
     for col in ['IssueDate', 'MaturityDate', 'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'LastAccrualDate']:
-        initial_bonds_df_global[col] = pd.to_datetime(initial_bonds_df_global[col], errors='coerce')
+        present = (
+            initial_bonds_df_global[col].notna()
+            & initial_bonds_df_global[col].astype('string').str.strip().ne('')
+        )
+        parsed = pd.to_datetime(initial_bonds_df_global[col], errors='coerce')
+        if parsed[present].isna().any():
+            raise ValueError(f'Initial portfolio column {col} contains malformed dates.')
+        initial_bonds_df_global[col] = parsed
 
     num_cols = [
         'FaceValue',
@@ -132,17 +165,40 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
         'InterestPaymentFrequency',
     ]
     for col in num_cols:
-        initial_bonds_df_global[col] = pd.to_numeric(initial_bonds_df_global[col], errors='coerce').fillna(0.0)
+        present = (
+            initial_bonds_df_global[col].notna()
+            & initial_bonds_df_global[col].astype('string').str.strip().ne('')
+        )
+        parsed = pd.to_numeric(initial_bonds_df_global[col], errors='coerce')
+        if parsed[present].isna().any() or not parsed[present].map(np.isfinite).all():
+            raise ValueError(f'Initial portfolio column {col} contains malformed numerics.')
+        initial_bonds_df_global[col] = parsed
 
-    initial_bonds_df_global['BondID'] = pd.to_numeric(initial_bonds_df_global['BondID'], errors='coerce').astype('Int64')
+    bond_ids = pd.to_numeric(initial_bonds_df_global['BondID'], errors='coerce')
+    if bond_ids.isna().any() or not bond_ids.map(np.isfinite).all():
+        raise ValueError('Initial portfolio BondID contains malformed numerics.')
+    if not bond_ids.map(lambda value: float(value).is_integer()).all():
+        raise ValueError('Initial portfolio BondID values must be integers.')
+    if bond_ids.duplicated().any():
+        raise ValueError('Initial portfolio BondID values must be unique.')
+    initial_bonds_df_global['BondID'] = bond_ids.astype('Int64')
 
-    initial_bonds_df_global['SecurityType'] = initial_bonds_df_global['SecurityType'].astype(str).apply(
-        lambda x: x if x in SECURITY_TYPES else 'Fixed'
+    initial_bonds_df_global['SecurityType'] = initial_bonds_df_global['SecurityType'].astype(str)
+    unknown_security_types = sorted(
+        set(initial_bonds_df_global['SecurityType']) - set(SECURITY_TYPES)
     )
-    default_nm_holder = base_config.get('nonmarketable_params', {}).get('initial_holder', 'Private')
-    initial_bonds_df_global['HolderType'] = initial_bonds_df_global['HolderType'].astype(str).apply(
-        lambda x: x if x in HOLDER_TYPES else default_nm_holder
+    if unknown_security_types:
+        raise ValueError(
+            f'Initial portfolio contains unknown SecurityType values: {unknown_security_types}'
+        )
+    initial_bonds_df_global['HolderType'] = initial_bonds_df_global['HolderType'].astype(str)
+    unknown_holder_types = sorted(
+        set(initial_bonds_df_global['HolderType']) - set(HOLDER_TYPES)
     )
+    if unknown_holder_types:
+        raise ValueError(
+            f'Initial portfolio contains unknown HolderType values: {unknown_holder_types}'
+        )
     initial_bonds_df_global['HolderSubBucket'] = (
         initial_bonds_df_global['HolderSubBucket']
         .fillna("")
@@ -151,11 +207,36 @@ def _process_loaded_initial_portfolio(initial_bonds_df_global, base_config):
     )
     private_mask = initial_bonds_df_global['HolderType'] == 'Private'
     valid_private_subbucket = initial_bonds_df_global['HolderSubBucket'].isin(PRIVATE_SUBBUCKETS)
-    initial_bonds_df_global.loc[private_mask & ~valid_private_subbucket, 'HolderSubBucket'] = (
-        PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
-    )
-    initial_bonds_df_global.loc[~private_mask, 'HolderSubBucket'] = ""
-    initial_bonds_df_global['Status'] = initial_bonds_df_global['Status'].fillna('Active').astype(str)
+    if (private_mask & ~valid_private_subbucket).any():
+        raise ValueError(
+            'Initial portfolio Private rows require a canonical HolderSubBucket.'
+        )
+    if (~private_mask & initial_bonds_df_global['HolderSubBucket'].ne('')).any():
+        raise ValueError(
+            'Initial portfolio non-Private rows must not declare HolderSubBucket.'
+        )
+    initial_bonds_df_global['Status'] = initial_bonds_df_global['Status'].astype(str)
+    invalid_statuses = sorted(set(initial_bonds_df_global['Status']) - {'Active'})
+    if invalid_statuses:
+        raise ValueError(
+            f'Initial portfolio contains unsupported Status values: {invalid_statuses}'
+        )
+    if (initial_bonds_df_global['FaceValue'] < 0.0).any():
+        raise ValueError('Initial portfolio FaceValue must be nonnegative.')
+    if (initial_bonds_df_global['OriginalMaturityYears'] <= 0.0).any():
+        raise ValueError('Initial portfolio OriginalMaturityYears must be positive.')
+    if (initial_bonds_df_global['CouponRate'] < 0.0).any():
+        raise ValueError('Initial portfolio CouponRate must be nonnegative.')
+    if (initial_bonds_df_global['IssueDate'] >= initial_bonds_df_global['MaturityDate']).any():
+        raise ValueError('Initial portfolio IssueDate must precede MaturityDate.')
+
+    tips_rows = initial_bonds_df_global['SecurityType'].eq('TIPS')
+    for column in ('OriginalPrincipal', 'AdjustedPrincipal', 'ReferenceCPI_Issue', 'IndexRatio'):
+        if tips_rows.any() and initial_bonds_df_global.loc[tips_rows, column].isna().any():
+            raise ValueError(f'Initial portfolio TIPS rows require {column}.')
+    frn_rows = initial_bonds_df_global['SecurityType'].eq('FRN')
+    if frn_rows.any() and initial_bonds_df_global.loc[frn_rows, 'FixedSpread'].isna().any():
+        raise ValueError('Initial portfolio FRN rows require FixedSpread.')
 
     tips_init_mask = (initial_bonds_df_global['SecurityType'] == 'TIPS') & (
         initial_bonds_df_global['OriginalPrincipal'] < TGA_FLOOR_TOLERANCE
@@ -258,6 +339,15 @@ def _load_initial_portfolio(base_config, sim_start_date, script_dir):
     else:
         initial_bonds_path = portfolio_config.get('file')
 
+    allowed_portfolio_modes = {'empty', 'file', 'generated', 'config_derived'}
+    if portfolio_mode not in allowed_portfolio_modes:
+        raise ValueError(
+            f'Unsupported initial portfolio mode {portfolio_mode!r}; '
+            f'expected one of {sorted(allowed_portfolio_modes)}.'
+        )
+    if portfolio_mode == 'file' and not initial_bonds_path:
+        raise ValueError('Initial portfolio mode file requires initial_portfolio.file.')
+
     if portfolio_mode in {'generated', 'config_derived'}:
         print(f'Portfolio mode: {portfolio_mode} — running portfolio generator...')
         from csv_gen import generate_initial_portfolio, save_portfolio_csv
@@ -288,11 +378,10 @@ def _load_initial_portfolio(base_config, sim_start_date, script_dir):
             elif initial_bonds_path.lower().endswith(('.xls', '.xlsx')):
                 initial_bonds_df_global = pd.read_excel(initial_bonds_path)
             else:
-                print(
-                    f'Warning: Unsupported initial bonds file format: {initial_bonds_path}. '
-                    'Only CSV and Excel supported.'
+                raise ValueError(
+                    f'Unsupported initial portfolio file format: {initial_bonds_path}. '
+                    'Only CSV and Excel are supported.'
                 )
-                initial_bonds_df_global = pd.DataFrame(columns=BOND_PORTFOLIO_COLS)
 
             return _process_loaded_initial_portfolio(initial_bonds_df_global, base_config)
         except FileNotFoundError as e:
@@ -346,7 +435,7 @@ def main(config_file=None):
 
         if num_groups == 1:
             print('Running single scenario group...')
-            process_scenario_group(
+            group_summary = process_scenario_group(
                 scenario_groups[0],
                 base_config_subset_for_groups,
                 initial_bonds_df_global,
@@ -356,6 +445,12 @@ def main(config_file=None):
                 group_index=0,
                 total_groups=1,
             )
+            if group_summary.get('status') != 'completed':
+                print(
+                    'FATAL ERROR: Scenario group did not complete: '
+                    f"{group_summary.get('message', group_summary.get('status'))}"
+                )
+                raise SystemExit(1)
         else:
             try:
                 cpu_count = os.cpu_count() or 1
@@ -426,9 +521,17 @@ def main(config_file=None):
                     f" - Group: {summary.get('group_name', 'N/A'):<30} | "
                     f"Status: {summary.get('status', 'N/A'):<25} | Time: {time_str}"
                 )
+            failed_groups = [
+                summary
+                for summary in group_results_summary
+                if summary.get('status') != 'completed'
+            ]
+            if failed_groups:
+                print('FATAL ERROR: One or more scenario groups did not complete.')
+                raise SystemExit(1)
     else:
-        print("\nNo 'scenario_groups' list found or list is empty in the config file.")
-        print("To run simulations, define at least one group under 'scenario_groups'.")
+        print("\nFATAL ERROR: Define at least one scenario group in the configuration.")
+        raise SystemExit(1)
 
     overall_execution_time = time.time() - overall_start_time
     print(f'\n--- Overall execution finished in {overall_execution_time:.2f} seconds. ---')

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import concurrent.futures
 
 import pandas as pd
+import pytest
 
-from sim_groups import save_group_results_csv
+import sim_groups
+import simulation_core
+from sim_groups import process_scenario_group, save_group_results_csv
 
 
 def _scenario_frame(start_value: int) -> pd.DataFrame:
@@ -18,6 +22,116 @@ def _scenario_frame(start_value: int) -> pd.DataFrame:
         },
         index=pd.to_datetime(['2025-01-01', '2025-01-08', '2025-01-15']),
     )
+
+
+class _ImmediateExecutor:
+    """Execute submitted callables synchronously while returning real futures."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def submit(self, function, *args, **kwargs):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def test_process_scenario_group_does_not_publish_a_successful_subset(
+    monkeypatch,
+) -> None:
+    exported = []
+
+    def fake_run(_params, _start, _end, _frequency, scenario_name):
+        if scenario_name == 'failed':
+            raise RuntimeError('deliberate failure')
+        return _scenario_frame(1), {}
+
+    monkeypatch.setattr(
+        sim_groups.concurrent.futures,
+        'ProcessPoolExecutor',
+        _ImmediateExecutor,
+    )
+    monkeypatch.setattr(sim_groups, 'run_simulation', fake_run)
+    monkeypatch.setattr(
+        sim_groups,
+        'save_group_results_csv',
+        lambda *args, **kwargs: exported.append('csv'),
+    )
+    monkeypatch.setattr(
+        sim_groups,
+        'export_ratewall_bundle',
+        lambda *args, **kwargs: exported.append('ratewall'),
+    )
+    monkeypatch.setattr(
+        sim_groups,
+        'plot_multi_results',
+        lambda *args, **kwargs: exported.append('plot'),
+    )
+
+    result = process_scenario_group(
+        {
+            'group_name': 'atomic-group',
+            'scenarios': [
+                {'name': 'successful', 'overrides': {}},
+                {'name': 'failed', 'overrides': {}},
+            ],
+            'group_output_settings': {'save_results_csv': True},
+        },
+        {'ratewall_contract': {'enabled': True}},
+        pd.DataFrame(),
+        '2025-01-01',
+        '2025-01-15',
+        'W',
+        0,
+        1,
+    )
+
+    assert result['status'] == 'failed'
+    assert result['failed_scenarios'] == ['failed']
+    assert exported == []
+
+
+def test_simulation_main_exits_nonzero_when_single_group_fails(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        simulation_core,
+        '_load_base_config',
+        lambda _path: {
+            'simulation_period': {
+                'start_date': '2025-01-01',
+                'end_date': '2025-01-15',
+                'frequency': 'W',
+            },
+            'scenario_groups': [{'group_name': 'atomic-group', 'scenarios': [{}]}],
+        },
+    )
+    monkeypatch.setattr(simulation_core, 'validate_config', lambda _config: [])
+    monkeypatch.setattr(
+        simulation_core,
+        '_load_initial_portfolio',
+        lambda *_args: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        simulation_core,
+        'process_scenario_group',
+        lambda *_args, **_kwargs: {
+            'group_name': 'atomic-group',
+            'status': 'failed',
+            'message': 'scenario failed',
+        },
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        simulation_core.main('unused.yaml')
+
+    assert exc_info.value.code == 1
 
 
 def _cbo_export_frame(start_value: int) -> pd.DataFrame:

@@ -1,0 +1,748 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tdcsim.local/schemas/cbo-run-manifest-v2.schema.json",
+  "title": "TDCSIM bounded CBO scenario run manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "verification_grade",
+    "generated_at_utc",
+    "baseline",
+    "scenario",
+    "code_environment",
+    "claim_boundary",
+    "coupling_decisions",
+    "compiled_manifest",
+    "compiled_inputs_digest",
+    "compiled_inputs",
+    "simulation",
+    "fiscal_incidence_policy_id",
+    "outputs",
+    "output_manifest",
+    "output_hashes",
+    "boundary_checks",
+    "validation",
+    "unsupported_components",
+    "evidence_profile",
+    "aggregation_clock",
+    "bounded_evidence",
+    "execution_contract",
+    "execution_milestones"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "tdcsim_cbo_scenario_run_manifest_v2"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$"
+    },
+    "status": {
+      "const": "complete"
+    },
+    "verification_grade": {
+      "const": "bounded_replay_v1"
+    },
+    "generated_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "baseline": {
+      "$ref": "#/$defs/baseline"
+    },
+    "scenario": {
+      "$ref": "#/$defs/scenario"
+    },
+    "code_environment": {
+      "type": "object"
+    },
+    "claim_boundary": {
+      "type": "object"
+    },
+    "coupling_decisions": {
+      "type": "object"
+    },
+    "compiled_manifest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "compiled_inputs_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "compiled_inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "minItems": 1
+    },
+    "simulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_date",
+        "end_date",
+        "frequency"
+      ],
+      "properties": {
+        "start_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "end_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "frequency": {
+          "const": "daily"
+        }
+      }
+    },
+    "fiscal_incidence_policy_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "outputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "output_manifest": {
+      "type": "object"
+    },
+    "output_hashes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "boundary_checks": {
+      "type": "object"
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "gates",
+        "invariants"
+      ],
+      "properties": {
+        "status": {
+          "const": "pass"
+        },
+        "gates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/check"
+          }
+        },
+        "invariants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/check"
+          }
+        }
+      }
+    },
+    "unsupported_components": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true
+    },
+    "evidence_profile": {
+      "const": "bounded_period_closure_v1"
+    },
+    "aggregation_clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock_id",
+        "bucket_label_rule",
+        "opening_partial_policy",
+        "snapshot_date_rule"
+      ],
+      "properties": {
+        "clock_id": {
+          "const": "federal_fiscal_year_period_end_v1"
+        },
+        "bucket_label_rule": {
+          "const": "federal_fiscal_year_by_period_end"
+        },
+        "opening_partial_policy": {
+          "const": "unannualized_separate_partial_bucket"
+        },
+        "snapshot_date_rule": {
+          "const": "exact_september_30"
+        }
+      }
+    },
+    "bounded_evidence": {
+      "$ref": "#/$defs/boundedEvidence"
+    },
+    "evaluated_nominal_curve": {
+      "$ref": "#/$defs/evaluatedNominalCurveRuntime"
+    },
+    "open04_campaign": {
+      "$ref": "#/$defs/open04Campaign"
+    },
+    "execution_contract": {
+      "$ref": "#/$defs/executionContract"
+    },
+    "parent_watchdog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "sampler",
+        "child_pid",
+        "child_returncode",
+        "action",
+        "peak_rss_bytes",
+        "worker_peak_rss_bytes",
+        "effective_peak_rss_bytes",
+        "acceptance_peak_rss_bytes",
+        "terminate_rss_bytes",
+        "kill_rss_bytes",
+        "poll_interval_seconds"
+      ],
+      "properties": {
+        "status": {
+          "const": "accepted"
+        },
+        "sampler": {
+          "const": "parent_process_rss_poll_v1"
+        },
+        "child_pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "child_returncode": {
+          "const": 0
+        },
+        "action": {
+          "const": "completed"
+        },
+        "peak_rss_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6442450944
+        },
+        "worker_peak_rss_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6442450944
+        },
+        "effective_peak_rss_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6442450944
+        },
+        "acceptance_peak_rss_bytes": {
+          "const": 6442450944
+        },
+        "terminate_rss_bytes": {
+          "const": 10737418240
+        },
+        "kill_rss_bytes": {
+          "const": 12884901888
+        },
+        "poll_interval_seconds": {
+          "const": 1.0
+        }
+      }
+    },
+    "execution_milestones": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 6,
+      "uniqueItems": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "execution_milestones": {
+            "contains": {
+              "const": "parent_watchdog_accepted"
+            }
+          }
+        },
+        "required": [
+          "execution_milestones"
+        ]
+      },
+      "then": {
+        "required": [
+          "parent_watchdog"
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "parent_watchdog"
+        ]
+      },
+      "then": {
+        "properties": {
+          "execution_milestones": {
+            "contains": {
+              "const": "parent_watchdog_accepted"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "executionContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "single_writer_claim",
+        "writer_claim_file_name",
+        "writer_claim_scope",
+        "writer_claim_scope_id",
+        "one_scenario_per_worker",
+        "process_pool_enabled",
+        "parent_watchdog_required",
+        "scenario_process_mode",
+        "numerical_thread_environment"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "tdcsim_cbo_execution_contract_v1"
+        },
+        "single_writer_claim": {
+          "const": true
+        },
+        "writer_claim_file_name": {
+          "const": ".tdcsim-cbo-bounded-writer.claim"
+        },
+        "writer_claim_scope": {
+          "enum": [
+            "open04_campaign_root",
+            "output_parent"
+          ]
+        },
+        "writer_claim_scope_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$"
+        },
+        "one_scenario_per_worker": {
+          "const": true
+        },
+        "process_pool_enabled": {
+          "const": false
+        },
+        "parent_watchdog_required": {
+          "type": "boolean"
+        },
+        "scenario_process_mode": {
+          "enum": [
+            "parent_watchdog_worker",
+            "library_call"
+          ]
+        },
+        "numerical_thread_environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "required": [
+        "logical_name",
+        "relative_path",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "logical_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "semantic_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "lineage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_id",
+        "package_sha256",
+        "manifest_sha256",
+        "release_attestation_sha256"
+      ],
+      "properties": {
+        "package_id": {
+          "type": "string"
+        },
+        "package_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "release_attestation_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "canonical_sha256",
+        "source_file_sha256",
+        "relative_path",
+        "referenced_file_hashes",
+        "referenced_files"
+      ],
+      "properties": {
+        "scenario_id": {
+          "type": "string"
+        },
+        "canonical_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_file_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "relative_path": {
+          "type": "string"
+        },
+        "referenced_file_hashes": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "referenced_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        }
+      }
+    },
+    "open04Campaign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_id",
+        "role",
+        "funding_closure_mode"
+      ],
+      "properties": {
+        "contract_id": {
+          "const": "open04_paired_tradeoff_v1"
+        },
+        "role": {
+          "enum": [
+            "baseline",
+            "candidate_a",
+            "candidate_b"
+          ]
+        },
+        "funding_closure_mode": {
+          "const": "cbo_debt_reference_plus_tga_floor_financing_v1"
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "not_applicable"
+          ]
+        },
+        "observed": {
+          "type": [
+            "number",
+            "string",
+            "boolean",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "number",
+            "string",
+            "boolean",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "boundedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "bytes",
+        "sha256",
+        "row_count"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "evaluatedNominalCurveRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "contract_id",
+        "sidecar_sha256",
+        "baseline_surface_sha256",
+        "interpolation_method",
+        "floor_zero",
+        "endpoint_behavior",
+        "runtime_selected_curve_date_count",
+        "runtime_selected_curve_date_set_sha256",
+        "grid_spec_id",
+        "grid_record_count",
+        "evaluated_delta_sha256",
+        "short_end_bitwise_mismatch_count",
+        "max_abs_analytic_delta_error_decimal"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "tdcsim_evaluated_nominal_curve_runtime_v1"
+        },
+        "contract_id": {
+          "const": "open04_log_tenor_2y10y_25bp_v1"
+        },
+        "sidecar_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "baseline_surface_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "interpolation_method": {
+          "const": "pchip"
+        },
+        "floor_zero": {
+          "const": false
+        },
+        "endpoint_behavior": {
+          "const": "clamp"
+        },
+        "runtime_selected_curve_date_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "runtime_selected_curve_date_set_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "grid_spec_id": {
+          "const": "open04_evaluated_curve_grid_v1"
+        },
+        "grid_record_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evaluated_delta_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "short_end_bitwise_mismatch_count": {
+          "const": 0
+        },
+        "max_abs_analytic_delta_error_decimal": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1e-12
+        }
+      }
+    },
+    "boundedEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_schema_version",
+        "event_count",
+        "event_root_sha256",
+        "final_state_sha256",
+        "period_count",
+        "portfolio_row_budget",
+        "max_portfolio_rows",
+        "max_active_portfolio_rows",
+        "key_cardinality_budget",
+        "max_key_cardinality",
+        "peak_rss_bytes",
+        "memory_thresholds",
+        "deterministic_artifacts",
+        "resource_artifact",
+        "invariant_status"
+      ],
+      "properties": {
+        "event_schema_version": {
+          "const": "tdcsim_transient_accounting_event_v1"
+        },
+        "event_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "event_root_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "final_state_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "period_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "portfolio_row_budget": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_portfolio_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_active_portfolio_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "key_cardinality_budget": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_key_cardinality": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "peak_rss_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "memory_thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "minimum_available_bytes",
+            "acceptance_peak_rss_bytes",
+            "application_abort_rss_bytes",
+            "parent_graceful_stop_rss_bytes",
+            "parent_kill_rss_bytes"
+          ],
+          "properties": {
+            "minimum_available_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "acceptance_peak_rss_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "application_abort_rss_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "parent_graceful_stop_rss_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "parent_kill_rss_bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "deterministic_artifacts": {
+          "type": "object",
+          "minProperties": 10,
+          "additionalProperties": {
+            "$ref": "#/$defs/boundedArtifact"
+          }
+        },
+        "resource_artifact": {
+          "$ref": "#/$defs/boundedArtifact"
+        },
+        "invariant_status": {
+          "const": "pass"
+        }
+      }
+    }
+  }
+}

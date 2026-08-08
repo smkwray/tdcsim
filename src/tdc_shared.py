@@ -16,13 +16,19 @@ BOND_PORTFOLIO_COLS = [
 
 # --- Categories ---
 HOLDER_TYPES = ['Banks', 'CB', 'Foreign', 'FedInternal', 'TrustFunds', 'Private']
+# Stable event serialization order. This is presentation policy, not a second
+# taxonomy: it must contain each canonical holder exactly once.
+HOLDER_EVENT_ORDER = ('Banks', 'CB', 'Foreign', 'Private', 'TrustFunds', 'FedInternal')
+if set(HOLDER_EVENT_ORDER) != set(HOLDER_TYPES) or len(HOLDER_EVENT_ORDER) != len(HOLDER_TYPES):
+    raise RuntimeError('HOLDER_EVENT_ORDER must be a permutation of HOLDER_TYPES')
 INTRAGOV_HOLDERS = frozenset({'FedInternal', 'TrustFunds'})
 SECURITY_TYPES = ['Fixed', 'TIPS', 'FRN', 'NonMarketable']
 # The publicly marketable subset of SECURITY_TYPES. Derived, not restated, so adding a
 # security type is one edit here rather than an edit plus a hunt for parallel copies.
 PUBLIC_MARKETABLE_SECURITY_TYPES = frozenset(SECURITY_TYPES) - {'NonMarketable'}
 MATURITY_CATEGORIES = ['bills', 'notes', 'bonds']
-PREFERENCE_CATEGORIES = ['bills', 'notes', 'bonds', 'tips', 'frn', 'nonmarketable']
+MARKETABLE_PREFERENCE_CATEGORIES = ('bills', 'notes', 'bonds', 'tips', 'frn')
+PREFERENCE_CATEGORIES = [*MARKETABLE_PREFERENCE_CATEGORIES, 'nonmarketable']
 PRIVATE_SUBBUCKET_DOMESTIC_NONBANK = 'domestic_nonbank_deposit_funded'
 PRIVATE_SUBBUCKET_MMF = 'mmf_cash_fund_route'
 PRIVATE_SUBBUCKETS = [

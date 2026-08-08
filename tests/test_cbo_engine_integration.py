@@ -40,6 +40,10 @@ from funding_plan import build_funding_plan
 from sim_engine import run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
+from tdcsim_cbo.bounded_output import (
+    BoundedResourceLimits,
+    BoundedScenarioEvidenceSink,
+)
 
 
 def _bill_yield_for_price(price_ratio: float) -> float:
@@ -704,6 +708,137 @@ def test_cbo_branch_hits_controlled_debt_target_at_enforced_period(tmp_path: Pat
     assert period["CBOControlledDebtTargetError"] == pytest.approx(0.0, abs=0.000001)
 
 
+def test_bounded_cbo_sink_matches_legacy_short_fixture(tmp_path: Path) -> None:
+    paths = _build_temp_forecast_inputs(tmp_path / "inputs")
+    legacy_results, legacy_portfolio = run_simulation(
+        _minimal_engine_params(paths),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+    )
+    sink = BoundedScenarioEvidenceSink(
+        tmp_path / "bounded",
+        limits=BoundedResourceLimits(
+            minimum_available_bytes=0,
+            application_abort_rss_bytes=0,
+            parent_graceful_stop_rss_bytes=0,
+            parent_kill_rss_bytes=0,
+            acceptance_peak_rss_bytes=0,
+            portfolio_row_budget=10_000,
+            key_cardinality_budget=8_192,
+        ),
+        rss_reader=lambda: 1,
+        available_reader=lambda: 1,
+    )
+    bounded_results, bounded_portfolio = run_simulation(
+        _minimal_engine_params(paths),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+        handoff_sink=sink,
+        require_bounded_handoff=True,
+    )
+
+    pd.testing.assert_frame_equal(
+        bounded_results,
+        legacy_results,
+        check_exact=True,
+        check_names=True,
+    )
+    pd.testing.assert_frame_equal(
+        bounded_portfolio.reset_index(drop=True),
+        legacy_portfolio.reset_index(drop=True),
+        check_exact=True,
+        check_names=True,
+    )
+    summary = bounded_results.attrs["bounded_handoff_summary"]
+    assert summary["evidence_profile"] == "bounded_period_closure_v1"
+    assert summary["period_count"] == 1
+    assert summary["event_count"] > 0
+    assert summary["max_portfolio_rows"] <= summary["portfolio_row_budget"]
+    assert set(summary["deterministic_artifacts"]) == set(summary["artifacts"]) - {
+        "resources"
+    }
+    annual = pd.read_csv(tmp_path / "bounded" / "tdcsim_annual_economic_summary.csv.gz")
+    assert len(annual) == 1
+    row = annual.iloc[0]
+    final = legacy_results.iloc[-1]
+    assert row["period_label"] == "FY2026_PARTIAL_OPENING"
+    assert row["modeled_financing_cost_bil"] == pytest.approx(
+        final["FinancingCost_Period"]
+    )
+    assert row["cumulative_modeled_financing_cost_bil"] == pytest.approx(
+        row["interest_outlay_bil"]
+        + row["issue_discount_cost_bil"]
+        + row["nonmarketable_interest_capitalized_bil"]
+        + row["tips_inflation_accretion_bil"]
+    )
+    assert row["tdc_change_ex_overlap_bil"] == pytest.approx(
+        row["tdc_change_bil"] - row["overlap_cashflow_bil"]
+    )
+    assert row["cumulative_tdc_change_ex_overlap_bil"] == pytest.approx(
+        row["cumulative_tdc_change_bil"]
+        - row["cumulative_overlap_cashflow_bil"]
+    )
+    assert row["new_issuance_wam_years"] == pytest.approx(
+        final["NewIssuanceWAM"]
+    )
+    assert row["new_issuance_bill_share"] == pytest.approx(
+        final["NewIssuanceBillShare"]
+    )
+    assert row["new_issuance_short_maturity_share"] == pytest.approx(
+        final["NewIssuanceShortMaturityShare"]
+    )
+    assert row["outstanding_controlled_wam_years"] == pytest.approx(
+        final["OutstandingControlledWAM"]
+    )
+    assert row["outstanding_controlled_bill_share"] == pytest.approx(
+        final["OutstandingControlledBillShare"]
+    )
+    assert row["outstanding_controlled_short_maturity_share"] == pytest.approx(
+        final["OutstandingControlledShortMaturityShare"]
+    )
+    assert (
+        row["modeled_financing_cost_basis"]
+        == "nominal_model_cost_incurred_within_simulation_horizon"
+    )
+    assert row["modeled_financing_cost_units"] == "billions_of_nominal_dollars"
+    assert row["cumulative_basis"] == "since_simulation_origin"
+
+    second_sink = BoundedScenarioEvidenceSink(
+        tmp_path / "bounded-second",
+        limits=BoundedResourceLimits(
+            minimum_available_bytes=0,
+            application_abort_rss_bytes=0,
+            parent_graceful_stop_rss_bytes=0,
+            parent_kill_rss_bytes=0,
+            acceptance_peak_rss_bytes=0,
+            portfolio_row_budget=10_000,
+            key_cardinality_budget=8_192,
+        ),
+        rss_reader=lambda: 2,
+        available_reader=lambda: 2,
+    )
+    second_results, _ = run_simulation(
+        _minimal_engine_params(paths),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+        handoff_sink=second_sink,
+        require_bounded_handoff=True,
+    )
+    second_summary = second_results.attrs["bounded_handoff_summary"]
+    assert second_summary["event_root_sha256"] == summary["event_root_sha256"]
+    assert second_summary["final_state_sha256"] == summary["final_state_sha256"]
+    assert (
+        second_summary["deterministic_artifacts"]
+        == summary["deterministic_artifacts"]
+    )
+
+
 def test_cbo_frn_coupon_date_accrues_interval_before_payment(tmp_path: Path) -> None:
     paths = _build_temp_forecast_inputs(tmp_path)
     paths["frn_rate_path_file"] = _write_frn_rate_path(tmp_path, rate_decimal=0.06)
@@ -727,6 +862,57 @@ def test_cbo_frn_coupon_date_accrues_interval_before_payment(tmp_path: Path) -> 
     assert period["TDC_FRNInterestToDU"] == pytest.approx(expected_payment)
     assert opening_frn["BenchmarkRate_FRN"] == pytest.approx(0.06)
     assert opening_frn["AccruedInterest_FRN"] == pytest.approx(0.0)
+
+
+def test_bounded_cbo_sink_matches_legacy_frn_coupon_fixture(tmp_path: Path) -> None:
+    paths = _build_temp_forecast_inputs(tmp_path / "inputs")
+    paths["frn_rate_path_file"] = _write_frn_rate_path(
+        tmp_path / "inputs",
+        rate_decimal=0.06,
+    )
+
+    def params() -> dict[str, Any]:
+        value = _minimal_engine_params(paths)
+        value["initial_bonds_df"] = _opening_frn_portfolio(accrued_interest=1.0)
+        return value
+
+    legacy_results, legacy_portfolio = run_simulation(
+        params(),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+    )
+    sink = BoundedScenarioEvidenceSink(
+        tmp_path / "bounded",
+        limits=BoundedResourceLimits(
+            minimum_available_bytes=0,
+            application_abort_rss_bytes=0,
+            parent_graceful_stop_rss_bytes=0,
+            parent_kill_rss_bytes=0,
+            acceptance_peak_rss_bytes=0,
+            portfolio_row_budget=10_000,
+            key_cardinality_budget=8_192,
+        ),
+        rss_reader=lambda: 1,
+        available_reader=lambda: 1,
+    )
+    bounded_results, bounded_portfolio = run_simulation(
+        params(),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+        handoff_sink=sink,
+        require_bounded_handoff=True,
+    )
+
+    pd.testing.assert_frame_equal(bounded_results, legacy_results, check_exact=True)
+    pd.testing.assert_frame_equal(
+        bounded_portfolio.reset_index(drop=True),
+        legacy_portfolio.reset_index(drop=True),
+        check_exact=True,
+    )
 
 
 def test_cbo_frn_maturity_date_accrues_interval_before_redemption_payment(tmp_path: Path) -> None:
@@ -1120,6 +1306,137 @@ def test_cbo_run_metadata_records_funding_mode_and_bridge_rows(tmp_path: Path) -
     assert results.iloc[-1]["CBONetInterestBridgeRows"] == pytest.approx(3.0)
 
 
+def test_cbo_reference_mode_finances_tga_floor_with_priced_liability(
+    tmp_path: Path,
+) -> None:
+    paths = _build_temp_forecast_inputs(
+        tmp_path,
+        cbo_public_debt_target_bil=1_145.0,
+        pre_issuance_controlled_debt_bil=1_000.0,
+        signed_primary_flow_bil=40.0,
+        cash_residual_bil=5.0,
+    )
+    params = _minimal_engine_params(paths)
+    params["initial_values"]["tga"] = 10.0
+    params["funding_rule"].update(
+        {
+            "mode": "cbo_debt_reference_plus_tga_floor_financing_v1",
+            "cash_closure_target_bil": 0.0,
+            "validation_floor_bil": -0.000001,
+        }
+    )
+
+    results, portfolio = run_simulation(
+        params,
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+    )
+    period = results.iloc[-1]
+
+    assert period["TGA"] == pytest.approx(0.0, abs=1e-9)
+    assert period["CBOCashReconciliationResidual"] == pytest.approx(5.0)
+    assert period["CashFinancingProceeds"] > 0.0
+    assert period["CashFinancingFaceIssued"] > period["CashFinancingProceeds"]
+    assert period["IssuePriceCashGap"] == pytest.approx(
+        period["NewDebtIssued"] - period["AuctionProceeds"]
+    )
+    assert period["ScenarioControlledDebt"] == pytest.approx(
+        period["CBOControlledDebtPostIssuance"]
+    )
+    assert period["DebtDriftFromReference"] == pytest.approx(
+        period["CashFinancingFaceIssued"]
+    )
+    assert period["CBOControlledDebtTargetApplicable"] == pytest.approx(0.0)
+    assert period["CBOControlledDebtTargetError"] == pytest.approx(0.0)
+    issued = portfolio.loc[portfolio["IssueDate"].eq(pd.Timestamp("2026-09-30"))]
+    assert issued["FaceValue"].sum() == pytest.approx(period["NewDebtIssued"])
+    handoff = results.attrs["handoff_tables"]["tdcsim_period_issuance_flows"]
+    assert {row["issuance_leg"] for row in handoff} == {
+        "cbo_reference_face_issuance",
+        "tga_floor_cash_financing",
+    }
+
+
+def test_cbo_reference_financing_securities_generate_future_coupon_cashflows(
+    tmp_path: Path,
+) -> None:
+    start = "2026-01-01"
+    end = "2026-08-01"
+    periods = build_simulation_calendar(start, end, "daily")
+    paths = _build_temp_forecast_inputs(
+        tmp_path,
+        periods=periods,
+        period_start=start,
+        period_end=end,
+        cbo_public_debt_target_bil=125.0,
+        pre_issuance_controlled_debt_bil=0.0,
+        signed_primary_flow_bil=100.0,
+        base_cash_balance_bil=0.0,
+    )
+    params = _minimal_engine_params(paths, opening_controlled_debt_bil=0.0)
+    params["initial_values"]["tga"] = 0.0
+    params["treasury_issuance_profile"]["bills"][
+        "target_percentage_of_remainder"
+    ] = 0.0
+    params["treasury_issuance_profile"]["notes"][
+        "target_percentage_of_remainder"
+    ] = 1.0
+    params["funding_rule"].update(
+        {
+            "mode": "cbo_debt_reference_plus_tga_floor_financing_v1",
+            "cash_closure_target_bil": 0.0,
+            "validation_floor_bil": -0.000001,
+        }
+    )
+
+    results, portfolio = run_simulation(
+        params,
+        start,
+        end,
+        freq="D",
+        scenario_name="baseline",
+    )
+
+    assert results["CashFinancingProceeds"].sum() > 0.0
+    assert results["InterestOutlay_Period"].sum() > 0.0
+    financed = portfolio.loc[
+        portfolio["IssueDate"].gt(pd.Timestamp(start))
+        & portfolio["CouponRate"].gt(0.0)
+    ]
+    assert not financed.empty
+    assert financed["FirstInterestPaymentDate"].notna().all()
+
+
+def test_cbo_exact_target_mode_remains_binding_and_does_not_finance_tga_floor(
+    tmp_path: Path,
+) -> None:
+    paths = _build_temp_forecast_inputs(
+        tmp_path,
+        cbo_public_debt_target_bil=1_145.0,
+        pre_issuance_controlled_debt_bil=1_000.0,
+        signed_primary_flow_bil=40.0,
+    )
+    params = _minimal_engine_params(paths)
+    params["initial_values"]["tga"] = 10.0
+
+    results, _ = run_simulation(
+        params,
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+    )
+    period = results.iloc[-1]
+
+    assert period["CBOControlledDebtTargetApplicable"] == pytest.approx(1.0)
+    assert period["CBOControlledDebtTargetError"] == pytest.approx(0.0)
+    assert period["CashFinancingFaceIssued"] == pytest.approx(0.0)
+    assert period["CashFinancingProceeds"] == pytest.approx(0.0)
+    assert period["TGA"] < 0.0
+
+
 def test_holder_preference_changes_do_not_change_face_issuance_or_debt_target(tmp_path: Path) -> None:
     paths = _build_temp_forecast_inputs(tmp_path)
 
@@ -1255,6 +1572,63 @@ def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_pat
     )
     assert period["TDC_SecondaryTrades"] == pytest.approx(
         period["CBOFedSecondaryPurchaseDepositEffect"]
+    )
+
+
+def test_bounded_cbo_sink_matches_legacy_fed_transfer_fixture(tmp_path: Path) -> None:
+    paths = _build_temp_forecast_inputs(
+        tmp_path / "inputs",
+        cbo_public_debt_target_bil=1_250.0,
+    )
+    fed_rows = build_fed_holdings_path_rows(
+        scenario_id="baseline",
+        periods=_single_period(),
+        opening_state_date="2026-09-20",
+        opening_cb_holdings_bil=0.0,
+        cbo_fy_end_fed_holdings_bil={2026: 50.0},
+        observation_date="2026-09-20",
+        available_date="2026-09-20",
+    )
+    paths["fed_holdings_path_file"] = _write_csv(
+        tmp_path / "inputs" / "tdcsim_fed_holdings_path.csv",
+        fed_rows,
+    )
+    legacy_results, legacy_portfolio = run_simulation(
+        _minimal_engine_params(paths),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+    )
+    sink = BoundedScenarioEvidenceSink(
+        tmp_path / "bounded",
+        limits=BoundedResourceLimits(
+            minimum_available_bytes=0,
+            application_abort_rss_bytes=0,
+            parent_graceful_stop_rss_bytes=0,
+            parent_kill_rss_bytes=0,
+            acceptance_peak_rss_bytes=0,
+            portfolio_row_budget=10_000,
+            key_cardinality_budget=8_192,
+        ),
+        rss_reader=lambda: 1,
+        available_reader=lambda: 1,
+    )
+    bounded_results, bounded_portfolio = run_simulation(
+        _minimal_engine_params(paths),
+        "2026-09-20",
+        "2026-09-30",
+        freq="10D",
+        scenario_name="baseline",
+        handoff_sink=sink,
+        require_bounded_handoff=True,
+    )
+
+    pd.testing.assert_frame_equal(bounded_results, legacy_results, check_exact=True)
+    pd.testing.assert_frame_equal(
+        bounded_portfolio.reset_index(drop=True),
+        legacy_portfolio.reset_index(drop=True),
+        check_exact=True,
     )
 
 

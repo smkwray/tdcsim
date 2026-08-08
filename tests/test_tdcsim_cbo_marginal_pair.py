@@ -767,7 +767,7 @@ def _refresh_pair_manifest_file(pair_dir: Path, filename: str) -> None:
     write_json(manifest_path, manifest)
 
 
-def test_pair_cli_source_verification_reaches_replay_grade(
+def test_pair_cli_source_verification_reaches_bounded_replay_grade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -783,7 +783,7 @@ def test_pair_cli_source_verification_reaches_replay_grade(
 
     def fake_verify(run_dir: Path, *, baseline_package: Path, attestation: Path) -> dict:
         calls.append((Path(run_dir), Path(baseline_package), Path(attestation)))
-        return {"status": "pass", "verification_grade": "replay"}
+        return {"status": "pass", "verification_grade": "bounded_replay_v1"}
 
     monkeypatch.setattr("tdcsim_cbo.verifier.verify_scenario_run", fake_verify)
     pair_dir = tmp_path / "pair-replay"
@@ -808,8 +808,8 @@ def test_pair_cli_source_verification_reaches_replay_grade(
         (baseline.resolve(), package.resolve(), attestation.resolve()),
         (shock.resolve(), package.resolve(), attestation.resolve()),
     ]
-    assert manifest["baseline_run"]["source_run_verification_grade"] == "replay"
-    assert manifest["shock_run"]["source_run_verification_grade"] == "replay"
+    assert manifest["baseline_run"]["source_run_verification_grade"] == "bounded_replay_v1"
+    assert manifest["shock_run"]["source_run_verification_grade"] == "bounded_replay_v1"
 
 
 def test_pair_rejects_a_source_run_that_does_not_pass_verification(tmp_path: Path) -> None:
@@ -1001,7 +1001,7 @@ def test_replay_campaign_verifies_after_relocation(tmp_path: Path) -> None:
             baseline_package=source.baseline_package,
             attestation=source.attestation,
         )
-        assert verified["verification_grade"] == "replay"
+        assert verified["verification_grade"] == "bounded_replay_v1"
 
 
 def _write_relocation_shock_surface(

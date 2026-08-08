@@ -9,6 +9,7 @@ from typing import Any
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
+    MARKETABLE_PREFERENCE_CATEGORIES,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
 )
@@ -17,7 +18,6 @@ from tdc_shared import (
 SCHEMA_VERSION = "tdcsim_cbo_opening_portfolio_v1"
 MSPD_TABLE_1_SOURCE = "MSPD Table 1"
 PUBLIC_MARKETABLE_CLASSES = ("Bills", "Notes", "Bonds", "TIPS", "FRN")
-MARKETABLE_PREFERENCE_CATEGORIES = ("bills", "notes", "bonds", "tips", "frn")
 CLASS_TO_CATEGORY = {
     "Bills": "bills",
     "Notes": "notes",

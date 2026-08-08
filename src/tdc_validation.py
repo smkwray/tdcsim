@@ -47,6 +47,8 @@ CBO_CONFIG_BLOCK_SCHEMAS = {
         'target_enforcement': None,
         'negative_required_issuance_action': None,
         'target_tolerance_bil': None,
+        'cash_closure_target_bil': None,
+        'validation_floor_bil': None,
         'fed_secondary_sale_buyer_mix': {
             'type': None,
             'basis': None,
@@ -339,11 +341,22 @@ def validate_issuance_profile(issuance_profile: dict, label: str = 'treasury_iss
         target_pct = cat_cfg.get('target_percentage_of_remainder', 0.0)
         _assert_nonnegative(target_pct, f"{label}.{cat}.target_percentage_of_remainder", errors)
         try:
-            fixed_remainder_sum += float(target_pct)
+            target_pct_value = float(target_pct)
+            fixed_remainder_sum += target_pct_value
         except Exception:
-            pass
+            target_pct_value = 0.0
         maturities = cat_cfg.get('maturities', [])
         distribution = cat_cfg.get('maturity_distribution', [])
+        if target_pct_value > TGA_FLOOR_TOLERANCE and not maturities:
+            errors.append(
+                f"{label}.{cat} has target_percentage_of_remainder={target_pct_value:.4f} "
+                "but no 'maturities' defined."
+            )
+        if target_pct_value > TGA_FLOOR_TOLERANCE and not distribution:
+            errors.append(
+                f"{label}.{cat} has target_percentage_of_remainder={target_pct_value:.4f} "
+                "but no 'maturity_distribution' defined."
+            )
         if maturities or distribution:
             if len(maturities) != len(distribution):
                 errors.append(

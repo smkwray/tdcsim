@@ -7,8 +7,13 @@ import pytest
 import yaml
 
 from csv_gen import generate_initial_portfolio
-from sim_engine import _handoff_append_holder_stocks, _handoff_maturity_bucket
+from sim_engine import (
+    _build_issuance_supply_schedule,
+    _handoff_append_holder_stocks,
+    _handoff_maturity_bucket,
+)
 from simulation_core import (
+    _process_loaded_initial_portfolio,
     execute_preference_trades,
     get_security_category_for_prefs,
     run_simulation,
@@ -1620,3 +1625,65 @@ class TestStrictConfigValidation:
         }
         errors = validate_issuance_profile(profile)
         assert not any('TIPS' in e and 'maturities' in e for e in errors)
+
+    def test_positive_fixed_category_without_terms_is_rejected(self):
+        profile = base_issuance_profile()
+        profile['bills'] = {'target_percentage_of_remainder': 1.0}
+
+        errors = validate_issuance_profile(profile)
+
+        assert any('bills' in error and 'maturities' in error for error in errors)
+        assert any(
+            'bills' in error and 'maturity_distribution' in error
+            for error in errors
+        )
+
+    def test_frn_issuance_uses_declared_maturity_distribution(self):
+        profile = base_issuance_profile()
+        profile['FRN'] = {
+            'target_percentage': 1.0,
+            'maturities': [3.0, 5.0],
+            'maturity_distribution': [0.25, 0.75],
+        }
+
+        schedule = _build_issuance_supply_schedule(
+            100.0,
+            face_target_mode=True,
+            issuance_leg='test',
+            issuance_profile=profile,
+            tips_real_curve_years=[],
+            tips_real_curve_rates=[],
+            current_yield_curve_years=[1.0, 10.0],
+            current_yield_curve_rates=[0.04, 0.05],
+            yield_interpolation_method='linear',
+            yield_floor_zero=True,
+            evaluated_nominal_shock=None,
+            tips_real_coupon=0.0,
+            frn_spread=0.001,
+            cbo_funding_mode=False,
+            cbo_inputs={},
+            cbo_scenario_id='test',
+            current_date=pd.Timestamp('2025-01-01'),
+        )
+
+        frn_rows = [row for row in schedule if row['type'] == 'FRN']
+        assert [row['maturity'] for row in frn_rows] == [3.0, 5.0]
+        assert [row['face_amount'] for row in frn_rows] == pytest.approx([25.0, 75.0])
+
+
+def test_loaded_initial_portfolio_rejects_missing_malformed_and_unknown_values():
+    valid = pd.DataFrame([make_bond_row()], columns=BOND_PORTFOLIO_COLS)
+
+    with pytest.raises(ValueError, match='missing required columns'):
+        _process_loaded_initial_portfolio(valid.drop(columns=['FaceValue']), {})
+
+    malformed = valid.copy()
+    malformed['FaceValue'] = malformed['FaceValue'].astype(object)
+    malformed.loc[0, 'FaceValue'] = 'not-a-number'
+    with pytest.raises(ValueError, match='FaceValue.*malformed numerics'):
+        _process_loaded_initial_portfolio(malformed, {})
+
+    unknown = valid.copy()
+    unknown.loc[0, 'SecurityType'] = 'MysteryBond'
+    with pytest.raises(ValueError, match='unknown SecurityType'):
+        _process_loaded_initial_portfolio(unknown, {})

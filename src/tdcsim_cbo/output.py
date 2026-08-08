@@ -19,12 +19,18 @@ SUMMARY_COLUMNS = [
     "Date",
     "TotalDebt_Agg",
     "CBOControlledDebtTarget",
+    "CBOControlledDebtReference",
+    "ScenarioControlledDebt",
+    "DebtDriftFromReference",
+    "CashFinancingFaceIssued",
+    "CashFinancingProceeds",
     "CBOControlledDebtPreIssuance",
     "CBOControlledDebtPostIssuance",
     "CBOControlledDebtTargetError",
     "CBORequiredFaceIssuance",
     "NewDebtIssued",
     "AuctionProceeds",
+    "IssuePriceCashGap",
     "PrimaryDeficit",
     "TGA",
     "Reserves",
@@ -71,6 +77,50 @@ SUMMARY_COLUMNS = [
     "OutstandingControlledWAM",
     "OutstandingControlledBillShare",
     "OutstandingControlledShortMaturityShare",
+]
+
+BOUNDED_SUMMARY_COLUMNS = [
+    *SUMMARY_COLUMNS,
+    "PrincipalPaid_Bonds",
+    "InterestOutlay_Period",
+    "IssueDiscountCost_Period",
+    "NonMarketableInterestCapitalized_Period",
+    "TIPSInflationAccretion_Period",
+    "FinancingCost_Period",
+    "TDC_Change",
+    "TDC_FiscalFlow",
+    "TDC_DebtService",
+    "TDC_AuctionAbsorption",
+    "TDC_SecondaryTrades",
+    "TDC_Other",
+    "TDC_PrincipalToDU",
+    "TDC_PrincipalCashToDU",
+    "TDC_InterestToDU",
+    "TDC_PrincipalToDU_DomesticNonbank",
+    "TDC_PrincipalToDU_MMF",
+    "TDC_PrincipalCashToDU_DomesticNonbank",
+    "TDC_PrincipalCashToDU_MMF",
+    "TDC_PrincipalCashToDU_MMFPlumbing",
+    "TDC_BillDiscountInterestToDU_DomesticNonbank",
+    "TDC_BillDiscountInterestToDU_MMF",
+    "TDC_CouponInterestToDU_DomesticNonbank",
+    "TDC_CouponInterestToDU_MMF",
+    "TDC_FRNInterestToDU_DomesticNonbank",
+    "TDC_FRNInterestToDU_MMF",
+    "TDC_TIPSCouponInterestToDU_DomesticNonbank",
+    "TDC_TIPSCouponInterestToDU_MMF",
+    "TDC_TIPSInflationCompensationToDU_DomesticNonbank",
+    "TDC_TIPSInflationCompensationToDU_MMF",
+    "TDC_GrossIssuanceProceedsAbsorbedByDU",
+    "TDC_NetPrincipalIssuanceCashflowToDU",
+    "TDC_AuctionAbsorption_DomesticNonbank",
+    "TDC_AuctionAbsorption_MMF",
+    "TDC_AuctionAbsorption_MMFPlumbing",
+    "TDC_SecondaryTrades_DomesticNonbank",
+    "TDC_SecondaryTrades_MMF",
+    "TDC_SecondaryTrades_MMFPlumbing",
+    "CBOBuybackFaceRetired",
+    "CBOBuybackCashPaid",
 ]
 
 COMMON_METADATA_COLUMNS = [
@@ -155,6 +205,7 @@ HANDOFF_TABLE_COLUMNS = {
         "security_id",
         "holder_sector",
         "holder_subsector",
+        "issuance_leg",
         "instrument_type",
         "maturity_bucket",
         "weighted_original_term_years",
@@ -258,6 +309,11 @@ HANDOFF_TABLE_COLUMNS = {
         "public_nonmarketable_bridge_bil",
         "non_treasury_and_definition_bridge_bil",
         "controlled_public_marketable_target_bil",
+        "cbo_controlled_debt_reference_bil",
+        "scenario_controlled_debt_bil",
+        "debt_drift_from_reference_bil",
+        "cash_financing_face_issued_bil",
+        "cash_financing_proceeds_bil",
         "controlled_debt_pre_issuance_bil",
         "face_issued_bil",
         "face_retired_bil",
@@ -669,6 +725,102 @@ def write_scenario_outputs(
         catalog_path = out / "catalog.sqlite"
         _write_catalog(catalog_path, outputs)
         outputs["catalog_sqlite"] = _artifact_record(out, catalog_path)
+    return outputs
+
+
+def write_bounded_scenario_outputs(
+    results: pd.DataFrame,
+    final_portfolio: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    bounded_summary: Mapping[str, Any],
+    profile: str = "compact",
+    compression: str = "gzip",
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write fixed-size run state around already-streamed bounded evidence.
+
+    The bounded sink owns every compact accounting/economic evidence file.  This
+    finalizer intentionally does not call ``_handoff_tables`` or materialize any
+    whole-history handoff DataFrame.
+    """
+
+    if profile not in {"summary", "compact", "audit"}:
+        raise ValueError(f"unsupported output profile: {profile}")
+    if compression not in {"gzip", "none"}:
+        raise ValueError(f"unsupported compression: {compression}")
+    if bounded_summary.get("evidence_profile") != "bounded_period_closure_v1":
+        raise ValueError("bounded output summary has an unsupported evidence profile")
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    suffix = ".csv.gz" if compression == "gzip" else ".csv"
+
+    results_out = _ensure_date_column(results)
+    result_cols = [
+        col for col in BOUNDED_SUMMARY_COLUMNS if col in results_out.columns
+    ]
+    if profile == "audit":
+        result_cols = list(results_out.columns)
+    result_path = out / f"results_{profile}{suffix}"
+    _write_frame(
+        results_out[result_cols] if result_cols else results_out,
+        result_path,
+        compression=compression,
+    )
+
+    outputs: dict[str, Any] = {
+        "profile": profile,
+        "compression": compression,
+        "results": _artifact_record(out, result_path),
+        "evidence_profile": bounded_summary["evidence_profile"],
+        "verification_grade": bounded_summary["verification_grade"],
+    }
+    if profile in {"compact", "audit"}:
+        portfolio = final_portfolio
+        if profile == "compact" and "Status" in portfolio.columns:
+            portfolio = portfolio[portfolio["Status"].astype(str).eq("Active")]
+        portfolio_path = out / f"final_portfolio_{profile}{suffix}"
+        _write_frame(portfolio, portfolio_path, compression=compression)
+        outputs["final_portfolio"] = _artifact_record(out, portfolio_path)
+
+    summary = _summary(results, final_portfolio)
+    summary.update(
+        {
+            "evidence_profile": bounded_summary["evidence_profile"],
+            "verification_grade": bounded_summary["verification_grade"],
+            "event_count": int(bounded_summary["event_count"]),
+            "event_root_sha256": str(bounded_summary["event_root_sha256"]),
+            "final_state_sha256": str(bounded_summary["final_state_sha256"]),
+            "peak_rss_bytes": int(bounded_summary["peak_rss_bytes"]),
+            "portfolio_row_budget": int(bounded_summary["portfolio_row_budget"]),
+            "max_portfolio_rows": int(bounded_summary["max_portfolio_rows"]),
+            "max_key_cardinality": int(bounded_summary["max_key_cardinality"]),
+        }
+    )
+    summary_path = out / "summary.json"
+    write_json(summary_path, summary)
+    outputs["summary"] = _artifact_record(out, summary_path)
+    outputs["summary_values"] = summary
+    if metadata:
+        outputs["row_metadata"] = dict(metadata)
+
+    artifacts = bounded_summary.get("artifacts")
+    deterministic = bounded_summary.get("deterministic_artifacts")
+    if not isinstance(artifacts, Mapping) or not isinstance(deterministic, Mapping):
+        raise ValueError("bounded output summary is missing artifact manifests")
+    for logical_name, expected in sorted(artifacts.items()):
+        if not isinstance(expected, Mapping):
+            raise ValueError(f"bounded artifact record is malformed: {logical_name}")
+        path = out / str(expected.get("path") or "")
+        actual = _artifact_record(out, path)
+        if (
+            actual["sha256"] != expected.get("sha256")
+            or actual["bytes"] != expected.get("bytes")
+        ):
+            raise ValueError(f"bounded artifact changed after sink finalization: {logical_name}")
+        actual["row_count"] = int(expected.get("row_count", 0))
+        outputs[logical_name] = actual
+    outputs["deterministic_evidence_artifacts"] = dict(deterministic)
     return outputs
 
 
@@ -1316,4 +1468,9 @@ def _write_catalog(path: Path, outputs: Mapping[str, Any]) -> None:
         conn.execute("INSERT INTO summary (payload) VALUES (?)", (json.dumps(outputs.get("summary_values", {}), sort_keys=True),))
 
 
-__all__ = ["SUMMARY_COLUMNS", "hash_output_tree", "write_scenario_outputs"]
+__all__ = [
+    "SUMMARY_COLUMNS",
+    "hash_output_tree",
+    "write_bounded_scenario_outputs",
+    "write_scenario_outputs",
+]

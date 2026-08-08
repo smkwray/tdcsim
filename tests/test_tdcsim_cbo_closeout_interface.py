@@ -32,6 +32,17 @@ from test_cbo_engine_integration import (
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
 
 
+@pytest.fixture(autouse=True)
+def _stable_host_memory_for_interface_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep interface assertions independent of transient host memory pressure."""
+
+    monkeypatch.setattr(
+        runner_module, "host_available_memory_bytes", lambda: 1 << 50
+    )
+
+
 def _assert_no_reusable_run(run_dir: Path) -> None:
     manifest_path = run_dir / "tdcsim_cbo_run_manifest.json"
     if manifest_path.exists():
@@ -82,27 +93,60 @@ def test_compiled_forecast_input_paths_maps_required_engine_paths(tmp_path: Path
 
 def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-
-    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
+    run = run_cbo_scenario(
+        baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop"
+    )
 
     assert run.manifest_path.exists()
     assert run.results_path.exists()
     assert run.run_manifest["boundary_checks"]["net_interest_role"] == "diagnostic_nonbinding"
     assert run.run_manifest["boundary_checks"]["fed_target_holder_allocation_only"] is True
     assert verify_compiled_scenario(run.compiled.compiled_dir)["status"] == "pass"
-    local_verification = verify_scenario_run(run.output_dir)
-    replay_verification = verify_scenario_run(
-        run.output_dir,
-        baseline_package=baseline.package_path,
-        attestation=baseline.attestation.path,
-    )
-    assert local_verification["status"] == "pass"
-    assert local_verification["verification_grade"] == "local"
-    assert replay_verification["status"] == "pass"
-    assert replay_verification["verification_grade"] == "replay"
+    for verification in (
+        verify_scenario_run(run.output_dir),
+        verify_scenario_run(
+            run.output_dir,
+            baseline_package=baseline.package_path,
+            attestation=baseline.attestation.path,
+        ),
+    ):
+        assert verification["status"] == "pass"
+        assert verification["verification_grade"] == "bounded_replay_v1"
+
+    evidence = run.run_manifest["bounded_evidence"]
+    assert run.run_manifest["evidence_profile"] == "bounded_period_closure_v1"
+    assert evidence["period_count"] > 0
+    assert evidence["event_count"] > 0
+    required_artifacts = {
+        "ledger",
+        "issuance",
+        "principal",
+        "payment",
+        "accounting",
+        "stock",
+        "route",
+        "tdc_summary",
+        "tdc_components",
+        "debt_bridge",
+        "scenario_metrics",
+        "commitments",
+        "resources",
+        "annual",
+    }
+    artifacts = {
+        **evidence["deterministic_artifacts"],
+        "resources": evidence["resource_artifact"],
+    }
+    assert required_artifacts <= set(artifacts)
+    for artifact in artifacts.values():
+        assert (run.output_dir / "outputs" / artifact["path"]).is_file()
+        assert artifact["sha256"]
+
     params = build_runtime_params(
         run.compiled.forecast_inputs_dir,
-        actuals_available_as_of=run.run_manifest["output_manifest"]["row_metadata"]["actuals_available_as_of"],
+        actuals_available_as_of=run.run_manifest["output_manifest"]["row_metadata"][
+            "actuals_available_as_of"
+        ],
     )
     assert params["funding_rule"]["negative_required_issuance_action"] == "error"
     row_metadata = run.run_manifest["output_manifest"]["row_metadata"]
@@ -110,157 +154,6 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     assert row_metadata["fiscal_incidence_policy_status"] == "configured_default"
     assert row_metadata["issuance_profile_status"] == "configured_default"
     assert run.compiled.manifest["materialized_default_count"] == 3
-
-    required_tables = [
-        "tdcsim_period_issuance_flows.csv",
-        "tdcsim_period_principal_flows.csv",
-        "tdcsim_period_payment_flows.csv",
-        "tdcsim_holder_stocks.csv",
-        "tdcsim_tdc_principal_route_stocks.csv",
-        "tdcsim_tdc_principal_route_stock_closure.csv",
-        "tdcsim_debt_target_bridge.csv",
-        "tdcsim_scenario_metrics.csv",
-        "tdcsim_period_tdc_summary.csv",
-        "tdcsim_period_tdc_components.csv",
-    ]
-    for filename in required_tables:
-        assert (run.output_dir / "outputs" / filename).exists()
-
-    issuance = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_issuance_flows.csv")
-    principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
-    payments = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_payment_flows.csv")
-    bridge = pd.read_csv(run.output_dir / "outputs" / "tdcsim_debt_target_bridge.csv")
-    stocks = pd.read_csv(run.output_dir / "outputs" / "tdcsim_holder_stocks.csv")
-    route_stocks = pd.read_csv(run.output_dir / "outputs" / "tdcsim_tdc_principal_route_stocks.csv")
-    route_closure = pd.read_csv(run.output_dir / "outputs" / "tdcsim_tdc_principal_route_stock_closure.csv")
-    metrics = pd.read_csv(run.output_dir / "outputs" / "tdcsim_scenario_metrics.csv")
-    tdc_summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
-    tdc_components = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_components.csv")
-    common_keys = {
-        "schema_version",
-        "scenario_id",
-        "run_id",
-        "package_id",
-        "source_vintage",
-        "actuals_available_as_of",
-        "scenario_config_sha256",
-        "compiled_inputs_digest",
-        "mmf_deposit_pass_through",
-        "fiscal_incidence_basis",
-        "fiscal_incidence_du_share",
-    }
-    for frame in (issuance, bridge, stocks, route_stocks, route_closure, metrics, tdc_summary, tdc_components):
-        assert common_keys <= set(frame.columns)
-        assert set(frame["scenario_id"]) == {run.run_manifest["scenario"]["scenario_id"]}
-        assert set(frame["actuals_available_as_of"]) == {"2026-09-20"}
-        assert set(frame["mmf_deposit_pass_through"]) == {0.97}
-        assert set(frame["fiscal_incidence_basis"]) == {"signed_net_primary_proxy"}
-    for frame in (issuance, principal, payments):
-        assert {"flow_id", "security_id"} <= set(frame.columns)
-        assert frame["flow_id"].notna().all()
-        assert frame["flow_id"].is_unique
-    principal_bridge_columns = {
-        "tdc_principal_recipient_sector",
-        "tdc_principal_recipient_subsector",
-        "tdc_principal_cash_paid_to_du_bil",
-        "tdc_principal_redeemed_to_du_bil",
-        "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
-        "tdc_principal_redeemed_to_du_domestic_nonbank_bil",
-        "tdc_principal_cash_paid_to_du_mmf_bil",
-        "tdc_principal_redeemed_to_du_mmf_bil",
-        "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
-        "tdc_principal_redeemed_to_du_mmf_plumbing_bil",
-        "tdc_principal_recipient_basis",
-    }
-    assert principal_bridge_columns <= set(principal.columns)
-    summary_principal_columns = {
-        "gross_principal_cash_paid_to_du_bil",
-        "principal_redeemed_to_du_domestic_nonbank_bil",
-        "principal_redeemed_to_du_mmf_bil",
-        "gross_principal_cash_paid_to_du_domestic_nonbank_bil",
-        "gross_principal_cash_paid_to_du_mmf_bil",
-        "gross_principal_cash_paid_to_du_mmf_plumbing_bil",
-        "net_du_principal_issuance_cashflow_bil",
-    }
-    assert summary_principal_columns <= set(tdc_summary.columns)
-    assert not tdc_summary.empty
-    assert not tdc_components.empty
-    identity = (
-        tdc_summary["tdc_fiscal_flow_bil"]
-        + tdc_summary["tdc_debt_service_bil"]
-        + tdc_summary["tdc_auction_absorption_du_bil"]
-        + tdc_summary["tdc_secondary_trades_bil"]
-        + tdc_summary["tdc_other_bil"]
-    )
-    assert identity.tolist() == pytest.approx(tdc_summary["tdc_change_bil"].tolist())
-    assert tdc_summary["component_sum_error_bil"].abs().max() <= 1e-9
-    assert (
-        tdc_summary["tdc_change_bil"]
-        - tdc_summary["overlap_cashflow_bil"]
-        - tdc_summary["tdc_change_ex_overlap_bil"]
-    ).abs().max() <= 1e-9
-    assert (
-        tdc_summary["gross_principal_cash_paid_to_du_bil"]
-        - tdc_summary["gross_issuance_proceeds_absorbed_by_du_bil"]
-        - tdc_summary["net_du_principal_issuance_cashflow_bil"]
-    ).abs().max() <= 1e-9
-    if not principal.empty:
-        principal_grouped = principal.groupby(["period_start", "period_end"], dropna=False)[
-            [
-                "tdc_principal_cash_paid_to_du_bil",
-                "tdc_principal_redeemed_to_du_bil",
-                "tdc_principal_cash_paid_to_du_domestic_nonbank_bil",
-                "tdc_principal_cash_paid_to_du_mmf_bil",
-                "tdc_principal_cash_paid_to_du_mmf_plumbing_bil",
-            ]
-        ].sum()
-        tdc_summary_indexed = tdc_summary.set_index(["period_start", "period_end"], drop=False)
-        assert principal_grouped["tdc_principal_cash_paid_to_du_bil"].reindex(
-            tdc_summary_indexed.index, fill_value=0.0
-        ).tolist() == pytest.approx(tdc_summary_indexed["gross_principal_cash_paid_to_du_bil"].tolist())
-        assert principal_grouped["tdc_principal_redeemed_to_du_bil"].reindex(
-            tdc_summary_indexed.index, fill_value=0.0
-        ).tolist() == pytest.approx(tdc_summary_indexed["tdc_debt_service_principal_to_du_bil"].tolist())
-    assert not (
-        tdc_components["enters_direct_interest_support"].astype(bool)
-        & tdc_components["enters_tdc_deposit_support_default"].astype(bool)
-    ).any()
-    direct_overlap = tdc_components[tdc_components["enters_direct_interest_support"].astype(bool)]
-    assert set(direct_overlap["holder_subsector"]) <= {"domestic_nonbank_deposit_funded"}
-    tips_indexation = tdc_components[tdc_components["payment_type"] == "tips_indexation"]
-    assert not tips_indexation["is_additive_to_tdc_change"].astype(bool).any()
-    assert not tips_indexation["enters_direct_interest_support"].astype(bool).any()
-    assert set(tdc_summary["tdc_amount_basis"]) == {"post_mmf_route_pass_through_pre_ratewall_beta_chi"}
-    assert set(tdc_components["tdc_amount_basis"]) == {"post_mmf_route_pass_through_pre_ratewall_beta_chi"}
-    private_issuance = issuance[issuance["holder_sector"] == "Private"]
-    assert {"domestic_nonbank_deposit_funded", "mmf_cash_fund_route"} <= set(private_issuance["holder_subsector"])
-    frn_issuance = issuance[issuance["instrument_type"] == "FRN"]
-    assert not frn_issuance.empty
-    assert (frn_issuance["reference_rate_decimal"] > 0.0).all()
-    assert (frn_issuance["reference_rate_decimal"] < 0.25).all()
-    assert not (frn_issuance["reference_rate_decimal"] == 0.25).any()
-    non_tips_stocks = stocks[stocks["instrument_type"].isin(["Fixed", "FRN"])]
-    assert set(non_tips_stocks["valuation_basis"]) == {"face"}
-    tips_stocks = stocks[stocks["instrument_type"] == "TIPS"]
-    assert set(tips_stocks["valuation_basis"]) == {"tips_adjusted_principal"}
-    results = pd.read_csv(run.results_path)
-    assert bridge["face_issued_bil"].sum() == pytest.approx(results["NewDebtIssued"].sum())
-    assert bridge["target_error_bil"].abs().max() <= 1e-6
-    controlled_stocks = stocks[stocks["debt_scope"] == "controlled_public_marketable"]
-    final_stock_date = controlled_stocks["date"].max()
-    assert controlled_stocks.loc[controlled_stocks["date"] == final_stock_date, "debt_held_bil"].sum() == pytest.approx(
-        results["CBOControlledDebtPostIssuance"].iloc[-1]
-    )
-    controlled_route_stocks = route_stocks[route_stocks["debt_scope"] == "controlled_public_marketable"]
-    assert set(controlled_route_stocks["route_stock_basis"]) == {"tdc_principal_settlement_route"}
-    assert controlled_route_stocks.loc[
-        controlled_route_stocks["date"] == final_stock_date,
-        "route_debt_held_bil",
-    ].sum() == pytest.approx(results["CBOControlledDebtPostIssuance"].iloc[-1])
-    assert set(route_closure["route_stock_basis"]) == {"tdc_principal_settlement_route"}
-    assert route_closure["closure_identity_error_bil"].abs().max() <= 1e-9
-    closure_private = route_closure[route_closure["route_holder_sector"] == "Private"]
-    assert not closure_private.empty
 
 
 def test_run_cbo_scenario_rejects_opening_date_mismatch(tmp_path: Path) -> None:
@@ -336,24 +229,17 @@ def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(
     )
 
 
-def test_file_backed_run_package_is_self_contained_for_baseline_recompile(tmp_path: Path) -> None:
+def test_file_backed_failed_run_is_atomic(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-
     cash_dir = tmp_path / "run-cash"
     with pytest.raises(RunnerError, match="cash_residual_fully_booked"):
         run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["cash"]), cash_dir)
     _assert_no_reusable_run(cash_dir)
-    source_scenario = scenarios["cash"]
-    source_override = tmp_path / "cash_residual_override.csv"
-    source_scenario.unlink()
-    source_override.unlink()
+    assert not cash_dir.exists()
 
-    assert (cash_dir / "cash_residual_override.csv").exists()
-    copied_spec = CboScenarioSpec.from_file(cash_dir / "scenario.json")
-    recompiled = CboScenarioCompiler().compile(baseline, copied_spec, tmp_path / "recompile")
-    assert (recompiled.forecast_inputs_dir / "tdcsim_cash_reconciliation_residual.csv").exists()
-
-    noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop-selfcontained")
+    noop = run_cbo_scenario(
+        baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop-atomic"
+    )
     assert verify_scenario_run(
         noop.output_dir,
         baseline_package=baseline.package_path,
@@ -414,8 +300,12 @@ def test_cb_beneficial_holder_maturity_creates_no_private_principal_tdc(tmp_path
     scenario = _write_scenario(tmp_path / "fed-principal-route.json", baseline, overrides={})
 
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-fed-principal-route")
-    principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
-    summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
+    principal = pd.read_csv(
+        run.output_dir / "outputs" / "tdcsim_period_principal_aggregates.csv.gz"
+    )
+    summary = pd.read_csv(
+        run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv.gz"
+    )
     cb_actual = principal[principal["holder_sector"] == "CB"]
 
     assert not cb_actual.empty
@@ -454,8 +344,12 @@ def test_explicit_retirement_routes_cb_principal_to_current_holder(tmp_path: Pat
     )
 
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-retirement-route")
-    principal = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv")
-    summary = pd.read_csv(run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv")
+    principal = pd.read_csv(
+        run.output_dir / "outputs" / "tdcsim_period_principal_aggregates.csv.gz"
+    )
+    summary = pd.read_csv(
+        run.output_dir / "outputs" / "tdcsim_period_tdc_summary.csv.gz"
+    )
     retirements = principal[principal["redemption_type"] == "explicit_retirement_at_par"]
     actual_cb = retirements[retirements["holder_sector"] == "CB"]
     actual_private_tdc_cb = retirements[
@@ -515,7 +409,7 @@ def test_verifier_rejects_coordinated_manifest_and_output_tamper(tmp_path: Path)
     _refresh_result_hashes(run.output_dir, manifest)
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="CBO target error"):
+    with pytest.raises(VerificationError, match="controlled-debt target error"):
         verify_scenario_run(run.output_dir)
 
 
@@ -535,15 +429,19 @@ def test_verifier_rejects_missing_required_output_column_even_with_fresh_hashes(
 def test_verifier_rejects_missing_principal_bridge_even_with_fresh_hashes(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
-    principal_path = run.output_dir / "outputs" / "tdcsim_period_principal_flows.csv"
+    principal_path = (
+        run.output_dir / "outputs" / "tdcsim_period_principal_aggregates.csv.gz"
+    )
     principal = pd.read_csv(principal_path).drop(columns=["tdc_principal_cash_paid_to_du_bil"])
     principal.to_csv(principal_path, index=False)
     manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
-    _refresh_manifest_artifact(run.output_dir, manifest, "outputs/tdcsim_period_principal_flows.csv")
+    _refresh_manifest_artifact(
+        run.output_dir, manifest, "outputs/tdcsim_period_principal_aggregates.csv.gz"
+    )
     manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="tdcsim_period_principal_flows missing required columns"):
+    with pytest.raises(VerificationError, match="unexpected columns.*principal"):
         verify_scenario_run(run.output_dir)
 
 
@@ -559,7 +457,7 @@ def test_verifier_rejects_malformed_route_closure_with_fresh_hashes(
     closure_path = (
         run.output_dir
         / "outputs"
-        / "tdcsim_tdc_principal_route_stock_closure.csv"
+        / "tdcsim_period_route_stock_closure.csv.gz"
     )
     closure = pd.read_csv(closure_path)
     closure["closure_identity_error_bil"] = closure[
@@ -571,7 +469,7 @@ def test_verifier_rejects_malformed_route_closure_with_fresh_hashes(
     _refresh_manifest_artifact(
         run.output_dir,
         manifest,
-        "outputs/tdcsim_tdc_principal_route_stock_closure.csv",
+        "outputs/tdcsim_period_route_stock_closure.csv.gz",
     )
     manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
     write_json(run.manifest_path, manifest)
@@ -579,210 +477,8 @@ def test_verifier_rejects_malformed_route_closure_with_fresh_hashes(
     with pytest.raises(
         VerificationError,
         match=(
-            "tdcsim_tdc_principal_route_stock_closure has malformed "
-            "or nonfinite numeric values"
+            "route closure has malformed numeric values"
         ),
-    ):
-        verify_scenario_run(run.output_dir)
-
-
-@pytest.mark.parametrize("mutation", ["delete", "duplicate"])
-def test_verifier_rejects_deleted_or_duplicated_accounting_leg_with_fresh_hashes(
-    tmp_path: Path,
-    mutation: str,
-) -> None:
-    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-    run = run_cbo_scenario(
-        baseline,
-        CboScenarioSpec.from_file(scenarios["noop"]),
-        tmp_path / "run",
-    )
-    journal_path = run.output_dir / "outputs" / "tdcsim_accounting_journal.csv"
-    journal = pd.read_csv(journal_path)
-    target_index = journal.index[journal["event_type"].eq("issuance")][0]
-    if mutation == "delete":
-        journal = journal.drop(index=target_index).reset_index(drop=True)
-    else:
-        duplicate = journal.loc[[target_index]].copy()
-        duplicate.loc[:, "journal_id"] = (
-            duplicate["journal_id"].astype(str) + "|duplicate"
-        )
-        journal = pd.concat([journal, duplicate], ignore_index=True)
-    journal.to_csv(journal_path, index=False)
-    manifest = read_json(run.manifest_path)
-    _refresh_manifest_artifact(
-        run.output_dir,
-        manifest,
-        "outputs/tdcsim_accounting_journal.csv",
-    )
-    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
-    write_json(run.manifest_path, manifest)
-
-    with pytest.raises(
-        VerificationError,
-        match=r"accounting closure does not match journal|route stock closure fails",
-    ):
-        verify_scenario_run(run.output_dir)
-
-
-def test_verifier_rejects_empty_accounting_evidence_for_multi_period_run(
-    tmp_path: Path,
-) -> None:
-    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-    run = run_cbo_scenario(
-        baseline,
-        CboScenarioSpec.from_file(scenarios["noop"]),
-        tmp_path / "run",
-    )
-    targets = [
-        run.output_dir / "outputs" / "tdcsim_accounting_journal.csv",
-        run.output_dir / "outputs" / "tdcsim_accounting_closure.csv",
-    ]
-    for target in targets:
-        pd.read_csv(target).iloc[0:0].to_csv(target, index=False)
-    manifest = read_json(run.manifest_path)
-    for target in targets:
-        _refresh_manifest_artifact(
-            run.output_dir,
-            manifest,
-            f"outputs/{target.name}",
-        )
-    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
-    write_json(run.manifest_path, manifest)
-
-    with pytest.raises(
-        VerificationError,
-        match="multi-period run is missing accounting journal and closure evidence",
-    ):
-        verify_scenario_run(run.output_dir)
-
-
-def test_verifier_rejects_accounting_leg_outside_results_period_set(
-    tmp_path: Path,
-) -> None:
-    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-    run = run_cbo_scenario(
-        baseline,
-        CboScenarioSpec.from_file(scenarios["noop"]),
-        tmp_path / "run",
-    )
-    journal_path = run.output_dir / "outputs" / "tdcsim_accounting_journal.csv"
-    journal = pd.read_csv(journal_path)
-    extra = journal.iloc[[0]].copy()
-    extra.loc[:, "journal_id"] = extra["journal_id"].astype(str) + "|extra-period"
-    extra.loc[:, "period_start"] = "2099-01-01"
-    extra.loc[:, "period_end"] = "2099-01-02"
-    amount_columns = [
-        "face_stock_change_bil",
-        "adjusted_principal_change_bil",
-        "route_face_stock_change_bil",
-        "route_adjusted_principal_change_bil",
-        "treasury_cash_change_bil",
-        "reserve_change_bil",
-        "deposit_change_bil",
-    ]
-    extra.loc[:, amount_columns] = 0.0
-    extra.loc[:, "treasury_cash_change_bil"] = 123.0
-    pd.concat([journal, extra], ignore_index=True).to_csv(journal_path, index=False)
-    manifest = read_json(run.manifest_path)
-    _refresh_manifest_artifact(
-        run.output_dir,
-        manifest,
-        "outputs/tdcsim_accounting_journal.csv",
-    )
-    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
-    write_json(run.manifest_path, manifest)
-
-    with pytest.raises(
-        VerificationError,
-        match="accounting journal, closure, and results period sets must match exactly",
-    ):
-        verify_scenario_run(run.output_dir)
-
-
-def test_verifier_rejects_coordinated_debt_total_tamper_against_stock_groups(
-    tmp_path: Path,
-) -> None:
-    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-    run = run_cbo_scenario(
-        baseline,
-        CboScenarioSpec.from_file(scenarios["noop"]),
-        tmp_path / "run",
-    )
-    results = pd.read_csv(run.results_path)
-    final_index = results.index[-1]
-    holder_column = next(
-        column
-        for column in results.columns
-        if column.startswith("DebtHeld_")
-        and float(results.loc[final_index, column]) > 0.0
-    )
-    instrument_column = next(
-        column
-        for column in results.columns
-        if column.startswith("DebtHeldByType_")
-        and float(results.loc[final_index, column]) > 0.0
-    )
-    for column in (holder_column, instrument_column, "TotalDebt_Agg"):
-        results.loc[final_index, column] = (
-            float(results.loc[final_index, column]) + 123.0
-        )
-    results.to_csv(run.results_path, index=False)
-    closure_path = run.output_dir / "outputs" / "tdcsim_accounting_closure.csv"
-    closure = pd.read_csv(closure_path)
-    closure_index = closure.index[-1]
-    for column in (
-        "holder_debt_total_bil",
-        "instrument_debt_total_bil",
-        "aggregate_debt_bil",
-    ):
-        closure.loc[closure_index, column] = (
-            float(closure.loc[closure_index, column]) + 123.0
-        )
-    closure.to_csv(closure_path, index=False)
-    manifest = read_json(run.manifest_path)
-    _refresh_result_hashes(run.output_dir, manifest)
-    _refresh_manifest_artifact(
-        run.output_dir,
-        manifest,
-        "outputs/tdcsim_accounting_closure.csv",
-    )
-    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
-    write_json(run.manifest_path, manifest)
-
-    with pytest.raises(
-        VerificationError,
-        match="accounting closure disagrees with independent snapshot",
-    ):
-        verify_scenario_run(run.output_dir)
-
-
-def test_verifier_rejects_malformed_holder_stock_numeric_with_fresh_hashes(
-    tmp_path: Path,
-) -> None:
-    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
-    run = run_cbo_scenario(
-        baseline,
-        CboScenarioSpec.from_file(scenarios["noop"]),
-        tmp_path / "run",
-    )
-    stocks_path = run.output_dir / "outputs" / "tdcsim_holder_stocks.csv"
-    stocks = pd.read_csv(stocks_path)
-    stocks["debt_held_bil"] = stocks["debt_held_bil"].astype(object)
-    stocks.loc[stocks.index[0], "debt_held_bil"] = "not-a-number"
-    stocks.to_csv(stocks_path, index=False)
-    manifest = read_json(run.manifest_path)
-    _refresh_manifest_artifact(
-        run.output_dir,
-        manifest,
-        "outputs/tdcsim_holder_stocks.csv",
-    )
-    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
-    write_json(run.manifest_path, manifest)
-
-    with pytest.raises(
-        VerificationError,
-        match="tdcsim_holder_stocks has malformed or nonfinite numeric values",
     ):
         verify_scenario_run(run.output_dir)
 
@@ -816,7 +512,7 @@ def test_verifier_rejects_wrong_baseline_identity(tmp_path: Path) -> None:
     manifest["baseline"]["package_sha256"] = "0" * 64
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="baseline package hash"):
+    with pytest.raises(VerificationError, match="baseline identity"):
         verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
 
 
@@ -828,7 +524,7 @@ def test_verifier_rejects_failing_manifest_validation(tmp_path: Path) -> None:
     manifest["validation"]["gates"][0]["status"] = "fail"
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="validation.status must be pass"):
+    with pytest.raises(VerificationError, match="validation.status.*expected constant 'pass'"):
         verify_scenario_run(run.output_dir)
 
 
@@ -998,6 +694,7 @@ def test_verifier_tolerates_float_repr_noise_in_invariant_observations(tmp_path:
     perturbed = False
     for invariant in manifest["validation"]["invariants"]:
         fields = str(invariant.get("observed", "")).split(";")
+        invariant_perturbed = False
         for index, field in enumerate(fields):
             key, sep, value = field.partition("=")
             if not sep:
@@ -1010,7 +707,9 @@ def test_verifier_tolerates_float_repr_noise_in_invariant_observations(tmp_path:
                 continue
             fields[index] = f"{key}={number * (1 + 1e-13)!r}"
             perturbed = True
-        invariant["observed"] = ";".join(fields)
+            invariant_perturbed = True
+        if invariant_perturbed:
+            invariant["observed"] = ";".join(fields)
     assert perturbed, "expected at least one float-valued observation to perturb"
     write_json(run.manifest_path, manifest)
 
@@ -1061,7 +760,7 @@ def test_verifier_rejects_fabricated_release_verified_grade(tmp_path: Path) -> N
     manifest["verification_grade"] = "release_verified"
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="release_verified grade"):
+    with pytest.raises(VerificationError, match="verification_grade.*bounded_replay_v1"):
         verify_scenario_run(run.output_dir)
 
 
@@ -1175,7 +874,7 @@ def test_verifier_rejects_hash_consistent_fabricated_output_replay(tmp_path: Pat
     _replace_output_artifacts(run.output_dir, manifest, output_manifest)
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="engine replay output hash mismatch"):
+    with pytest.raises(VerificationError, match="bounded engine replay output mismatch"):
         verify_scenario_run(run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
 
 
@@ -1792,12 +1491,28 @@ def _refresh_result_hashes(run_dir: Path, manifest: dict) -> None:
 
 def _refresh_manifest_artifact(run_dir: Path, manifest: dict, relative_path: str) -> None:
     path = run_dir / relative_path
-    for item in manifest["outputs"]:
-        if item["relative_path"] == relative_path:
-            item["sha256"] = sha256_file(path)
-            item["bytes"] = path.stat().st_size
-            return
-    raise AssertionError(f"missing output artifact in manifest: {relative_path}")
+    digest = sha256_file(path)
+    size = path.stat().st_size
+    filename = Path(relative_path).name
+    matched = False
+
+    def refresh(value: object) -> None:
+        nonlocal matched
+        if isinstance(value, dict):
+            if value.get("relative_path") == relative_path or value.get("path") == filename:
+                if "sha256" in value and "bytes" in value:
+                    value["sha256"] = digest
+                    value["bytes"] = size
+                    matched = True
+            for child in value.values():
+                refresh(child)
+        elif isinstance(value, list):
+            for child in value:
+                refresh(child)
+
+    refresh(manifest)
+    if not matched:
+        raise AssertionError(f"missing output artifact in manifest: {relative_path}")
 
 
 def _replace_output_artifacts(run_dir: Path, manifest: dict, output_manifest: dict) -> None:

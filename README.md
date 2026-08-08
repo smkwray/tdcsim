@@ -18,6 +18,16 @@ python run.py tdc_config_optional.yaml  # run the optional-feature example confi
 
 By default, the project uses the shipped `tdc_config.yaml` and generates a synthetic starting portfolio. Generated CSVs and plots are written to `output/`.
 
+## Implemented surfaces
+
+TDCSim now contains three related execution surfaces:
+
+- **Configuration runner** — `run.py` executes the scenario groups in a YAML configuration. A group is atomic: if any scenario fails or returns no data, the command exits nonzero and publishes none of that group's CSV, plot, or RateWall outputs.
+- **Governed CBO runner** — `tdcsim-cbo` validates, compiles, runs, and independently verifies scenarios against a bound baseline package. It also contains marginal-pair and forecast-state export commands.
+- **Historical replay library** — the `historical_replay_*` modules materialize and reconcile governed quarterly inputs. Tests requiring the declared raw/generated inputs run only in the explicit integration lane.
+
+The `open04_campaign` and `open04_export` modules retain validation compatibility for the fixed three-path reference evidence. Private campaign-controller commands and their local folder conventions are not part of the public CLI.
+
 ## CBO baseline scenario runner
 
 The CBO scenario lane accepts a locally generated or supplied, verified baseline package.
@@ -25,7 +35,7 @@ Its outputs are scenario-analysis artifacts, not forecasts or release claims:
 
 1. Use a locally generated or supplied CBO baseline package, such as `output/cbo_forecast_release_bound_package.zip`.
 2. Generate example scenario files with `scripts/write_cbo_example_scenarios.py`.
-3. Run a scenario with `tdcsim-cbo run` or the `tdcsim_cbo` Python API.
+3. Check them with `tdcsim-cbo validate`, then use `compile`, `run`, and `verify` as needed.
 4. Read `outputs/results_compact.csv.gz`, `outputs/final_portfolio_compact.csv.gz`, and `outputs/summary.json`.
 
 See [examples/cbo_downstream_quickstart.md](examples/cbo_downstream_quickstart.md) for the exact commands and supported knobs.
@@ -119,7 +129,7 @@ This identity is enforced row-wise and verified by automated tests. It tells you
 
 | Holder | Role | Deposit/reserve impact |
 |---|---|---|
-| `Private` | Domestic nonbanks in the DU ledger, internally split between domestic nonbank deposit-funded and MMF cash-fund routes in source-backed runs | DU for domestic nonbank deposit-funded flows; MMF cash-fund flows pass 15% to DU deposits by default, with the residual routed to reserve/plumbing |
+| `Private` | Domestic nonbanks in the DU ledger, internally split between domestic nonbank deposit-funded and MMF cash-fund routes in source-backed runs | DU for domestic nonbank deposit-funded flows; MMF cash-fund flows pass 97% to DU deposits by default, with the residual routed to reserve/plumbing |
 | `Banks` | Commercial banks | RU — auction absorption drains reserves and avoids the direct DU deposit drain that occurs when DUs buy issuance |
 | `CB` | Central bank | RU — remittances and balance-sheet operations |
 | `Foreign` | Foreign official and private holders | RU — outside the DU deposit ledger for TDC accounting |
@@ -243,6 +253,7 @@ Scenarios are defined as overrides on the base config. Each scenario in a group 
 ### Optional additions
 
 - `initial_portfolio.mode: config_derived` builds the starting stock from the configured issuance profile, holder preferences, and yield curve instead of the legacy hard-coded maturity menus.
+- `initial_portfolio.mode: file` requires a non-empty CSV or Excel file with complete core identifiers, dates, terms, holder labels, and security labels. Malformed values and unknown taxonomy entries fail instead of being replaced with zeros or defaults.
 - `rate_sensitive_demand` keeps yields exogenous but lets auction and secondary demand shares flex with yield level, spread-to-anchor, or curve slope. When `enabled: false`, behavior is unchanged.
 - `financing_cost_options.include_tips_inflation_accretion: true` adds TIPS principal accretion to `FinancingCost_Period` and exposes `TIPSInflationAccretion_Period` / `TIPSInflationAccretion_Cumulative`.
 - The engine now exposes lightweight diagnostics for the new demand system via `AuctionDemandShift_AvgAbs`, `AuctionDemandShift_MaxAbs`, `SecondaryDemandShift_AvgAbs`, and `SecondaryDemandShift_MaxAbs`.
@@ -321,6 +332,8 @@ src/
   tdc_validation.py      strict config and event validation
   csv_gen.py             synthetic initial-portfolio generator
   tdc_shared.py          shared constants, schema definitions, dtypes
+  historical_replay*.py governed quarterly replay materialization and reconciliation
+  tdcsim_cbo/            typed CBO contracts, compiler, runner, verifier, bounded evidence, and OPEN04 reference workflow
 tests/
   conftest.py            test import path setup
   test_config_and_trading.py     config validation, issuance mechanics, trading logic
@@ -356,6 +369,9 @@ pytest -q
 
 # Explicit raw/generated-artifact lane. Missing declared inputs fail; they do not skip.
 pytest -q -m integration
+
+# Isolated bounded-memory acceptance lane.
+pytest -q -m memory_stress
 ```
 
 ---

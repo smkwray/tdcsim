@@ -118,6 +118,30 @@
         }
       }
     },
+    "open04_campaign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_id",
+        "role",
+        "funding_closure_mode"
+      ],
+      "properties": {
+        "contract_id": {
+          "const": "open04_paired_tradeoff_v1"
+        },
+        "role": {
+          "enum": [
+            "baseline",
+            "candidate_a",
+            "candidate_b"
+          ]
+        },
+        "funding_closure_mode": {
+          "const": "cbo_debt_reference_plus_tga_floor_financing_v1"
+        }
+      }
+    },
     "coupling": {
       "type": "object",
       "additionalProperties": false,
@@ -312,6 +336,7 @@
           "enum": [
             "parallel_bp",
             "key_rate_bp",
+            "evaluated_additive_key_rate_bp",
             "full_surface_file"
           ]
         },
@@ -332,6 +357,21 @@
             "log_tenor_linear",
             "pchip_log_tenor"
           ]
+        },
+        "application": {
+          "const": "post_baseline_evaluation"
+        },
+        "lower_endpoint": {
+          "const": "zero_at_or_below_first_key"
+        },
+        "upper_endpoint": {
+          "const": "flat_at_or_above_last_key"
+        },
+        "time_profile": {
+          "const": "constant_across_curve_dates"
+        },
+        "compounding": {
+          "const": "none"
         },
         "file": {
           "$ref": "#/$defs/fileRef"
@@ -376,6 +416,37 @@
           },
           "required": [
             "mode",
+            "shocks"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "file"
+                ]
+              },
+              {
+                "required": [
+                  "shock_bp"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "evaluated_additive_key_rate_bp"
+            }
+          },
+          "required": [
+            "mode",
+            "application",
+            "interpolation",
+            "lower_endpoint",
+            "upper_endpoint",
+            "time_profile",
+            "compounding",
             "shocks"
           ],
           "not": {

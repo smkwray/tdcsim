@@ -320,7 +320,7 @@ def _scenario(
         "provenance": {"kind": "user_stress_assumption", "label": label},
         "coupling": {**coupling, "primary_deficit_to_debt_target": "independent_no_plug"},
         "overrides": overrides,
-        "output": {"profile": "compact", "compression": "gzip", "catalog_sqlite": True},
+        "output": {"profile": "compact", "compression": "gzip", "catalog_sqlite": False},
     }
     if simulation:
         scenario["simulation"] = simulation

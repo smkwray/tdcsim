@@ -26,6 +26,7 @@ import yaml
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
 from tdc_shared import (
+    MARKETABLE_PREFERENCE_CATEGORIES,
     MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
     MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
     MMF_DEPOSIT_PASS_THROUGH_STATUS,
@@ -39,7 +40,7 @@ TREASURY_CURVE_XML = "https://home.treasury.gov/resource-center/data-chart-cente
 RATEWALL_CLAIM_BOUNDARY = "tdcsim_ratewall_source_backed_input_contract_not_evidence_mode"
 TENORS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
 TDCSIM_HOLDERS = ["Banks", "CB", "Foreign", "Private"]
-PREFERENCE_CATEGORIES = ["bills", "notes", "bonds", "tips", "frn"]
+PREFERENCE_CATEGORIES = list(MARKETABLE_PREFERENCE_CATEGORIES)
 PRIVATE_SUBBUCKET_SOURCE_BUCKETS = {
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: "domestic_nonbank",
     PRIVATE_SUBBUCKET_MMF: "mmf",
@@ -1405,7 +1406,7 @@ def build_ratewall_config(
     base_prefs = {
         holder: {
             f"{category}_pct": (1.0 / len(TDCSIM_HOLDERS))
-            for category in ["bills", "notes", "bonds", "tips", "frn"]
+            for category in MARKETABLE_PREFERENCE_CATEGORIES
         }
         for holder in TDCSIM_HOLDERS
     }

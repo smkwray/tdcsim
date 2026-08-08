@@ -1,19 +1,27 @@
 import csv
 import json
+import math
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from evaluated_nominal_curve import (
+    NOMINAL_EVALUATED_SHOCK_FILE,
+    evaluated_nominal_contract_metadata,
+)
 from forecast_paths import OPERATING_CASH_COMPARISON_ROLE, OPERATING_CASH_OPENING_STATE_ROLE
 from tdcsim_cbo import CboBaselinePackage, CboScenarioCompiler, CboScenarioSpec
 from tdcsim_cbo._json import sha256_file, write_json
 from tdcsim_cbo.compiler import (
+    INPUT_FILES,
     OPENING_RUNTIME_STATE_FILE,
     RUNTIME_ASSUMPTIONS_FILE,
     CompilerError,
     HOLDER_PREFERENCE_EVENTS_FILE,
     ISSUANCE_MIX_FILE,
+    _compile_holder_preferences,
+    _open04_change_perimeter,
     digest_input_tree,
 )
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
@@ -82,6 +90,269 @@ def test_same_baseline_and_scenario_compile_digest_repeats_across_work_dirs(tmp_
 
     assert first.compiled_inputs_digest == second.compiled_inputs_digest
     assert first.manifest["input_hashes"] == second.manifest["input_hashes"]
+
+
+def test_legacy_key_rate_compile_keeps_stored_surface_transform_without_sidecar(
+    tmp_path: Path,
+) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["coupling"]["tips_real_yield"] = "independent_explicit_path"
+    scenario["overrides"] = {
+        "nominal_yield_curve": {
+            "mode": "key_rate_bp",
+            "interpolation": "log_tenor_linear",
+            "shocks": [
+                {"tenor_years": 0.25, "shock_bp": 10.0},
+                {"tenor_years": 10.0, "shock_bp": 20.0},
+            ],
+        }
+    }
+
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(scenario),
+        tmp_path / "work",
+    )
+
+    surface_name = INPUT_FILES["nominal_yield_curve"]
+    baseline_surface = compiled.baseline_dir / "forecast_inputs" / surface_name
+    compiled_surface = compiled.forecast_inputs_dir / surface_name
+    assert sha256_file(compiled_surface) != sha256_file(baseline_surface)
+    assert surface_name in compiled.changed_inputs
+    assert NOMINAL_EVALUATED_SHOCK_FILE not in compiled.changed_inputs
+    assert not (
+        compiled.forecast_inputs_dir / NOMINAL_EVALUATED_SHOCK_FILE
+    ).exists()
+
+
+@pytest.mark.parametrize("shock_bp", [-25.0, 25.0])
+def test_open04_evaluated_nominal_compile_preserves_surface_and_binds_sidecar(
+    tmp_path: Path,
+    shock_bp: float,
+) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    spec = CboScenarioSpec.from_mapping(
+        _open04_scenario_mapping(baseline, shock_bp=shock_bp)
+    )
+
+    first = CboScenarioCompiler().compile(
+        baseline,
+        spec,
+        tmp_path / "work-first",
+    )
+    second = CboScenarioCompiler().compile(
+        baseline,
+        spec,
+        tmp_path / "work-second",
+    )
+
+    surface_name = "tdcsim_yield_curve_surface.csv"
+    baseline_surface = first.baseline_dir / "forecast_inputs" / surface_name
+    compiled_surface = first.forecast_inputs_dir / surface_name
+    sidecar_path = first.forecast_inputs_dir / NOMINAL_EVALUATED_SHOCK_FILE
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+    assert sha256_file(compiled_surface) == sha256_file(baseline_surface)
+    assert surface_name not in first.changed_inputs
+    assert NOMINAL_EVALUATED_SHOCK_FILE in first.changed_inputs
+    assert sidecar["key_rates"][0] == {
+        "tenor_years": 2.0,
+        "shock_bp": 0.0,
+    }
+    assert math.copysign(1.0, sidecar["key_rates"][0]["shock_bp"]) == 1.0
+    assert sidecar["key_rates"][1]["shock_bp"] == shock_bp
+    assert first.manifest["evaluated_nominal_curve"] == (
+        evaluated_nominal_contract_metadata(sidecar_path, compiled_surface)
+    )
+    perimeter = first.manifest["open04_change_perimeter"]
+    assert perimeter["schema_version"] == "tdcsim_open04_change_perimeter_v3"
+    assert perimeter["economic_changed_paths"] == [
+        "issuance_mix",
+        "nominal_yield_curve_assumption",
+    ]
+    assert perimeter["physical_changed_inputs"] == [
+        ISSUANCE_MIX_FILE,
+        NOMINAL_EVALUATED_SHOCK_FILE,
+    ]
+    assert perimeter["materialized_default_inputs"] == sorted(
+        first.manifest["materialized_defaults"]
+    )
+    assert perimeter["fixed_adapter_inputs"] == []
+    assert len(perimeter["fixed_adapter_input_records_sha256"]) == 64
+    assert perimeter["baseline_input_count"] == len(
+        [
+            path
+            for path in (first.baseline_dir / "forecast_inputs").rglob("*")
+            if path.is_file()
+        ]
+    )
+    assert perimeter["compiled_input_count"] == len(
+        first.manifest["input_hashes"]
+    )
+    baseline_paths = {
+        path.relative_to(first.baseline_dir / "forecast_inputs").as_posix()
+        for path in (first.baseline_dir / "forecast_inputs").rglob("*")
+        if path.is_file()
+    }
+    compiled_paths = {
+        item["path"] for item in first.manifest["input_hashes"]
+    }
+    assert perimeter["approved_added_input_count"] == len(
+        compiled_paths - baseline_paths
+    )
+    assert len(perimeter["approved_added_input_records_sha256"]) == 64
+    assert perimeter["fixed_input_comparison_status"] == "pass"
+    assert len(perimeter["fixed_input_records_sha256"]) == 64
+    assert first.manifest["open04_change_perimeter"] == (
+        second.manifest["open04_change_perimeter"]
+    )
+    assert any(
+        item["path"] == NOMINAL_EVALUATED_SHOCK_FILE
+        and item["sha256"] == sha256_file(sidecar_path)
+        for item in first.manifest["input_hashes"]
+    )
+    assert sha256_file(sidecar_path) == sha256_file(
+        second.forecast_inputs_dir / NOMINAL_EVALUATED_SHOCK_FILE
+    )
+    assert first.manifest["evaluated_nominal_curve"] == (
+        second.manifest["evaluated_nominal_curve"]
+    )
+
+
+def test_open04_compile_classifies_opening_fed_identity_as_fixed_adapter(
+    tmp_path: Path,
+) -> None:
+    package, attestation = _write_compiler_package(
+        tmp_path,
+        include_opening_fed_target=False,
+    )
+    baseline = CboBaselinePackage.open(
+        package,
+        attestation_path=attestation,
+    )
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(
+            _open04_scenario_mapping(baseline, shock_bp=-25.0)
+        ),
+        tmp_path / "work",
+    )
+    repeated = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(
+            _open04_scenario_mapping(baseline, shock_bp=-25.0)
+        ),
+        tmp_path / "work-repeated",
+    )
+
+    perimeter = compiled.manifest["open04_change_perimeter"]
+    assert perimeter["fixed_adapter_inputs"] == [
+        INPUT_FILES["fed_holdings"]
+    ]
+    assert len(perimeter["fixed_adapter_input_records_sha256"]) == 64
+    assert perimeter["physical_changed_inputs"] == [
+        ISSUANCE_MIX_FILE,
+        NOMINAL_EVALUATED_SHOCK_FILE,
+    ]
+    assert perimeter["fixed_input_comparison_status"] == "pass"
+    assert INPUT_FILES["fed_holdings"] in compiled.changed_inputs
+    assert repeated.compiled_inputs_digest == compiled.compiled_inputs_digest
+    assert (
+        repeated.manifest["open04_change_perimeter"][
+            "fixed_adapter_input_records_sha256"
+        ]
+        == perimeter["fixed_adapter_input_records_sha256"]
+    )
+    assert sha256_file(
+        repeated.forecast_inputs_dir / INPUT_FILES["fed_holdings"]
+    ) == sha256_file(
+        compiled.forecast_inputs_dir / INPUT_FILES["fed_holdings"]
+    )
+
+    with pytest.raises(CompilerError, match="must equal"):
+        _open04_change_perimeter(
+            compiled.baseline_dir / "forecast_inputs",
+            compiled.forecast_inputs_dir,
+            scenario_changed=set(perimeter["physical_changed_inputs"]),
+            materialized_defaults=set(
+                perimeter["materialized_default_inputs"]
+            ),
+            fixed_adapter_inputs=set(),
+            changed_inputs=compiled.changed_inputs,
+        )
+
+    with pytest.raises(CompilerError, match="outside its approved perimeter"):
+        _open04_change_perimeter(
+            compiled.baseline_dir / "forecast_inputs",
+            compiled.forecast_inputs_dir,
+            scenario_changed=set(perimeter["physical_changed_inputs"]),
+            materialized_defaults=set(
+                perimeter["materialized_default_inputs"]
+            ),
+            fixed_adapter_inputs={"unexpected-fixed-adapter.csv"},
+            changed_inputs=compiled.changed_inputs,
+        )
+
+
+def test_open04_compile_rejects_shortened_simulation_horizon(
+    tmp_path: Path,
+) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _open04_scenario_mapping(baseline, shock_bp=-25.0)
+    scenario["simulation"] = {
+        "frequency": "daily",
+        "start_date": "2027-01-01",
+        "end_date": "2027-01-01",
+    }
+    spec = CboScenarioSpec.from_mapping(scenario)
+
+    with pytest.raises(
+        CompilerError,
+        match="full compiled-input horizon",
+    ):
+        CboScenarioCompiler().compile(
+            baseline,
+            spec,
+            tmp_path / "work",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "missing", "extra"])
+def test_open04_change_perimeter_rejects_changed_inputs_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    baseline = _compiler_baseline(tmp_path)
+    compiled = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(
+            _open04_scenario_mapping(baseline, shock_bp=-25.0)
+        ),
+        tmp_path / "work",
+    )
+    perimeter = compiled.manifest["open04_change_perimeter"]
+    changed_inputs = list(compiled.manifest["changed_inputs"])
+    if mutation == "duplicate":
+        changed_inputs.append(changed_inputs[0])
+        message = "duplicate-free"
+    elif mutation == "missing":
+        changed_inputs.remove(NOMINAL_EVALUATED_SHOCK_FILE)
+        message = "must equal"
+    else:
+        changed_inputs.append("unexpected-open04-input.csv")
+        message = "must equal"
+
+    with pytest.raises(CompilerError, match=message):
+        _open04_change_perimeter(
+            compiled.baseline_dir / "forecast_inputs",
+            compiled.forecast_inputs_dir,
+            scenario_changed=set(perimeter["physical_changed_inputs"]),
+            materialized_defaults=set(
+                perimeter["materialized_default_inputs"]
+            ),
+            changed_inputs=changed_inputs,
+        )
 
 
 def test_compiler_dag_is_independent_of_override_key_order(tmp_path: Path) -> None:
@@ -414,7 +685,7 @@ def test_holder_preferences_reject_cb_auction_share_when_baseline_fed_target_act
         CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
 
 
-def test_holder_preferences_overwrite_baseline_claim_labels(tmp_path: Path) -> None:
+def test_holder_preferences_preserve_existing_audit_cells(tmp_path: Path) -> None:
     baseline = _compiler_baseline(tmp_path)
     scenario = _scenario_mapping(baseline)
     scenario["overrides"] = {"holder_preferences": {"mode": "static_shares", "rows": _holder_preference_rows(cb_share=0.0)}}
@@ -422,10 +693,119 @@ def test_holder_preferences_overwrite_baseline_claim_labels(tmp_path: Path) -> N
     compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
 
     rows = _read_csv(compiled.forecast_inputs_dir / "tdcsim_holder_profile_assumptions.csv")
-    assert {row["source_role"] for row in rows} == {"scenario_assumption"}
-    assert {row["runtime_role"] for row in rows} == {"memo_only"}
-    assert {row["claim_boundary"] for row in rows} == {"holder preference profile not exact holder ownership"}
-    assert {row["scenario_transform"] for row in rows} == {"static_shares"}
+    existing = {
+        row["holder_type"]: row
+        for row in rows
+        if row["holder_type"] in {"Banks", "Private", "CB"}
+    }
+    assert {row["source_role"] for row in existing.values()} == {""}
+    assert {row["runtime_role"] for row in existing.values()} == {""}
+    assert {row["claim_boundary"] for row in existing.values()} == {""}
+    assert {row["scenario_transform"] for row in existing.values()} == {""}
+    added = [
+        row for row in rows if row["holder_type"] not in existing
+    ]
+    assert {row["source_role"] for row in added} == {"scenario_assumption"}
+    assert {row["scenario_transform"] for row in added} == {"static_shares"}
+
+
+def test_holder_compiler_changes_only_selected_top_level_cells() -> None:
+    header = [
+        "holder_type",
+        "holder_subbucket",
+        "source_role",
+        "runtime_role",
+        "claim_boundary",
+        "scenario_transform",
+        "bonds_pct",
+        "bonds_route_share",
+    ]
+    baseline = [
+        {
+            "holder_type": "Banks",
+            "holder_subbucket": "",
+            "source_role": "baseline_assumption",
+            "runtime_role": "memo_only",
+            "claim_boundary": "baseline boundary",
+            "scenario_transform": "none",
+            "bonds_pct": "0.10526315789473685",
+            "bonds_route_share": "",
+        },
+        {
+            "holder_type": "Foreign",
+            "holder_subbucket": "",
+            "source_role": "baseline_assumption",
+            "runtime_role": "memo_only",
+            "claim_boundary": "baseline boundary",
+            "scenario_transform": "none",
+            "bonds_pct": "0.2631578947368421",
+            "bonds_route_share": "",
+        },
+        {
+            "holder_type": "Private",
+            "holder_subbucket": "",
+            "source_role": "baseline_assumption",
+            "runtime_role": "memo_only",
+            "claim_boundary": "baseline boundary",
+            "scenario_transform": "none",
+            "bonds_pct": "0.631578947368421",
+            "bonds_route_share": "",
+        },
+        {
+            "holder_type": "Private",
+            "holder_subbucket": "domestic_nonbank_deposit_funded",
+            "source_role": "scenario_assumption",
+            "runtime_role": "memo_only",
+            "claim_boundary": "private route boundary",
+            "scenario_transform": "static_routes",
+            "bonds_pct": "",
+            "bonds_route_share": "0.95",
+        },
+        {
+            "holder_type": "Private",
+            "holder_subbucket": "mmf_cash_fund_route",
+            "source_role": "scenario_assumption",
+            "runtime_role": "memo_only",
+            "claim_boundary": "private route boundary",
+            "scenario_transform": "static_routes",
+            "bonds_pct": "",
+            "bonds_route_share": "0.05",
+        },
+    ]
+    override = {
+        "mode": "static_shares",
+        "rows": [
+            {
+                "security_type": "bonds",
+                "shares": {
+                    "Banks": 0.11526315789473685,
+                    "CB": 0.0,
+                    "FedInternal": 0.0,
+                    "Foreign": 0.2631578947368421,
+                    "Private": 0.621578947368421,
+                    "TrustFunds": 0.0,
+                },
+            }
+        ],
+    }
+
+    compiled = _compile_holder_preferences(
+        baseline,
+        header,
+        override,
+        fed_stock_target_active=False,
+    )
+
+    assert compiled[0]["bonds_pct"] == "0.11526315789473685"
+    assert compiled[2]["bonds_pct"] == "0.621578947368421"
+    assert compiled[1] == baseline[1]
+    assert compiled[3:5] == baseline[3:]
+    for index in (0, 2):
+        assert {
+            key
+            for key in header
+            if compiled[index].get(key) != baseline[index].get(key)
+        } == {"bonds_pct"}
 
 
 def test_dated_holder_preferences_materialize_engine_event_artifact(tmp_path: Path) -> None:
@@ -682,6 +1062,42 @@ def _scenario_mapping(baseline: CboBaselinePackage) -> dict:
     }
 
 
+def _open04_scenario_mapping(
+    baseline: CboBaselinePackage,
+    *,
+    shock_bp: float,
+) -> dict:
+    scenario = _scenario_mapping(baseline)
+    scenario["scenario_id"] = (
+        "open04_low_cost_high_tdc_v1"
+        if shock_bp < 0.0
+        else "open04_low_tdc_high_cost_v1"
+    )
+    scenario["coupling"] = {
+        "frn_benchmark": "independent_explicit_path",
+        "tips_real_yield": "independent_explicit_path",
+        "operating_cash_inflation": "baseline_cpi",
+        "primary_deficit_to_debt_target": "independent_no_plug",
+    }
+    scenario["overrides"] = {
+        "issuance_mix": _issuance_mix_override(),
+        "nominal_yield_curve": {
+            "mode": "evaluated_additive_key_rate_bp",
+            "application": "post_baseline_evaluation",
+            "interpolation": "log_tenor_linear",
+            "lower_endpoint": "zero_at_or_below_first_key",
+            "upper_endpoint": "flat_at_or_above_last_key",
+            "time_profile": "constant_across_curve_dates",
+            "compounding": "none",
+            "shocks": [
+                {"tenor_years": 2.0, "shock_bp": -0.0},
+                {"tenor_years": 10.0, "shock_bp": shock_bp},
+            ],
+        },
+    }
+    return scenario
+
+
 def _holder_preference_rows(*, cb_share: float = 0.0) -> list[dict]:
     private_share = 1.0 - cb_share
     return [
@@ -736,8 +1152,12 @@ def _write_compiler_package(
     _write_csv(
         inputs / "tdcsim_yield_curve_surface.csv",
         [
-            {"curve_date": "2027-01-01", "tenor_years": 0.25, "nominal_rate_decimal": 0.03, "nominal_rate": 3.0},
-            {"curve_date": "2027-01-02", "tenor_years": 0.25, "nominal_rate_decimal": 0.031, "nominal_rate": 3.1},
+            {"scenario_id": scenario_id, "curve_date": "2027-01-01", "tenor_years": 0.25, "nominal_rate_decimal": 0.03, "nominal_rate": 3.0},
+            {"scenario_id": scenario_id, "curve_date": "2027-01-01", "tenor_years": 2.0, "nominal_rate_decimal": 0.032, "nominal_rate": 3.2},
+            {"scenario_id": scenario_id, "curve_date": "2027-01-01", "tenor_years": 10.0, "nominal_rate_decimal": 0.04, "nominal_rate": 4.0},
+            {"scenario_id": scenario_id, "curve_date": "2027-01-02", "tenor_years": 0.25, "nominal_rate_decimal": 0.031, "nominal_rate": 3.1},
+            {"scenario_id": scenario_id, "curve_date": "2027-01-02", "tenor_years": 2.0, "nominal_rate_decimal": 0.033, "nominal_rate": 3.3},
+            {"scenario_id": scenario_id, "curve_date": "2027-01-02", "tenor_years": 10.0, "nominal_rate_decimal": 0.041, "nominal_rate": 4.1},
         ],
     )
     _write_csv(

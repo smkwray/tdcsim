@@ -13,6 +13,7 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 from dateutil.relativedelta import relativedelta
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_price_ratio
+from evaluated_nominal_curve import CurveContractError, EvaluatedNominalShock
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     DAYS_PER_YEAR_ACTUAL,
@@ -37,6 +38,7 @@ from sim_pricing import (
     calculate_coupon_rate,
     value_treasury_security,
     calculate_face_from_proceeds_target,
+    evaluate_nominal_yield,
     get_coupon_dates_in_period,
     get_maturity_category,
     get_security_category_for_prefs,
@@ -78,6 +80,7 @@ from yield_curve_path import curve_for_date, load_yield_curve_surface
 
 
 CBO_FUNDING_MODE = 'cbo_public_debt_target'
+CBO_DEBT_REFERENCE_FINANCING_MODE = 'cbo_debt_reference_plus_tga_floor_financing_v1'
 CASH_FUNDING_MODE = 'cash_tga_target'
 _US_FEDERAL_HOLIDAYS = USFederalHolidayCalendar()
 _BUSINESS_DAY_CACHE = {}
@@ -88,7 +91,24 @@ def _is_cbo_funding_mode(params):
     funding_rule = params.get('funding_rule', {})
     if not isinstance(funding_rule, dict):
         return False
-    return str(funding_rule.get('mode', '')).strip() == CBO_FUNDING_MODE
+    return str(funding_rule.get('mode', '')).strip() in {
+        CBO_FUNDING_MODE,
+        CBO_DEBT_REFERENCE_FINANCING_MODE,
+    }
+
+
+def _evaluated_nominal_shock_from_config(yield_surface_cfg):
+    if not isinstance(yield_surface_cfg, dict):
+        return None
+    shock = yield_surface_cfg.get('evaluated_nominal_shock')
+    if shock is None:
+        return None
+    if not isinstance(shock, EvaluatedNominalShock):
+        raise CurveContractError(
+            'yield_curve_surface.evaluated_nominal_shock must be an '
+            'EvaluatedNominalShock'
+        )
+    return shock
 
 
 def _federal_fiscal_year(date_value):
@@ -967,6 +987,7 @@ def _handoff_append_issuance(
     security_id='',
     holder_sector='',
     holder_subsector='',
+    issuance_leg='ordinary_issuance',
 ):
     face_issued = float(face_issued or 0.0)
     cash_proceeds = float(cash_proceeds or 0.0)
@@ -979,6 +1000,7 @@ def _handoff_append_issuance(
             'security_id': _handoff_security_id({'BondID': security_id}),
             'holder_sector': '' if pd.isna(holder_sector) else str(holder_sector),
             'holder_subsector': '' if pd.isna(holder_subsector) else str(holder_subsector),
+            'issuance_leg': str(issuance_leg),
             'instrument_type': str(security_type),
             'maturity_bucket': _handoff_maturity_bucket(security_type, maturity_years),
             'weighted_original_term_years': float(maturity_years) if not pd.isna(maturity_years) else np.nan,
@@ -1290,8 +1312,18 @@ def _handoff_append_transfer_changes(
     event_type,
     settlement_scope,
 ):
-    holder_before = _handoff_portfolio_stock_map(before)
-    holder_after = _handoff_portfolio_stock_map(after)
+    if isinstance(before, dict) and set(before) == {'holder', 'route'}:
+        holder_before = before['holder']
+        route_before = before['route']
+    else:
+        holder_before = _handoff_portfolio_stock_map(before)
+        route_before = _handoff_portfolio_stock_map(before, route=True)
+    if isinstance(after, dict) and set(after) == {'holder', 'route'}:
+        holder_after = after['holder']
+        route_after = after['route']
+    else:
+        holder_after = _handoff_portfolio_stock_map(after)
+        route_after = _handoff_portfolio_stock_map(after, route=True)
     for key in sorted(set(holder_before) | set(holder_after)):
         before_face, before_adjusted = holder_before.get(key, (0.0, 0.0))
         after_face, after_adjusted = holder_after.get(key, (0.0, 0.0))
@@ -1321,8 +1353,6 @@ def _handoff_append_transfer_changes(
             settlement_scope=settlement_scope,
             is_intragovernmental=holder in INTRAGOV_HOLDERS,
         )
-    route_before = _handoff_portfolio_stock_map(before, route=True)
-    route_after = _handoff_portfolio_stock_map(after, route=True)
     for key in sorted(set(route_before) | set(route_after)):
         before_face, before_adjusted = route_before.get(key, (0.0, 0.0))
         after_face, after_adjusted = route_after.get(key, (0.0, 0.0))
@@ -1455,6 +1485,7 @@ def _fed_secondary_dirty_value(
     *,
     interpolation_method,
     floor_zero,
+    nominal_shock=None,
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
 ):
@@ -1498,12 +1529,13 @@ def _fed_secondary_dirty_value(
         time_to_maturity = (maturity_date - settlement_date).total_seconds() / (
             DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60
         )
-        nominal_yield = get_yield_for_maturity(
+        nominal_yield = evaluate_nominal_yield(
             time_to_maturity,
             yield_curve_years,
             yield_curve_rates,
             method=interpolation_method,
             floor_zero=floor_zero,
+            shock=nominal_shock,
         )
         if pd.isna(nominal_yield) or not np.isfinite(float(nominal_yield)):
             raise ValueError('Fed secondary transfer row has no finite market yield.')
@@ -1669,9 +1701,10 @@ def _transfer_public_marketable_debt_to_cb(
     *,
     interpolation_method='linear',
     floor_zero=True,
-
+    nominal_shock=None,
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
+    portfolio_row_budget=None,
 ):
     """Move public marketable debt to CB and return dirty-value settlement by seller."""
     if bond_portfolio is None or bond_portfolio.empty:
@@ -1721,6 +1754,7 @@ def _transfer_public_marketable_debt_to_cb(
             yield_curve_rates,
             interpolation_method=interpolation_method,
             floor_zero=floor_zero,
+            nominal_shock=nominal_shock,
             tips_real_curve_years=tips_real_curve_years,
             tips_real_curve_rates=tips_real_curve_rates,
         )
@@ -1761,6 +1795,13 @@ def _transfer_public_marketable_debt_to_cb(
         purchase_cash += dirty_value
         remaining -= purchase_amount
     if new_rows:
+        if (
+            portfolio_row_budget is not None
+            and len(bond_portfolio) + len(new_rows) > int(portfolio_row_budget)
+        ):
+            raise RuntimeError(
+                'Portfolio-row budget would be exceeded by a Fed secondary purchase split.'
+            )
         bond_portfolio = pd.concat([bond_portfolio, pd.DataFrame(new_rows)], ignore_index=True)
     return bond_portfolio, purchased_total, sold_by_holder, sold_by_private_route, purchase_cash
 
@@ -1775,9 +1816,10 @@ def _transfer_cb_marketable_debt_to_public(
     *,
     interpolation_method='linear',
     floor_zero=True,
-
+    nominal_shock=None,
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
+    portfolio_row_budget=None,
 ):
     """Move CB marketable holdings to the declared public buyer vector at dirty value."""
     if bond_portfolio is None or bond_portfolio.empty:
@@ -1821,6 +1863,7 @@ def _transfer_cb_marketable_debt_to_public(
             yield_curve_rates,
             interpolation_method=interpolation_method,
             floor_zero=floor_zero,
+            nominal_shock=nominal_shock,
             tips_real_curve_years=tips_real_curve_years,
             tips_real_curve_rates=tips_real_curve_rates,
         )
@@ -1881,6 +1924,13 @@ def _transfer_cb_marketable_debt_to_public(
         sale_cash += pricing['dirty_value']
         remaining -= sale_amount
     if new_rows:
+        if (
+            portfolio_row_budget is not None
+            and len(bond_portfolio) + len(new_rows) > int(portfolio_row_budget)
+        ):
+            raise RuntimeError(
+                'Portfolio-row budget would be exceeded by a Fed secondary sale split.'
+            )
         bond_portfolio = pd.concat([bond_portfolio, pd.DataFrame(new_rows)], ignore_index=True)
     return bond_portfolio, sold_total, bought_by_holder, bought_by_private_route, sale_cash
 
@@ -1927,6 +1977,195 @@ def _quote_issuance(
         yield_at_issuance,
         amount,
     )
+
+
+def _build_issuance_supply_schedule(
+    amount,
+    *,
+    face_target_mode,
+    issuance_leg,
+    issuance_profile,
+    tips_real_curve_years,
+    tips_real_curve_rates,
+    current_yield_curve_years,
+    current_yield_curve_rates,
+    yield_interpolation_method,
+    yield_floor_zero,
+    evaluated_nominal_shock,
+    tips_real_coupon,
+    frn_spread,
+    cbo_funding_mode,
+    cbo_inputs,
+    cbo_scenario_id,
+    current_date,
+):
+    """Build one priced issuance leg without mutating portfolio or cash state."""
+
+    amount = float(amount or 0.0)
+    if amount <= TGA_FLOOR_TOLERANCE:
+        return []
+    tips_pct = issuance_profile.get('TIPS', {}).get('target_percentage', 0.0)
+    frn_pct = issuance_profile.get('FRN', {}).get('target_percentage', 0.0)
+    nonmkt_pct = issuance_profile.get('NonMarketable', {}).get('target_percentage', 0.0)
+    if cbo_funding_mode:
+        nonmkt_pct = 0.0
+    issued_tips = amount * tips_pct
+    issued_frn = amount * frn_pct
+    issued_nonmkt = amount * nonmkt_pct
+    fixed_amount = max(0.0, amount - issued_tips - issued_frn - issued_nonmkt)
+    schedule = []
+
+    def _profile_terms(profile, label):
+        maturities = profile.get('maturities', [])
+        distribution = profile.get('maturity_distribution', [])
+        if not maturities or not distribution or len(maturities) != len(distribution):
+            raise ValueError(
+                f'{label} issuance requires matching non-empty maturities and '
+                'maturity_distribution.'
+            )
+        try:
+            maturities = [float(value) for value in maturities]
+            distribution = [float(value) for value in distribution]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f'{label} issuance terms must be numeric.') from exc
+        if any(value <= 0.0 for value in maturities):
+            raise ValueError(f'{label} issuance maturities must be positive.')
+        if any(value < 0.0 for value in distribution):
+            raise ValueError(f'{label} issuance weights must be nonnegative.')
+        total = sum(distribution)
+        if total <= TGA_FLOOR_TOLERANCE:
+            raise ValueError(f'{label} issuance weights must sum to a positive value.')
+        return maturities, [value / total for value in distribution]
+
+    tips_profile = issuance_profile.get('TIPS', {})
+    if issued_tips > TGA_FLOOR_TOLERANCE:
+        maturities, normalized = _profile_terms(tips_profile, 'TIPS')
+        for maturity_years, weight in zip(maturities, normalized):
+            target = issued_tips * weight
+            if target <= TGA_FLOOR_TOLERANCE:
+                continue
+            if not tips_real_curve_years or not tips_real_curve_rates:
+                raise ValueError('TIPS issuance requires an explicit real yield curve.')
+            issue_yield = get_yield_for_maturity(
+                maturity_years,
+                tips_real_curve_years,
+                tips_real_curve_rates,
+                method=yield_interpolation_method,
+                floor_zero=False,
+            )
+            coupon = calculate_coupon_rate('TIPS', maturity_years, issue_yield, tips_real_coupon)
+            face, proceeds, price = _quote_issuance(
+                'TIPS', maturity_years, coupon, issue_yield, target, face_target_mode
+            )
+            schedule.append({
+                'type': 'TIPS', 'maturity': maturity_years, 'face_amount': face,
+                'proceeds': proceeds, 'coupon': coupon, 'issue_price_ratio': price,
+                'issue_yield': issue_yield, 'issuance_leg': issuance_leg,
+            })
+
+    if issued_frn > TGA_FLOOR_TOLERANCE:
+        frn_profile = issuance_profile.get('FRN', {})
+        maturities, normalized = _profile_terms(frn_profile, 'FRN')
+        for maturity_years, weight in zip(maturities, normalized):
+            target = issued_frn * weight
+            if target <= TGA_FLOOR_TOLERANCE:
+                continue
+            face, proceeds, price = _quote_issuance(
+                'FRN', maturity_years, 0.0, np.nan, target, face_target_mode
+            )
+            schedule.append({
+                'type': 'FRN', 'maturity': maturity_years, 'face_amount': face,
+                'proceeds': proceeds, 'spread': frn_spread, 'issue_price_ratio': price,
+                'issue_yield': np.nan, 'issuance_leg': issuance_leg,
+            })
+
+    fixed_allocations = {}
+    fixed_category_shares = {
+        category: float(
+            issuance_profile.get(category, {}).get(
+                'target_percentage_of_remainder', 0.0
+            )
+        )
+        for category in MATURITY_CATEGORIES
+    }
+    fixed_share_total = sum(fixed_category_shares.values())
+    if fixed_amount > TGA_FLOOR_TOLERANCE:
+        if fixed_share_total <= TGA_FLOOR_TOLERANCE:
+            raise ValueError('Fixed issuance requires a positive maturity-category allocation.')
+        for category in MATURITY_CATEGORIES:
+            profile = issuance_profile.get(category, {})
+            category_amount = (
+                fixed_amount * fixed_category_shares[category] / fixed_share_total
+            )
+            if category_amount <= TGA_FLOOR_TOLERANCE:
+                continue
+            maturities, normalized = _profile_terms(profile, category)
+            for maturity_years, weight in zip(maturities, normalized):
+                target = category_amount * weight
+                if target > TGA_FLOOR_TOLERANCE:
+                    fixed_allocations[maturity_years] = (
+                        fixed_allocations.get(maturity_years, 0.0) + target
+                    )
+    unallocated = fixed_amount - sum(fixed_allocations.values())
+    allocation_tolerance = max(TGA_FLOOR_TOLERANCE, abs(fixed_amount) * 1.0e-12)
+    if abs(unallocated) > allocation_tolerance:
+        raise ValueError(
+            f'Fixed issuance maturity allocation does not close: residual={unallocated}'
+        )
+    for maturity_years, target in fixed_allocations.items():
+        if target <= TGA_FLOOR_TOLERANCE:
+            continue
+        issue_yield = evaluate_nominal_yield(
+            maturity_years,
+            current_yield_curve_years,
+            current_yield_curve_rates,
+            method=yield_interpolation_method,
+            floor_zero=yield_floor_zero,
+            shock=evaluated_nominal_shock,
+        )
+        coupon = calculate_coupon_rate('Fixed', maturity_years, issue_yield, 0)
+        bill_discount_rate = None
+        if (
+            cbo_funding_mode
+            and abs(float(maturity_years) - 0.25) <= 1e-12
+            and coupon <= TGA_FLOOR_TOLERANCE
+        ):
+            quote_pct = _cbo_macro_value(
+                cbo_inputs,
+                cbo_scenario_id,
+                current_date,
+                'cbo_3m_tbill_rate_pct',
+                np.nan,
+            )
+            if not pd.isna(quote_pct):
+                bill_discount_rate = float(quote_pct) / 100.0
+            elif not pd.isna(issue_yield):
+                bill_discount_rate = 360.0 * float(issue_yield) / (
+                    365.0 + float(issue_yield) * CBO_3M_BILL_DAYS
+                )
+        face, proceeds, price = _quote_issuance(
+            'Fixed', maturity_years, coupon, issue_yield, target, face_target_mode,
+            bill_discount_rate=bill_discount_rate,
+        )
+        schedule.append({
+            'type': 'Fixed', 'maturity': maturity_years, 'face_amount': face,
+            'proceeds': proceeds, 'coupon': coupon, 'issue_price_ratio': price,
+            'issue_yield': issue_yield, 'issuance_leg': issuance_leg,
+        })
+
+    if issued_nonmkt > TGA_FLOOR_TOLERANCE:
+        maturity_years = issuance_profile.get('NonMarketable', {}).get(
+            'nominal_maturity_years', 30.0
+        )
+        face, proceeds, price = _quote_issuance(
+            'NonMarketable', maturity_years, 0.0, np.nan, issued_nonmkt, face_target_mode
+        )
+        schedule.append({
+            'type': 'NonMarketable', 'maturity': maturity_years, 'face_amount': face,
+            'proceeds': proceeds, 'coupon': 0.0, 'issue_price_ratio': price,
+            'issue_yield': np.nan, 'issuance_leg': issuance_leg,
+        })
+    return schedule
 
 
 def _get_weighted_average_maturity(category, issuance_profile, frn_benchmark_mat):
@@ -1998,14 +2237,36 @@ def _get_curve_reference_levels(
     *,
     interpolation_method='linear',
     floor_zero=True,
+    nominal_shock=None,
 ):
     params = _get_rate_sensitive_multipliers_config(rate_sensitive_params)
     anchor_mat = max(0.0, float(params.get('anchor_maturity_years', 5.0) or 5.0))
     slope_short = max(0.0, float(params.get('slope_short_maturity_years', 2.0) or 2.0))
     slope_long = max(0.0, float(params.get('slope_long_maturity_years', 10.0) or 10.0))
-    anchor_yield = get_yield_for_maturity(anchor_mat, yield_curve_years, yield_curve_rates, method=interpolation_method, floor_zero=floor_zero)
-    short_yield = get_yield_for_maturity(slope_short, yield_curve_years, yield_curve_rates, method=interpolation_method, floor_zero=floor_zero)
-    long_yield = get_yield_for_maturity(slope_long, yield_curve_years, yield_curve_rates, method=interpolation_method, floor_zero=floor_zero)
+    anchor_yield = evaluate_nominal_yield(
+        anchor_mat,
+        yield_curve_years,
+        yield_curve_rates,
+        method=interpolation_method,
+        floor_zero=floor_zero,
+        shock=nominal_shock,
+    )
+    short_yield = evaluate_nominal_yield(
+        slope_short,
+        yield_curve_years,
+        yield_curve_rates,
+        method=interpolation_method,
+        floor_zero=floor_zero,
+        shock=nominal_shock,
+    )
+    long_yield = evaluate_nominal_yield(
+        slope_long,
+        yield_curve_years,
+        yield_curve_rates,
+        method=interpolation_method,
+        floor_zero=floor_zero,
+        shock=nominal_shock,
+    )
     anchor_yield = 0.0 if pd.isna(anchor_yield) else float(anchor_yield)
     short_yield = 0.0 if pd.isna(short_yield) else float(short_yield)
     long_yield = 0.0 if pd.isna(long_yield) else float(long_yield)
@@ -2298,16 +2559,16 @@ def _frn_rate_date_for_accrual_day(bond, accrual_date, lockout_business_days):
 
 def _frn_rate_path_row_for_date(frame, scenario_id, date_value, lookup=None):
     target = pd.Timestamp(date_value).normalize()
-    if isinstance(lookup, dict):
-        for candidate in [str(scenario_id), 'all', 'default', '']:
-            row = lookup.get((candidate, target))
-            if row is not None:
-                return row
     if frame is None or frame.empty:
         return None
     rows = _cbo_rows_for_scenario(frame, scenario_id)
     if rows is None or rows.empty:
         return None
+    selected_scenario = str(rows['scenario_id'].fillna('').astype(str).iloc[0])
+    if isinstance(lookup, dict):
+        row = lookup.get((selected_scenario, target))
+        if row is not None:
+            return row
     starts = pd.to_datetime(rows['period_start'], errors='coerce').dt.normalize()
     ends = pd.to_datetime(rows['period_end'], errors='coerce').dt.normalize()
     covering = rows.loc[(starts < target) & (target <= ends)].copy()
@@ -2328,6 +2589,7 @@ def _frn_reference_rate_for_date(
     yield_curve_rates,
     interpolation_method,
     floor_zero,
+    nominal_shock=None,
 ):
     frn_path_frame = (
         cbo_inputs.get('frn_rate_path')
@@ -2348,6 +2610,10 @@ def _frn_reference_rate_for_date(
         )
         if row is not None:
             return float(row['benchmark_rate_decimal'])
+    if nominal_shock is not None:
+        raise CurveContractError(
+            'OPEN-04 evaluated nominal shock requires complete explicit FRN benchmark coverage'
+        )
     rate = get_yield_for_maturity(
         benchmark_maturity_years,
         yield_curve_years,
@@ -2425,6 +2691,7 @@ def _capitalize_nonmarketable_interest(
     *,
     interpolation_method,
     floor_zero,
+    nominal_shock=None,
     handoff_tables=None,
 ):
     frequency = str(
@@ -2471,12 +2738,13 @@ def _capitalize_nonmarketable_interest(
                 basket = basket[basket['CurrentTTM'] >= minimum_maturity]
                 if not basket.empty:
                     yields = basket['CurrentTTM'].apply(
-                        lambda maturity: get_yield_for_maturity(
+                        lambda maturity: evaluate_nominal_yield(
                             maturity,
                             yield_curve_years,
                             yield_curve_rates,
                             method=interpolation_method,
                             floor_zero=floor_zero,
+                            shock=nominal_shock,
                         )
                     ).dropna()
                     if not yields.empty:
@@ -2501,12 +2769,13 @@ def _capitalize_nonmarketable_interest(
                 [5.0, 10.0],
             )
             yields = [
-                get_yield_for_maturity(
+                evaluate_nominal_yield(
                     maturity,
                     yield_curve_years,
                     yield_curve_rates,
                     method=interpolation_method,
                     floor_zero=floor_zero,
+                    shock=nominal_shock,
                 )
                 for maturity in maturities
             ]
@@ -2538,7 +2807,16 @@ def _capitalize_nonmarketable_interest(
     return total_credit
 
 
-def run_simulation(params, start_date, end_date, freq='W', scenario_name='Default'):
+def run_simulation(
+    params,
+    start_date,
+    end_date,
+    freq='W',
+    scenario_name='Default',
+    *,
+    handoff_sink=None,
+    require_bounded_handoff=False,
+):
     """
     Runs the core economic simulation including Treasury operations, fiscal flows,
     central bank actions, secondary market trading, AND handles date-based events
@@ -2547,18 +2825,68 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     """
     sim_start_time = time.time()
     sim_mode = str(params.get('simulation_period', {}).get('mode', 'forward')).strip().lower()
+    yield_surface_cfg = params.get('yield_curve_surface', {}) if isinstance(params.get('yield_curve_surface', {}), dict) else {}
+    evaluated_nominal_shock = _evaluated_nominal_shock_from_config(yield_surface_cfg)
     if sim_mode == 'historical_replay':
+        if evaluated_nominal_shock is not None:
+            raise CurveContractError(
+                'evaluated nominal shock is supported only by the forward CBO runtime'
+            )
         from historical_replay import run_historical_replay
 
         return run_historical_replay(params, start_date, end_date, scenario_name=scenario_name)
     validate_run_params(params, scenario_name=scenario_name)
     funding_rule_cfg = params.get('funding_rule', {})
-    cbo_funding_mode = str(funding_rule_cfg.get('mode', '')).strip() == CBO_FUNDING_MODE
-    yield_surface_cfg = params.get('yield_curve_surface', {}) if isinstance(params.get('yield_curve_surface', {}), dict) else {}
+    funding_rule_mode = str(funding_rule_cfg.get('mode', '')).strip()
+    cbo_funding_mode = funding_rule_mode in {
+        CBO_FUNDING_MODE,
+        CBO_DEBT_REFERENCE_FINANCING_MODE,
+    }
+    cbo_reference_financing_mode = (
+        funding_rule_mode == CBO_DEBT_REFERENCE_FINANCING_MODE
+    )
     yield_interpolation_method = str(
         yield_surface_cfg.get('interpolation_method', 'pchip' if cbo_funding_mode else 'linear')
     ).strip().lower()
     yield_floor_zero = bool(yield_surface_cfg.get('floor_zero', not cbo_funding_mode))
+    if evaluated_nominal_shock is not None:
+        if not cbo_funding_mode:
+            raise CurveContractError(
+                'evaluated nominal shock requires CBO funding mode'
+            )
+        if yield_interpolation_method != 'pchip' or yield_floor_zero is not False:
+            raise CurveContractError(
+                'evaluated nominal shock requires baseline pchip with floor_zero=false'
+            )
+        rate_sensitive_cfg = params.get('rate_sensitive_demand', {})
+        if not isinstance(rate_sensitive_cfg, dict):
+            raise CurveContractError(
+                'evaluated nominal shock requires a disabled rate_sensitive_demand mapping'
+            )
+        if (
+            'enabled' not in rate_sensitive_cfg
+            or rate_sensitive_cfg.get('enabled') is not False
+        ):
+            raise CurveContractError(
+                'evaluated nominal shock requires rate_sensitive_demand.enabled=false'
+            )
+        simulation_period_cfg = params.get('simulation_period', {})
+        if not isinstance(simulation_period_cfg, dict):
+            raise CurveContractError(
+                'evaluated nominal shock requires a simulation_period mapping'
+            )
+        if (
+            'enable_preference_trading' not in simulation_period_cfg
+            or simulation_period_cfg.get('enable_preference_trading') is not False
+        ):
+            raise CurveContractError(
+                'evaluated nominal shock requires simulation_period.enable_preference_trading=false'
+            )
+        raw_events = params.get('events', [])
+        if not isinstance(raw_events, list) or raw_events:
+            raise CurveContractError(
+                'evaluated nominal shock requires an empty events list'
+            )
     coarse_frequency_warning = None
     try:
         configured_start_date_pd = pd.to_datetime(start_date)
@@ -2590,18 +2918,26 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             f'after the opening date; received {num_periods} time step(s).'
         )
     print(f'--- Starting Simulation: {scenario_name} ---')
-    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_TreasuryInterestCashReceived', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBOFedSecondarySaleCash', 'CBOFedSecondarySaleReserveEffect', 'CBOFedSecondarySaleDepositEffect', 'CBOFedPrivateMaturityTDC', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
+    results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssuePriceCashGap', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_TreasuryInterestCashReceived', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtReference', 'ScenarioControlledDebt', 'DebtDriftFromReference', 'CashFinancingFaceIssued', 'CashFinancingProceeds', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBOFedSecondarySaleCash', 'CBOFedSecondarySaleReserveEffect', 'CBOFedSecondarySaleDepositEffect', 'CBOFedPrivateMaturityTDC', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
-    handoff_tables = {
-        'tdcsim_accounting_journal': [],
-        'tdcsim_period_issuance_flows': [],
-        'tdcsim_period_principal_flows': [],
-        'tdcsim_period_payment_flows': [],
-        'tdcsim_holder_stocks': [],
-        'tdcsim_tdc_principal_route_stocks': [],
-        'tdcsim_debt_target_bridge': [],
-        'tdcsim_scenario_metrics': [],
-    }
+    if require_bounded_handoff and handoff_sink is None:
+        raise ValueError(
+            'Production CBO execution requires a bounded handoff sink; '
+            'the legacy list collector is a short-fixture oracle only.'
+        )
+    bounded_handoff = handoff_sink is not None
+    handoff_tables = handoff_sink
+    if handoff_tables is None:
+        handoff_tables = {
+            'tdcsim_accounting_journal': [],
+            'tdcsim_period_issuance_flows': [],
+            'tdcsim_period_principal_flows': [],
+            'tdcsim_period_payment_flows': [],
+            'tdcsim_holder_stocks': [],
+            'tdcsim_tdc_principal_route_stocks': [],
+            'tdcsim_debt_target_bridge': [],
+            'tdcsim_scenario_metrics': [],
+        }
     for status_col in ['FundingMode', 'FiscalIncidenceStatus', 'NetInterestDiagnosticStatus', 'CBOCashResidualStatus']:
         results[status_col] = ''
     for status_col in [
@@ -2626,7 +2962,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         'CBOFedNetStockChange',
     ]:
         results[numeric_col] = 0.0
-    results['FundingMode'] = CBO_FUNDING_MODE if cbo_funding_mode else CASH_FUNDING_MODE
+    results['FundingMode'] = funding_rule_mode if cbo_funding_mode else CASH_FUNDING_MODE
     raw_events = params.get('events', [])
     scheduled_events = defaultdict(list)
     processed_event_ids = set()
@@ -2657,6 +2993,16 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         current_yield_curve_years = yield_p.get('years', [])
         current_yield_curve_rates = yield_p.get('rates', [])
         cbo_inputs = _load_cbo_engine_inputs(params, scenario_name)
+        if evaluated_nominal_shock is not None:
+            frn_rate_path = (
+                cbo_inputs.get('frn_rate_path')
+                if isinstance(cbo_inputs, dict)
+                else None
+            )
+            if not isinstance(frn_rate_path, pd.DataFrame) or frn_rate_path.empty:
+                raise CurveContractError(
+                    'OPEN-04 evaluated nominal shock requires an explicit FRN benchmark path'
+                )
         cbo_scenario_id = (
             cbo_inputs.get('scenario_id', scenario_name)
             if isinstance(cbo_inputs, dict)
@@ -2916,11 +3262,17 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     )
     results.loc[t0, 'CBOFundingModeActive'] = 1.0 if cbo_funding_mode else 0.0
     results.loc[t0, ['CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOFiscalIncidencePolicyPresent', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBONetInterestBridgeRows']] = 0.0
-    _handoff_append_holder_stocks(
-        handoff_tables,
-        bond_portfolio[bond_portfolio['Status'] == 'Active'].copy() if not bond_portfolio.empty else bond_portfolio,
-        t0,
-    )
+    if bounded_handoff:
+        handoff_tables.capture_portfolio_snapshot(
+            bond_portfolio,
+            snapshot_date=t0,
+        )
+    else:
+        _handoff_append_holder_stocks(
+            handoff_tables,
+            bond_portfolio[bond_portfolio['Status'] == 'Active'].copy() if not bond_portfolio.empty else bond_portfolio,
+            t0,
+        )
     if cbo_funding_mode:
         results.loc[t0, 'CBOFedStockMode'] = 'synthetic_cb_treasury_stock_target_beneficial_holder'
         results.loc[t0, 'CBOFedSettlementScope'] = 'not_applicable_opening_row'
@@ -2995,6 +3347,11 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
     bond_id_counter = int(max_existing_id) + 1
     last_quarter_start_date = t0
     weeks_in_quarter = 0
+    if bounded_handoff:
+        handoff_tables.begin_run(
+            opening_date=t0,
+            opening_result=results.loc[t0].to_dict(),
+        )
     for i in range(1, num_periods):
         prev_date = dates[i - 1]
         current_date = dates[i]
@@ -3167,6 +3524,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 frn_yield = float(frn_path_row['benchmark_rate_decimal'])
                 day_count_basis = float(frn_path_row.get('day_count_basis', FRN_DAY_COUNT_BASIS) or FRN_DAY_COUNT_BASIS)
             else:
+                if evaluated_nominal_shock is not None:
+                    raise CurveContractError(
+                        'OPEN-04 evaluated nominal shock cannot use the nominal-curve FRN fallback'
+                    )
                 frn_yield = get_yield_for_maturity(
                     frn_benchmark_mat,
                     current_yield_curve_years,
@@ -3374,6 +3735,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             current_yield_curve_rates,
             interpolation_method=yield_interpolation_method,
             floor_zero=yield_floor_zero,
+            nominal_shock=evaluated_nominal_shock,
             handoff_tables=handoff_tables,
         )
         principal_paid_by_holder = {h: 0.0 for h in HOLDER_TYPES}
@@ -3819,6 +4181,9 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         cbo_cash_residual_status = 'not_applicable'
         cbo_buyback_face_retired = 0.0
         cbo_buyback_cash_paid = 0.0
+        cash_financing_face_issued = 0.0
+        cash_financing_proceeds = 0.0
+        issue_price_cash_gap = 0.0
         cbo_fed_holdings_target = 0.0
         cbo_fed_auction_share = 0.0
         cbo_fed_allocation_override_active = False
@@ -3845,10 +4210,14 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 funding_rule_cfg.get('negative_required_issuance_action', 'error') or 'error'
             )
             raw_required_issuance = cbo_controlled_debt_target - cbo_pre_issuance_controlled_debt
-            if raw_required_issuance < -target_tolerance and negative_issuance_action in {
+            if (
+                not cbo_reference_financing_mode
+                and raw_required_issuance < -target_tolerance
+                and negative_issuance_action in {
                 'retire_shortest_public_marketable',
                 'buyback_shortest_public_marketable',
-            }:
+                }
+            ):
                 amount_to_retire = abs(raw_required_issuance)
                 bond_portfolio, retired_amount, retired_by_holder, retired_by_private_route, retirement_events = (
                     _retire_public_marketable_debt_to_target(
@@ -3941,14 +4310,20 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     + total_principal_paid_period
                     + total_interest_paid_period
                 )
-            total_issuance_target_period = calculate_required_face_issuance(
-                cbo_controlled_debt_target,
-                cbo_pre_issuance_controlled_debt,
-                strict=True,
-                tolerance=target_tolerance,
+            total_issuance_target_period = (
+                max(0.0, raw_required_issuance)
+                if cbo_reference_financing_mode
+                else calculate_required_face_issuance(
+                    cbo_controlled_debt_target,
+                    cbo_pre_issuance_controlled_debt,
+                    strict=True,
+                    tolerance=target_tolerance,
+                )
             )
             cbo_face_target_mode = True
-            results.loc[current_date, 'CBOControlledDebtTargetApplicable'] = 1.0
+            results.loc[current_date, 'CBOControlledDebtTargetApplicable'] = (
+                0.0 if cbo_reference_financing_mode else 1.0
+            )
             if isinstance(cbo_inputs.get('operating_cash'), pd.DataFrame) and not cbo_inputs['operating_cash'].empty:
                 cbo_operating_cash_row = _cbo_exact_date_row(
                     cbo_inputs['operating_cash'],
@@ -4017,7 +4392,77 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             )
         else:
             tips_real_curve_years, tips_real_curve_rates = _generic_tips_real_curve(tips_p)
-        if total_issuance_target_period > TGA_FLOOR_TOLERANCE:
+        issuance_supply_schedule = _build_issuance_supply_schedule(
+            total_issuance_target_period,
+            face_target_mode=cbo_face_target_mode,
+            issuance_leg=(
+                'cbo_reference_face_issuance'
+                if cbo_reference_financing_mode
+                else 'ordinary_issuance'
+            ),
+            issuance_profile=issuance_profile,
+            tips_real_curve_years=tips_real_curve_years,
+            tips_real_curve_rates=tips_real_curve_rates,
+            current_yield_curve_years=current_yield_curve_years,
+            current_yield_curve_rates=current_yield_curve_rates,
+            yield_interpolation_method=yield_interpolation_method,
+            yield_floor_zero=yield_floor_zero,
+            evaluated_nominal_shock=evaluated_nominal_shock,
+            tips_real_coupon=tips_real_coupon,
+            frn_spread=frn_spread,
+            cbo_funding_mode=cbo_funding_mode,
+            cbo_inputs=cbo_inputs,
+            cbo_scenario_id=cbo_scenario_id,
+            current_date=current_date,
+        )
+        if cbo_reference_financing_mode:
+            reference_cash_proceeds = sum(
+                float(item['proceeds']) for item in issuance_supply_schedule
+            )
+            cash_closure_target = float(
+                funding_rule_cfg.get('cash_closure_target_bil', 0.0) or 0.0
+            )
+            projected_after_reference = (
+                projected_tga_pre_issuance
+                + cbo_cash_residual_period
+                + reference_cash_proceeds
+            )
+            cash_financing_proceeds_target = max(
+                0.0, cash_closure_target - projected_after_reference
+            )
+            financing_schedule = _build_issuance_supply_schedule(
+                cash_financing_proceeds_target,
+                face_target_mode=False,
+                issuance_leg='tga_floor_cash_financing',
+                issuance_profile=issuance_profile,
+                tips_real_curve_years=tips_real_curve_years,
+                tips_real_curve_rates=tips_real_curve_rates,
+                current_yield_curve_years=current_yield_curve_years,
+                current_yield_curve_rates=current_yield_curve_rates,
+                yield_interpolation_method=yield_interpolation_method,
+                yield_floor_zero=yield_floor_zero,
+                evaluated_nominal_shock=evaluated_nominal_shock,
+                tips_real_coupon=tips_real_coupon,
+                frn_spread=frn_spread,
+                cbo_funding_mode=cbo_funding_mode,
+                cbo_inputs=cbo_inputs,
+                cbo_scenario_id=cbo_scenario_id,
+                current_date=current_date,
+            )
+            expected_cash_financing_face = sum(
+                float(item['face_amount']) for item in financing_schedule
+            )
+            expected_cash_financing_proceeds = sum(
+                float(item['proceeds']) for item in financing_schedule
+            )
+            if abs(expected_cash_financing_proceeds - cash_financing_proceeds_target) > target_tolerance:
+                raise RuntimeError(
+                    f"TGA-floor financing proceeds miss at {current_date.date()}: "
+                    f"target={cash_financing_proceeds_target:.12f}, "
+                    f"actual={expected_cash_financing_proceeds:.12f}"
+                )
+            issuance_supply_schedule.extend(financing_schedule)
+        if issuance_supply_schedule:
             effective_auction_prefs_for_period = holder_preferences_for_period(
                 holder_absorption_lookup,
                 scenario_name=scenario_name,
@@ -4026,112 +4471,6 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 fallback_preferences=current_auction_prefs,
                 warning_cache=holder_absorption_warning_cache,
             )
-            tips_pct = issuance_profile.get('TIPS', {}).get('target_percentage', 0.0)
-            frn_pct = issuance_profile.get('FRN', {}).get('target_percentage', 0.0)
-            nonmkt_pct_profile = issuance_profile.get('NonMarketable', {}).get('target_percentage', 0.0)
-            if cbo_funding_mode:
-                nonmkt_pct_profile = 0.0
-            issued_tips = total_issuance_target_period * tips_pct
-            issued_frn = total_issuance_target_period * frn_pct
-            issued_nonmkt = total_issuance_target_period * nonmkt_pct_profile
-            marketable_fixed_rate_issuance = max(0, total_issuance_target_period - issued_tips - issued_frn - issued_nonmkt)
-            issuance_supply_schedule = []
-            tips_profile = issuance_profile.get('TIPS', {})
-            if issued_tips > TGA_FLOOR_TOLERANCE and tips_profile.get('maturities'):
-                dist = tips_profile.get('maturity_distribution', [])
-                mats = tips_profile.get('maturities', [])
-                dist_sum = sum(dist)
-                norm_dist = [d / dist_sum for d in dist] if dist_sum > TGA_FLOOR_TOLERANCE else []
-                if len(norm_dist) == len(mats):
-                    for maturity_yrs, weight in zip(mats, norm_dist):
-                        proceeds_target = issued_tips * weight
-                        if proceeds_target > TGA_FLOOR_TOLERANCE:
-                            if not tips_real_curve_years or not tips_real_curve_rates:
-                                raise ValueError(
-                                    'TIPS issuance requires an explicit real yield curve.'
-                                )
-                            yld = get_yield_for_maturity(
-                                maturity_yrs,
-                                tips_real_curve_years,
-                                tips_real_curve_rates,
-                                method=yield_interpolation_method,
-                                floor_zero=False,
-                            )
-                            real_coupon = calculate_coupon_rate('TIPS', maturity_yrs, yld, tips_real_coupon)
-                            face_amount, proceeds_amount, issue_price_ratio = _quote_issuance('TIPS', maturity_yrs, real_coupon, yld, proceeds_target, cbo_face_target_mode)
-                            issuance_supply_schedule.append({'type': 'TIPS', 'maturity': maturity_yrs, 'face_amount': face_amount, 'proceeds': proceeds_amount, 'coupon': real_coupon, 'issue_price_ratio': issue_price_ratio, 'issue_yield': yld})
-            if issued_frn > TGA_FLOOR_TOLERANCE:
-                frn_face, frn_proceeds, frn_issue_price_ratio = _quote_issuance('FRN', 2.0, 0.0, np.nan, issued_frn, cbo_face_target_mode)
-                issuance_supply_schedule.append({'type': 'FRN', 'maturity': 2.0, 'face_amount': frn_face, 'proceeds': frn_proceeds, 'spread': frn_spread, 'issue_price_ratio': frn_issue_price_ratio, 'issue_yield': np.nan})
-            fixed_remainder_alloc = {}
-            total_fixed_target_allocation = 0.0
-            for cat_name in MATURITY_CATEGORIES:
-                cat_profile = issuance_profile.get(cat_name, {})
-                cat_pct_remain = cat_profile.get('target_percentage_of_remainder', 0.0)
-                cat_amount_target = marketable_fixed_rate_issuance * cat_pct_remain
-                maturities = cat_profile.get('maturities', [])
-                distribution = cat_profile.get('maturity_distribution', [])
-                if cat_amount_target > TGA_FLOOR_TOLERANCE and maturities and distribution:
-                    dist_sum = sum(distribution)
-                    norm_dist = [d / dist_sum for d in distribution] if dist_sum > TGA_FLOOR_TOLERANCE else []
-                    if len(norm_dist) == len(maturities):
-                        total_fixed_target_allocation += cat_amount_target
-                        for maturity_yrs, weight in zip(maturities, norm_dist):
-                            proceeds_target = cat_amount_target * weight
-                            if proceeds_target > TGA_FLOOR_TOLERANCE:
-                                fixed_remainder_alloc[maturity_yrs] = fixed_remainder_alloc.get(maturity_yrs, 0.0) + proceeds_target
-            fixed_unallocated = marketable_fixed_rate_issuance - sum(fixed_remainder_alloc.values())
-            if abs(fixed_unallocated) > TGA_FLOOR_TOLERANCE:
-                rem_mat_default = issuance_profile.get('remainder_maturity_years', None)
-                if rem_mat_default is None:
-                    bill_mats = issuance_profile.get('bills', {}).get('maturities', [0.25])
-                    rem_mat_default = min(bill_mats) if bill_mats else 0.25
-                fixed_remainder_alloc[rem_mat_default] = fixed_remainder_alloc.get(rem_mat_default, 0.0) + fixed_unallocated
-            for maturity_yrs, proceeds_target in fixed_remainder_alloc.items():
-                if proceeds_target > TGA_FLOOR_TOLERANCE:
-                    yld = get_yield_for_maturity(
-                        maturity_yrs,
-                        current_yield_curve_years,
-                        current_yield_curve_rates,
-                        method=yield_interpolation_method,
-                        floor_zero=yield_floor_zero,
-                    )
-                    coupon = calculate_coupon_rate('Fixed', maturity_yrs, yld, 0)
-                    bill_discount_rate = None
-                    if (
-                        cbo_funding_mode
-                        and abs(float(maturity_yrs) - 0.25) <= 1e-12
-                        and coupon <= TGA_FLOOR_TOLERANCE
-                    ):
-                        cbo_3m_quote_pct = _cbo_macro_value(
-                            cbo_inputs,
-                            cbo_scenario_id,
-                            current_date,
-                            'cbo_3m_tbill_rate_pct',
-                            np.nan,
-                        )
-                        if not pd.isna(cbo_3m_quote_pct):
-                            bill_discount_rate = float(cbo_3m_quote_pct) / 100.0
-                        elif not pd.isna(yld):
-                            bill_discount_rate = (
-                                360.0 * float(yld)
-                                / (365.0 + float(yld) * CBO_3M_BILL_DAYS)
-                            )
-                    face_amount, proceeds_amount, issue_price_ratio = _quote_issuance(
-                        'Fixed',
-                        maturity_yrs,
-                        coupon,
-                        yld,
-                        proceeds_target,
-                        cbo_face_target_mode,
-                        bill_discount_rate=bill_discount_rate,
-                    )
-                    issuance_supply_schedule.append({'type': 'Fixed', 'maturity': maturity_yrs, 'face_amount': face_amount, 'proceeds': proceeds_amount, 'coupon': coupon, 'issue_price_ratio': issue_price_ratio, 'issue_yield': yld})
-            if issued_nonmkt > TGA_FLOOR_TOLERANCE:
-                nm_issuance_profile_details = issuance_profile.get('NonMarketable', {})
-                nm_maturity_years = nm_issuance_profile_details.get('nominal_maturity_years', 30.0)
-                nm_face, nm_proceeds, nm_issue_price_ratio = _quote_issuance('NonMarketable', nm_maturity_years, 0.0, np.nan, issued_nonmkt, cbo_face_target_mode)
-                issuance_supply_schedule.append({'type': 'NonMarketable', 'maturity': nm_maturity_years, 'face_amount': nm_face, 'proceeds': nm_proceeds, 'coupon': 0.0, 'issue_price_ratio': nm_issue_price_ratio, 'issue_yield': np.nan})
             allocations_by_holder_item_ref = defaultdict(lambda: defaultdict(float))
             item_details_by_item_ref = {}
             next_item_ref_id = 0
@@ -4149,23 +4488,33 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     raise ValueError(f'[{scenario_name}@{current_date.date()}] No preference category key for {item_type} maturity {item_maturity}.')
                 total_desired_value = 0.0
                 sector_desired_value = {}
-                item_yield = supply_item.get('issue_yield')
-                if pd.isna(item_yield):
-                    item_yield = get_yield_for_maturity(
-                        item_maturity,
+                rate_sensitive_auction_enabled = (
+                    isinstance(rate_sensitive_p, dict)
+                    and bool(rate_sensitive_p.get('enabled', False))
+                )
+                if rate_sensitive_auction_enabled:
+                    item_yield = supply_item.get('issue_yield')
+                    if pd.isna(item_yield):
+                        item_yield = get_yield_for_maturity(
+                            item_maturity,
+                            current_yield_curve_years,
+                            current_yield_curve_rates,
+                            method=yield_interpolation_method,
+                            floor_zero=yield_floor_zero,
+                        )
+                    item_yield = 0.0 if pd.isna(item_yield) else float(item_yield)
+                    anchor_yield, curve_slope = _get_curve_reference_levels(
+                        rate_sensitive_p,
                         current_yield_curve_years,
                         current_yield_curve_rates,
-                        method=yield_interpolation_method,
+                        interpolation_method=yield_interpolation_method,
                         floor_zero=yield_floor_zero,
+                        nominal_shock=evaluated_nominal_shock,
                     )
-                item_yield = 0.0 if pd.isna(item_yield) else float(item_yield)
-                anchor_yield, curve_slope = _get_curve_reference_levels(
-                    rate_sensitive_p,
-                    current_yield_curve_years,
-                    current_yield_curve_rates,
-                    interpolation_method=yield_interpolation_method,
-                    floor_zero=yield_floor_zero,
-                )
+                else:
+                    item_yield = 0.0
+                    anchor_yield = 0.0
+                    curve_slope = 0.0
                 holder_share_weights = {}
                 for holder in HOLDER_TYPES:
                     holder_prefs = effective_auction_prefs_for_period.get(holder, {})
@@ -4246,6 +4595,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         fixed_spread_val = details.get('spread', 0.0) if sec_type == 'FRN' else 0.0
                         issue_price_ratio_val = details.get('issue_price_ratio', 1.0)
                         issue_yield_val = details.get('issue_yield', np.nan)
+                        issuance_leg_val = details.get('issuance_leg', 'ordinary_issuance')
                         is_noncash_intragovernmental_issuance = holder in INTRAGOV_HOLDERS
                         issue_proceeds_val = (
                             0.0
@@ -4262,6 +4612,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                                 yield_curve_rates=current_yield_curve_rates,
                                 interpolation_method=yield_interpolation_method,
                                 floor_zero=yield_floor_zero,
+                                nominal_shock=evaluated_nominal_shock,
                             )
                             if sec_type == 'FRN'
                             else np.nan
@@ -4293,6 +4644,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                             total_issued_proceeds_by_private_route[holder_subbucket] += issue_proceeds_val
                         actual_issued_amount += route_face_value
                         actual_auction_proceeds += issue_proceeds_val
+                        issue_price_cash_gap += route_face_value - issue_proceeds_val
+                        if issuance_leg_val == 'tga_floor_cash_financing':
+                            cash_financing_face_issued += route_face_value
+                            cash_financing_proceeds += issue_proceeds_val
                         if not is_noncash_intragovernmental_issuance:
                             issue_discount_cost_period += max(
                                 0.0,
@@ -4313,6 +4668,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                             security_id=next_bond_id_to_assign,
                             holder_sector=holder,
                             holder_subsector=holder_subbucket if holder == 'Private' else '',
+                            issuance_leg=issuance_leg_val,
                         )
                         next_bond_id_to_assign += 1
             bond_id_counter = next_bond_id_to_assign
@@ -4324,6 +4680,11 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         new_bonds_df[col] = pd.NA if dtype == 'Int64' else pd.NaT if dtype == 'datetime64[ns]' else np.nan
                 new_bonds_df = new_bonds_df[BOND_PORTFOLIO_COLS]
                 new_bonds_df = new_bonds_df.astype(PORTFOLIO_DTYPES, errors='ignore')
+                if bounded_handoff:
+                    handoff_tables.check_portfolio_rows(
+                        len(bond_portfolio),
+                        pending=len(new_bonds_df),
+                    )
                 try:
                     if bond_portfolio.empty:
                         bond_portfolio = new_bonds_df
@@ -4333,6 +4694,20 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     raise
         results.loc[current_date, 'NewDebtIssued'] = actual_issued_amount
         results.loc[current_date, 'AuctionProceeds'] = actual_auction_proceeds
+        results.loc[current_date, 'IssuePriceCashGap'] = issue_price_cash_gap
+        if cbo_reference_financing_mode:
+            if abs(cash_financing_proceeds - cash_financing_proceeds_target) > target_tolerance:
+                raise RuntimeError(
+                    f"TGA-floor financing cash settlement miss at {current_date.date()}: "
+                    f"target={cash_financing_proceeds_target:.12f}, "
+                    f"actual={cash_financing_proceeds:.12f}"
+                )
+            if abs(cash_financing_face_issued - expected_cash_financing_face) > target_tolerance:
+                raise RuntimeError(
+                    f"TGA-floor financing face allocation miss at {current_date.date()}"
+                )
+            results.loc[current_date, 'CashFinancingFaceIssued'] = cash_financing_face_issued
+            results.loc[current_date, 'CashFinancingProceeds'] = cash_financing_proceeds
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
             cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))
@@ -4410,7 +4785,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             fed_purchase_shortfall = cbo_fed_holdings_target - current_cb_after_issuance
             fed_target_tolerance = float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001)
             if fed_purchase_shortfall > TGA_FLOOR_TOLERANCE:
-                fed_transfer_before = bond_portfolio.copy(deep=True)
+                fed_transfer_before = {
+                    'holder': _handoff_portfolio_stock_map(bond_portfolio),
+                    'route': _handoff_portfolio_stock_map(bond_portfolio, route=True),
+                }
                 (
                     bond_portfolio,
                     fed_secondary_purchase_face,
@@ -4425,8 +4803,14 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     current_yield_curve_rates,
                     interpolation_method=yield_interpolation_method,
                     floor_zero=yield_floor_zero,
+                    nominal_shock=evaluated_nominal_shock,
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
+                    portfolio_row_budget=(
+                        handoff_tables.portfolio_row_budget
+                        if bounded_handoff
+                        else None
+                    ),
                 )
                 _handoff_append_transfer_changes(
                     handoff_tables,
@@ -4485,7 +4869,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     bond_portfolio,
                     funding_rule_cfg.get('fed_secondary_sale_buyer_mix'),
                 )
-                fed_transfer_before = bond_portfolio.copy(deep=True)
+                fed_transfer_before = {
+                    'holder': _handoff_portfolio_stock_map(bond_portfolio),
+                    'route': _handoff_portfolio_stock_map(bond_portfolio, route=True),
+                }
                 (
                     bond_portfolio,
                     fed_secondary_sale_face,
@@ -4501,8 +4888,14 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     fed_secondary_sale_buyer_mix,
                     interpolation_method=yield_interpolation_method,
                     floor_zero=yield_floor_zero,
+                    nominal_shock=evaluated_nominal_shock,
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
+                    portfolio_row_budget=(
+                        handoff_tables.portfolio_row_budget
+                        if bounded_handoff
+                        else None
+                    ),
                 )
                 _handoff_append_transfer_changes(
                     handoff_tables,
@@ -4560,7 +4953,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             try:
                 pref_trade_monetary_impact = {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0}
                 bond_portfolio_temp = bond_portfolio.reset_index(drop=True)
-                preference_transfer_before = bond_portfolio_temp.copy(deep=True)
+                preference_transfer_before = {
+                    'holder': _handoff_portfolio_stock_map(bond_portfolio_temp),
+                    'route': _handoff_portfolio_stock_map(bond_portfolio_temp, route=True),
+                }
                 effective_secondary_prefs = _build_dynamic_secondary_preferences(
                     current_secondary_prefs,
                     rate_sensitive_p,
@@ -4649,7 +5045,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             cbo_post_issuance_controlled_debt = _controlled_public_marketable_debt_from_portfolio(active_bonds_final)
             cbo_target_error = cbo_post_issuance_controlled_debt - cbo_controlled_debt_target
             target_tolerance = float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001)
-            if abs(cbo_target_error) > target_tolerance:
+            if (
+                not cbo_reference_financing_mode
+                and abs(cbo_target_error) > target_tolerance
+            ):
                 raise RuntimeError(
                     f"CBO controlled debt target miss at {current_date.date()}: "
                     f"target={cbo_controlled_debt_target:.12f}, "
@@ -4658,9 +5057,14 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 )
             results.loc[current_date, 'CBOFundingModeActive'] = 1.0
             results.loc[current_date, 'CBOControlledDebtTarget'] = cbo_controlled_debt_target
+            results.loc[current_date, 'CBOControlledDebtReference'] = cbo_controlled_debt_target
+            results.loc[current_date, 'ScenarioControlledDebt'] = cbo_post_issuance_controlled_debt
+            results.loc[current_date, 'DebtDriftFromReference'] = cbo_target_error
             results.loc[current_date, 'CBOControlledDebtPreIssuance'] = cbo_pre_issuance_controlled_debt
             results.loc[current_date, 'CBOControlledDebtPostIssuance'] = cbo_post_issuance_controlled_debt
-            results.loc[current_date, 'CBOControlledDebtTargetError'] = cbo_target_error
+            results.loc[current_date, 'CBOControlledDebtTargetError'] = (
+                0.0 if cbo_reference_financing_mode else cbo_target_error
+            )
             results.loc[current_date, 'CBOOperatingCashTarget'] = cbo_operating_cash_target
             results.loc[current_date, 'CBOCashReconciliationResidual'] = cbo_cash_reconciliation_residual_input
             results.loc[current_date, 'CBOFiscalIncidencePolicyPresent'] = 1.0 if cbo_incidence is not None else 0.0
@@ -4713,6 +5117,11 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                         'non_treasury_and_definition_residual_bil',
                     ),
                     'controlled_public_marketable_target_bil': cbo_controlled_debt_target,
+                    'cbo_controlled_debt_reference_bil': cbo_controlled_debt_target,
+                    'scenario_controlled_debt_bil': cbo_post_issuance_controlled_debt,
+                    'debt_drift_from_reference_bil': cbo_target_error,
+                    'cash_financing_face_issued_bil': cash_financing_face_issued,
+                    'cash_financing_proceeds_bil': cash_financing_proceeds,
                     'controlled_debt_pre_issuance_bil': cbo_pre_issuance_controlled_debt,
                     'face_issued_bil': actual_issued_amount,
                     'face_retired_bil': cbo_buyback_face_retired,
@@ -4721,7 +5130,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                     'target_error_bil': cbo_target_error,
                     'intragovernmental_excluded_bil': intragov_excluded,
                     'fed_included_bil': fed_included,
-                    'funding_mode': CBO_FUNDING_MODE,
+                    'funding_mode': funding_rule_mode,
                     'intragovernmental_treatment': 'excluded_from_public_debt',
                     'fed_held_treasury_treatment': 'included_in_public_debt',
                     'public_nonmarketable_treatment': 'explicit_bridge_not_marketable_issuance',
@@ -4778,7 +5187,17 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         results.loc[current_date, 'OutstandingControlledWAM'] = outstanding_metrics['wam_years']
         results.loc[current_date, 'OutstandingControlledBillShare'] = outstanding_metrics['bill_share']
         results.loc[current_date, 'OutstandingControlledShortMaturityShare'] = outstanding_metrics['short_maturity_share']
-        _handoff_append_holder_stocks(handoff_tables, active_bonds_final, current_date)
+        if bounded_handoff:
+            handoff_tables.capture_portfolio_snapshot(
+                bond_portfolio,
+                snapshot_date=current_date,
+            )
+        else:
+            _handoff_append_holder_stocks(
+                handoff_tables,
+                active_bonds_final,
+                current_date,
+            )
         handoff_tables['tdcsim_scenario_metrics'].append(
             {
                 'date': str(pd.Timestamp(current_date).date()),
@@ -4824,6 +5243,15 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
                 f"shortfall={tga_discrepancy:.12f}"
             )
         current_tga = projected_tga
+        if cbo_reference_financing_mode:
+            validation_floor = float(
+                funding_rule_cfg.get('validation_floor_bil', -0.000001)
+            )
+            if current_tga < validation_floor:
+                raise RuntimeError(
+                    f"TGA-floor financing failed at {current_date.date()}: "
+                    f"TGA={current_tga:.12f}, floor={validation_floor:.12f}"
+                )
         if cbo_funding_mode:
             results.loc[current_date, 'CBOCashResidual'] = current_tga - cbo_operating_cash_target
         adjusted_reserve_change_period = reserve_change_period
@@ -5017,6 +5445,12 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
         results.loc[current_date, 'AuctionDemandShift_MaxAbs'] = auction_shift_weighted_max
         results.loc[current_date, 'SecondaryDemandShift_AvgAbs'] = secondary_shift_avg
         results.loc[current_date, 'SecondaryDemandShift_MaxAbs'] = secondary_shift_max
+        if bounded_handoff:
+            handoff_tables.close_period(
+                prev_date=prev_date,
+                current_date=current_date,
+                closing_result=results.loc[current_date].to_dict(),
+            )
     sim_duration = time.time() - sim_start_time
     print(f'--- Finished Simulation: {scenario_name} ({sim_duration:.2f} seconds) ---')
     final_portfolio_out = pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES)
@@ -5025,7 +5459,10 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             final_portfolio_out = bond_portfolio[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES, errors='ignore')
         except Exception:
             final_portfolio_out = bond_portfolio
-    results.attrs['handoff_tables'] = handoff_tables
+    if bounded_handoff:
+        results.attrs['bounded_handoff_summary'] = handoff_tables.finalize()
+    else:
+        results.attrs['handoff_tables'] = handoff_tables
     results.attrs['run_metadata'] = {
         'scenario_name': scenario_name,
         'start_date': str(start_date),
@@ -5051,7 +5488,7 @@ def run_simulation(params, start_date, end_date, freq='W', scenario_name='Defaul
             if holder_absorption_source_scenario_id
             else 0
         ),
-        'funding_rule_mode': CBO_FUNDING_MODE if cbo_funding_mode else str(funding_rule_cfg.get('mode', 'legacy_cash_tga')),
+        'funding_rule_mode': funding_rule_mode if cbo_funding_mode else str(funding_rule_cfg.get('mode', 'legacy_cash_tga')),
         'cbo_funding_mode_active': bool(cbo_funding_mode),
         'cbo_net_interest_bridge_rows': (
             int(len(cbo_inputs['net_interest_bridge']))
