@@ -33,6 +33,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import signal
 import platform
 import shlex
 import subprocess
@@ -77,6 +79,9 @@ CONTROLLER_SUMMARY_SCHEMA = "tdcsim_open04_host_task_controller_summary_v1"
 HOST_TASK_RECEIPT_SCHEMA = "tdcsim_open04_host_task_completion_receipt_v1"
 RUN_MANIFEST_FILE = "tdcsim_cbo_run_manifest.json"
 RUN_POLL_SECONDS = 10.0
+TREE_TERMINATE_GRACE_SECONDS = 10.0
+TREE_KILL_WAIT_SECONDS = 5.0
+AGGREGATE_RSS_METHOD = "sum_of_role_peak_rss_upper_bound"
 
 
 class ReproductionError(RuntimeError):
@@ -216,6 +221,308 @@ def _build_code_identity(
         "runtime_identity_source": dist["identity_source"],
     }
     return identity
+
+
+def _assert_frozen_runtime_identity(
+    contract: Mapping[str, Any], runtime_dir: Path
+) -> None:
+    """Bind the current installed runtime to the frozen producer before work."""
+    from tdcsim_cbo._json import sha256_file
+    from tdcsim_cbo.runtime_identity import (
+        distribution_identity,
+        installed_archive_sha256,
+        locked_environment_mismatches,
+        verify_wheel_against_git_commit,
+        wheel_file_digest,
+    )
+
+    common = contract["common_identity"]
+    wheel = runtime_dir / f"tdcsim-{common['package_version']}-py3-none-any.whl"
+    dist = distribution_identity()
+    expected = {
+        "name": common["package_name"],
+        "version": common["package_version"],
+        "file_digest": common["distribution_file_digest"],
+        "identity_source": "installed_distribution_files",
+    }
+    if any(dist.get(key) != value for key, value in expected.items()):
+        _fail("installed distribution differs from the frozen campaign identity")
+    if not wheel.is_file() or sha256_file(wheel) != common["wheel_sha256"]:
+        _fail("retained release wheel differs from the frozen campaign identity")
+    if installed_archive_sha256() != common["wheel_sha256"]:
+        _fail("installed archive differs from the frozen campaign identity")
+    if wheel_file_digest(wheel) != common["distribution_file_digest"]:
+        _fail("retained wheel runtime files differ from the frozen campaign identity")
+    verify_wheel_against_git_commit(wheel, PROJECT_ROOT, common["code_commit_sha"])
+    locks = []
+    for name, key in (
+        ("uv.lock", "uv_lock_sha256"),
+        ("requirements.lock.txt", "requirements_lock_sha256"),
+    ):
+        payload = subprocess.run(
+            ["git", "show", f"{common['code_commit_sha']}:{name}"],
+            cwd=PROJECT_ROOT, check=True, capture_output=True,
+        ).stdout
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != common[key]:
+            _fail(f"frozen {name} digest differs from its producer commit")
+        locks.append({"relative_path": name, "sha256": digest, "bytes": len(payload)})
+        if name == "requirements.lock.txt":
+            mismatches = locked_environment_mismatches(payload)
+            if mismatches:
+                _fail(f"installed dependencies differ from the frozen lock: {mismatches}")
+    # Preserve the uv.lock, requirements.lock.txt order frozen by preflight.
+    lock_digest = hashlib.sha256(json.dumps(
+        locks, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    if lock_digest != common["dependency_lock_set_sha256"]:
+        _fail("dependency lock set differs from the frozen campaign identity")
+    if platform.python_version() != common["python_version"]:
+        _fail("Python version differs from the frozen campaign identity")
+
+
+class _WindowsJob:
+    """Contain descendants before a gated bootstrap can start the role."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self.ctypes = ctypes
+        self.member_handles: dict[int, Any] = {}
+        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+        for name, args, result in (
+            ("CreateJobObjectW", [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+            ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+            ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
+            ("OpenProcess", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            ("WaitForSingleObject", [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+        ):
+            func = getattr(self.api, name)
+            func.argtypes, func.restype = args, result
+        self.handle = self.api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        if not self.api.SetInformationJobObject(
+            self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        if not self.api.AssignProcessToJobObject(self.handle, int(process._handle)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+
+    def remember_members(self) -> bool:
+        # Retain wait handles before termination: ActiveProcesses can become
+        # zero before the member processes themselves become signalled.
+        ctypes = self.ctypes
+        capacity = 32
+        while True:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [("assigned", ctypes.c_uint32), ("listed", ctypes.c_uint32),
+                            ("ids", ctypes.c_size_t * capacity)]
+            members = ProcessIds()
+            if self.api.QueryInformationJobObject(
+                self.handle, 3, ctypes.byref(members), ctypes.sizeof(members), None
+            ):
+                break
+            error = ctypes.get_last_error()
+            if error != 234:  # ERROR_MORE_DATA
+                raise ctypes.WinError(error)
+            capacity = max(capacity * 2, members.assigned)
+        for pid in members.ids[:members.listed]:
+            if pid in self.member_handles:
+                continue
+            handle = self.api.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+            if not handle:
+                error = ctypes.get_last_error()
+                if error == 87:  # The process exited before OpenProcess.
+                    continue
+                raise ctypes.WinError(error)
+            self.member_handles[pid] = handle
+        return members.assigned != 0
+
+    def alive(self) -> bool:
+        if self.handle is None:
+            return False
+        active = self.remember_members()
+        for handle in self.member_handles.values():
+            status = self.api.WaitForSingleObject(handle, 0)
+            if status == 258:  # WAIT_TIMEOUT: termination is not complete.
+                active = True
+            elif status != 0:
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+        return active
+
+    def kill(self) -> None:
+        self.remember_members()
+        if not self.api.TerminateJobObject(self.handle, 1):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self.handle:
+            self.api.CloseHandle(self.handle)
+            self.handle = None
+        for handle in self.member_handles.values():
+            self.api.CloseHandle(handle)
+        self.member_handles.clear()
+
+
+class _RoleProcess:
+    """A role's OS containment boundary, including children after leader exit."""
+
+    def __init__(self, command: list[str], **kwargs: Any) -> None:
+        self.job = None
+        self.process = None
+        try:
+            if os.name == "nt":
+                from tdcsim_cbo.cli import _watchdog_worker_launch
+
+                self.job = _WindowsJob()
+                executable, venv_launcher = _watchdog_worker_launch()
+                if venv_launcher is not None:
+                    kwargs["env"] = {**kwargs.get("env", os.environ),
+                                     "__PYVENV_LAUNCHER__": venv_launcher}
+                # No role code or descendants execute before Job assignment.
+                bootstrap = (
+                    "import subprocess,sys; "
+                    "token=sys.stdin.buffer.read(1); "
+                    "sys.exit(subprocess.call(sys.argv[1:]) if token == b'1' else 1)"
+                )
+                self.process = subprocess.Popen(
+                    [executable, "-B", "-c", bootstrap, *command],
+                    stdin=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **kwargs,
+                )
+                self.job.assign(self.process)
+                self.process.stdin.write(b"1")
+                self.process.stdin.close()
+            else:
+                self.process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        except BaseException:
+            if self.process is not None:
+                # A failed assignment leaves only the waiting bootstrap alive.
+                if self.job is not None:
+                    self.job.kill()
+                self.process.kill()
+                self.process.wait(timeout=5)
+            if self.job is not None:
+                self.job.close()
+            raise
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    def poll(self) -> int | None:
+        return self.process.poll()
+
+    def alive(self) -> bool:
+        self.process.poll()  # reap our direct child before probing descendants
+        if self.job is not None:
+            return self.job.alive()
+        # Exclude zombies: they cannot execute or write, and only their parent
+        # (possibly the host's init) can reap them after group termination.
+        result = subprocess.run(
+            ["ps", "-axo", "pgid=,stat="], check=True, capture_output=True, text=True
+        )
+        return any(
+            len(fields := line.split()) >= 2
+            and fields[0] == str(self.pid) and not fields[1].startswith("Z")
+            for line in result.stdout.splitlines()
+        )
+
+    def terminate(self) -> None:
+        if self.job is not None:
+            self.job.remember_members()
+            try:
+                self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            except OSError:
+                pass  # Escalate the Job after the same bounded grace period.
+        else:
+            try:
+                os.killpg(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def kill(self) -> None:
+        if self.job is not None:
+            self.job.kill()
+        else:
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def close(self) -> None:
+        self.process.wait(timeout=5)
+        if self.job is not None:
+            self.job.close()
+
+
+def _drain_role_processes(processes: Mapping[str, _RoleProcess]) -> None:
+    """Bounded terminate, escalate, and positively verify every role tree."""
+    for process in processes.values():
+        process.terminate()
+    for duration, escalate in ((TREE_TERMINATE_GRACE_SECONDS, True), (TREE_KILL_WAIT_SECONDS, False)):
+        deadline = time.monotonic() + duration
+        while any(process.alive() for process in processes.values()):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        survivors = [process for process in processes.values() if process.alive()]
+        if not survivors:
+            for process in processes.values():
+                process.close()
+            return
+        if escalate:
+            for process in survivors:
+                process.kill()
+    _fail("role process trees did not drain after terminate and kill deadlines")
+
+
+def _aggregate_peak_rss_mb(role_evidence: Mapping[str, Mapping[str, Any]], budget: int) -> float:
+    """Conservative aggregate upper bound, not a simultaneous host sample."""
+    peak_bytes = sum(int(evidence["peak_rss_bytes"]) for evidence in role_evidence.values())
+    if peak_bytes > budget:
+        _fail(f"aggregate role peak RSS {peak_bytes} bytes exceeds acceptance budget {budget}")
+    return peak_bytes / float(1024**2)
 
 
 def _find_campaign(contract_sha256: str) -> tuple[Path, Path, dict[str, Any]]:
@@ -496,6 +803,7 @@ def stage_run(args: argparse.Namespace) -> int:
 
     _assert_installed_distribution_import()
     campaign_root, runtime_dir, contract = _find_campaign(args.contract_sha256)
+    _assert_frozen_runtime_identity(contract, runtime_dir)
     common = contract["common_identity"]
     worktree = _ensure_release_worktree(common["code_commit_sha"])
     environment = _release_environment(
@@ -530,48 +838,54 @@ def stage_run(args: argparse.Namespace) -> int:
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         + f"-{platform.node()}-open04-{contract['campaign_id']}"
     )
-    processes: dict[str, subprocess.Popen[bytes]] = {}
+    processes: dict[str, _RoleProcess] = {}
     commands: dict[str, list[str]] = {}
     started_at: dict[str, str] = {}
     completed_at: dict[str, str] = {}
     logs: dict[str, Any] = {}
-    for role in roles:
-        run_root = campaign_root / contract["roles"][role]["run_relative_path"]
-        scenario_path = campaign_root / contract["roles"][role][
-            "scenario_source_relative_path"
-        ]
-        command = [
-            sys.executable,
-            "-B",
-            "-m",
-            "tdcsim_cbo.cli",
-            "run",
-            "--baseline",
-            str(BASELINE_PACKAGE),
-            "--attestation",
-            str(BASELINE_ATTESTATION),
-            "--scenario",
-            str(scenario_path),
-            "--output-dir",
-            str(run_root),
-        ]
-        commands[role] = command
-        log_path = log_dir / f"{role}.log"
-        log_handle = log_path.open("ab")
-        logs[role] = log_handle
-        started_at[role] = _utc_now()
-        processes[role] = subprocess.Popen(
-            command,
-            cwd=PROJECT_ROOT,
-            env=environment,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-        print(f"launched {role}: pid {processes[role].pid} -> {log_path}")
-
     failures: dict[str, int] = {}
     pending = set(roles)
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f"launcher interrupted by signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupted)
     try:
+        for role in roles:
+            run_root = campaign_root / contract["roles"][role]["run_relative_path"]
+            scenario_path = campaign_root / contract["roles"][role][
+                "scenario_source_relative_path"
+            ]
+            command = [
+                sys.executable,
+                "-B",
+                "-m",
+                "tdcsim_cbo.cli",
+                "run",
+                "--baseline",
+                str(BASELINE_PACKAGE),
+                "--attestation",
+                str(BASELINE_ATTESTATION),
+                "--scenario",
+                str(scenario_path),
+                "--output-dir",
+                str(run_root),
+            ]
+            commands[role] = command
+            log_path = log_dir / f"{role}.log"
+            log_handle = log_path.open("ab")
+            logs[role] = log_handle
+            started_at[role] = _utc_now()
+            processes[role] = _RoleProcess(
+                command,
+                cwd=PROJECT_ROOT,
+                env=environment,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+            print(f"launched {role}: pid {processes[role].pid} -> {log_path}")
+
         while pending:
             for role in sorted(pending):
                 code = processes[role].poll()
@@ -584,15 +898,21 @@ def stage_run(args: argparse.Namespace) -> int:
                 else:
                     failures[role] = code
                     print(f"{role}: FAILED with exit code {code}")
-            if failures and pending:
-                for role in sorted(pending):
-                    print(f"terminating {role} after sibling failure")
-                    processes[role].terminate()
+            if failures:
+                break
             if pending:
                 time.sleep(RUN_POLL_SECONDS)
     finally:
-        for handle in logs.values():
-            handle.close()
+        # A second interrupt must not interrupt the bounded drain itself.
+        previous_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            _drain_role_processes(processes)
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
+            for handle in logs.values():
+                handle.close()
     if failures:
         _fail(
             f"role runs failed: {failures}; see logs under {log_dir}; no "
@@ -634,17 +954,10 @@ def stage_run(args: argparse.Namespace) -> int:
             ),
         }
 
-    peak_rss_mb = max(
-        role_evidence[role]["peak_rss_bytes"] for role in roles
-    ) / float(1024**2)
-    aggregate_budget = int(
-        contract["execution_contract"]["aggregate_acceptance_peak_rss_bytes"]
+    peak_rss_mb = _aggregate_peak_rss_mb(
+        role_evidence,
+        int(contract["execution_contract"]["aggregate_acceptance_peak_rss_bytes"]),
     )
-    if peak_rss_mb * 1024**2 > aggregate_budget:
-        _fail(
-            f"batch peak RSS {peak_rss_mb} MiB exceeds the aggregate "
-            "acceptance budget"
-        )
 
     summary = {
         "schema_version": CONTROLLER_SUMMARY_SCHEMA,
@@ -656,6 +969,7 @@ def stage_run(args: argparse.Namespace) -> int:
         "batch_started_at_utc": batch_started,
         "batch_completed_at_utc": _utc_now(),
         "controller_peak_rss_mb": peak_rss_mb,
+        "controller_peak_rss_method": AGGREGATE_RSS_METHOD,
         "roles": {
             role: {
                 "command": commands[role],
@@ -729,11 +1043,12 @@ def stage_run(args: argparse.Namespace) -> int:
 
 
 def stage_verify(args: argparse.Namespace) -> int:
-    import tdcsim_cbo.verifier as verifier_module
-    from tdcsim_cbo.open04_campaign import verify_open04_campaign_post_run
-
     _assert_installed_distribution_import()
     campaign_root, runtime_dir, contract = _find_campaign(args.contract_sha256)
+    _assert_frozen_runtime_identity(contract, runtime_dir)
+
+    import tdcsim_cbo.verifier as verifier_module
+    from tdcsim_cbo.open04_campaign import verify_open04_campaign_post_run
     common = contract["common_identity"]
     worktree = _ensure_release_worktree(common["code_commit_sha"])
     _apply_environment(
@@ -801,10 +1116,11 @@ def stage_verify(args: argparse.Namespace) -> int:
 
 def stage_export(args: argparse.Namespace) -> int:
     from tdcsim_cbo._json import read_json, sha256_file
-    from tdcsim_cbo.open04_export import export_open04_thin_package
-
     _assert_installed_distribution_import()
     campaign_root, runtime_dir, contract = _find_campaign(args.contract_sha256)
+    _assert_frozen_runtime_identity(contract, runtime_dir)
+
+    from tdcsim_cbo.open04_export import export_open04_thin_package
     common = contract["common_identity"]
     worktree = _ensure_release_worktree(common["code_commit_sha"])
     _apply_environment(
