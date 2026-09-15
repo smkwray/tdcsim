@@ -30,6 +30,7 @@ htmlcov/
 # Secrets / local config
 .env
 .env.*
+.private-denylist
 *.pem
 *.key
 

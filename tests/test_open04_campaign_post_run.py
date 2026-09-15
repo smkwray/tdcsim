@@ -474,7 +474,7 @@ def _materialize_complete_run(
         "campaign_contract_sha256": contract_sha256,
         "role": role,
         "run_id": manifest["run_id"],
-        "host": "DEVICE_B",
+        "host": "TEST_REMOTE_HOST",
         "controller": "remote_controller",
         "placement": "auto",
         "terminal_status": "completed",
