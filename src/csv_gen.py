@@ -87,17 +87,25 @@ CONFIG_DERIVED_SECURITY_TYPES = {
 
 
 def _get_maturity_category(maturity_years):
-    if maturity_years <= ISSUANCE_PROFILE_CUTOFFS['bills_cutoff_years']: return 'bills'
-    elif maturity_years <= ISSUANCE_PROFILE_CUTOFFS['notes_cutoff_years']: return 'notes'
-    else: return 'bonds'
+    if maturity_years <= ISSUANCE_PROFILE_CUTOFFS['bills_cutoff_years']:
+        return 'bills'
+    elif maturity_years <= ISSUANCE_PROFILE_CUTOFFS['notes_cutoff_years']:
+        return 'notes'
+    else:
+        return 'bonds'
 
 
 def _get_fixed_coupon_at_issue(maturity_years):
-    if maturity_years <= 1.0: return 0.00
-    elif maturity_years <= 3.0: return random.uniform(0.005, 0.015)
-    elif maturity_years <= 7.0: return random.uniform(0.010, 0.020)
-    elif maturity_years <= 10.0: return random.uniform(0.015, 0.025)
-    else: return random.uniform(0.020, 0.035)
+    if maturity_years <= 1.0:
+        return 0.00
+    elif maturity_years <= 3.0:
+        return random.uniform(0.005, 0.015)
+    elif maturity_years <= 7.0:
+        return random.uniform(0.010, 0.020)
+    elif maturity_years <= 10.0:
+        return random.uniform(0.015, 0.025)
+    else:
+        return random.uniform(0.020, 0.035)
 
 
 def _issue_yield_at_issue(maturity_years, security_type, coupon_rate=0.0):
@@ -123,7 +131,8 @@ def _get_random_issue_date(sim_start_date):
     start_issue_date = datetime(2020, 1, 1)
     end_issue_date = sim_start_date - timedelta(days=1)
     days_between = (end_issue_date - start_issue_date).days
-    if days_between <= 0: return start_issue_date
+    if days_between <= 0:
+        return start_issue_date
     return start_issue_date + timedelta(days=random.randrange(days_between))
 
 
@@ -370,9 +379,12 @@ def _generate_one_portfolio(target_face_values, sim_start_date):
     all_bonds_data = []
 
     for holder_key_target in target_face_values.keys():
-        if holder_key_target.startswith('Private_'): holder_type_csv = 'Private'
-        elif holder_key_target.startswith('TrustFunds_'): holder_type_csv = 'TrustFunds'
-        else: holder_type_csv = holder_key_target
+        if holder_key_target.startswith('Private_'):
+            holder_type_csv = 'Private'
+        elif holder_key_target.startswith('TrustFunds_'):
+            holder_type_csv = 'TrustFunds'
+        else:
+            holder_type_csv = holder_key_target
 
         if holder_key_target == 'TrustFunds_NonMarketable' or holder_key_target == 'Private_NonMarketable':
             target_nonmarketable_value = target_face_values[holder_key_target]
@@ -381,24 +393,37 @@ def _generate_one_portfolio(target_face_values, sim_start_date):
             num_tranches_nm = NUM_TRANCHES_PER_TYPE[nm_type_key]
             maturity_options_nm = MATURITY_YEAR_OPTIONS[nm_type_key]
             weights_nm = MATURITY_YEAR_WEIGHTS.get(nm_type_key)
-            if target_nonmarketable_value <= 0 or num_tranches_nm == 0: continue
+            if target_nonmarketable_value <= 0 or num_tranches_nm == 0:
+                continue
             face_per_nm_tranche = target_nonmarketable_value / num_tranches_nm
             for _ in range(num_tranches_nm):
                 bond_id_counter += 1
                 bond = {col: None for col in BOND_PORTFOLIO_COLS}
-                bond['BondID'] = bond_id_counter; bond['SecurityType'] = 'NonMarketable'; bond['HolderType'] = holder_type_csv; bond['Status'] = 'Active'
+                bond['BondID'] = bond_id_counter
+                bond['SecurityType'] = 'NonMarketable'
+                bond['HolderType'] = holder_type_csv
+                bond['Status'] = 'Active'
                 maturity_date_dt = datetime(1900,1,1)
                 while maturity_date_dt <= sim_start_date:
                     issue_dt = _get_random_issue_date(sim_start_date)
-                    if weights_nm and len(weights_nm) == len(maturity_options_nm): orig_mat_yrs = random.choices(maturity_options_nm, weights=weights_nm, k=1)[0]
-                    else: orig_mat_yrs = random.choice(maturity_options_nm)
-                    years_int = int(orig_mat_yrs); months_int = int(round((orig_mat_yrs - years_int) * 12))
+                    if weights_nm and len(weights_nm) == len(maturity_options_nm):
+                        orig_mat_yrs = random.choices(maturity_options_nm, weights=weights_nm, k=1)[0]
+                    else:
+                        orig_mat_yrs = random.choice(maturity_options_nm)
+                    years_int = int(orig_mat_yrs)
+                    months_int = int(round((orig_mat_yrs - years_int) * 12))
                     maturity_date_dt = issue_dt + relativedelta(years=years_int, months=months_int)
-                bond['IssueDate'] = issue_dt; bond['OriginalMaturityYears'] = orig_mat_yrs; bond['MaturityDate'] = maturity_date_dt
+                bond['IssueDate'] = issue_dt
+                bond['OriginalMaturityYears'] = orig_mat_yrs
+                bond['MaturityDate'] = maturity_date_dt
                 rounding_decimals = 4 if nm_type_key == 'nonmarketable_private' else 2
                 bond['FaceValue'] = round(face_per_nm_tranche, rounding_decimals)
-                if bond['FaceValue'] < min_face_value_nm: bond['FaceValue'] = min_face_value_nm
-                bond['CouponRate'] = 0.0; bond['OriginalPrincipal'] = bond['FaceValue']; bond['AdjustedPrincipal'] = bond['FaceValue']; bond['IndexRatio'] = 1.0
+                if bond['FaceValue'] < min_face_value_nm:
+                    bond['FaceValue'] = min_face_value_nm
+                bond['CouponRate'] = 0.0
+                bond['OriginalPrincipal'] = bond['FaceValue']
+                bond['AdjustedPrincipal'] = bond['FaceValue']
+                bond['IndexRatio'] = 1.0
                 bond['IssueYieldAtIssue'] = 0.0
                 bond['IssuePriceRatio'] = 1.0
                 bond['IssueProceeds'] = bond['FaceValue']
@@ -406,39 +431,76 @@ def _generate_one_portfolio(target_face_values, sim_start_date):
             continue
 
         holder_total_target = target_face_values.get(holder_key_target, 0.0)
-        if holder_total_target <= 0: continue
+        if holder_total_target <= 0:
+            continue
         prefs = SECTOR_PREFERENCES.get(holder_type_csv, {})
         for sec_cat_key_with_pct, cat_prefs_pct in prefs.items():
             target_fv_cat = holder_total_target * cat_prefs_pct
-            if target_fv_cat < MIN_FACE_VALUE_BILLIONS_MARKETABLE: continue
+            if target_fv_cat < MIN_FACE_VALUE_BILLIONS_MARKETABLE:
+                continue
             cat_key = sec_cat_key_with_pct.replace('_pct', '')
-            if cat_key == 'bills': actual_sec_type = 'Fixed'; mat_opts = MATURITY_YEAR_OPTIONS['bills']; num_tranches = NUM_TRANCHES_PER_TYPE['bills']; weights = MATURITY_YEAR_WEIGHTS['bills']
-            elif cat_key == 'notes': actual_sec_type = 'Fixed'; mat_opts = MATURITY_YEAR_OPTIONS['notes']; num_tranches = NUM_TRANCHES_PER_TYPE['notes']; weights = MATURITY_YEAR_WEIGHTS['notes']
-            elif cat_key == 'bonds': actual_sec_type = 'Fixed'; mat_opts = MATURITY_YEAR_OPTIONS['bonds']; num_tranches = NUM_TRANCHES_PER_TYPE['bonds']; weights = MATURITY_YEAR_WEIGHTS['bonds']
-            elif cat_key == 'tips': actual_sec_type = 'TIPS'; mat_opts = MATURITY_YEAR_OPTIONS['tips']; num_tranches = NUM_TRANCHES_PER_TYPE['tips']; weights = MATURITY_YEAR_WEIGHTS['tips']
-            elif cat_key == 'frn': actual_sec_type = 'FRN'; mat_opts = MATURITY_YEAR_OPTIONS['frn']; num_tranches = NUM_TRANCHES_PER_TYPE['frn']; weights = MATURITY_YEAR_WEIGHTS['frn']
-            else: continue
-            if not mat_opts or num_tranches == 0: continue
-            num_tranches = max(1, num_tranches); face_per_tranche = target_fv_cat / num_tranches
+            if cat_key == 'bills':
+                actual_sec_type = 'Fixed'
+                mat_opts = MATURITY_YEAR_OPTIONS['bills']
+                num_tranches = NUM_TRANCHES_PER_TYPE['bills']
+                weights = MATURITY_YEAR_WEIGHTS['bills']
+            elif cat_key == 'notes':
+                actual_sec_type = 'Fixed'
+                mat_opts = MATURITY_YEAR_OPTIONS['notes']
+                num_tranches = NUM_TRANCHES_PER_TYPE['notes']
+                weights = MATURITY_YEAR_WEIGHTS['notes']
+            elif cat_key == 'bonds':
+                actual_sec_type = 'Fixed'
+                mat_opts = MATURITY_YEAR_OPTIONS['bonds']
+                num_tranches = NUM_TRANCHES_PER_TYPE['bonds']
+                weights = MATURITY_YEAR_WEIGHTS['bonds']
+            elif cat_key == 'tips':
+                actual_sec_type = 'TIPS'
+                mat_opts = MATURITY_YEAR_OPTIONS['tips']
+                num_tranches = NUM_TRANCHES_PER_TYPE['tips']
+                weights = MATURITY_YEAR_WEIGHTS['tips']
+            elif cat_key == 'frn':
+                actual_sec_type = 'FRN'
+                mat_opts = MATURITY_YEAR_OPTIONS['frn']
+                num_tranches = NUM_TRANCHES_PER_TYPE['frn']
+                weights = MATURITY_YEAR_WEIGHTS['frn']
+            else:
+                continue
+            if not mat_opts or num_tranches == 0:
+                continue
+            num_tranches = max(1, num_tranches)
+            face_per_tranche = target_fv_cat / num_tranches
             if face_per_tranche < MIN_FACE_VALUE_BILLIONS_MARKETABLE and target_fv_cat >= MIN_FACE_VALUE_BILLIONS_MARKETABLE:
-                num_tranches = int(target_fv_cat / MIN_FACE_VALUE_BILLIONS_MARKETABLE); num_tranches = max(1, num_tranches)
+                num_tranches = int(target_fv_cat / MIN_FACE_VALUE_BILLIONS_MARKETABLE)
+                num_tranches = max(1, num_tranches)
                 face_per_tranche = target_fv_cat / num_tranches
-            if face_per_tranche < MIN_FACE_VALUE_BILLIONS_MARKETABLE: continue
+            if face_per_tranche < MIN_FACE_VALUE_BILLIONS_MARKETABLE:
+                continue
             for _ in range(num_tranches):
                 bond_id_counter += 1
                 bond = {col: None for col in BOND_PORTFOLIO_COLS}
-                bond['BondID'] = bond_id_counter; bond['SecurityType'] = actual_sec_type; bond['HolderType'] = holder_type_csv; bond['Status'] = 'Active'
+                bond['BondID'] = bond_id_counter
+                bond['SecurityType'] = actual_sec_type
+                bond['HolderType'] = holder_type_csv
+                bond['Status'] = 'Active'
                 maturity_date_dt = datetime(1900,1,1)
                 while maturity_date_dt <= sim_start_date:
                     issue_dt = _get_random_issue_date(sim_start_date)
-                    if weights and len(weights) == len(mat_opts): orig_mat_yrs = random.choices(mat_opts, weights=weights, k=1)[0]
-                    else: orig_mat_yrs = random.choice(mat_opts)
-                    years_int = int(orig_mat_yrs); months_int = int(round((orig_mat_yrs - years_int) * 12))
+                    if weights and len(weights) == len(mat_opts):
+                        orig_mat_yrs = random.choices(mat_opts, weights=weights, k=1)[0]
+                    else:
+                        orig_mat_yrs = random.choice(mat_opts)
+                    years_int = int(orig_mat_yrs)
+                    months_int = int(round((orig_mat_yrs - years_int) * 12))
                     maturity_date_dt = issue_dt + relativedelta(years=years_int, months=months_int)
-                bond['IssueDate'] = issue_dt; bond['OriginalMaturityYears'] = orig_mat_yrs; bond['MaturityDate'] = maturity_date_dt
+                bond['IssueDate'] = issue_dt
+                bond['OriginalMaturityYears'] = orig_mat_yrs
+                bond['MaturityDate'] = maturity_date_dt
                 bond['FaceValue'] = round(face_per_tranche, 3)
-                if bond['FaceValue'] < MIN_FACE_VALUE_BILLIONS_MARKETABLE: bond['FaceValue'] = MIN_FACE_VALUE_BILLIONS_MARKETABLE
-                bond['OriginalPrincipal'] = bond['FaceValue']; bond['AdjustedPrincipal'] = bond['FaceValue']
+                if bond['FaceValue'] < MIN_FACE_VALUE_BILLIONS_MARKETABLE:
+                    bond['FaceValue'] = MIN_FACE_VALUE_BILLIONS_MARKETABLE
+                bond['OriginalPrincipal'] = bond['FaceValue']
+                bond['AdjustedPrincipal'] = bond['FaceValue']
                 if actual_sec_type == 'Fixed':
                     bond['CouponRate'] = _get_fixed_coupon_at_issue(bond['OriginalMaturityYears'])
                     bond['MaturityCategory'] = _get_maturity_category(bond['OriginalMaturityYears'])
@@ -571,8 +633,10 @@ def save_portfolio_csv(df, filepath):
             df_out[col] = df_out[col].fillna('')
 
     for calc_col in ['TimeToMaturity', 'DiscountYield', 'CleanPrice', 'AccruedInterest', 'DirtyValue', 'DirtyPriceRatio']:
-        if calc_col not in df_out.columns: df_out[calc_col] = ''
-        else: df_out[calc_col] = df_out[calc_col].fillna('').astype(str)
+        if calc_col not in df_out.columns:
+            df_out[calc_col] = ''
+        else:
+            df_out[calc_col] = df_out[calc_col].fillna('').astype(str)
 
     df_out.to_csv(filepath, index=False, lineterminator='\n')
     print(f"CSV saved to: {os.path.abspath(filepath)} ({len(df_out)} bonds)")

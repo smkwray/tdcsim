@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tdcsim"
 version = "0.1.0"
-description = "Treasury debt composition simulator with CBO baseline forecast inputs"
+description = "Accounting-consistent Treasury funding and deposit-component scenario simulator"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -62,6 +62,7 @@ py-modules = [
   "ratewall_input_builder",
   "ratewall_paths",
   "route_component_support_registry",
+  "settlement_routes",
   "sim_engine",
   "sim_groups",
   "sim_helpers",
@@ -78,3 +79,11 @@ py-modules = [
 
 [tool.setuptools.package-data]
 tdcsim_cbo = ["schemas/*.json"]
+
+# These entry points put the source checkout on sys.path before importing it.
+[tool.ruff.lint.per-file-ignores]
+"scripts/run_cbo_forecast_smoke.py" = ["E402"]
+"scripts/run_cbo_scenario.py" = ["E402"]
+"scripts/verify_cbo_scenario_run.py" = ["E402"]
+"tests/test_cbo_forecast_runner.py" = ["E402"]
+"tests/test_cbo_package_verifier.py" = ["E402"]

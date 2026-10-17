@@ -21,8 +21,6 @@ from uuid import uuid4
 
 import pandas as pd
 
-import evaluated_nominal_curve
-import sim_pricing
 from evaluated_nominal_curve import OPEN04_OUTPUT_CONTRACT
 from forecast_paths import (
     compiled_forecast_input_paths,
@@ -71,6 +69,7 @@ from .manifest import (
 )
 from .open04_campaign import (
     parse_open04_campaign_marker,
+    scenario_funding_closure_mode,
     requires_open04_strict_execution,
 )
 from .output import hash_output_tree, write_bounded_scenario_outputs
@@ -178,6 +177,7 @@ def run_cbo_scenario(
     output_profile: str | None = None,
     resource_limits: BoundedResourceLimits | None = None,
     watchdog_handoff: str | Path | None = None,
+    trc_routing_path: str | Path | None = None,
 ) -> CboScenarioRun:
     """Compile and run one CBO scenario with bounded evidence and atomic promotion."""
 
@@ -187,6 +187,7 @@ def run_cbo_scenario(
     handoff_path = _watchdog_handoff_path(out, watchdog_handoff)
     open04_marker = None
     open04_active = False
+    funding_closure_mode = "cbo_public_debt_target"
     release_source_identity: Mapping[str, Any] | None = None
     out.parent.mkdir(parents=True, exist_ok=True)
     progress_path = _watchdog_progress_path(out, handoff_path)
@@ -226,6 +227,7 @@ def run_cbo_scenario(
         if isinstance(scenario_data, Mapping):
             open04_marker = parse_open04_campaign_marker(scenario_data)
             open04_active = requires_open04_strict_execution(scenario_data)
+            funding_closure_mode = scenario_funding_closure_mode(scenario_data)
         if (
             open04_active
             and output_profile is not None
@@ -299,11 +301,7 @@ def run_cbo_scenario(
             simulation_start_date=start,
             simulation_end_date=end,
             scenario_id=engine_scenario_id,
-            funding_closure_mode=(
-                open04_marker.funding_closure_mode
-                if open04_marker is not None
-                else "cbo_public_debt_target"
-            ),
+            funding_closure_mode=funding_closure_mode,
         )
         evaluated_nominal_runtime = build_evaluated_nominal_runtime_binding(
             inputs,
@@ -312,6 +310,16 @@ def run_cbo_scenario(
         )
         assumption_statuses = _adapter_assumption_statuses(inputs)
         engine_params = _engine_runtime_params(params)
+        trc_routing_source = None
+        if trc_routing_path is not None:
+            routing_path = Path(trc_routing_path).expanduser().resolve()
+            routing_bytes = routing_path.read_bytes()
+            engine_params["trc_routing"] = json.loads(routing_bytes.decode("utf-8"))
+            trc_routing_source = {
+                "filename": routing_path.name,
+                "sha256": hashlib.sha256(routing_bytes).hexdigest(),
+                "bytes": len(routing_bytes),
+            }
         if resource_limits is None:
             limits = replace(
                 base_limits,
@@ -406,6 +414,11 @@ def run_cbo_scenario(
         bounded_summary = results.attrs.get("bounded_handoff_summary")
         if not isinstance(bounded_summary, Mapping):
             raise RunnerError("bounded engine did not return its finalization summary")
+        if trc_routing_source is not None:
+            trc_metadata = results.attrs.get("trc_metadata")
+            if not isinstance(trc_metadata, Mapping):
+                raise RunnerError("TRC routing was supplied but the engine returned no TRC metadata")
+            results.attrs["trc_metadata"] = {**dict(trc_metadata), "routing_source": trc_routing_source}
         boundaries = validate_run_boundaries(results, inputs)
         _assert_hard_boundaries_pass(boundaries)
         outputs = write_bounded_scenario_outputs(
@@ -456,6 +469,8 @@ def run_cbo_scenario(
                 ),
             ),
         )
+        if open04_marker is None and "funding_closure" in spec.data:
+            run_manifest["funding_closure_mode"] = funding_closure_mode
         if open04_marker is not None:
             run_manifest["open04_campaign"] = {
                 "contract_id": open04_marker.contract_id,

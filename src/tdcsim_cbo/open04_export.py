@@ -52,7 +52,6 @@ from .open04_campaign import (
     Open04CampaignError,
     validate_open04_campaign_contract_mapping,
     validate_open04_campaign_post_receipt_mapping,
-    validate_open04_scenario_contract,
 )
 from .output import TDC_AMOUNT_BASIS, TDC_HOLDER_SCOPE, TDC_OVERLAP_POLICY
 from .verifier import VerificationError, verify_scenario_run

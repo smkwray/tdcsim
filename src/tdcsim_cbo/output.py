@@ -666,6 +666,31 @@ TDC_COMPONENT_SPECS = [
 ]
 
 
+def _write_trc_outputs(
+    results: pd.DataFrame,
+    out: Path,
+    outputs: dict[str, Any],
+    *,
+    suffix: str,
+    compression: str,
+) -> None:
+    """Write the opt-in Treasury component of reserves table and its routing record."""
+
+    trc = results.attrs.get("trc_results")
+    if trc is None:
+        return
+    metadata = results.attrs.get("trc_metadata")
+    if not isinstance(trc, pd.DataFrame) or not isinstance(metadata, Mapping):
+        raise ValueError("TRC results require a DataFrame and a metadata mapping")
+    trc_path = out / f"tdcsim_trc_results{suffix}"
+    _write_frame(_ensure_date_column(trc), trc_path, compression=compression)
+    outputs["tdcsim_trc_results"] = _artifact_record(out, trc_path)
+    outputs["tdcsim_trc_results"]["row_count"] = int(len(trc))
+    metadata_path = out / "tdcsim_trc_metadata.json"
+    write_json(metadata_path, dict(metadata))
+    outputs["tdcsim_trc_metadata"] = _artifact_record(out, metadata_path)
+
+
 def write_scenario_outputs(
     results: pd.DataFrame,
     final_portfolio: pd.DataFrame,
@@ -721,6 +746,7 @@ def write_scenario_outputs(
         outputs[logical_name] = _artifact_record(out, path)
         outputs[logical_name]["row_count"] = int(len(frame))
 
+    _write_trc_outputs(results, out, outputs, suffix=suffix, compression=compression)
     if catalog_sqlite:
         catalog_path = out / "catalog.sqlite"
         _write_catalog(catalog_path, outputs)
@@ -821,6 +847,7 @@ def write_bounded_scenario_outputs(
         actual["row_count"] = int(expected.get("row_count", 0))
         outputs[logical_name] = actual
     outputs["deterministic_evidence_artifacts"] = dict(deterministic)
+    _write_trc_outputs(results, out, outputs, suffix=suffix, compression=compression)
     return outputs
 
 

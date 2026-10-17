@@ -1,404 +1,192 @@
-# TDCsim — Treasury Deposit Contribution Simulator
+# TDCSim — Treasury Deposit Component scenarios
 
-TDCsim is a **stock-flow Treasury funding-chain simulator** for research and scenario analysis. It answers a focused question: **how Treasury issuance, debt service, holder mix, and Treasury cash management change the Treasury-attributed deposit contribution (TDC), reserves, and the maturity structure of debt**.
+TDCSim is a stock-flow simulator for the Treasury funding chain. It compares how
+issuance, debt service, holder allocation, and Treasury cash management change the
+Treasury-attributed contribution to deposits, reserve balances, and the maturity
+structure of debt. Its outputs are accounting-consistent scenarios, not causal
+estimates or forecasts.
 
-The simulator is designed for scenario analysis, not forecasting. It makes the Treasury funding chain explicit so you can compare mechanisms across counterfactuals — different issuance mixes, yield curves, holder preferences, Treasury operating-cash paths, and debt-service dynamics.
+## Install and validate
 
-## Quick start
+Use Python 3.11 or newer from a source checkout:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
-pip install -e .
-pytest -q          # run the test suite
-python run.py      # run all scenario groups
-python run.py tdc_config_optional.yaml  # run the optional-feature example config
+python -m pip install -r requirements-dev.txt -e .
+python -m pytest -q
+python -m tdcsim_cbo.cli --help
 ```
 
-By default, the project uses the shipped `tdc_config.yaml` and generates a synthetic starting portfolio. Generated CSVs and plots are written to `output/`.
+The default test suite uses synthetic fixtures. It includes scenario compilation,
+execution, output verification, settlement accounting, and failure handling.
+`pytest.ini` excludes the integration and memory-stress lanes from this command.
 
-## Implemented surfaces
+## Choose a runner
 
-TDCSim now contains three related execution surfaces:
-
-- **Configuration runner** — `run.py` executes the scenario groups in a YAML configuration. A group is atomic: if any scenario fails or returns no data, the command exits nonzero and publishes none of that group's CSV, plot, or RateWall outputs.
-- **Governed CBO runner** — `tdcsim-cbo` validates, compiles, runs, and independently verifies scenarios against a bound baseline package. It also contains marginal-pair and forecast-state export commands.
-- **Historical replay library** — the `historical_replay_*` modules materialize and reconcile governed quarterly inputs. Tests requiring the declared raw/generated inputs run only in the explicit integration lane.
-
-The `open04_campaign` and `open04_export` modules retain validation compatibility for the fixed three-path reference evidence. Private campaign-controller commands and their local folder conventions are not part of the public CLI.
-
-## CBO baseline scenario runner
-
-The CBO scenario lane accepts a locally generated or supplied, verified baseline package.
-Its outputs are scenario-analysis artifacts, not forecasts or release claims:
-
-1. Use a locally generated or supplied CBO baseline package, such as `output/cbo_forecast_release_bound_package.zip`.
-2. Generate example scenario files with `scripts/write_cbo_example_scenarios.py`.
-3. Check them with `tdcsim-cbo validate`, then use `compile`, `run`, and `verify` as needed.
-4. Read `outputs/results_compact.csv.gz`, `outputs/final_portfolio_compact.csv.gz`, and `outputs/summary.json`.
-
-See [examples/cbo_downstream_quickstart.md](examples/cbo_downstream_quickstart.md) for the exact commands and supported knobs.
-
-## What the simulator does
-
-TDCsim models a Treasury liability portfolio at the tranche level and steps it forward through time. In each period the engine:
-
-1. **Applies fiscal flows** — spending, taxes, and the primary deficit path.
-2. **Updates Treasury cash, reserves, and TDC** — tracks the Treasury General Account (the baseline proxy for Treasury operating cash), banking-system reserves, and the Treasury-attributed deposit contribution.
-3. **Pays interest and principal by holder type** — coupon payments, bill maturities, and TIPS/FRN-specific debt service, routed through the correct balance-sheet channels.
-4. **Issues new debt** across a configurable maturity and security-type mix — bills, notes, bonds, TIPS, FRNs, and non-marketable liabilities.
-5. **Allocates new issuance across holders** using configurable sector preferences, determining who absorbs each tranche and what the deposit/reserve impact is.
-6. **Optionally simulates secondary-market preference trading** — a simplified reallocation mechanism where holders trade toward their preferred portfolio mix.
-7. **Tracks debt composition, financing cost, CPI/reference CPI paths, and WAM** period by period.
-
-## Core idea: TDC is a contribution, not "all deposits"
-
-The simulator is built around the idea that Treasury operations can change deposits even when the headline fiscal story looks similar. The deposit effect depends on **who receives Treasury outlays**, **who buys new issuance**, **who receives debt service**, and **whether cash is accumulating in or leaving Treasury operating cash (TOC)**. In the current implementation, `TGA` is the primary tracked proxy for `TOC`.
-
-That is why a Treasury debt-management problem can be monetary even without changing the headline deficit path.
-
-> **Positive TDC increases domestic nonbank deposits. Negative TDC reduces domestic nonbank deposits.**
-
----
-
-## Conceptual definitions
-
-The simulator is motivated by the following accounting identities.
-
-### 1. DU / RU transaction view
-
-$$\Delta D^{TDC}_{DU} = (G^{ND}_{DU} - R^T_{DU}) + DS^T_{DU} + (Q^T_{DU\to RU} - Q^T_{RU\to DU})$$
-
-| Term | Meaning |
-|---|---|
-| $(G^{ND}_{DU} - R^T_{DU})$ | Net non-debt-service Treasury payments to DUs |
-| $DS^T_{DU}$ | Treasury-security debt service to DUs |
-| $(Q^T_{DU\to RU} - Q^T_{RU\to DU})$ | Net Treasury-security sales from DUs to the reserve-side settlement sector (RUs) |
-
-**DUs** are domestic nonbank deposit-using sectors. **RUs** are the reserve-side settlement sector: counterparties outside the DU deposit ledger, including banks, the central bank, Treasury operating accounts, and foreign official or banking entities. The RU label is a settlement shorthand, not a claim that every RU literally holds reserve balances.
-
-### 2. Treasury / central-bank / TOC view
-
-$$\Delta D^{TDC}_{DU} = (Q^T_{DU\to RU} - Q^T_{RU\to DU}) + (I^T + R^T_{RU} + \Pi^F_T - G^{ND}_{RU} - DS^T_{RU}) - \Delta TOC$$
-
-| Term | Meaning |
-|---|---|
-| $(Q^T_{DU\to RU} - Q^T_{RU\to DU})$ | Net Treasury-security sales from DUs to RUs |
-| $(I^T + R^T_{RU} + \Pi^F_T - G^{ND}_{RU} - DS^T_{RU})$ | Net Treasury and remittance flows with RUs |
-| $\Delta TOC$ | Change in Treasury operating cash |
-
-Operationally, the current simulator tracks `TGA` rather than full `TOC`, so baseline runs use the approximation `ΔTOC ≈ ΔTGA` unless TT&L or other Treasury operating balances are modeled separately.
-
-### 3. Bank-balance-sheet decomposition view
-
-$$\Delta D_{TDC} = (\Delta M - \Delta C - \Delta X) - (\Delta L_{B,DU} + \Delta S_{B,DU} - \Delta CB_B) - \Delta CB_{NB} - \Delta FI_{NonTS}$$
-
-| Term | Meaning |
-|---|---|
-| $\Delta M - \Delta C - \Delta X$ | DU liquid balances net of non-deposits |
-| $\Delta L_{B,DU} + \Delta S_{B,DU} - \Delta CB_B$ | Bank non-TS asset acquisition from DUs (net) |
-| $\Delta CB_{NB}$ | CB non-TS operations with non-banks |
-| $\Delta FI_{NonTS}$ | Foreign non-TS flows to DUs |
-
-These three views are different ways of isolating the **same Treasury Deposit Contribution**.
-
----
-
-## TDC decomposition
-
-The simulator reports the mechanism directly through a 5-term decomposition:
-
-| Channel | Column | What it captures |
+| Interface | Inputs | Use |
 |---|---|---|
-| Fiscal flows | `TDC_FiscalFlow` | Net non-debt-service fiscal impact (spending minus taxes) |
-| Debt service | `TDC_DebtService` | Deposit effect of interest and principal payments by holder type |
-| Auction absorption | `TDC_AuctionAbsorption` | Deposit effect of new debt issuance by holder type |
-| Secondary trades | `TDC_SecondaryTrades` | Deposit effect of preference-driven secondary-market trading |
-| Other | `TDC_Other` | Reserve transfers, CB expenses, minting flows |
+| `python run.py CONFIG.yaml` | YAML configuration; generated or supplied portfolio | Stylized scenario comparisons |
+| `tdcsim-cbo` | Verified Congressional Budget Office (CBO) baseline package, attestation, and JSON scenario | Baseline-bound scenarios with independent verification |
+| `historical_replay_*` Python modules | Declared historical source inputs | Materialization and accounting reconciliation |
 
-$$TDC_{Change} = TDC_{FiscalFlow} + TDC_{DebtService} + TDC_{AuctionAbsorption} + TDC_{SecondaryTrades} + TDC_{Other}$$
+The CBO interface consumes CBO inputs; it is not the official CBO model. Its
+`forecast` filenames identify input and output contracts, not a forecasting claim.
 
-This identity is enforced row-wise and verified by automated tests. It tells you **why** TDC moved, not just that it moved.
+### Configuration scenarios
 
----
+```bash
+python run.py tdc_config.yaml
+# Alternative configuration with optional demand and financing-cost features:
+python run.py tdc_config_optional.yaml
+```
 
-## Holder types and security types
+These commands run multi-year scenario groups and write local outputs. The shipped
+configuration generates a stylized opening portfolio and compares issuance,
+holder, and rate assumptions. See [scenario_overview.md](scenario_overview.md)
+for the individual comparisons.
 
-### Holders
+A scenario overrides the base fiscal path, yield curve, issuance mix, holder
+preferences, or dated events. The opening portfolio is selected once per run.
+`initial_portfolio.mode` accepts `generated`, `config_derived`, or `file`;
+required malformed inputs and unknown taxonomy labels fail explicitly.
 
-| Holder | Role | Deposit/reserve impact |
-|---|---|---|
-| `Private` | Domestic nonbanks in the DU ledger, internally split between domestic nonbank deposit-funded and MMF cash-fund routes in source-backed runs | DU for domestic nonbank deposit-funded flows; MMF cash-fund flows pass 97% to DU deposits by default, with the residual routed to reserve/plumbing |
-| `Banks` | Commercial banks | RU — auction absorption drains reserves and avoids the direct DU deposit drain that occurs when DUs buy issuance |
-| `CB` | Central bank | RU — remittances and balance-sheet operations |
-| `Foreign` | Foreign official and private holders | RU — outside the DU deposit ledger for TDC accounting |
-| `FedInternal` | Treasury-internal accounts | Intragovernmental — P&I is a TGA/TOC wash, no reserve/deposit impact |
-| `TrustFunds` | Social Security, Medicare, etc. | Intragovernmental — large non-marketable holdings, P&I is a TGA/TOC wash |
+Each group publishes its results only if all its scenarios succeed. Output
+settings control CSVs and plots. Optional demand elasticities and Treasury
+Inflation-Protected Securities (TIPS) inflation-accretion accounting are described
+in [optional_feature_scenarios.yaml](examples/optional_feature_scenarios.yaml)
+and [calibration_notes.md](examples/calibration_notes.md).
 
-### Security types
+### CBO baseline scenarios
 
-| Type | Features |
+Supply a baseline package and its attestation, then validate, run, and verify a
+scenario. Generated packages and retained runs are not included in this repository.
+
+```bash
+tdcsim-cbo validate --help
+tdcsim-cbo run --help
+tdcsim-cbo verify --help
+```
+
+The [downstream quick start](examples/cbo_downstream_quickstart.md) gives the full
+commands, example generator, input requirements, output columns, and supported
+scenario controls. The package opening date must match the scenario start date.
+A passing verification binds the outputs to their inputs and producer and checks
+the declared accounting and replay requirements; it does not validate the economic
+assumptions as predictions.
+
+## Accounting and interpretation
+
+**TDC** means Treasury Deposit Component. The model records the Treasury-attributed
+deposit-settlement flow and its cumulative contribution, rather than the entire
+deposit stock. **DU** is the covered domestic nonbank deposit-claim perimeter.
+**RS** is its complement in the settlement system. Incidence follows the claim
+debited or credited at settlement, not the legal sector of the holder. Existing
+producer fields containing `ru_flow` retain their artifact names.
+
+For exact flows measured on the same clock and perimeter, the accounting identity
+is
+
+$$\Delta D^P = F^{T,P} + N^P,$$
+
+where $F^{T,P}$ is the Treasury-attributed deposit-settlement flow and $N^P$ contains
+all other deposit changes. The coefficient on the exact flow is one. A conditional
+projection coefficient estimated from public-data proxies is a separate object.
+TDCSim supplies neither that estimate nor evidence identifying post-landing
+retention.
+
+The simulator decomposes its period contribution as
+
+$$TDC_{Change}=TDC_{FiscalFlow}+TDC_{DebtService}+TDC_{AuctionAbsorption}+TDC_{SecondaryTrades}+TDC_{Other}.$$
+
+| Component | Modeled mechanism |
 |---|---|
-| `Fixed` | Fixed-rate marketable Treasury debt (bills, notes, bonds) |
-| `TIPS` | Treasury Inflation-Protected Securities — principal adjusts by CPI index ratio, real coupon rate |
-| `FRN` | Floating Rate Notes — coupon resets to benchmark + spread each period |
-| `NonMarketable` | Non-marketable Treasury liabilities (trust fund bonds) — interest credited semiannually, not traded |
+| `TDC_FiscalFlow` | Net non-debt-service fiscal payments |
+| `TDC_DebtService` | Interest and principal paid through the configured settlement routes |
+| `TDC_AuctionAbsorption` | Deposit effect of new Treasury issuance |
+| `TDC_SecondaryTrades` | Deposit effect of modeled secondary-market transfers |
+| `TDC_Other` | Other explicitly modeled Treasury and central-bank flows |
 
-Bills use **discounted proceeds** (not face value) for TGA/reserve/deposit effects. Secondary trading categorizes by **original maturity** (not remaining maturity).
+The decomposition is checked row by row. Bills settle at cash proceeds rather
+than face value. TIPS and floating-rate notes (FRNs) carry their own indexation
+and payment conventions. The Treasury General Account (**TGA**) is the model's
+tracked proxy for Treasury operating cash, so unmodeled cash accounts remain a
+boundary of the calculation.
 
----
+### Treasury component of reserves
 
-## Scenario levers
+The opt-in Treasury component of reserves (**TRC**) uses the same Treasury events
+with a separate reserve-settlement route registry. Enable it with `trc_routing`
+in the YAML runner or `--trc-routing PATH` in the CBO runner.
 
-The simulator is configuration-driven. Typical scenario levers include:
+The policy must declare foreign settlement routes, the sourced share of money
+market fund (MMF) flows settled through overnight reverse repurchase agreements
+(**ON RRP**), and opening Federal Reserve nonreserve balances. MMF deposit
+pass-through sets deposit incidence; it does not determine reserve incidence.
+The daily ledger checks closure and rejects negative route balances.
 
-- **Fiscal path** — spending and tax growth rates
-- **TGA target and floor** — Treasury cash-management policy in the baseline `TGA` proxy for `TOC`
-- **Yield curve** — exogenous term structure (static or scenario-specific)
-- **Issuance profile** — allocation across bills, notes, bonds, TIPS, FRNs, and non-marketable debt
-- **Sector holding preferences** — who absorbs new issuance at auction
-- **Secondary-market trading** — optional preference-driven reallocation
-- **TIPS parameters** — inflation rate, reference CPI, real coupon
-- **FRN parameters** — benchmark rate, spread
-- **Dated events** — parameter changes that take effect mid-simulation (e.g., a Treasury cash rebuild starting in Q3, a yield curve shift in year 3)
-- **Initial portfolio** — generated from config or loaded from CSV
+TRC is emitted separately in `tdcsim_trc_results` and
+`tdcsim_trc_metadata.json`. The legacy `Reserves` column is a deprecated
+holder-routed Treasury path. It excludes non-Treasury reserve factors and is
+neither an observed nor a forecast reserve stock.
 
-This makes the project a **counterfactual lab** rather than a one-off chart generator.
+## Outputs and downstream use
 
-## Default scenario set
+Configuration runs write CSVs and plots under `output/`. CBO runs write a manifest,
+compiled inputs, compact results, final portfolios, settlement-flow tables, and
+verification evidence under the requested run directory. The downstream quick
+start documents their units and accounting bases.
 
-The shipped `tdc_config.yaml` includes three scenario groups:
-
-1. **Treasury Market Scenarios** — a baseline, a bank-absorption + lower-rates scenario, and a maturity-shift scenario. Compares headline mechanisms.
-2. **One-Factor Isolation** — five scenarios that change exactly one lever at a time (issuance mix, holder preferences, yield curve) relative to a common baseline. Supports ceteris paribus attribution.
-3. **TDC vs Debt Management** — a combined comparison group focused on debt-management policy.
-
-See `scenario_overview.md` for full scenario descriptions and decomposition logic.
-
----
-
-## Outputs
-
-A typical run produces:
-
-- **TDC level and change** with the full 5-term decomposition
-- **TGA and reserve balances** period by period, with `TGA` serving as the tracked proxy for Treasury operating cash
-- **Government spending, taxes, and primary deficit**
-- **Interest payments, principal payments, and debt-service outlays**
-- **New issuance by period**
-- **Debt held by sector** and **by security type**
-- **Aggregate WAM** of the active debt stock
-- **Inflation / CPI reference paths** for TIPS accounting
-- **Final tranche-level portfolio**
-- **Scenario comparison charts** (saved as PNG)
-- **Optional scenario CSVs** when a scenario group's `group_output_settings.save_results_csv` is `true`
-
-Key result columns:
-
-| Column | Description |
+| Result | Meaning |
 |---|---|
-| `TDC_Level` | Cumulative Treasury Deposit Contribution |
-| `TDC_Change` | Period change in TDC (= sum of decomposition) |
-| `Reserves` | Banking-system reserve balance |
-| `TGA` | Treasury General Account balance, used here as the tracked baseline proxy for Treasury operating cash |
-| `TotalDebt_Agg` | Total outstanding debt |
-| `DebtServiceOutlay_Cumulative` | Cumulative debt-service payments |
-| `FinancingCost_Cumulative` | Cumulative financing cost |
-| `TIPSInflationAccretion_Cumulative` | Optional cumulative TIPS principal accretion included in financing cost |
-| `AuctionDemandShift_AvgAbs` | Mean absolute auction-share shift from rate-sensitive demand overlays |
-| `SecondaryDemandShift_AvgAbs` | Mean absolute secondary-target shift from rate-sensitive demand overlays |
+| `TDC_Change` | Modeled period Treasury-attributed deposit contribution |
+| `TDC_Level` | Opening level plus the cumulative modeled contribution |
+| `TGA` | Modeled Treasury General Account balance |
+| `TotalDebt_Agg` | Outstanding modeled debt |
+| `FinancingCost_Cumulative` | Cumulative financing cost under the selected options |
 | `WAM` | Weighted-average maturity of the active portfolio |
 
----
+[RateWall](https://github.com/smkwray/ratewall) consumes verified scenario exports.
+Its deposit-support inputs distinguish cashflow overlap and MMF pass-through;
+consumers must preserve those bases rather than apply the adjustments twice.
+[TDCest](https://github.com/smkwray/tdcest) owns public-data measurement and
+[EA-TDC](https://github.com/smkwray/ea-tdc) owns conditional deposit projections.
+Simulation outputs do not replace either evidence chain.
 
-## Use cases
+Local `data/`, `output/`, `plots/`, environments, caches, and build products are
+ignored. Keep source inputs, their manifests, the executable producer identity,
+and output verification together when retaining a run. No downloaded baseline or
+historical source data is required for the default synthetic tests.
 
-TDCsim is especially useful for:
+## Limits
 
-- **Debt-management counterfactuals** — compare issuance profiles (more bills vs. more notes vs. more bonds) and see how TDC, reserves, and financing cost diverge.
-- **Treasury cash rebuild and spend-down episodes** — study how TOC/TGA refills change TDC and reserves depending on who funds the refill.
-- **Holder-mix experiments** — ask whether the same gross issuance has different monetary effects depending on whether banks, non-banks, foreigners, or the CB absorb it.
-- **Debt-service channel analysis** — measure how growing debt-service payments feed back into TGA, reserves, and TDC depending on who holds the debt.
-- **WAM and maturity-structure analysis** — compare whether shorter or longer maturity structures change TDC, funding needs, or reserve pressure.
-- **Explaining why TDC can move differently from debt or deficits** — the main reason the model exists. A larger debt stock or deficit does not mechanically imply a larger TDC if the holder mix and cash-management path change.
+- Yield curves are exogenous. A holder-allocation change does not itself identify
+  a rate response; any coupled rate path is an explicit scenario assumption.
+- Generated portfolios are stylized. `config_derived` aligns the opening stock
+  with configuration assumptions but does not reconstruct the actual Treasury
+  portfolio.
+- Preference trading is a simplified reallocation mechanism, not a market
+  microstructure model. Holder assumptions and fiscal incidence require their own
+  justification.
+- The configuration runner's weekly stepping and the CBO runner's daily calendar
+  have different timing contracts. Coarse configuration frequencies are
+  approximate and controlled by `coarse_frequency_action`.
+- TIPS inflation accretion enters financing cost only when the corresponding
+  option is enabled.
+- CBO net interest is diagnostic; it does not finance issuance. Operating cash is
+  a scenario proxy, and Federal Reserve holdings use stock-target allocation.
+- Accounting closure establishes internal consistency, not causal identification,
+  a deposit multiplier, or an empirical retention ratio.
 
----
-
-## Configuration
-
-The main configuration file is `tdc_config.yaml`.
-
-| Section | Purpose |
-|---|---|
-| `simulation_period` | Start date, end date, frequency, and whether preference trading is enabled |
-| `initial_values` | Starting TGA, reserves, and TDC level |
-| `initial_portfolio` | Mode (`generated`, `config_derived`, or `file`), generation parameters, target face values by holder |
-| `fiscal_params` | Spending and tax assumptions |
-| `tga_params` | Treasury cash target and floor |
-| `yield_curve` | Exogenous term structure inputs (named curves for scenario overrides) |
-| `treasury_issuance_profile` | Issuance mix — bills/notes/bonds/TIPS/FRNs/nonmarketable, maturity distributions |
-| `sector_preferences` | Holder absorption preferences for auction allocation |
-| `rate_sensitive_demand` | Optional demand elasticities layered on top of auction and secondary preference blocks |
-| `tips_params` | Inflation rate, reference CPI, real coupon rate |
-| `financing_cost_options` | Optional financing-cost accounting toggles |
-| `frn_params` | Benchmark rate and spread |
-| `nonmarketable_params` | Trust fund interest crediting rate |
-| `scenario_groups` | Scenario batches — each group defines scenarios with parameter overrides and output settings |
-
-Scenarios are defined as overrides on the base config. Each scenario in a group specifies which parameters to change (yield curve, issuance profile, sector preferences, events, etc.), and the engine runs all scenarios in a group and produces comparative plots.
-
-`initial_portfolio` is different: it is loaded once before scenarios run, so changing the starting stock is a run-level choice, not a per-scenario override.
-
-### Optional additions
-
-- `initial_portfolio.mode: config_derived` builds the starting stock from the configured issuance profile, holder preferences, and yield curve instead of the legacy hard-coded maturity menus.
-- `initial_portfolio.mode: file` requires a non-empty CSV or Excel file with complete core identifiers, dates, terms, holder labels, and security labels. Malformed values and unknown taxonomy entries fail instead of being replaced with zeros or defaults.
-- `rate_sensitive_demand` keeps yields exogenous but lets auction and secondary demand shares flex with yield level, spread-to-anchor, or curve slope. When `enabled: false`, behavior is unchanged.
-- `financing_cost_options.include_tips_inflation_accretion: true` adds TIPS principal accretion to `FinancingCost_Period` and exposes `TIPSInflationAccretion_Period` / `TIPSInflationAccretion_Cumulative`.
-- The engine now exposes lightweight diagnostics for the new demand system via `AuctionDemandShift_AvgAbs`, `AuctionDemandShift_MaxAbs`, `SecondaryDemandShift_AvgAbs`, and `SecondaryDemandShift_MaxAbs`.
-
-Mergeable examples live in [examples/optional_feature_scenarios.yaml](examples/optional_feature_scenarios.yaml). A ready-to-run alternate config is available at [tdc_config_optional.yaml](tdc_config_optional.yaml), and the chosen auction-demand coefficients are summarized in [examples/calibration_notes.md](examples/calibration_notes.md).
-
----
-
-## Important assumptions and conventions
-
-1. **TDC is a contribution, not the whole deposit stock.** The model isolates the Treasury-attributable contribution to DU deposit dynamics.
-2. **Private remains the RateWall-facing DU proxy, with internal source-backed sub-buckets.** Source-backed holder paths keep the exact `Private` holder string but split the route internally into `domestic_nonbank_deposit_funded` (1.0 deposit pass-through) and `mmf_cash_fund_route` (97% to DU, regime-aware and ON-RRP-drained, by default). The MMF residual is reserve/plumbing, not DU deposit support.
-3. **RU is a settlement label.** It includes entities outside the DU deposit ledger and does not mean every included entity literally holds reserves.
-4. **Intragovernmental holders are split into FedInternal and TrustFunds.** Both are intragovernmental (P&I is a TGA/TOC wash, no reserve or deposit impact).
-5. **Monetary units are billions USD.** Time units are years (for yields, TTM, WAM).
-6. **Transaction values, not mark-to-market.** For TDC accounting, the price that matters is the cash-settlement value at which the security changes hands.
-7. **Yield curves are exogenous.** The model does not endogenize rates from demand.
-8. **`TGA` is the current implementation cash variable.** The broader accounting concept is `TOC`; baseline runs use `ΔTOC ≈ ΔTGA`.
-9. **WAM is a scenario statistic, not a sufficient statistic.** It is useful, but does not replace the full holder-by-instrument funding-chain view.
-
----
-
-## How it works
-
-The runtime flow:
-
-1. `run.py` calls `simulation_core.main()` and can optionally take a config path argument.
-2. `simulation_core.py` loads and validates the selected config file, then loads or generates the initial portfolio.
-3. `sim_groups.py` dispatches each scenario group (parallel for multiple groups, serial for one).
-4. For each scenario, `sim_engine.py` runs the simulation loop period by period — fiscal flows, debt service, issuance, allocation, optional secondary trading — and accumulates results.
-5. `sim_plotting.py` writes comparison charts across scenarios in each group.
-6. Results are returned as DataFrames with all tracked columns.
-
-Scenario-group CSV export is configured under `group_output_settings`:
-
-```yaml
-group_output_settings:
-  save_plot_filename: "output/tdc_vs_cost"
-  save_results_csv: true
-  # Optional; defaults to save_plot_filename when omitted.
-  save_results_filename: "output/tdc_vs_cost"
-```
-
-This writes one CSV per scenario, a combined long-form file named
-`<base>_results.csv`, and a final-state summary named
-`<base>_final_state.csv`. Each row includes `Scenario` and `Date`, so the
-combined file can be used directly by external charting tools.
-
-## Project layout
-
-```text
-run.py                   CLI entry point
-tdc_config.yaml          default configuration and scenario groups
-scenario_overview.md     scenario descriptions and design notes
-requirements.txt         runtime Python dependencies
-requirements-dev.txt     runtime + test dependencies
-pytest.ini               pytest configuration
-LICENSE                  MIT license
-src/
-  simulation_core.py     config loading, validation, orchestration, portfolio loading/generation
-  sim_engine.py          core simulation loop (fiscal, debt service, issuance, allocation)
-  sim_pricing.py         yield interpolation, coupon scheduling, accrued interest, bond pricing
-  sim_trading.py         secondary-market preference trading
-  sim_plotting.py        scenario comparison chart generation
-  sim_groups.py          scenario group dispatch and parallel execution
-  sim_helpers.py         nested config updates, event application, run validation wrapper
-  ratewall_contract.py   quarterly RateWall contract bundle export
-  ratewall_input_builder.py  source-backed RateWall input bundle builder
-  ratewall_paths.py      runtime source-backed fiscal and holder path loaders
-  yield_curve_path.py    dynamic yield-curve surface loader
-  contract_validation.py RateWall contract identity validation
-  holder_mapping.py      holder perimeter mapping contract
-  quarterly_aggregation.py  period-to-quarter aggregation helpers
-  route_component_support_registry.py  component support registry checks
-  ratewall_assumption_mode_schema.py   assumption-mode schema rows
-  tdc_validation.py      strict config and event validation
-  csv_gen.py             synthetic initial-portfolio generator
-  tdc_shared.py          shared constants, schema definitions, dtypes
-  historical_replay*.py governed quarterly replay materialization and reconciliation
-  tdcsim_cbo/            typed CBO contracts, compiler, runner, verifier, bounded evidence, and OPEN04 reference workflow
-tests/
-  conftest.py            test import path setup
-  test_config_and_trading.py     config validation, issuance mechanics, trading logic
-  test_engine_and_validation.py  accounting identities, bucket splits, maturity categorization
-  test_ratewall_contract.py      RateWall input paths, contract export, source registry
-  test_ratewall_assumption_mode_schema.py  assumption-mode schema
-  test_route_component_support_registry.py component support registry
-  test_coupon_schedule.py        coupon date scheduling and accrual
-  test_yield_curve.py            yield interpolation and curve handling
-output/                  generated portfolios and plots (gitignored)
-```
-
-## Testing
-
-The automated suite covers:
-
-- Coupon scheduling and accrual calculations
-- Yield curve interpolation
-- Configuration validation and error handling
-- Accounting identities (TDC decomposition sums, debt stock consistency)
-- Holder bucket splits and maturity categorization
-- TIPS, FRN, and non-marketable instrument behavior
-- Secondary trading mechanics
-- Event validation and application
-- RateWall quarterly contract export, component-sum validation, and source registry semantics
-- Source-backed RateWall input paths, dynamic yield surfaces, and fail-loud path loading
+Additional test lanes require their declared inputs or an isolated memory budget:
 
 ```bash
-# Run tests (install dev dependencies first)
-pip install -r requirements-dev.txt
-pip install -e .
-pytest -q
-
-# Explicit raw/generated-artifact lane. Missing declared inputs fail; they do not skip.
-pytest -q -m integration
-
-# Isolated bounded-memory acceptance lane.
-pytest -q -m memory_stress
+python -m pytest -q -m integration
+python -m pytest -q -m memory_stress
 ```
 
----
-
-## Important limitations
-
-This is a mechanism-focused simulator, not a macro forecast model.
-
-- **Yield curves are exogenous.** The model does not endogenize rates from demand. Statements like "more bank demand lowers rates" require an explicit yield curve scenario, not just a preference shift.
-- **The legacy generated starting portfolio is stylized.** `initial_portfolio.mode: generated` uses representative maturities and coupons, not a full reconstruction of the actual outstanding Treasury portfolio. `config_derived` reduces this gap but still does not recreate the real Treasury stock.
-- **Best used for comparing scenarios**, not estimating real-world outcomes directly.
-- **Preference trading is simplified.** It is a single-pass reallocation per period, not a full market microstructure model.
-- **By default, TIPS inflation accretion is excluded from financing cost.** Enable `financing_cost_options.include_tips_inflation_accretion` to include it explicitly.
-- **Coupon logic assumes sub-semiannual step frequency.** Weekly (the default) is always safe. Monthly or coarser frequencies may miss coupon dates.
-- **Coarse frequencies are guarded but still approximate.** `simulation_period.coarse_frequency_action` can be set to `warn`, `allow`, or `error`. The shipped configs use `warn`; weekly remains the recommended mode.
-
-## What this is not
-
-TDCsim is not:
-
-- a GDP or inflation forecasting model,
-- a full model of all economy-wide deposits,
-- a full market-microstructure model,
-- a substitute for empirical estimation of TDC in real-world data,
-- investment, legal, or policy advice.
-
-It is a **structured scenario engine** built around Treasury accounting, sector allocation, and funding-chain mechanics.
+Missing required integration inputs fail rather than skip. These lanes are
+separate from a lightweight source-checkout validation.
 
 ## License
 

@@ -1,0 +1,24 @@
+{
+  "schema_version": "tdcsim_trc_routing_v1",
+  "description": "OPEN-04 route-aware companion and scenario-family policy: aggregate reserve-balance incidence of the modeled Treasury events. Foreign holders settle through US banks because the scenarios model no non-Treasury dollar inflows that could sustain foreign official purchases from Federal Reserve accounts. Money-fund route flows settle through bank accounts because money funds held essentially no ON RRP at the opening.",
+  "assumption_status": "scenario_assumption_unobserved_settlement_accounts",
+  "foreign_settlement_mix": {
+    "foreign_bank_settled": 1.0,
+    "foreign_official_deposit": 0.0,
+    "foreign_official_rrp": 0.0
+  },
+  "mmf_cash_fund_route": {
+    "on_rrp_share": 0.0,
+    "source": "FRED RRPONTSYD: total ON RRP accepted was 0.251 billion dollars on 2026-06-18, the last operation before the 2026-06-21 opening; money funds held essentially no ON RRP balance from which to fund purchases or in which to place receipts"
+  },
+  "opening_fed_nonreserve_balances_bil": {
+    "ONRRP_MMF": 0.251,
+    "ForeignOfficialFedDeposits": 9.44,
+    "ForeignOfficialFedRRP": 328.797
+  },
+  "opening_balance_sources": {
+    "ONRRP_MMF": "FRED RRPONTSYD total ON RRP accepted on 2026-06-18, the last operation before the 2026-06-21 opening; an upper bound on the money-fund balance",
+    "ForeignOfficialFedDeposits": "FRED WDFOL H.4.1 foreign official deposits, Wednesday level 2026-06-17",
+    "ForeignOfficialFedRRP": "FRED WLRRAFOIAL H.4.1 foreign official and international reverse repurchase agreements, Wednesday level 2026-06-17"
+  }
+}

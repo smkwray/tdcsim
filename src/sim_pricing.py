@@ -433,7 +433,7 @@ def get_yield_for_maturity(
         else:
             interp_rate = np.interp(target_maturity_years, yield_curve_years_np, yield_curve_rates_np)
         return max(0.0, interp_rate) if floor_zero else interp_rate
-    except Exception as e:
+    except Exception:
         return np.nan
 
 
@@ -720,13 +720,11 @@ def calculate_bond_market_price(face_value, coupon_rate, maturity_date, current_
             search_year = current_date.year
             max_search_year = maturity_date.year + 1
             while search_year <= max_search_year:
-                found_in_year = False
                 for month in potential_payment_months:
                     try:
                         pmt_date = get_payment_date(search_year, month, issue_day_pattern)
                         if pmt_date > current_date and pmt_date <= maturity_date:
                             payment_dates.append(pmt_date)
-                            found_in_year = True
                     except ValueError:
                         continue
                 if payment_dates and payment_dates[-1] >= maturity_date:
@@ -747,7 +745,7 @@ def calculate_bond_market_price(face_value, coupon_rate, maturity_date, current_
             except (OverflowError, ValueError):
                 pv_face_value = 0.0
             market_price = pv_coupons + pv_face_value
-    except (OverflowError, ValueError, ZeroDivisionError) as e:
+    except (OverflowError, ValueError, ZeroDivisionError):
         market_price = 0.0
     return max(0.0, market_price)
 

@@ -44,9 +44,6 @@ from tdc_shared import (
 from ._json import sha256_file
 from .output import (
     HANDOFF_TABLE_COLUMNS,
-    TDC_COMPONENT_SPECS,
-    TDC_IDENTITY_COLUMNS,
-    TDC_OVERLAP_COLUMNS,
     _accounting_closure_handoff_tables,
     _route_stock_closure_handoff_tables,
     _tdc_handoff_tables,
@@ -2071,14 +2068,14 @@ def _validate_bounded_reducer_key(name: str, row: Mapping[str, Any]) -> None:
         )
 
     if name not in {"tdcsim_debt_target_bridge", "tdcsim_scenario_metrics"}:
-        instrument, maturity = require_pair(
+        instrument, _ = require_pair(
             "instrument_type",
             "maturity_bucket",
             "instrument_maturity_pairs",
             label=f"{name} instrument/maturity pair",
         )
     else:
-        instrument = maturity = ""
+        instrument = ""
 
     if name == "tdcsim_period_principal_flows":
         redemption_type = str(row.get("redemption_type", ""))

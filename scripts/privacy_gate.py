@@ -73,15 +73,18 @@ def scan_repo(root: Path, terms: list[bytes]) -> list[str]:
     return found
 
 
-def scan_reachable(root: Path, terms: list[bytes]) -> list[str]:
+def scan_reachable(root: Path, terms: list[bytes], revision: str = "--all") -> list[str]:
     found: list[str] = []
     objects: set[str] = set()
-    for line in git(root, "rev-list", "--objects", "--all").decode().splitlines():
+    for line in git(root, "rev-list", "--objects", revision).decode().splitlines():
         sha, _, path = line.partition(" ")
         objects.add(sha)
         if path:
             found += hits(f"historical path {path}", path.encode(), terms)
-    refs = git(root, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(objecttype)")
+    refs = (
+        git(root, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(objecttype)")
+        if revision == "--all" else b""
+    )
     for row in refs.splitlines():
         fields = row.split(b"\0")
         if len(fields) < 2:
@@ -107,6 +110,14 @@ def scan_reachable(root: Path, terms: list[bytes]) -> list[str]:
     return found
 
 
+def outgoing_revision(root: Path) -> str:
+    try:
+        git(root, "rev-parse", "--verify", "@{upstream}")
+    except subprocess.CalledProcessError:
+        return "HEAD"
+    return "@{upstream}..HEAD"
+
+
 def self_test() -> None:
     terms = [b"synthetic-private-token"]
     source = Path(__file__).read_bytes()
@@ -125,7 +136,7 @@ def self_test() -> None:
         git(root, "init", "-q")
         git(root, "config", "user.name", "Privacy Gate")
         git(root, "config", "user.email", "privacy-gate@example.invalid")
-        git(root, "config", "core.hooksPath", "/dev/null")
+        git(root, "config", "core.hooksPath", str(root / ".git" / "hooks"))
         (root / "index-only.txt").write_bytes(b"synthetic-private-token")
         git(root, "add", "index-only.txt")
         (root / "index-only.txt").write_bytes(b"clean")
@@ -137,6 +148,16 @@ def self_test() -> None:
         git(root, "branch", "synthetic-private-token-ref")
         if not scan_reachable(root, terms):
             raise GateError("commit/tag/ref self-test failed")
+        (root / "index-only.txt").write_bytes(b"clean public change")
+        git(root, "add", "index-only.txt")
+        git(root, "commit", "-qm", "Clean outgoing change")
+        if scan_reachable(root, terms, "HEAD~1..HEAD"):
+            raise GateError("outgoing range included inherited history or unrelated refs")
+        (root / "index-only.txt").write_bytes(b"synthetic-private-token")
+        git(root, "add", "index-only.txt")
+        git(root, "commit", "-qm", "New outgoing change")
+        if not scan_reachable(root, terms, "HEAD~1..HEAD"):
+            raise GateError("outgoing private blob self-test failed")
 
 
 def main() -> int:
@@ -146,7 +167,11 @@ def main() -> int:
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--cached", action="store_true")
     scope.add_argument("--repo", action="store_true")
-    scope.add_argument("--outgoing", action="store_true")
+    scope.add_argument(
+        "--outgoing", action="store_true",
+        help="scan upstream..HEAD (all HEAD ancestry on first publication)",
+    )
+    scope.add_argument("--all-history", action="store_true", help="scan all local refs and ancestry")
     args = parser.parse_args()
     try:
         root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
@@ -154,16 +179,18 @@ def main() -> int:
         root = Path(git(Path.cwd(), "rev-parse", "--git-dir").decode().strip()).resolve()
     try:
         if args.public_ci:
-            if args.require_private or args.cached or args.repo or args.outgoing:
+            if args.require_private or args.cached or args.repo or args.outgoing or args.all_history:
                 raise GateError("--public-ci cannot use private scanning flags")
             self_test()
             print("privacy gate: public CI self-tests passed")
             return 0
-        if not args.require_private or not (args.cached or args.repo or args.outgoing):
+        if not args.require_private or not (args.cached or args.repo or args.outgoing or args.all_history):
             raise GateError("use --public-ci or --require-private with one scan scope")
         terms = load_terms(root)
         found = scan_cached(root, terms) if args.cached else (
-            scan_repo(root, terms) if args.repo else scan_reachable(root, terms)
+            scan_repo(root, terms) if args.repo else scan_reachable(
+                root, terms, outgoing_revision(root) if args.outgoing else "--all"
+            )
         )
         if found:
             raise GateError("private identifier found: " + "; ".join(found[:20]))

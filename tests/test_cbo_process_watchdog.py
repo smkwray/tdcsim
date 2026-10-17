@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -504,7 +505,7 @@ def test_cli_run_uses_hidden_worker_process_before_opening_inputs(
         "durable-worker-stdout",
     ]
     assert worker_log["bytes"] == worker_log_path.stat().st_size
-    assert worker_log["sha256"] == cli.sha256_file(worker_log_path)
+    assert worker_log["sha256"] == hashlib.sha256(worker_log_path.read_bytes()).hexdigest()
     assert failure_details["watchdog_handoff_status"] == "unavailable"
     assert failure_details["watchdog_handoff_error"] == "RunnerError"
     assert captured["thread_environment"] == {

@@ -183,7 +183,6 @@ def enrich_opening_frn_from_daily_indexes(
         accrued = face_value * accrued_per100 / 100.0
         spread_decimal = float(source_row["spread"]) / 100.0
         daily_index_decimal = float(source_row["daily_index"]) / 100.0
-        daily_accrual_rate_decimal = float(source_row["daily_int_accrual_rate"]) / 100.0
         enriched.at[idx, "FixedSpread"] = spread_decimal
         enriched.at[idx, "BenchmarkRate_FRN"] = daily_index_decimal
         enriched.at[idx, "AccruedInterest_FRN"] = accrued

@@ -525,6 +525,33 @@ class Open04CampaignMarker:
     funding_closure_mode: str
 
 
+DEFAULT_FUNDING_CLOSURE_MODE = "cbo_public_debt_target"
+SCENARIO_FUNDING_CLOSURE_MODES = frozenset(
+    {DEFAULT_FUNDING_CLOSURE_MODE, OPEN04_FUNDING_CLOSURE_MODE}
+)
+
+
+def scenario_funding_closure_mode(data: Mapping[str, Any]) -> str:
+    """Return a scenario's funding closure: the OPEN-04 marker, a declared mode, or the default."""
+
+    scenario = _require_mapping(data, label="scenario")
+    marker = parse_open04_campaign_marker(scenario)
+    declared = scenario.get("funding_closure")
+    if marker is not None:
+        if declared is not None:
+            raise Open04CampaignError(
+                "OPEN-04 scenarios take their funding closure from the campaign marker"
+            )
+        return marker.funding_closure_mode
+    if declared is None:
+        return DEFAULT_FUNDING_CLOSURE_MODE
+    closure = _require_mapping(declared, label="scenario.funding_closure")
+    mode = str(closure.get("mode") or "")
+    if set(closure) != {"mode"} or mode not in SCENARIO_FUNDING_CLOSURE_MODES:
+        raise Open04CampaignError("scenario.funding_closure.mode is unsupported")
+    return mode
+
+
 def parse_open04_campaign_marker(
     data: Mapping[str, Any],
 ) -> Open04CampaignMarker | None:

@@ -969,10 +969,6 @@ def _write_yield_and_frn_rate_paths(package: Path) -> None:
         for row in yield_rows
         if abs(float(row["tenor_years"]) - 0.25) <= 1e-9
     )
-    nominal_by_key = {
-        (str(row["curve_date"]), str(row["tenor_years"])): float(row["nominal_rate_decimal"])
-        for row in yield_rows
-    }
     for index in range(RUN_ROWS):
         current = start + timedelta(days=index)
         previous = current - timedelta(days=1)

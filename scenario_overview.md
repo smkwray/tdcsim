@@ -1,15 +1,15 @@
 # Simulation Scenarios: Overview and Design
 
-This document describes the scenarios configured in `tdc_config.yaml` and the modeling assumptions driving their results.
+This document describes the scenarios configured in `tdc_config.yaml` and the modeling assumptions driving their results. TDC means Treasury Deposit Component; DU denotes the covered domestic nonbank deposit-claim perimeter. Scenario differences describe model mechanisms, not identified causal effects.
 
 **Important:** Yield curves are exogenous scenario inputs. The model does not endogenize rates from demand. Statements like "more bank demand lowers rates" require an explicit yield curve change, not just a holder preference shift.
 
 ## Treasury Market Scenarios (3 scenarios)
 
 ### 1. Baseline
-- **Definition**: Status quo for Treasury issuance and market demand.
+- **Definition**: Configured reference assumptions for Treasury issuance and market demand.
 - **Yield Curve**: Standard upward-sloping (`yield_curve_default`).
-- **Holder Mix**: Historical average allocation (`sector_preferences_default`).
+- **Holder Mix**: Configured reference allocation (`sector_preferences_default`).
 - **Issuance Mix**: Default profile — 20% bills, 60% notes, 20% bonds (`default_issuance_profile`).
 - **Purpose**: Benchmark for comparison.
 
@@ -58,18 +58,18 @@ The isolation scenarios allow the following attribution for the compound scenari
 
 The "plus any interaction" caveat means these are approximate decompositions, not exact additive ones.
 
-## Known Model Limitations
+## Model limits and input conventions
 
-The following are known simplifications in the current simulator. They do not affect the shipped scenario results under the default configuration (weekly frequency, zero TIPS inflation, static yield curves, no FRN issuance), but they constrain the model's applicability outside those settings.
+Interpret these configuration-runner comparisons under the following assumptions. The CBO runner has its own daily calendar and baseline-bound input contract, documented in [the downstream quick start](examples/cbo_downstream_quickstart.md).
 
 1. **By default, TIPS inflation accretion is excluded from financing cost.** When `cpi_annual_inflation > 0`, TIPS principal grows via index-ratio adjustment, but this accretion is not recorded in `FinancingCost_Period` unless `financing_cost_options.include_tips_inflation_accretion` is enabled. The shipped configuration leaves it off because baseline inflation is zero.
 
-2. **Coupon and accrual logic assumes sub-semiannual step frequency.** The engine pays at most one coupon per tranche per step. For the shipped weekly frequency this is always correct (a weekly step never spans two semiannual coupon dates). Coarser frequencies (monthly or longer) could miss coupons. FRN accrual similarly uses the step's benchmark rate across the full interval rather than resetting on quarterly calendar dates.
+2. **Fixed-rate and TIPS coupon aggregation requires short steps.** The engine pays at most one fixed-rate or TIPS coupon per tranche per step. An interval containing multiple coupon dates can therefore undercount payments; weekly steps avoid that case for the semiannual schedule. Floating-rate notes accrue day by day and use a dated benchmark path when supplied. Coarse frequency settings remain guarded because other within-period ordering is approximate.
 
 3. **The legacy initial portfolio is stylized.** The default `generated` portfolio uses hard-coded maturity menus, coupon ranges, and TIPS reference CPI values that are independent of the scenario's yield curve and issuance profile. Using `initial_portfolio.mode: config_derived` makes the starting stock internally consistent with the configured curve and issuance profile, but it is still a model-generated approximation rather than a reconstruction of the real Treasury stock.
 
 4. **Secondary trading is single-pass per period.** When preference trading is enabled, the engine executes at most one bond trade per seller/buyer/category pair per period. Large imbalances may take multiple periods to resolve. This is a conservative approximation that understates rebalancing speed. (Preference trading is disabled in the shipped configuration.)
 
-5. **Nonmarketable interest crediting is validated for weekly steps only.** The crediting logic checks June 30 and December 31 within the current step's year. A step that crosses a year boundary could miss a credit date. Weekly steps never cross year boundaries within a single step.
+5. **Nonmarketable interest uses declared credit dates.** Semiannual crediting checks June 30 and December 31 across every year spanned by a step; annual crediting uses December 31. The credited rate follows the configured rate-setting rule.
 
-6. **Loaded portfolio coercion.** When using `mode: file`, unknown security types are silently converted to `Fixed` and unknown holder types to the default holder. The shipped configuration uses `mode: generated` and is not affected.
+6. **Loaded portfolio validation.** With `mode: file`, required fields must be complete and parseable. Unknown security and holder labels raise instead of being converted to defaults.

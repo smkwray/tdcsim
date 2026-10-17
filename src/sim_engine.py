@@ -34,7 +34,6 @@ from tdc_shared import (
 )
 from sim_helpers import OUTPUT_COLUMN_RENAMES, apply_event_actions, validate_run_params
 from sim_pricing import (
-    calculate_accrued_interest,
     calculate_coupon_rate,
     value_treasury_security,
     calculate_face_from_proceeds_target,
@@ -47,6 +46,7 @@ from sim_pricing import (
     quote_issuance_from_face_target,
 )
 from sim_trading import execute_preference_trades
+from settlement_routes import TRC_RESULT_COLUMNS, TrcLedger, parse_trc_routing, trc_metadata
 from tdc_validation import is_coarse_frequency
 from tips_indexation import build_projected_cpi_lookup_from_macro, build_tips_daily_cpi_lookups_from_monthly_path
 from forecast_paths import (
@@ -3253,6 +3253,14 @@ def run_simulation(
     init_vals = params.get('initial_values', {})
     results.loc[t0, 'TGA'] = init_vals.get('tga', 0.0)
     results.loc[t0, 'Reserves'] = init_vals.get('reserves', 0.0)
+    trc_ledger = None
+    trc_rows = []
+    if params.get('trc_routing') is not None:
+        trc_ledger = TrcLedger(
+            parse_trc_routing(params['trc_routing'], mmf_deposit_pass_through=mmf_deposit_pass_through),
+            opening_reserves=float(init_vals.get('reserves', 0.0)),
+        )
+        trc_rows.append(trc_ledger.opening_row(t0))
     results.loc[t0, 'TDC_Level'] = init_vals.get('tdc_level', init_vals.get('deposits', 0.0))
     results.loc[t0, 'CB_DeferredAsset'] = 0.0
     results.loc[t0, 'CPI_Level'] = cpi_start
@@ -3708,6 +3716,8 @@ def run_simulation(
             )
         fiscal_tga_change = taxes_period - gov_spending_period
         reserve_change_period += fiscal_reserve_change
+        if trc_ledger is not None:
+            trc_ledger.record_public_cash('FiscalFlow', fiscal_reserve_change, 'covered_deposit_settled')
         deposit_change_period += fiscal_deposit_change
         tga_change_period += fiscal_tga_change
         _handoff_append_journal(
@@ -4105,6 +4115,18 @@ def run_simulation(
             legacy_total=principal_paid_by_holder.get('Private', 0.0) + interest_paid_by_holder.get('Private', 0.0),
         )
         reserve_change_period += debt_service_reserve_change
+        if trc_ledger is not None:
+            trc_ledger.record_holder_cash(
+                'DebtService',
+                {
+                    holder: principal_paid_by_holder.get(holder, 0.0) + interest_paid_by_holder.get(holder, 0.0)
+                    for holder in ('Banks', 'Private', 'Foreign')
+                },
+                {
+                    route: principal_paid_by_private_route[route] + interest_paid_by_private_route[route]
+                    for route in PRIVATE_SUBBUCKETS
+                },
+            )
         deposit_change_period += debt_service_deposit_change
         tga_change_period += debt_service_tga_change
         _handoff_append_journal(
@@ -4274,6 +4296,12 @@ def run_simulation(
                     for h in ['Banks', 'Private', 'Foreign']
                 )
                 reserve_change_period += buyback_reserve_change
+                if trc_ledger is not None:
+                    trc_ledger.record_holder_cash(
+                        'Buyback',
+                        {holder: retired_by_holder.get(holder, 0.0) for holder in ('Banks', 'Private', 'Foreign')},
+                        retired_by_private_route,
+                    )
                 buyback_deposit_change = _effective_private_amount(
                     retired_by_private_route,
                     mmf_deposit_pass_through,
@@ -4750,6 +4778,15 @@ def run_simulation(
             settlement_scope='auction_cash_settlement',
         )
         reserve_change_period += issuance_reserve_change
+        if trc_ledger is not None:
+            trc_ledger.record_holder_cash(
+                'AuctionSettlement',
+                {
+                    holder: -total_issued_proceeds_by_holder.get(holder, 0.0)
+                    for holder in ('Banks', 'Private', 'Foreign')
+                },
+                {route: -value for route, value in total_issued_proceeds_by_private_route.items()},
+            )
         deposit_change_period += issuance_deposit_change
         tga_change_period += issuance_tga_change
         if cbo_funding_mode:
@@ -4841,6 +4878,12 @@ def run_simulation(
                 for route in PRIVATE_SUBBUCKETS:
                     fed_secondary_private_route_effects[route] += fed_secondary_private_routes[route]
                 reserve_change_period += fed_secondary_reserve_effect
+                if trc_ledger is not None:
+                    trc_ledger.record_holder_cash(
+                        'FedSecondary',
+                        {holder: fed_secondary_sellers.get(holder, 0.0) for holder in ('Banks', 'Private', 'Foreign')},
+                        fed_secondary_private_routes,
+                    )
                 deposit_change_period += fed_secondary_deposit_effect
                 _handoff_append_journal(
                     handoff_tables,
@@ -4924,6 +4967,12 @@ def run_simulation(
                 for route in PRIVATE_SUBBUCKETS:
                     fed_secondary_private_route_effects[route] -= fed_secondary_buyer_private_routes[route]
                 reserve_change_period += fed_secondary_reserve_effect
+                if trc_ledger is not None:
+                    trc_ledger.record_holder_cash(
+                        'FedSecondary',
+                        {holder: -fed_secondary_buyers.get(holder, 0.0) for holder in ('Banks', 'Private', 'Foreign')},
+                        {route: -value for route, value in fed_secondary_buyer_private_routes.items()},
+                    )
                 deposit_change_period += fed_secondary_deposit_effect
                 _handoff_append_journal(
                     handoff_tables,
@@ -4982,6 +5031,7 @@ def run_simulation(
                     scenario_name,
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
+                    trc_ledger=trc_ledger,
                 )
                 bond_portfolio = bond_portfolio_temp
                 _handoff_append_transfer_changes(
@@ -5230,6 +5280,8 @@ def run_simulation(
             settlement_scope='configured_other_transfer',
         )
         reserve_change_period += other_reserve_change
+        if trc_ledger is not None:
+            trc_ledger.record_public_cash('OtherTreasuryFed', other_reserve_change, 'bank_reserve_settled')
         deposit_change_period += other_deposit_change
         tga_change_period += other_tga_change
         prev_reserves = results.loc[prev_date, 'Reserves']
@@ -5262,6 +5314,14 @@ def run_simulation(
         results.loc[current_date, 'TDC_Level'] = current_deposits
         results.loc[current_date, 'TGA'] = current_tga
         results.loc[current_date, 'ReserveChange'] = adjusted_reserve_change_period
+        if trc_ledger is not None:
+            trc_rows.append(
+                trc_ledger.close_period(
+                    current_date,
+                    legacy_reserve_change=adjusted_reserve_change_period,
+                    legacy_reserves=current_reserves,
+                )
+            )
         results.loc[current_date, 'TDC_Change'] = adjusted_deposit_change_period
         results.loc[current_date, 'TGAChange'] = current_tga - prev_tga
         results.loc[current_date, 'TDC_FiscalFlow'] = fiscal_deposit_change
@@ -5459,6 +5519,11 @@ def run_simulation(
             final_portfolio_out = bond_portfolio[BOND_PORTFOLIO_COLS].astype(PORTFOLIO_DTYPES, errors='ignore')
         except Exception:
             final_portfolio_out = bond_portfolio
+    if trc_ledger is not None:
+        trc_frame = pd.DataFrame(trc_rows, columns=list(TRC_RESULT_COLUMNS))
+        trc_frame['Date'] = pd.to_datetime(trc_frame['Date']).dt.strftime('%Y-%m-%d')
+        results.attrs['trc_results'] = trc_frame
+        results.attrs['trc_metadata'] = trc_metadata(trc_ledger.policy, trc_ledger)
     if bounded_handoff:
         results.attrs['bounded_handoff_summary'] = handoff_tables.finalize()
     else:

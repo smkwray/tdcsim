@@ -194,6 +194,7 @@ def execute_preference_trades(
     *,
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
+    trc_ledger=None,
 ):
     """
     Executes secondary market trades between holders based on deviations from their target portfolio preferences.
@@ -451,6 +452,15 @@ def execute_preference_trades(
                 net_reserve_change -= actual_dirty_value_traded
             elif buyer == 'CB' and seller == 'Foreign':
                 net_reserve_change += actual_dirty_value_traded
+            if trc_ledger is not None:
+                trc_ledger.record_trade(
+                    'SecondaryTrades',
+                    buyer=buyer,
+                    buyer_private_route=buyer_private_route if buyer == 'Private' else None,
+                    seller=seller,
+                    seller_private_route=seller_private_route if seller == 'Private' else None,
+                    amount=actual_dirty_value_traded,
+                )
             imbalance_values[seller][category] -= actual_dirty_value_traded
             imbalance_values[buyer][category] += actual_dirty_value_traded
             tradeable_idx = bond_to_trade_priced.name

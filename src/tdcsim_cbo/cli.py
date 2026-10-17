@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
-from ._json import sha256_bytes, sha256_file
+from ._json import sha256_bytes
 from .baseline import CboBaselinePackage
 from .compiler import CboScenarioCompiler
 from .contract import CboScenarioSpec
@@ -56,6 +56,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_cmd.add_argument("--scenario", required=True)
     run_cmd.add_argument("--output-dir", required=True)
     run_cmd.add_argument("--profile", choices=["summary", "compact", "audit"], default=None)
+    run_cmd.add_argument(
+        "--trc-routing",
+        type=Path,
+        default=None,
+        help="opt-in Treasury component of reserves routing assumptions (JSON)",
+    )
     run_cmd.add_argument("--_watchdog-worker", action="store_true", help=argparse.SUPPRESS)
     run_cmd.add_argument("--_watchdog-handoff", help=argparse.SUPPRESS)
 
@@ -305,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_dir,
             output_profile=args.profile,
             watchdog_handoff=args._watchdog_handoff,
+            trc_routing_path=args.trc_routing,
         )
         if args._watchdog_handoff is None:
             print(run.run_manifest["output_manifest"]["summary"]["sha256"])

@@ -9,7 +9,7 @@ import shutil
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import pandas as pd
 

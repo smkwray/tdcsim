@@ -141,7 +141,7 @@ def _assert_failure_drains_real_process_tree(launcher, monkeypatch, tmp_path, fa
                 "interrupt": KeyboardInterrupt, "exception": RuntimeError}[failure]
     try:
         with pytest.raises(expected):
-            launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64))
+            launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64, trc_routing=None))
         assert processes and pids
         assert all(process.poll() is not None for process in processes)
         assert all(not _alive(pid) for pid in pids)
@@ -288,7 +288,7 @@ def test_run_receipts_bind_aggregate_and_positive_tree_drain(launcher, monkeypat
 
     monkeypatch.setattr(launcher, "_RoleProcess", launch_with_synthetic_manifest)
     if accepted:
-        assert launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64)) == 0
+        assert launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64, trc_routing=None)) == 0
         summary = json.loads((tmp_path / launcher.CONTROLLER_SUMMARY_NAME).read_text())
         assert summary["controller_peak_rss_method"] == "sum_of_role_peak_rss_upper_bound"
         assert summary["controller_peak_rss_mb"] == sum(peaks) / 1024**2
@@ -302,8 +302,40 @@ def test_run_receipts_bind_aggregate_and_positive_tree_drain(launcher, monkeypat
             assert receipt["controller_process_tree_drained"] is True
     else:
         with pytest.raises(launcher.ReproductionError, match="aggregate"):
-            launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64))
+            launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64, trc_routing=None))
         assert not list(campaign.glob("*.json"))
         assert not (tmp_path / launcher.CONTROLLER_SUMMARY_NAME).exists()
     assert all(process.poll() is not None for process in processes)
     assert all(not _alive(pid) for pid in pids)
+
+
+def test_trc_routing_reaches_every_role_command(launcher, monkeypatch, tmp_path):
+    """A companion run passes the same routing file to all three roles; legacy runs pass none."""
+
+    _prepare_run(launcher, monkeypatch, tmp_path, "success")
+    _, _, contract = launcher._find_campaign("a" * 64)
+    contract["execution_contract"] = {"aggregate_acceptance_peak_rss_bytes": 10 * 1024**3}
+    routing = tmp_path / "routing.json"
+    routing.write_text("{}\n")
+    start = launcher._RoleProcess
+    commands = []
+
+    def capture(command, **kwargs):
+        commands.append(list(command))
+        process = start(command, **kwargs)
+        root = Path(command[command.index("--output-dir") + 1])
+        (root / "outputs").mkdir(parents=True)
+        summary = root / "outputs/summary.json"
+        summary.write_text('{}\n')
+        (root / launcher.RUN_MANIFEST_FILE).write_text(json.dumps({
+            "status": "complete", "run_id": root.parent.name,
+            "output_manifest": {"summary": {"sha256": hashlib.sha256(summary.read_bytes()).hexdigest()}},
+            "bounded_evidence": {"peak_rss_bytes": 1},
+        }))
+        return process
+
+    monkeypatch.setattr(launcher, "_RoleProcess", capture)
+    assert launcher.stage_run(argparse.Namespace(contract_sha256="a" * 64, trc_routing=str(routing))) == 0
+    assert len(commands) == 3
+    for command in commands:
+        assert command[command.index("--trc-routing") + 1] == str(routing.resolve())

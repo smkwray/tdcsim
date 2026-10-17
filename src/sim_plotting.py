@@ -254,7 +254,7 @@ def plot_multi_results(all_results_data, config_for_plots, scenario_order=None, 
                     os.makedirs(os.path.dirname(os.path.abspath(save_path_combined)), exist_ok=True)
                     print(f'Attempting to save combined plot: {save_path_combined}')
                     fig.savefig(save_path_combined, bbox_inches='tight', dpi=300)
-                    print(f'Combined plot saved successfully.')
+                    print('Combined plot saved successfully.')
                 except Exception as e:
                     print(f'Error saving combined plot to {save_path_combined}: {e}')
             if show_plot:

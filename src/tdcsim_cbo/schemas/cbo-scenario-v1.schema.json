@@ -250,6 +250,21 @@
           "default": false
         }
       }
+    },
+    "funding_closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "cbo_public_debt_target",
+            "cbo_debt_reference_plus_tga_floor_financing_v1"
+          ]
+        }
+      }
     }
   },
   "$defs": {

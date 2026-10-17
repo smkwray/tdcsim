@@ -30,7 +30,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from budget_interest import build_average_interest_rate_diagnostic, build_net_interest_diagnostic
+from budget_interest import build_net_interest_diagnostic
 from cbo_policy_bundle import (
     build_fiscal_incidence_policy_rows,
     build_fiscal_incidence_sensitivity_results,
@@ -46,13 +46,11 @@ from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
     build_cash_reconciliation_residual_rows,
     build_current_fy_splice_row,
-    build_current_fy_splice_row_from_fiscaldata,
     build_debt_stock_path_rows,
     build_fed_holdings_path_rows,
     build_operating_cash_path_rows,
     build_primary_deficit_path_rows,
     calculate_public_debt_bridge_components,
-    federal_fiscal_year,
     tga_closing_balance_bil_from_dts_row,
 )
 from forecast_input_builder import (
@@ -2624,9 +2622,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         clean=not args.no_clean,
     )
-    manifest = bundle.manifest
     if not args.build_inputs_only:
-        manifest = run_smoke(bundle)
+        run_smoke(bundle)
     print(json.dumps({"manifest": str(bundle.output_dir / "manifest.json"), "scenario_id": SCENARIO_ID}, sort_keys=True))
     return 0
 

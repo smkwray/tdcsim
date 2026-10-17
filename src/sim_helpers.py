@@ -41,7 +41,7 @@ def _set_nested_value(target_dict, path_keys, value):
             return False
         d[last_key] = value
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 def update_dict_recursive(d, u):

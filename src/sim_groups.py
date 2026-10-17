@@ -101,6 +101,9 @@ def save_group_results_csv(successful_scenario_results, scenario_order, group_ou
         scenario_stem = _clean_filename(scenario_name)
         scenario_path = f'{output_base}_{scenario_stem}.csv'
         scenario_frame.to_csv(scenario_path, index=False)
+        trc_frame = results_df.attrs.get('trc_results')
+        if trc_frame is not None:
+            trc_frame.to_csv(f'{output_base}_{scenario_stem}_trc.csv', index=False)
 
     if not long_frames:
         print(f"Warning [Group {group_name}]: No successful scenario data available for CSV export.")

@@ -19,8 +19,6 @@ from typing import Any
 
 import pandas as pd
 
-import evaluated_nominal_curve
-import sim_pricing
 from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
@@ -68,10 +66,13 @@ from .curve_runtime import (
 )
 from .manifest import RUN_CLAIM_BOUNDARY, RUN_UNSUPPORTED_COMPONENTS, cash_closure_validation_invariants
 from .open04_campaign import (
+    DEFAULT_FUNDING_CLOSURE_MODE,
     OPEN04_FUNDING_CLOSURE_MODE,
+    SCENARIO_FUNDING_CLOSURE_MODES,
     open04_expected_change_perimeter,
     parse_open04_campaign_marker,
     requires_open04_strict_execution,
+    scenario_funding_closure_mode,
 )
 from .output import (
     HANDOFF_TABLE_COLUMNS,
@@ -926,7 +927,10 @@ def _manifest_funding_closure_mode(manifest: Mapping[str, Any]) -> str:
 
     open04 = manifest.get("open04_campaign")
     if open04 is None:
-        return "cbo_public_debt_target"
+        mode = str(manifest.get("funding_closure_mode") or DEFAULT_FUNDING_CLOSURE_MODE)
+        if mode not in SCENARIO_FUNDING_CLOSURE_MODES:
+            raise VerificationError("run manifest funding closure mode is unsupported")
+        return mode
     if not isinstance(open04, Mapping):
         raise VerificationError("run manifest open04_campaign must be an object")
     if open04.get("funding_closure_mode") != OPEN04_FUNDING_CLOSURE_MODE:
@@ -1282,6 +1286,8 @@ def _verify_scenario_copy(root: Path, manifest: dict[str, Any]) -> None:
     spec = CboScenarioSpec.from_file(path)
     if spec.canonical_sha256() != scenario.get("canonical_sha256"):
         raise VerificationError("run scenario canonical hash mismatch")
+    if scenario_funding_closure_mode(spec.data) != _manifest_funding_closure_mode(manifest):
+        raise VerificationError("run manifest funding closure differs from the scenario declaration")
     _verify_manifest_artifacts(root, scenario.get("referenced_files", []), base=root)
     declared = _scenario_file_refs(spec.data)
     if scenario.get("referenced_file_hashes") != declared:

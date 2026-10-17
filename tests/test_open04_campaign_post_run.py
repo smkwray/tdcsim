@@ -38,7 +38,7 @@ import tdcsim_cbo.verifier as verifier_module
 from test_open04_campaign_export import (
     _annual_rows,
     _write_gzip_csv,
-    open04_pre_run_fixture,
+    open04_pre_run_fixture as open04_pre_run_fixture,
 )
 
 
@@ -474,7 +474,7 @@ def _materialize_complete_run(
         "campaign_contract_sha256": contract_sha256,
         "role": role,
         "run_id": manifest["run_id"],
-        "host": "TEST_REMOTE_HOST",
+        "host": "synthetic-worker",
         "controller": "remote_controller",
         "placement": "auto",
         "terminal_status": "completed",

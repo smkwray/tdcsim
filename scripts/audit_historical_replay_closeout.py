@@ -9,10 +9,8 @@ replay, exact holder-by-security history, or observed market-price valuation.
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import math
-import platform
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -1670,7 +1668,6 @@ def build_plausibility_audit() -> pd.DataFrame:
             ~maturity.get("quarter", pd.Series("", index=maturity.index)).astype(str).isin(aggregate_only_quarters)
         ].copy()
         scopes = sorted(maturity_claim["source_scope"].dropna().astype(str).unique())
-        prior_status = maturity_claim["prior_status"].astype(str)
         constraint_role = maturity_claim.get(
             "constraint_role",
             pd.Series("hard_bucket_proxy_constraint", index=maturity_claim.index),

@@ -30,7 +30,6 @@ htmlcov/
 # Secrets / local config
 .env
 .env.*
-.private-denylist
 *.pem
 *.key
 
@@ -60,3 +59,11 @@ AGENTS.md
 # Syncthing transfer residue
 .syncthing.*
 **/.syncthing.*
+
+.private-denylist
+
+.*-private-denylist
+
+.codex/
+
+.cursor/

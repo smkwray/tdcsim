@@ -872,6 +872,8 @@ def stage_run(args: argparse.Namespace) -> int:
                 "--output-dir",
                 str(run_root),
             ]
+            if args.trc_routing is not None:
+                command.extend(["--trc-routing", str(Path(args.trc_routing).resolve())])
             commands[role] = command
             log_path = log_dir / f"{role}.log"
             log_handle = log_path.open("ab")
@@ -1200,6 +1202,40 @@ def stage_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def stage_trc_export(args: argparse.Namespace) -> int:
+    """Project a verified route-aware companion campaign into the FY TRC table."""
+
+    from tdcsim_cbo._json import read_json
+    from tdcsim_cbo.open04_trc_export import export_open04_trc_companion
+
+    _assert_installed_distribution_import()
+    companion_root, companion_runtime, companion = _find_campaign(args.contract_sha256)
+    _assert_frozen_runtime_identity(companion, companion_runtime)
+    receipt_path = companion_root / VERIFICATION_RECEIPT_NAME
+    if not receipt_path.is_file():
+        _fail("the companion campaign must pass the verify stage before TRC export")
+    verification = read_json(receipt_path)
+    if verification.get("status") != "pass" or verification.get("campaign_eligible") is not True:
+        _fail("the companion campaign verification receipt is not an eligible pass")
+    frozen_root, _, _ = _find_campaign(args.frozen_contract_sha256)
+    if frozen_root == companion_root:
+        _fail("the frozen and companion campaigns must differ")
+    commit = companion["common_identity"]["code_commit_sha"]
+    output = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else PROJECT_ROOT / "output" / "evidence" / "open04_trc" / _short_sha(commit)
+    )
+    receipt = export_open04_trc_companion(
+        companion_campaign_root=companion_root,
+        frozen_campaign_root=frozen_root,
+        output_dir=output,
+        producer_commit=commit,
+    )
+    print(json.dumps({"output_dir": str(output), "table_sha256": receipt["output"]["sha256"]}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="run_open04_reproduction",
@@ -1232,6 +1268,11 @@ def main(argv: list[str] | None = None) -> int:
         "run", help="launch the three role runs and write completion receipts"
     )
     run.add_argument("--contract-sha256", required=True)
+    run.add_argument(
+        "--trc-routing",
+        default=None,
+        help="opt-in Treasury component of reserves routing assumptions passed to every role",
+    )
     run.set_defaults(handler=stage_run)
 
     verify = sub.add_parser(
@@ -1259,6 +1300,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     export.add_argument("--consumer-project", default="thesis")
     export.set_defaults(handler=stage_export)
+
+    trc_export = sub.add_parser(
+        "trc-export",
+        help="verify legacy identity against the frozen campaign and export FY TRC paths",
+    )
+    trc_export.add_argument("--contract-sha256", required=True, help="companion campaign contract")
+    trc_export.add_argument("--frozen-contract-sha256", required=True)
+    trc_export.add_argument("--output-dir", default=None)
+    trc_export.set_defaults(handler=stage_trc_export)
 
     args = parser.parse_args(argv)
     return args.handler(args)

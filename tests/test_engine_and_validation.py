@@ -809,7 +809,6 @@ class TestTrancheSplitProration:
 
     def test_tips_split_prorates_original_principal(self):
         """A partial TIPS trade should prorate OriginalPrincipal, not copy it whole."""
-        import numpy as np
         # TIPS bond held by Banks
         tips_bond = make_bond_row(
             BondID=801,

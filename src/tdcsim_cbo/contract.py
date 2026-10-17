@@ -14,7 +14,7 @@ from evaluated_nominal_curve import (
     normalize_open04_override,
 )
 
-from ._json import canonical_json_sha256, canonical_json_text, read_json, sha256_file
+from ._json import canonical_json_sha256, canonical_json_text, read_json
 from ._schema import SchemaValidationError, validate_schema
 from .baseline import CboBaselinePackage
 from .open04_campaign import (

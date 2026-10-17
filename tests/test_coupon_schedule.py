@@ -7,7 +7,6 @@ that only detected coupons in the first year after issuance.
 """
 import sys
 import pandas as pd
-import numpy as np
 import pytest
 
 # ============================================================
@@ -261,7 +260,7 @@ def test_coupon_in_specific_week():
 
     # Old logic would miss this
     old_found = old_has_coupon_in_period(issue, maturity, prev, curr, frequency=2)
-    check(f"old logic misses it: {old_found}", old_found == False)
+    check(f"old logic misses it: {old_found}", not old_found)
 
 
 def test_no_coupon_week():

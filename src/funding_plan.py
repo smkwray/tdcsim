@@ -6,9 +6,9 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from sim_pricing import quote_issuance_from_face_target
+from tdc_shared import PUBLIC_MARKETABLE_SECURITY_TYPES
 
 DEFAULT_TOLERANCE = 1e-9
-from tdc_shared import PUBLIC_MARKETABLE_SECURITY_TYPES
 NONPUBLIC_HOLDERS = frozenset({"TrustFunds", "FedInternal", "Intragovernmental"})
 
 

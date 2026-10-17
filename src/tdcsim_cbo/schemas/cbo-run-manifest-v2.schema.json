@@ -268,6 +268,12 @@
       },
       "minItems": 6,
       "uniqueItems": true
+    },
+    "funding_closure_mode": {
+      "enum": [
+        "cbo_public_debt_target",
+        "cbo_debt_reference_plus_tga_floor_financing_v1"
+      ]
     }
   },
   "allOf": [

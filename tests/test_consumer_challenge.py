@@ -286,6 +286,9 @@ def test_dirty_tree_release_identity_is_rejected(tmp_path):
             "user.name=Test",
             "-c",
             "user.email=test@example.invalid",
+            # Keep this synthetic repository independent of host-global hooks.
+            "-c",
+            f"core.hooksPath={repo / '.git' / 'hooks'}",
             "commit",
             "-qm",
             "fixture",

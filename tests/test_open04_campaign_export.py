@@ -1422,7 +1422,6 @@ def open04_export_runs_fixture(
         )
 
     for role in ("baseline", "candidate_a", "candidate_b"):
-        controller_index = list(run_roots).index(role)
         controller_run_id = "fixture-controller-batch"
         controller_path = (
             campaign_root
@@ -1440,7 +1439,7 @@ def open04_export_runs_fixture(
                 ),
                 "role": role,
                 "run_id": receipt["roles"][role]["run_id"],
-                "host": "TEST_REMOTE_HOST",
+                "host": "synthetic-worker",
                 "controller": "remote_controller",
                 "placement": "auto",
                 "terminal_status": "completed",
@@ -2088,7 +2087,7 @@ def _synthetic_post_receipt(
             "run_id": f"{role}-run-id",
             "run_manifest_sha256": str(index) * 64,
             "run_relative_path": declared["run_relative_path"],
-            "host": "TEST_REMOTE_HOST",
+            "host": "synthetic-worker",
             "controller_completion_receipt_sha256": str(index + 1) * 64,
             "terminal_summary_sha256": str(index + 2) * 64,
             "source_output_manifest_sha256": str(index + 3) * 64,
