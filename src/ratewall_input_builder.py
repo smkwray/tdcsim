@@ -40,6 +40,18 @@ FISCALDATA_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_servi
 SOMA_ASOF_DATES_URL = "https://markets.newyorkfed.org/api/soma/asofdates/list.json"
 SOMA_TREASURY_ASOF_URL = "https://markets.newyorkfed.org/api/soma/tsy/get/asof/{as_of}.csv"
 SOMA_HOLDINGS_FILENAME = "nyfed_soma_treasury_holdings.csv"
+SOMA_TYPE_CLASSES = {
+    "Bills": ("Bills",),
+    "NotesBonds": ("Notes", "Bonds"),
+    "TIPS": ("Treasury Inflation-Protected Securities",),
+    "FRNs": ("Floating Rate Notes",),
+}
+MATURED_CLASS_CATEGORIES = {"Bills": "bills", "Notes": "notes", "Bonds": "bonds"}
+MSPD_TOTAL_TOLERANCE_MIL = 1.0
+BOND_HISTORY_SOURCE = (
+    "FiscalData MSPD security cohorts scaled to MSPD Table 1 class totals; "
+    "CB from NY Fed SOMA by CUSIP; non-Fed remainder split by WAMEST sector bill and nonbill holdings"
+)
 WAMEST_CANONICAL_RELATIVE_PATH = "wamest/outputs/full_coverage_release/canonical_sector_maturity.csv"
 # Opening-book holder routes for non-Fed holders: (HolderType, HolderSubBucket).
 NONCB_OPENING_ROUTES = (
@@ -357,7 +369,12 @@ def load_soma_cusip_holdings(path: Path) -> tuple[str, pd.DataFrame]:
         raise ValueError(f"SOMA holdings file {path.name} repeats CUSIPs: {sorted(set(cusips[cusips.duplicated()]))}")
     amount_mil = (par + inflation.where(is_tips, 0.0)) / 1.0e6
     return as_of_dates[0], pd.DataFrame(
-        {"cusip": cusips, "amount_mil": amount_mil, "maturity_date": maturity.dt.date.astype(str)}
+        {
+            "cusip": cusips,
+            "security_type": frame["Security Type"].astype(str).str.strip(),
+            "amount_mil": amount_mil,
+            "maturity_date": maturity.dt.date.astype(str),
+        }
     )
 
 
@@ -811,10 +828,13 @@ def build_initial_portfolio(
 ) -> tuple[pd.DataFrame, dict]:
     """Write the MSPD security-level opening book with CUSIP-level CB and WAMEST-split remainders.
 
-    Each MSPD Table 3 security is scaled to the Table 1 debt-held-by-public class
-    total. CB holds the SOMA amount of that CUSIP. The rest is split among non-Fed
-    holders by their WAMEST bill or nonbill holdings, so the split is uniform
-    within bills and within nonbills; no public source gives other holders by CUSIP.
+    MSPD Table 3 securities, plus one cohort per class for debt that matured on a
+    non-business record date and is paid on the next business day, are scaled to the
+    Table 1 debt-held-by-public class total. CB holds the SOMA amount of each CUSIP
+    (and SOMA's matured-unpaid amounts in the matured cohorts). The rest is split
+    among non-Fed holders by their WAMEST bill or nonbill holdings, so the split is
+    uniform within bills and within nonbills; no public source gives other holders
+    by CUSIP.
     """
 
     soma_as_of, soma = load_soma_cusip_holdings(soma_path)
@@ -829,27 +849,32 @@ def build_initial_portfolio(
 
     candidate_rows: list[dict] = []
     skipped: dict[str, int] = {}
+    class_totals: dict[str, float] = {}
+    unmatured_totals: dict[str, float] = {}
     for row in table3_rows:
         class_desc = str(row.get("security_class1_desc", ""))
         class_key = _class_key(class_desc)
         sec_type = _security_type(class_desc)
         if not class_key or not sec_type or class_desc == "Total Marketable":
             continue
+        label = str(row.get("security_class2_desc", "")).strip()
         outstanding = _safe_float(row.get("outstanding_amt"), math.nan)
+        if label.startswith("Total "):
+            # Subtotal rows. A "Total Matured" amount is derived as total less unmatured,
+            # because MSPD prints "*" for amounts under $500k.
+            if "Unmatured" in label:
+                unmatured_totals[class_key] = outstanding
+            elif "Matured" not in label:
+                class_totals[class_key] = outstanding
+            continue
         issue_date = pd.to_datetime(row.get("issue_date"), errors="coerce")
         maturity_date = pd.to_datetime(row.get("maturity_date"), errors="coerce")
         if not math.isfinite(outstanding):
-            # MSPD prints reopening detail rows without outstanding and "*" for amounts under $500k.
-            reason = "no_outstanding_amount"
-        elif outstanding <= 0:
-            reason = "nonpositive_outstanding_amount"
-        elif pd.isna(issue_date) or pd.isna(maturity_date):
-            reason = "missing_issue_or_maturity_date"
-        else:
-            reason = ""
-        if reason:
-            skipped[reason] = skipped.get(reason, 0) + 1
+            # Reopening detail rows repeat a security without an outstanding amount.
+            skipped["no_outstanding_amount"] = skipped.get("no_outstanding_amount", 0) + 1
             continue
+        if outstanding <= 0 or pd.isna(issue_date) or pd.isna(maturity_date):
+            raise ValueError(f"MSPD Table 3 security row {class_desc}:{label} has an amount without valid dates or a positive amount")
         candidate_rows.append(
             {
                 "source_row": row,
@@ -859,7 +884,7 @@ def build_initial_portfolio(
                 "issue_date": issue_date,
                 "maturity_date": maturity_date,
                 "original_maturity_years": max(0.01, (maturity_date - issue_date).days / 365.25),
-                "cusip": str(row.get("security_class2_desc", "")).strip(),
+                "cusip": label,
             }
         )
 
@@ -868,28 +893,70 @@ def build_initial_portfolio(
     for item in candidate_rows:
         raw_totals[item["class_key"]] = raw_totals.get(item["class_key"], 0.0) + item["outstanding"]
         cusip_outstanding[item["cusip"]] = cusip_outstanding.get(item["cusip"], 0.0) + item["outstanding"]
+    matured_mil: dict[str, float] = {}
+    for class_key, raw_total in raw_totals.items():
+        class_total = class_totals.get(class_key, math.nan)
+        unmatured = unmatured_totals.get(class_key, class_total)
+        if not math.isfinite(class_total) or not math.isfinite(unmatured):
+            raise ValueError(f"MSPD Table 3 has no class total for {class_key}")
+        if abs(raw_total - unmatured) > MSPD_TOTAL_TOLERANCE_MIL:
+            raise ValueError(f"MSPD Table 3 {class_key} securities sum to {raw_total} but the unmatured total is {unmatured}")
+        if class_total - unmatured < -MSPD_TOTAL_TOLERANCE_MIL:
+            raise ValueError(f"MSPD Table 3 {class_key} unmatured total exceeds the class total")
+        matured_mil[class_key] = max(0.0, class_total - unmatured)
 
     soma_amount = dict(zip(soma["cusip"], soma["amount_mil"]))
     unmatched = soma[~soma["cusip"].isin(cusip_outstanding)]
     unmatched_live = unmatched[unmatched["maturity_date"] > record_date]
     if not unmatched_live.empty:
         raise ValueError(f"SOMA CUSIPs outstanding after {record_date} are absent from MSPD: {sorted(unmatched_live['cusip'])}")
+    # SOMA securities maturing on a non-business record date are still outstanding as
+    # matured-unpaid debt; earlier maturities were paid before the record date.
+    matured_unpaid = unmatched[unmatched["maturity_date"] == record_date]
+    paid_before_record = unmatched[unmatched["maturity_date"] < record_date]
+    matured_cb_mil = {class_key: 0.0 for class_key in matured_mil}
+    for soma_type, amount in matured_unpaid.groupby("security_type")["amount_mil"].sum().items():
+        classes = [key for key in SOMA_TYPE_CLASSES.get(soma_type, ()) if matured_mil.get(key, 0.0) > 0.0]
+        if not classes:
+            raise ValueError(f"SOMA holds matured {soma_type} on {record_date} but MSPD shows no matured amount for it")
+        pool = sum(matured_mil[key] for key in classes)
+        for key in classes:
+            matured_cb_mil[key] += amount * matured_mil[key] / pool
+    record_ts = pd.Timestamp(record_date)
+    for class_key, amount in matured_mil.items():
+        if amount <= 0.0:
+            continue
+        candidate_rows.append(
+            {
+                "source_row": {"security_class1_desc": class_key},
+                "class_key": class_key,
+                "security_type": "Fixed" if class_key in {"Bills", "Notes", "Bonds"} else _security_type(class_key),
+                "outstanding": amount,
+                "issue_date": record_ts - pd.Timedelta(days=1),
+                "maturity_date": record_ts,
+                "original_maturity_years": 1.0 / 365.25,
+                "cusip": f"matured_unpaid_{class_key.lower().replace(' ', '_').replace('-', '_')}",
+                "matured_cb_mil": matured_cb_mil[class_key],
+                "maturity_category": MATURED_CLASS_CATEGORIES.get(class_key, ""),
+            }
+        )
 
     output_rows: list[dict] = []
     bond_id = 1
     for item in candidate_rows:
         target_total = targets.get(item["class_key"], 0.0)
-        raw_total = raw_totals.get(item["class_key"], 0.0)
-        if target_total <= 0 or raw_total <= 0:
+        if target_total <= 0:
             raise ValueError(f"MSPD Table 1 has no debt-held-by-public total for {item['class_key']}")
-        class_scale = target_total / raw_total
+        # Table 1 excludes intragovernmental holdings; scale each class's Table 3 total to it.
+        class_scale = target_total / class_totals[item["class_key"]]
+        is_matured = "matured_cb_mil" in item
         source_row = item["source_row"]
         class_desc = str(source_row.get("security_class1_desc", ""))
         cusip = item["cusip"]
         coupon_rate = _safe_float(source_row.get("interest_rate_pct")) / 100.0
         issue_yield = _safe_float(source_row.get("yield_pct"), coupon_rate * 100.0) / 100.0
         maturity_years = item["original_maturity_years"]
-        maturity_category = _maturity_category(class_desc, maturity_years)
+        maturity_category = item.get("maturity_category") or _maturity_category(class_desc, maturity_years)
         is_bill = maturity_category == "bills" and coupon_rate <= 1e-12
         price_ratio = 1.0
         if is_bill:
@@ -897,7 +964,10 @@ def build_initial_portfolio(
             price_ratio = max(0.75, min(1.0, 1.0 - issue_yield * day_count / 360.0))
         # MSPD and SOMA amounts are in millions of dollars; contract columns use billions.
         public_face = item["outstanding"] * class_scale / 1000.0
-        cb_face = soma_amount.get(cusip, 0.0) * item["outstanding"] / cusip_outstanding[cusip] / 1000.0
+        if is_matured:
+            cb_face = item["matured_cb_mil"] / 1000.0
+        else:
+            cb_face = soma_amount.get(cusip, 0.0) * item["outstanding"] / cusip_outstanding[cusip] / 1000.0
         if cb_face > public_face * (1.0 + 1e-9) + 1e-9:
             raise ValueError(f"SOMA holds more of {cusip} than MSPD debt held by the public: {cb_face} > {public_face}")
         remainder = max(0.0, public_face - cb_face)
@@ -964,14 +1034,17 @@ def build_initial_portfolio(
                     ),
                     "source_key": f"{record_date}:{class_desc}:{cusip}",
                     "observability_tier": (
-                        "security_level_observed_holder"
+                        "class_matured_unpaid_total"
+                        if is_matured
+                        else "security_level_observed_holder"
                         if is_cb
                         else "security_cohort_remainder_with_sector_bill_nonbill_allocation"
                     ),
                     "central_default_eligible": "true",
                     "sensitivity_only": "false",
                     "source_status": (
-                        "mspd_million_amounts_scaled_to_table1_class_total_and_converted_to_bil;"
+                        ("mspd_matured_unpaid_class_amount;" if is_matured else "")
+                        + "mspd_million_amounts_scaled_to_table1_class_total_and_converted_to_bil;"
                         + (
                             f"cb_from_nyfed_soma_asof_{soma_as_of}"
                             if is_cb
@@ -998,10 +1071,17 @@ def build_initial_portfolio(
         "cb_source": "nyfed_soma_treasury_holdings_by_cusip",
         "soma_as_of_date": soma_as_of,
         "soma_file_sha256": _sha256(soma_path),
-        "soma_matured_by_record_date": {
-            "cusips": int(len(unmatched)),
-            "amount_bil": float(unmatched["amount_mil"].sum() / 1000.0),
+        "soma_matured_unpaid_at_record_date": {
+            "cusips": int(len(matured_unpaid)),
+            "amount_bil": float(matured_unpaid["amount_mil"].sum() / 1000.0),
         },
+        # The Fed reinvested these at auctions MSPD records under new CUSIPs; their
+        # amounts sit with non-Fed holders in this book.
+        "soma_paid_before_record_date": {
+            "cusips": int(len(paid_before_record)),
+            "amount_bil": float(paid_before_record["amount_mil"].sum() / 1000.0),
+        },
+        "matured_unpaid_bil": {key: value / 1000.0 for key, value in sorted(matured_mil.items()) if value > 0.0},
         "noncb_source": WAMEST_CANONICAL_RELATIVE_PATH,
         "noncb_source_sha256": _sha256(wamest_path),
         "wamest_date": noncb["wamest_date"],
@@ -1670,10 +1750,7 @@ def build_all(
         "artifacts": artifacts,
         "files": {path.name: {"sha256": _sha256(path), "bytes": path.stat().st_size} for path in files},
         "source_hierarchy": {
-            "bond_history": (
-                "FiscalData MSPD security cohorts scaled to MSPD Table 1 class totals; "
-                "CB from NY Fed SOMA by CUSIP; non-Fed remainder split by WAMEST sector bill and nonbill holdings"
-            ),
+            "bond_history": BOND_HISTORY_SOURCE,
             "yield_curve": "Treasury daily par curve shape shifted to CBO 3-month and 10-year projected anchors",
             "primary_flow": "CBO total deficit less net interest as aggregate cash proxy",
             "holder_absorption": (
@@ -1688,13 +1765,81 @@ def build_all(
     return manifest
 
 
+def rebuild_opening_book(
+    output_dir: Path,
+    *,
+    record_date: str,
+    mspd_table_1: Path,
+    mspd_table_3_market: Path,
+    soma_holdings: Path,
+    wamest_canonical: Path,
+) -> dict:
+    """Rebuild only the opening book in an existing input directory from local source files.
+
+    The SOMA file is copied beside the book, and the manifest's opening-book entry and
+    file hashes are replaced; the other artifacts in the directory are left as they are.
+    """
+
+    manifest_path = output_dir / "tdcsim_ratewall_input_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tables = {}
+    for name, path in (("table1", mspd_table_1), ("table3", mspd_table_3_market)):
+        frame = pd.read_csv(path, dtype=str)
+        rows = frame[frame["record_date"] == record_date].fillna("").to_dict("records")
+        if not rows:
+            raise ValueError(f"{path.name} has no rows for record date {record_date}")
+        tables[name] = rows
+    soma_path = output_dir / SOMA_HOLDINGS_FILENAME
+    if soma_holdings.resolve() != soma_path.resolve():
+        soma_path.write_bytes(soma_holdings.read_bytes())
+    book_path = output_dir / "tdcsim_initial_portfolio_cohorts.csv"
+    _, metadata = build_initial_portfolio(
+        book_path,
+        record_date=record_date,
+        table1_rows=tables["table1"],
+        table3_rows=tables["table3"],
+        soma_path=soma_path,
+        wamest_path=wamest_canonical,
+    )
+    metadata["mspd_source_sha256"] = {path.name: _sha256(path) for path in (mspd_table_1, mspd_table_3_market)}
+    manifest["artifacts"]["initial_portfolio"] = metadata
+    for path in (book_path, soma_path):
+        manifest["files"][path.name] = {"sha256": _sha256(path), "bytes": path.stat().st_size}
+    manifest["source_hierarchy"]["bond_history"] = BOND_HISTORY_SOURCE
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build source-backed tdcsim inputs for RateWall.")
     parser.add_argument("--output-dir", default="data/ratewall_inputs")
     parser.add_argument("--config-path", default="tdc_config_ratewall_source_backed.yaml")
     parser.add_argument("--ratewall-root", default="../ratewall")
+    opening = parser.add_argument_group("rebuild only the opening book from local files")
+    opening.add_argument("--opening-book-only", action="store_true")
+    opening.add_argument("--record-date")
+    opening.add_argument("--mspd-table-1", type=Path)
+    opening.add_argument("--mspd-table-3-market", type=Path)
+    opening.add_argument("--soma-holdings", type=Path)
+    opening.add_argument("--wamest-canonical", type=Path)
     args = parser.parse_args()
     project_root = Path(__file__).resolve().parents[1]
+    if args.opening_book_only:
+        required = ("record_date", "mspd_table_1", "mspd_table_3_market", "soma_holdings")
+        missing = [f"--{name.replace('_', '-')}" for name in required if getattr(args, name) is None]
+        if missing:
+            parser.error(f"--opening-book-only requires {', '.join(missing)}")
+        manifest = rebuild_opening_book(
+            (project_root / args.output_dir).resolve(),
+            record_date=args.record_date,
+            mspd_table_1=args.mspd_table_1,
+            mspd_table_3_market=args.mspd_table_3_market,
+            soma_holdings=args.soma_holdings,
+            wamest_canonical=args.wamest_canonical
+            or (project_root / args.ratewall_root).resolve().parent / WAMEST_CANONICAL_RELATIVE_PATH,
+        )
+        print(json.dumps({"status": "ok", "initial_portfolio": manifest["artifacts"]["initial_portfolio"]}, indent=2, sort_keys=True))
+        return
     manifest = build_all(
         output_dir=(project_root / args.output_dir).resolve(),
         config_path=(project_root / args.config_path).resolve(),

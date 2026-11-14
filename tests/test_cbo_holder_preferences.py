@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+
+import pandas as pd
 import pytest
 
 from cbo_holder_preferences import (
@@ -7,6 +10,8 @@ from cbo_holder_preferences import (
     holder_profile_from_opening_weights,
     validate_holder_preferences_non_degenerate,
 )
+from scripts.run_cbo_forecast_smoke import load_opening_portfolio
+from tdcsim_cbo.runner import _holder_preferences
 
 WEIGHTS = {
     "bills": {
@@ -62,3 +67,27 @@ def test_profile_rows_carry_holder_and_route_shares():
 def test_malformed_opening_weights_raise(weights):
     with pytest.raises(ValueError, match="noncb_weights"):
         holder_profile_from_opening_weights(weights)
+
+
+def test_runner_reads_the_profile_the_package_writes(tmp_path):
+    # The package build and `tdcsim-cbo run` must divide new issuance the same way.
+
+    preferences, routes = holder_profile_from_opening_weights(WEIGHTS)
+    rows = build_holder_profile_rows(scenario_id="central", holder_preferences=preferences, private_subbucket_shares=routes)
+    path = tmp_path / "tdcsim_holder_profile_assumptions.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    loaded = _holder_preferences(path)
+    for holder in ("Banks", "Foreign", "Private", "CB"):
+        for category in ("bills", "notes", "frn"):
+            assert loaded[holder][f"{category}_pct"] == pytest.approx(preferences[holder][f"{category}_pct"])
+    assert loaded["__private_subbucket_shares__"]["bills"]["mmf_cash_fund_route"] == pytest.approx(0.5)
+
+
+def test_package_build_rejects_an_opening_book_without_soma_holdings(tmp_path):
+    book = tmp_path / "book.csv"
+    book.write_text("BondID\n1\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"artifacts": {"initial_portfolio": {"mspd_record_date": "2026-05-31"}}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="SOMA-based CB holdings"):
+        load_opening_portfolio(book, simulation_start_date="2026-06-21", source_manifest=manifest)

@@ -1392,6 +1392,20 @@ def load_opening_portfolio(
     portfolio_path = Path(path)
     if not portfolio_path.exists():
         raise FileNotFoundError(f"opening portfolio file is missing: {portfolio_path}")
+    source_manifest_path = Path(source_manifest)
+    if not source_manifest_path.exists():
+        raise FileNotFoundError(f"opening portfolio manifest is missing: {source_manifest_path}")
+    source_manifest_hash = _sha256_file(source_manifest_path)
+    source_manifest_data = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    manifest_initial = source_manifest_data.get("artifacts", {}).get("initial_portfolio", {})
+    if manifest_initial.get("cb_source") != OPENING_PORTFOLIO_CB_SOURCE or "noncb_weights" not in manifest_initial:
+        raise ValueError(
+            "opening portfolio manifest does not record SOMA-based CB holdings; "
+            "rebuild the book with src/ratewall_input_builder.py"
+        )
+    record_date = str(manifest_initial.get("mspd_record_date"))
+    if record_date != OPENING_PORTFOLIO_RECORD_DATE:
+        raise ValueError(f"opening portfolio record date changed unexpectedly: {record_date}")
     source = pd.read_csv(portfolio_path)
     source_rows_loaded = int(len(source))
     for column in BOND_PORTFOLIO_COLS:
@@ -1461,20 +1475,6 @@ def load_opening_portfolio(
             f"{debt_total:.12f} vs {OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL:.12f}"
         )
 
-    source_manifest_path = Path(source_manifest)
-    source_manifest_hash = _sha256_file(source_manifest_path) if source_manifest_path.exists() else None
-    source_manifest: dict[str, Any] = {}
-    if source_manifest_path.exists():
-        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
-    manifest_initial = source_manifest.get("artifacts", {}).get("initial_portfolio", {})
-    if manifest_initial.get("cb_source") != OPENING_PORTFOLIO_CB_SOURCE or "noncb_weights" not in manifest_initial:
-        raise ValueError(
-            "opening portfolio manifest does not record SOMA-based CB holdings; "
-            "rebuild the book with src/ratewall_input_builder.py"
-        )
-    record_date = str(manifest_initial.get("mspd_record_date", OPENING_PORTFOLIO_RECORD_DATE))
-    if record_date != OPENING_PORTFOLIO_RECORD_DATE:
-        raise ValueError(f"opening portfolio record date changed unexpectedly: {record_date}")
     rollforward_diagnostics = _opening_rollforward_diagnostic_rows(
         expired,
         rollforward,

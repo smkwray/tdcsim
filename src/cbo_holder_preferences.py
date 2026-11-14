@@ -52,6 +52,8 @@ def holder_profile_from_opening_weights(
     for category in MARKETABLE_PREFERENCE_CATEGORIES:
         shares = groups["bills" if category == "bills" else "nonbills"]
         private = shares[_DOMESTIC_NONBANK_KEY] + shares[_MMF_KEY]
+        if private <= 0.0:
+            raise ValueError(f"opening-book noncb_weights give private holders no {category} share")
         preferences["Banks"][f"{category}_pct"] = shares["Banks"]
         preferences["Foreign"][f"{category}_pct"] = shares["Foreign"]
         preferences["Private"][f"{category}_pct"] = private

@@ -989,12 +989,17 @@ def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tm
         )
 
 
-def _opening_book_inputs(tmp_path, *, soma_rows=None, wamest_overrides=None, drop_sector=None):
-    """Synthetic MSPD, SOMA and WAMEST inputs: one bill, one note and one TIPS security."""
+def _opening_book_inputs(tmp_path, *, soma_rows=None, drop_sector=None, extra_table3=None, soma_as_of="2026-04-29"):
+    """Synthetic MSPD, SOMA and WAMEST inputs shaped like the real files.
+
+    One bill, one note and one TIPS security; 100,000 of notes matured on the record
+    date and are unpaid; 1% of notes are held intragovernmentally, so Table 1 is below
+    the Table 3 class total.
+    """
 
     table1 = [
         {"security_type_desc": "Marketable", "security_class_desc": "Bills", "debt_held_public_mil_amt": "1000000"},
-        {"security_type_desc": "Marketable", "security_class_desc": "Notes", "debt_held_public_mil_amt": "2000000"},
+        {"security_type_desc": "Marketable", "security_class_desc": "Notes", "debt_held_public_mil_amt": "2079000"},
         {
             "security_type_desc": "Marketable",
             "security_class_desc": "Treasury Inflation-Protected Securities",
@@ -1002,12 +1007,12 @@ def _opening_book_inputs(tmp_path, *, soma_rows=None, wamest_overrides=None, dro
         },
     ]
 
-    def security(class_desc, cusip, outstanding, maturity, rate="0"):
+    def security(class_desc, cusip, outstanding, maturity="", rate="0", issue="2026-01-01"):
         return {
             "security_class1_desc": class_desc,
             "security_class2_desc": cusip,
             "outstanding_amt": outstanding,
-            "issue_date": "2026-01-01",
+            "issue_date": issue,
             "maturity_date": maturity,
             "interest_rate_pct": rate,
             "yield_pct": "4.0",
@@ -1015,22 +1020,31 @@ def _opening_book_inputs(tmp_path, *, soma_rows=None, wamest_overrides=None, dro
 
     table3 = [
         security("Bills Maturity Value", "FAKEBILL1", "1000000", "2026-09-01"),
+        security("Bills Maturity Value", "Total Unmatured Treasury Bills", "1000000", issue=""),
+        security("Bills Maturity Value", "Total Matured Treasury Bills", "*", issue=""),
+        security("Bills Maturity Value", "Total Treasury Bills", "1000000", issue=""),
         security("Notes", "FAKENOTE1", "2000000", "2031-01-01", "4.0"),
+        security("Notes", "Total Unmatured Treasury Notes", "2000000", issue=""),
+        security("Notes", "Total Matured Treasury Notes", "100000", issue=""),
+        security("Notes", "Total Treasury Notes", "2100000", issue=""),
         security("Inflation-Protected Securities", "FAKETIPS1", "300000", "2036-01-15", "1.0"),
         # Reopening detail rows carry no outstanding amount and are counted, not dropped silently.
-        {**security("Inflation-Protected Securities", "FAKETIPS1", "", "2036-01-15", "1.0"), "outstanding_amt": ""},
+        security("Inflation-Protected Securities", "FAKETIPS1", "", "2036-01-15", "1.0"),
+        security("Inflation-Protected Securities", "Total Treasury TIPS", "300000", issue=""),
+        *(extra_table3 or []),
     ]
     soma = soma_rows or [
         ("FAKEBILL1", "Bills", "2026-09-01", "100000000000", ""),
         ("FAKENOTE1", "NotesBonds", "2031-01-01", "500000000000", ""),
         ("FAKETIPS1", "TIPS", "2036-01-15", "50000000000", "10000000000"),
+        ("FAKEMAT01", "NotesBonds", "2026-04-30", "20000000000", ""),
         ("FAKEOLD01", "Bills", "2026-04-28", "7000000000", ""),
     ]
     soma_path = tmp_path / "soma.csv"
     pd.DataFrame(
         [
             {
-                "As Of Date": "2026-04-29",
+                "As Of Date": soma_as_of,
                 "CUSIP": f"'{cusip}'",
                 "Security Type": kind,
                 "Maturity Date": maturity,
@@ -1042,7 +1056,6 @@ def _opening_book_inputs(tmp_path, *, soma_rows=None, wamest_overrides=None, dro
     ).to_csv(soma_path, index=False)
 
     levels = {"bank_us_chartered": (100.0, 0.5), "foreigners_total": (300.0, 0.2), "money_market_funds": (200.0, 0.8)}
-    levels.update(wamest_overrides or {})
     wamest_rows = []
     for sector in rib.WAMEST_SECTOR_ROUTES:
         if sector == drop_sector:
@@ -1078,6 +1091,7 @@ def test_opening_book_pins_cb_to_soma_and_splits_remainder_by_wamest_bill_holdin
 
     # MSPD and SOMA are in millions; the book is in billions. CB holds exactly the
     # SOMA amount of each CUSIP, so Fed maturities land on the actual dates and sizes.
+    # The 1% intragovernmental scaling applies to the public total, never to SOMA.
     assert face[("FAKEBILL1", "CB", "")] == pytest.approx(100.0)
     assert face[("FAKENOTE1", "CB", "")] == pytest.approx(500.0)
     # TIPS outstanding in MSPD includes the inflation adjustment, so CB does too.
@@ -1089,35 +1103,64 @@ def test_opening_book_pins_cb_to_soma_and_splits_remainder_by_wamest_bill_holdin
     bill_total = 50.0 + 60.0 + 160.0 + 100.0
     assert face[("FAKEBILL1", "Private", "mmf_cash_fund_route")] == pytest.approx(900.0 * 160.0 / bill_total)
     note_total = 50.0 + 240.0 + 40.0 + 300.0
-    assert face[("FAKENOTE1", "Private", "mmf_cash_fund_route")] == pytest.approx(1500.0 * 40.0 / note_total)
-    assert face[("FAKENOTE1", "Foreign", "")] == pytest.approx(1500.0 * 240.0 / note_total)
+    note_public = 2000.0 * 0.99
+    assert face[("FAKENOTE1", "Private", "mmf_cash_fund_route")] == pytest.approx((note_public - 500.0) * 40.0 / note_total)
+    assert face[("FAKENOTE1", "Foreign", "")] == pytest.approx((note_public - 500.0) * 240.0 / note_total)
 
-    # Splitting holders never changes the security's public total.
+    # Notes that matured on the record date and are paid the next business day stay in
+    # the book as one cohort maturing on the record date, including the Fed's share, so
+    # the pre-start rollover replaces them; live notes are not inflated to absorb them.
+    matured = frame[frame["cusip_or_synthetic_id"].eq("matured_unpaid_notes")]
+    assert set(matured["MaturityDate"]) == {"2026-04-30"}
+    assert set(matured["MaturityCategory"]) == {"notes"}
+    assert matured["FaceValue"].astype(float).sum() == pytest.approx(100.0 * 0.99)
+    assert face[("matured_unpaid_notes", "CB", "")] == pytest.approx(20.0)
+
+    # Splitting holders never changes the public totals in Table 1.
     totals = frame.assign(FaceValue=frame["FaceValue"].astype(float)).groupby("cusip_or_synthetic_id")["FaceValue"].sum()
-    assert totals.to_dict() == pytest.approx({"FAKEBILL1": 1000.0, "FAKENOTE1": 2000.0, "FAKETIPS1": 300.0})
+    assert totals.sum() == pytest.approx(1000.0 + 2079.0 + 300.0)
 
-    # A SOMA security that matured before the MSPD date is reported, not silently dropped.
-    assert metadata["soma_matured_by_record_date"] == {"cusips": 1, "amount_bil": pytest.approx(7.0)}
+    assert metadata["soma_matured_unpaid_at_record_date"] == {"cusips": 1, "amount_bil": pytest.approx(20.0)}
+    # A SOMA security paid before the record date is reported, not silently dropped.
+    assert metadata["soma_paid_before_record_date"] == {"cusips": 1, "amount_bil": pytest.approx(7.0)}
+    assert metadata["matured_unpaid_bil"] == {"Notes": pytest.approx(100.0)}
     assert metadata["mspd_rows_skipped"] == {"no_outstanding_amount": 1}
     assert metadata["wamest_date"] == "2026-03-31"
-    assert set(frame.loc[frame["HolderType"].eq("CB"), "observability_tier"]) == {"security_level_observed_holder"}
+    assert set(frame.loc[frame["HolderType"].eq("CB") & ~frame["cusip_or_synthetic_id"].str.startswith("matured"), "observability_tier"]) == {
+        "security_level_observed_holder"
+    }
 
 
-def test_opening_book_fails_when_live_soma_security_is_missing_from_mspd(tmp_path):
-    inputs = _opening_book_inputs(
-        tmp_path,
-        soma_rows=[("FAKENEW01", "NotesBonds", "2030-01-01", "1000000000", "")],
-    )
-    with pytest.raises(ValueError, match="absent from MSPD"):
-        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
-
-
-def test_opening_book_fails_when_soma_exceeds_public_amount(tmp_path):
-    inputs = _opening_book_inputs(
-        tmp_path,
-        soma_rows=[("FAKEBILL1", "Bills", "2026-09-01", "1500000000000", "")],
-    )
-    with pytest.raises(ValueError, match="SOMA holds more"):
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"soma_rows": [("FAKENEW01", "NotesBonds", "2030-01-01", "1000000000", "")]}, "absent from MSPD"),
+        ({"soma_rows": [("FAKEBILL1", "Bills", "2026-09-01", "1500000000000", "")]}, "SOMA holds more"),
+        ({"soma_rows": [("FAKEBMAT1", "Bills", "2026-04-30", "1000000000", "")]}, "no matured amount"),
+        ({"soma_as_of": "2026-05-06"}, "after MSPD record date"),
+        # A dated security row without dates would otherwise vanish into the class scaling.
+        ({"extra_table3": [{"security_class1_desc": "Notes", "security_class2_desc": "FAKENOTE2", "outstanding_amt": "5"}]}, "without valid dates"),
+        (
+            {
+                "extra_table3": [
+                    {
+                        "security_class1_desc": "Bonds",
+                        "security_class2_desc": "FAKEBOND1",
+                        "outstanding_amt": "10",
+                        "issue_date": "2020-01-01",
+                        "maturity_date": "2050-01-01",
+                    },
+                    {"security_class1_desc": "Bonds", "security_class2_desc": "Total Treasury Bonds", "outstanding_amt": "10"},
+                    {"security_class1_desc": "Bonds", "security_class2_desc": "Total Unmatured Treasury Bonds", "outstanding_amt": "12"},
+                ]
+            },
+            "unmatured total",
+        ),
+    ],
+)
+def test_opening_book_fails_loudly_on_inconsistent_sources(tmp_path, overrides, message):
+    inputs = _opening_book_inputs(tmp_path, **overrides)
+    with pytest.raises(ValueError, match=message):
         rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
 
 
@@ -1130,6 +1173,42 @@ def test_opening_book_fails_on_unmapped_or_missing_wamest_sector(tmp_path, drop_
         pd.concat([frame, extra]).to_csv(inputs["wamest_path"], index=False)
     with pytest.raises(ValueError, match="route registry"):
         rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+def test_opening_book_rebuild_keeps_manifest_bound_to_the_files(tmp_path):
+    # The CBO package build trusts this manifest, so its hashes and opening-book entry
+    # must describe the rebuilt bytes, and unrelated artifacts must be left alone.
+    inputs = _opening_book_inputs(tmp_path)
+    t1 = tmp_path / "mspd_table_1.csv"
+    t3 = tmp_path / "mspd_table_3_market.csv"
+    pd.DataFrame([{**row, "record_date": "2026-04-30"} for row in inputs["table1_rows"]]).to_csv(t1, index=False)
+    pd.DataFrame([{**row, "record_date": "2026-04-30"} for row in inputs["table3_rows"]]).to_csv(t3, index=False)
+    out = tmp_path / "inputs"
+    out.mkdir()
+    (out / "other.csv").write_text("x\n1\n", encoding="utf-8")
+    other = {"sha256": "unchanged", "bytes": 4}
+    (out / "tdcsim_ratewall_input_manifest.json").write_text(
+        json.dumps({"artifacts": {"initial_portfolio": {}, "other": {"rows": 1}}, "files": {"other.csv": other}, "source_hierarchy": {}}),
+        encoding="utf-8",
+    )
+
+    manifest = rib.rebuild_opening_book(
+        out,
+        record_date="2026-04-30",
+        mspd_table_1=t1,
+        mspd_table_3_market=t3,
+        soma_holdings=inputs["soma_path"],
+        wamest_canonical=inputs["wamest_path"],
+    )
+
+    on_disk = json.loads((out / "tdcsim_ratewall_input_manifest.json").read_text(encoding="utf-8"))
+    assert on_disk == manifest
+    for name in ("tdcsim_initial_portfolio_cohorts.csv", rib.SOMA_HOLDINGS_FILENAME):
+        assert manifest["files"][name]["sha256"] == rib._sha256(out / name)
+    assert manifest["files"]["other.csv"] == other
+    assert manifest["artifacts"]["other"] == {"rows": 1}
+    assert manifest["artifacts"]["initial_portfolio"]["cb_source"] == "nyfed_soma_treasury_holdings_by_cusip"
+    assert set(manifest["artifacts"]["initial_portfolio"]["mspd_source_sha256"]) == {t1.name, t3.name}
 
 
 def test_soma_loader_rejects_files_without_required_columns(tmp_path):

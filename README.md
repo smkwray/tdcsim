@@ -71,9 +71,10 @@ inputs, example scenarios, output files and scenario controls. Each step:
   to the day. New securities settle on the day the path requires them, split by
   the scenario's security-type shares and maturity distribution. The runner
   issues on that daily need, without Treasury's auction calendar.
-- **Holders of new issuance.** A holder-preference profile divides each security
-  type among banks, foreign holders and private holders. The package ships a
-  default profile; scenarios can replace it from a chosen date.
+- **Holders of new issuance.** New bills are divided among banks, foreign holders,
+  money market funds (MMFs) and other domestic holders in proportion to their bill
+  holdings in the opening book; other security types follow holdings of longer
+  securities. Scenarios can replace these shares from a chosen date.
 - **Federal Reserve.** Fed holdings follow CBO's projected path. The Fed reaches
   it by buying or selling existing securities from other holders at market
   value; it receives no allocation of new issuance.
@@ -89,12 +90,14 @@ marketable security outstanding on the record date (about 460 in May 2026) with
 its own coupon and maturity date; the CBO package build adds each TIPS index
 ratio and FRN spread from Treasury data. Federal Reserve holdings come security
 by security from the New York Fed's System Open Market Account (SOMA) holdings.
-The rest of each security is divided among banks, foreign holders, money market
-funds (MMFs) and other domestic holders in proportion to each group's holdings of
-bills or of longer securities, as estimated by
-[WAMEST](https://github.com/smkwray/wamest) from Federal Reserve Financial
-Accounts (Z.1) and other public data. Securities that mature between the record
-date and the simulation start roll into 3-month bills.
+The rest of each security is divided among banks, foreign holders, MMFs and other
+domestic holders in proportion to each group's holdings of bills or of longer
+securities, as estimated by [WAMEST](https://github.com/smkwray/wamest) from
+Federal Reserve Financial Accounts (Z.1) and other public data. Securities that mature between the record
+date and the simulation start, including any matured on a weekend record date and
+paid the next business day, roll into 3-month bills. To rebuild the book from
+local MSPD, SOMA and WAMEST files, run
+`python src/ratewall_input_builder.py --opening-book-only --help`.
 
 ### Historical replay
 
