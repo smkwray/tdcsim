@@ -67,10 +67,15 @@ def empty_security_sources(tmp_path: Path) -> dict[str, str]:
         ]
     ).to_csv(frn_indexes, index=False)
     pd.DataFrame(columns=["index_date", "ref_cpi"]).to_csv(tips_cpi, index=False)
+    soma = tmp_path / "soma.csv"
+    pd.DataFrame(
+        columns=["As Of Date", "CUSIP", "Security Type", "Maturity Date", "Current Face Value", "Par Value", "Inflation Compensation"]
+    ).to_csv(soma, index=False)
     return {
         "auctions": str(auctions),
         "frn_daily_indexes": str(frn_indexes),
         "tips_cpi": str(tips_cpi),
+        "soma_treasury_holdings": str(soma),
     }
 
 

@@ -21,10 +21,8 @@ def load_soma_treasury_holdings(
 
     path_obj = Path(path)
     if not path_obj.exists():
-        return _empty_soma_frame()
+        raise FileNotFoundError(f"SOMA Treasury holdings file is missing: {path_obj}")
     raw = pd.read_csv(path_obj, low_memory=False)
-    if raw.empty:
-        return _empty_soma_frame()
     by_normalized = {_normalize_column(col): col for col in raw.columns}
 
     def col(name: str) -> str | None:
@@ -37,7 +35,14 @@ def load_soma_treasury_holdings(
     current_face_col = col("Current Face Value")
     par_col = col("Par Value")
     inflation_col = col("Inflation Compensation")
-    if asof_col is None or cusip_col is None or maturity_col is None:
+    missing = [
+        name
+        for name, column in (("As Of Date", asof_col), ("CUSIP", cusip_col), ("Maturity Date", maturity_col), ("Par Value", par_col))
+        if column is None
+    ]
+    if missing:
+        raise ValueError(f"SOMA Treasury holdings file {path_obj.name} lacks columns: {missing}")
+    if raw.empty:
         return _empty_soma_frame()
     working = pd.DataFrame(
         {

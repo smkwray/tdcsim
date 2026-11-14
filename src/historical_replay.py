@@ -331,7 +331,7 @@ def run_historical_replay(params: dict, start_date, end_date, scenario_name: str
     real_pricing_curve = load_real_yield_curve()
     cohorts = _attach_cohort_market_value_ratios(cohorts, pricing_curve, real_pricing_curve)
     soma_holdings = load_soma_treasury_holdings(
-        cfg.get(
+        paths.get(
             "soma_treasury_holdings",
             "data/historical_replay/raw/nyfed/soma_treasury_holdings_monthly.csv",
         ),

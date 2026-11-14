@@ -93,3 +93,14 @@ def test_build_soma_fixed_allocations_splits_duplicate_cusip_maturity_cohorts():
     assert diag["soma_face_mil"] == pytest.approx(25.0)
     assert diag["matched_face_mil"] == pytest.approx(25.0)
     assert diag["status"] == "matched"
+
+
+def test_soma_loader_fails_when_the_declared_file_is_missing_or_incomplete(tmp_path):
+    # A replay without SOMA silently loses the Fed's security-level holdings, so a
+    # missing file or column must stop the run instead of yielding an empty frame.
+    with pytest.raises(FileNotFoundError):
+        load_soma_treasury_holdings(tmp_path / "absent.csv", start_quarter="2022Q1", end_quarter="2022Q1")
+    path = tmp_path / "soma.csv"
+    pd.DataFrame([{"As Of Date": "2022-03-31", "CUSIP": "'912810AA1'"}]).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="lacks columns"):
+        load_soma_treasury_holdings(path, start_quarter="2022Q1", end_quarter="2022Q1")
