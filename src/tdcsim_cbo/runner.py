@@ -855,14 +855,7 @@ def build_runtime_params(
         },
         "yield_curve_surface": yield_curve_surface,
         "sector_preferences": holder_preferences,
-        "private_mmf_split": {
-            "bills": 0.25,
-            "notes": 0.10,
-            "bonds": 0.05,
-            "tips": 0.05,
-            "frn": 0.20,
-            "mmf_deposit_pass_through": _mmf_deposit_pass_through(inputs),
-        },
+        "private_mmf_split": {"mmf_deposit_pass_through": _mmf_deposit_pass_through(inputs)},
         "tips_params": {
             "cpi_start_level": 100.0,
             "cpi_annual_inflation": 0.0,

@@ -38,8 +38,7 @@ from cbo_policy_bundle import (
 )
 from cbo_holder_preferences import (
     build_holder_profile_rows,
-    default_cbo_holder_preferences,
-    default_private_subbucket_shares,
+    holder_profile_from_opening_weights,
     validate_holder_preferences_non_degenerate,
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
@@ -467,15 +466,6 @@ def build_forecast_bundle(
     write_forecast_rows_csv(inputs / "tdcsim_fiscal_incidence_sensitivity_results.csv", incidence_result_rows)
     write_forecast_rows_csv(inputs / "tdcsim_net_interest_bridge.csv", net_interest_rows)
 
-    holder_preferences = default_cbo_holder_preferences(include_private_routes=False)
-    validate_holder_preferences_non_degenerate(holder_preferences)
-    holder_profile_rows = build_holder_profile_rows(
-        scenario_id=SCENARIO_ID,
-        holder_preferences=holder_preferences,
-        private_subbucket_shares=default_private_subbucket_shares(),
-    )
-    write_rows_csv_union(inputs / "tdcsim_holder_profile_assumptions.csv", holder_profile_rows)
-
     initial_portfolio, opening_portfolio_metadata = load_opening_portfolio(
         opening_portfolio_path,
         simulation_start_date=SIMULATION_START_DATE,
@@ -483,6 +473,16 @@ def build_forecast_bundle(
         tips_cpi_detail=tips_cpi_detail_path,
         frn_daily_indexes=frn_daily_indexes_path,
     )
+    holder_preferences, private_subbucket_shares = holder_profile_from_opening_weights(
+        opening_portfolio_metadata["noncb_weights"]
+    )
+    validate_holder_preferences_non_degenerate(holder_preferences)
+    holder_profile_rows = build_holder_profile_rows(
+        scenario_id=SCENARIO_ID,
+        holder_preferences=holder_preferences,
+        private_subbucket_shares=private_subbucket_shares,
+    )
+    write_rows_csv_union(inputs / "tdcsim_holder_profile_assumptions.csv", holder_profile_rows)
     manifest_entry = source_package["source_files"].get(SOURCE_PACKAGE_INPUTS["ratewall_input_manifest"], {})
     opening_portfolio_metadata["source_manifest_original_sha256"] = manifest_entry.get("original_sha256")
     opening_portfolio_metadata["source_manifest_portable_sha256"] = manifest_entry.get("sha256")
@@ -575,7 +575,13 @@ def build_forecast_bundle(
     _write_json(out / "manifest.json", manifest)
     _write_json(inputs / "source_contract_smoke.json", manifest)
 
-    params = build_engine_params(inputs, baseline_input_paths, initial_portfolio, base_tga_bil)
+    params = build_engine_params(
+        inputs,
+        baseline_input_paths,
+        initial_portfolio,
+        base_tga_bil,
+        sector_preferences={**holder_preferences, "__private_subbucket_shares__": private_subbucket_shares},
+    )
     return ForecastBundle(
         output_dir=out,
         inputs_dir=inputs,
@@ -980,7 +986,7 @@ def build_manifest(
             "selection_order": "shortest_public_marketable_maturity_first",
             "runtime_columns": ["CBOBuybackFaceRetired", "CBOBuybackCashPaid"],
         },
-        "holder_preferences": _holder_preferences(),
+        "holder_preferences": holder_profile_from_opening_weights(opening_portfolio_metadata["noncb_weights"])[0],
         "fed_holdings_path": {
             "mode": "cbo_fed_holdings_endpoints_linear_actual_days_holder_target",
             "runtime_effect": "holder_allocation_only_total_issuance_unchanged",
@@ -1461,7 +1467,7 @@ def load_opening_portfolio(
     if source_manifest_path.exists():
         source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
     manifest_initial = source_manifest.get("artifacts", {}).get("initial_portfolio", {})
-    if manifest_initial.get("cb_source") != OPENING_PORTFOLIO_CB_SOURCE:
+    if manifest_initial.get("cb_source") != OPENING_PORTFOLIO_CB_SOURCE or "noncb_weights" not in manifest_initial:
         raise ValueError(
             "opening portfolio manifest does not record SOMA-based CB holdings; "
             "rebuild the book with src/ratewall_input_builder.py"
@@ -1511,6 +1517,9 @@ def load_opening_portfolio(
         "frn_indexation_diagnostic_rows": frn_diagnostics,
         "security_type_totals_bil": _portfolio_security_totals(aligned),
         "holder_totals_bil": _portfolio_holder_totals(aligned),
+        "noncb_weights": manifest_initial["noncb_weights"],
+        "wamest_date": manifest_initial.get("wamest_date"),
+        "soma_as_of_date": manifest_initial.get("soma_as_of_date"),
         "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
     }
     return aligned, metadata
@@ -1793,6 +1802,8 @@ def build_engine_params(
     baseline_input_paths: Mapping[str, str],
     initial_portfolio: pd.DataFrame,
     base_tga_bil: float,
+    *,
+    sector_preferences: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "initial_values": {"reserves": 3000.0, "tdc_level": 0.0, "tga": base_tga_bil},
@@ -1855,14 +1866,7 @@ def build_engine_params(
             "interpolation_method": "pchip",
             "floor_zero": False,
         },
-        "sector_preferences": _holder_preferences(),
-        "private_mmf_split": {
-            "bills": 0.25,
-            "notes": 0.10,
-            "bonds": 0.05,
-            "tips": 0.05,
-            "frn": 0.20,
-        },
+        "sector_preferences": dict(sector_preferences),
         "tips_params": {
             "cpi_start_level": 100.0,
             "cpi_annual_inflation": 0.0,
@@ -1893,10 +1897,6 @@ def build_engine_params(
         },
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
     }
-
-
-def _holder_preferences() -> dict[str, dict[str, float]]:
-    return default_cbo_holder_preferences(include_private_routes=False)
 
 
 def _baseline_input_paths(inputs_dir: Path) -> dict[str, str]:
