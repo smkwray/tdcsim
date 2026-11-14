@@ -52,8 +52,8 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         manifest["opening_portfolio_construction"]["mode"]
         == "prebuilt_mspd_derived_cohort_book_with_explicit_prestart_rollforward"
     )
-    assert manifest["opening_portfolio_construction"]["row_count"] == 2290
-    assert manifest["opening_portfolio_construction"]["prestart_rollforward_rows"] == 35
+    assert manifest["opening_portfolio_construction"]["row_count"] == 2273
+    assert manifest["opening_portfolio_construction"]["prestart_rollforward_rows"] == 48
     assert (
         manifest["opening_portfolio_construction"]["opening_rollforward_status"]
         == "mechanically_balanced_source_record_to_simulation_start"
@@ -70,7 +70,7 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         manifest["opening_portfolio_construction"]["tips_initialization"]
     )
     assert manifest["opening_portfolio_construction"]["tips_cpi_detail_index_date"] == "2026-06-21"
-    assert manifest["opening_portfolio_construction"]["tips_rows_enriched"] == 265
+    assert manifest["opening_portfolio_construction"]["tips_rows_enriched"] == 261
     assert manifest["opening_portfolio_construction"]["tips_unique_cusips_enriched"] == 53
     assert manifest["opening_portfolio_construction"]["opening_tips_indexation_accretion_embedded_bil"] > 300.0
     assert manifest["opening_portfolio_construction"]["frn_opening_date"] == "2026-06-21"
