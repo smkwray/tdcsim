@@ -989,43 +989,154 @@ def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tm
         )
 
 
-def test_ratewall_initial_portfolio_converts_mspd_millions_to_billions(tmp_path, monkeypatch):
-    def fake_fetch(endpoint, *, record_date, page_size=10000):
-        if endpoint.endswith("mspd_table_1"):
-            return [
-                {
-                    "security_type_desc": "Marketable",
-                    "security_class_desc": "Bills",
-                    "debt_held_public_mil_amt": "1000000",
-                }
-            ]
-        return [
+def _opening_book_inputs(tmp_path, *, soma_rows=None, wamest_overrides=None, drop_sector=None):
+    """Synthetic MSPD, SOMA and WAMEST inputs: one bill, one note and one TIPS security."""
+
+    table1 = [
+        {"security_type_desc": "Marketable", "security_class_desc": "Bills", "debt_held_public_mil_amt": "1000000"},
+        {"security_type_desc": "Marketable", "security_class_desc": "Notes", "debt_held_public_mil_amt": "2000000"},
+        {
+            "security_type_desc": "Marketable",
+            "security_class_desc": "Treasury Inflation-Protected Securities",
+            "debt_held_public_mil_amt": "300000",
+        },
+    ]
+
+    def security(class_desc, cusip, outstanding, maturity, rate="0"):
+        return {
+            "security_class1_desc": class_desc,
+            "security_class2_desc": cusip,
+            "outstanding_amt": outstanding,
+            "issue_date": "2026-01-01",
+            "maturity_date": maturity,
+            "interest_rate_pct": rate,
+            "yield_pct": "4.0",
+        }
+
+    table3 = [
+        security("Bills Maturity Value", "FAKEBILL1", "1000000", "2026-09-01"),
+        security("Notes", "FAKENOTE1", "2000000", "2031-01-01", "4.0"),
+        security("Inflation-Protected Securities", "FAKETIPS1", "300000", "2036-01-15", "1.0"),
+        # Reopening detail rows carry no outstanding amount and are counted, not dropped silently.
+        {**security("Inflation-Protected Securities", "FAKETIPS1", "", "2036-01-15", "1.0"), "outstanding_amt": ""},
+    ]
+    soma = soma_rows or [
+        ("FAKEBILL1", "Bills", "2026-09-01", "100000000000", ""),
+        ("FAKENOTE1", "NotesBonds", "2031-01-01", "500000000000", ""),
+        ("FAKETIPS1", "TIPS", "2036-01-15", "50000000000", "10000000000"),
+        ("FAKEOLD01", "Bills", "2026-04-28", "7000000000", ""),
+    ]
+    soma_path = tmp_path / "soma.csv"
+    pd.DataFrame(
+        [
             {
-                "security_class1_desc": "Bills Maturity Value",
-                "security_class2_desc": "FAKEBILL",
-                "outstanding_amt": "500000",
-                "issue_date": "2026-01-01",
-                "maturity_date": "2026-04-01",
-                "interest_rate_pct": "0",
-                "yield_pct": "4.0",
+                "As Of Date": "2026-04-29",
+                "CUSIP": f"'{cusip}'",
+                "Security Type": kind,
+                "Maturity Date": maturity,
+                "Par Value": par,
+                "Inflation Compensation": inflation,
             }
+            for cusip, kind, maturity, par, inflation in soma
         ]
+    ).to_csv(soma_path, index=False)
 
-    monkeypatch.setattr(rib, "_latest_record_date", lambda endpoint: "2026-04-30")
-    monkeypatch.setattr(rib, "_fetch_fiscaldata_rows", fake_fetch)
-    monkeypatch.setattr(rib, "_load_stock_holder_shares", lambda path: {"Private": 1.0})
+    levels = {"bank_us_chartered": (100.0, 0.5), "foreigners_total": (300.0, 0.2), "money_market_funds": (200.0, 0.8)}
+    levels.update(wamest_overrides or {})
+    wamest_rows = []
+    for sector in rib.WAMEST_SECTOR_ROUTES:
+        if sector == drop_sector:
+            continue
+        level, bill_share = levels.get(sector, (0.0, 0.0))
+        if sector == "households_nonprofits":
+            level, bill_share = 400.0, 0.25
+        wamest_rows.append(
+            {
+                "date": "2026-03-31",
+                "sector_key": sector,
+                "level": level,
+                "bill_share": bill_share,
+                "publication_status": "published_estimate",
+            }
+        )
+    wamest_path = tmp_path / "wamest.csv"
+    pd.DataFrame(wamest_rows).to_csv(wamest_path, index=False)
+    return {
+        "record_date": "2026-04-30",
+        "table1_rows": table1,
+        "table3_rows": table3,
+        "soma_path": soma_path,
+        "wamest_path": wamest_path,
+    }
 
-    frame, _ = rib.build_initial_portfolio(
-        tmp_path / "cohorts.csv",
-        tsyparty_z1_path=tmp_path / "unused.csv",
+
+def test_opening_book_pins_cb_to_soma_and_splits_remainder_by_wamest_bill_holdings(tmp_path):
+    frame, metadata = rib.build_initial_portfolio(tmp_path / "cohorts.csv", **_opening_book_inputs(tmp_path))
+    face = frame.assign(FaceValue=frame["FaceValue"].astype(float)).set_index(
+        ["cusip_or_synthetic_id", "HolderType", "HolderSubBucket"]
+    )["FaceValue"]
+
+    # MSPD and SOMA are in millions; the book is in billions. CB holds exactly the
+    # SOMA amount of each CUSIP, so Fed maturities land on the actual dates and sizes.
+    assert face[("FAKEBILL1", "CB", "")] == pytest.approx(100.0)
+    assert face[("FAKENOTE1", "CB", "")] == pytest.approx(500.0)
+    # TIPS outstanding in MSPD includes the inflation adjustment, so CB does too.
+    assert face[("FAKETIPS1", "CB", "")] == pytest.approx(60.0)
+
+    # Non-Fed bill remainder (900) follows WAMEST bill holdings: banks 50, foreign 60,
+    # MMF 160, domestic nonbank 100 of 370. Nonbills follow nonbill holdings instead,
+    # so money funds take far more of a bill than of a note.
+    bill_total = 50.0 + 60.0 + 160.0 + 100.0
+    assert face[("FAKEBILL1", "Private", "mmf_cash_fund_route")] == pytest.approx(900.0 * 160.0 / bill_total)
+    note_total = 50.0 + 240.0 + 40.0 + 300.0
+    assert face[("FAKENOTE1", "Private", "mmf_cash_fund_route")] == pytest.approx(1500.0 * 40.0 / note_total)
+    assert face[("FAKENOTE1", "Foreign", "")] == pytest.approx(1500.0 * 240.0 / note_total)
+
+    # Splitting holders never changes the security's public total.
+    totals = frame.assign(FaceValue=frame["FaceValue"].astype(float)).groupby("cusip_or_synthetic_id")["FaceValue"].sum()
+    assert totals.to_dict() == pytest.approx({"FAKEBILL1": 1000.0, "FAKENOTE1": 2000.0, "FAKETIPS1": 300.0})
+
+    # A SOMA security that matured before the MSPD date is reported, not silently dropped.
+    assert metadata["soma_matured_by_record_date"] == {"cusips": 1, "amount_bil": pytest.approx(7.0)}
+    assert metadata["mspd_rows_skipped"] == {"no_outstanding_amount": 1}
+    assert metadata["wamest_date"] == "2026-03-31"
+    assert set(frame.loc[frame["HolderType"].eq("CB"), "observability_tier"]) == {"security_level_observed_holder"}
+
+
+def test_opening_book_fails_when_live_soma_security_is_missing_from_mspd(tmp_path):
+    inputs = _opening_book_inputs(
+        tmp_path,
+        soma_rows=[("FAKENEW01", "NotesBonds", "2030-01-01", "1000000000", "")],
     )
+    with pytest.raises(ValueError, match="absent from MSPD"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
 
-    assert len(frame) == 1
-    row = frame.iloc[0]
-    assert row["HolderSubBucket"] == "domestic_nonbank_deposit_funded"
-    assert abs(float(row["face_value_bil"]) - 1000.0) < 1e-9
-    assert abs(float(row["FaceValue"]) - 1000.0) < 1e-9
-    assert "converted_to_bil" in row["source_status"]
+
+def test_opening_book_fails_when_soma_exceeds_public_amount(tmp_path):
+    inputs = _opening_book_inputs(
+        tmp_path,
+        soma_rows=[("FAKEBILL1", "Bills", "2026-09-01", "1500000000000", "")],
+    )
+    with pytest.raises(ValueError, match="SOMA holds more"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+@pytest.mark.parametrize("drop_sector", ["money_market_funds", None])
+def test_opening_book_fails_on_unmapped_or_missing_wamest_sector(tmp_path, drop_sector):
+    inputs = _opening_book_inputs(tmp_path, drop_sector=drop_sector)
+    if drop_sector is None:
+        frame = pd.read_csv(inputs["wamest_path"])
+        extra = frame.iloc[[0]].assign(sector_key="new_sector")
+        pd.concat([frame, extra]).to_csv(inputs["wamest_path"], index=False)
+    with pytest.raises(ValueError, match="route registry"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+def test_soma_loader_rejects_files_without_required_columns(tmp_path):
+    path = tmp_path / "soma.csv"
+    pd.DataFrame([{"As Of Date": "2026-04-29", "CUSIP": "'FAKEBILL1'"}]).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="lacks columns"):
+        rib.load_soma_cusip_holdings(path)
 
 
 def test_worker_count_respects_config_env_and_upper_bound(monkeypatch):

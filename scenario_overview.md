@@ -1,8 +1,8 @@
 # Simulation Scenarios: Overview and Design
 
-This document describes the scenarios configured in `tdc_config.yaml` and the modeling assumptions driving their results. TDC means Treasury Deposit Component; DU denotes the covered domestic nonbank deposit-claim perimeter. Scenario differences describe model mechanisms, not identified causal effects.
+This document describes the scenarios configured in `tdc_config.yaml` and the modeling assumptions driving their results. TDC means Treasury Deposit Component; DU is the deposit perimeter of domestic nonbank holders.
 
-**Important:** Yield curves are exogenous scenario inputs. The model does not endogenize rates from demand. Statements like "more bank demand lowers rates" require an explicit yield curve change, not just a holder preference shift.
+Yield curves are scenario inputs. A holder-preference shift changes rates only when the scenario also changes the curve.
 
 ## Treasury Market Scenarios (3 scenarios)
 
@@ -26,9 +26,7 @@ This document describes the scenarios configured in `tdc_config.yaml` and the mo
 
 ## One-Factor Isolation Scenarios (5 scenarios)
 
-These scenarios change exactly one mechanism at a time relative to `Factorial_Baseline`, enabling ceteris paribus attribution. This is a one-factor-at-a-time (OFAT) design, not a full factorial grid.
-
-**Limitation:** OFAT isolation supports statements like "holding X and Y fixed, changing Z does W." It does not identify interaction effects. If issuance mix and holder preferences interact (plausible since preferences operate over maturity buckets), the combined effect may differ from the sum of isolated effects.
+These scenarios change exactly one mechanism at a time relative to `Factorial_Baseline`, enabling ceteris paribus attribution. This is a one-factor-at-a-time (OFAT) design. Because holder preferences operate over maturity buckets, issuance-mix and holder changes can interact, and a combined effect can differ from the sum of the isolated effects.
 
 ### Factorial_Baseline
 - Identical overrides to the main Baseline. Serves as the control for all isolation comparisons.
@@ -56,8 +54,6 @@ The isolation scenarios allow the following attribution for the compound scenari
 - `MaturityShift_MoreNotes` ≈ `Factorial_IssuanceOnly` + `Factorial_HolderOnly_NotesPref` (plus any interaction)
 - `BanksBuyFromPriv_25bpsLowerRates` ≈ `Factorial_HolderOnly` + `Factorial_RateOnly` (plus any interaction)
 
-The "plus any interaction" caveat means these are approximate decompositions, not exact additive ones.
-
 ## Model limits and input conventions
 
 Interpret these configuration-runner comparisons under the following assumptions. The CBO runner has its own daily calendar and baseline-bound input contract, documented in [the downstream quick start](examples/cbo_downstream_quickstart.md).
@@ -66,9 +62,9 @@ Interpret these configuration-runner comparisons under the following assumptions
 
 2. **Fixed-rate and TIPS coupon aggregation requires short steps.** The engine pays at most one fixed-rate or TIPS coupon per tranche per step. An interval containing multiple coupon dates can therefore undercount payments; weekly steps avoid that case for the semiannual schedule. Floating-rate notes accrue day by day and use a dated benchmark path when supplied. Coarse frequency settings remain guarded because other within-period ordering is approximate.
 
-3. **The legacy initial portfolio is stylized.** The default `generated` portfolio uses hard-coded maturity menus, coupon ranges, and TIPS reference CPI values that are independent of the scenario's yield curve and issuance profile. Using `initial_portfolio.mode: config_derived` makes the starting stock internally consistent with the configured curve and issuance profile, but it is still a model-generated approximation rather than a reconstruction of the real Treasury stock.
+3. **The legacy initial portfolio is stylized.** The default `generated` portfolio uses hard-coded maturity menus, coupon ranges, and TIPS reference CPI values that are independent of the scenario's yield curve and issuance profile. `initial_portfolio.mode: config_derived` makes the starting stock consistent with the configured curve and issuance profile. `mode: file` loads a security-level book such as the one `src/ratewall_input_builder.py` builds from Treasury and Federal Reserve data.
 
-4. **Secondary trading is single-pass per period.** When preference trading is enabled, the engine executes at most one bond trade per seller/buyer/category pair per period. Large imbalances may take multiple periods to resolve. This is a conservative approximation that understates rebalancing speed. (Preference trading is disabled in the shipped configuration.)
+4. **Secondary trading is single-pass per period.** When preference trading is enabled, the engine executes at most one bond trade per seller/buyer/category pair per period. Large imbalances take several periods to resolve. (Preference trading is disabled in the shipped configuration.)
 
 5. **Nonmarketable interest uses declared credit dates.** Semiannual crediting checks June 30 and December 31 across every year spanned by a step; annual crediting uses December 31. The credited rate follows the configured rate-setting rule.
 

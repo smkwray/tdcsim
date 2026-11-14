@@ -28,8 +28,8 @@ packages = ["tdcsim_cbo", "tdcsim_cbo.schemas", "tdcsim_cbo.transforms"]
 py-modules = [
   "bill_quote_basis",
   "budget_interest",
+  "cbo_holder_preferences",
   "cbo_policy_bundle",
-  "cbo_portfolio_builder",
   "cbo_yield_curve_surface",
   "contract_validation",
   "csv_gen",

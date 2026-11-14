@@ -110,8 +110,8 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
     assert manifest["issuance_mix"]["tips"]["10.0y"] == 1.0
     assert manifest["issuance_mix"]["frn"]["target_percentage"] == 0.04
     assert manifest["operating_cash_construction"]["construction_mode"] == "constant_real_cbo_cpi_u"
-    assert "z1_holder_provenance_metadata" in manifest["opening_portfolio_construction"]["claim_boundary"]
-    assert "z1_inputs_not_packaged_for_portable_holder_constraint_reproduction" in (
+    assert "cb_from_nyfed_soma_by_cusip" in manifest["opening_portfolio_construction"]["claim_boundary"]
+    assert "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged" in (
         manifest["opening_portfolio_construction"]["claim_boundary"]
     )
     assert manifest["claim_boundary"]["package_role"] == "cbo_baseline_forecast_evidence_package"

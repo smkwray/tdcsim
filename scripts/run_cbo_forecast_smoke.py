@@ -36,7 +36,7 @@ from cbo_policy_bundle import (
     build_fiscal_incidence_sensitivity_results,
     build_net_interest_bridge_rows,
 )
-from cbo_portfolio_builder import (
+from cbo_holder_preferences import (
     build_holder_profile_rows,
     default_cbo_holder_preferences,
     default_private_subbucket_shares,
@@ -125,9 +125,11 @@ FISCAL_ACTUALS_THROUGH = "2026-05-31"
 OPENING_STATE_DATE = SIMULATION_START_DATE
 OPENING_PORTFOLIO_RECORD_DATE = "2026-05-31"
 CLAIM_BOUNDARY = "local_full_horizon_cbo_forecast_input_smoke_prebuilt_mspd_derived_opening_cohort_book"
+OPENING_PORTFOLIO_CB_SOURCE = "nyfed_soma_treasury_holdings_by_cusip"
 OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
-    "prebuilt_mspd_table3_market_derived_cohort_book_with_z1_holder_provenance_metadata; "
-    "z1_inputs_not_packaged_for_portable_holder_constraint_reproduction; "
+    "prebuilt_mspd_table3_market_derived_cohort_book; "
+    "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
+    "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
     "securities_maturing_between_record_date_and_simulation_start_are_explicit_prestart_rollforward_bills"
 )
 
@@ -1459,6 +1461,11 @@ def load_opening_portfolio(
     if source_manifest_path.exists():
         source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
     manifest_initial = source_manifest.get("artifacts", {}).get("initial_portfolio", {})
+    if manifest_initial.get("cb_source") != OPENING_PORTFOLIO_CB_SOURCE:
+        raise ValueError(
+            "opening portfolio manifest does not record SOMA-based CB holdings; "
+            "rebuild the book with src/ratewall_input_builder.py"
+        )
     record_date = str(manifest_initial.get("mspd_record_date", OPENING_PORTFOLIO_RECORD_DATE))
     if record_date != OPENING_PORTFOLIO_RECORD_DATE:
         raise ValueError(f"opening portfolio record date changed unexpectedly: {record_date}")

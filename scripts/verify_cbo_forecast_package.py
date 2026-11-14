@@ -238,8 +238,9 @@ CLAIM_BOUNDARY_EXCLUSIONS = {
     "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
 }
 APPROVED_OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
-    "prebuilt_mspd_table3_market_derived_cohort_book_with_z1_holder_provenance_metadata; "
-    "z1_inputs_not_packaged_for_portable_holder_constraint_reproduction; "
+    "prebuilt_mspd_table3_market_derived_cohort_book; "
+    "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
+    "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
     "securities_maturing_between_record_date_and_simulation_start_are_explicit_prestart_rollforward_bills"
 )
 APPROVED_TOP_LEVEL_MANIFEST_KEYS = {

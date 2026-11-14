@@ -1,7 +1,6 @@
 # CBO Downstream Quickstart
 
-This is the public use path for downstream projects. You should not need to
-understand the verifier internals to run scenarios.
+How to run scenarios against a CBO baseline package and read their outputs.
 
 ## Inputs
 
@@ -161,21 +160,13 @@ The CBO scenario interface supports the main downstream controls:
 - MMF deposit pass-through, defaulting to `0.97`.
 - Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
 - Operating cash can be constant nominal, constant real, explicit path-based, or `inflation_beta` where `0.0` means constant nominal and `1.0` means fully inflation-scaled.
-- Empirical issuance-duration scenarios can combine an issuance-mix override with a long-end `key_rate_bp` nominal-curve shock. These are externally calibrated assumption scenarios, not endogenous TDCSIM yield-response estimates.
+- Empirical issuance-duration scenarios can combine an issuance-mix override with a long-end `key_rate_bp` nominal-curve shock. The rate shock sizes are calibrated outside TDCSim.
 
-## Boundaries
+## Model Rules
 
-This lane is a CBO-baseline scenario runner. It does not claim to be the
-official CBO model.
-
-Keep these boundaries:
-
-- CBO net interest is diagnostic only. It does not fund issuance.
-- Operating cash and cash residual assumptions are not issuance plugs.
-- Fed holdings are stock-target holder allocation mechanics, not Fed auction purchases.
-- Fed remittances and deferred assets are not modeled in this lane.
-- Holder-preference changes affect new issuance from their effective date forward; they do not force secondary-market rebalancing of the existing stock.
-- Negative required issuance fails closed unless a scenario explicitly opts into the simplified at-par shortest-public-marketable retirement path.
-
-Those boundaries are why downstream projects can safely change scenario
-assumptions without accidentally changing what the CBO lane claims to prove.
+- Issuance follows CBO's debt path. CBO net interest is reported for comparison.
+- Operating-cash and cash-residual settings move the TGA path; issuance still follows the debt path.
+- The Fed meets its holdings path by buying or selling existing securities at market value and receives no allocation of new issuance.
+- Fed remittances and deferred assets are outside this runner.
+- Holder-preference changes apply to new issuance from their effective date; the existing stock keeps its holders.
+- A day that requires negative issuance stops the run, unless the scenario selects at-par retirement of the shortest public marketable securities.

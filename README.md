@@ -87,18 +87,22 @@ inputs, example scenarios, output files and scenario controls. Each step:
 from Treasury's Monthly Statement of the Public Debt (MSPD). It takes every
 marketable security outstanding on the record date (about 460 in May 2026) with
 its own coupon and maturity date; the CBO package build adds each TIPS index
-ratio and FRN spread from Treasury data. Each security is divided among holders
-by one set of sector shares taken from the latest Federal Reserve Financial
-Accounts (Z.1) holdings. Securities that mature between the record date and the
-simulation start roll into 3-month bills.
+ratio and FRN spread from Treasury data. Federal Reserve holdings come security
+by security from the New York Fed's System Open Market Account (SOMA) holdings.
+The rest of each security is divided among banks, foreign holders, money market
+funds (MMFs) and other domestic holders in proportion to each group's holdings of
+bills or of longer securities, as estimated by
+[WAMEST](https://github.com/smkwray/wamest) from Federal Reserve Financial
+Accounts (Z.1) and other public data. Securities that mature between the record
+date and the simulation start roll into 3-month bills.
 
 ### Historical replay
 
 The replay modules rebuild the historical Treasury stock quarter by quarter from
 MSPD security detail and auction results. They allocate each security to Z.1
-sectors with the Federal Reserve's System Open Market Account (SOMA) holdings
-fixed by security, accrue FRN and TIPS interest, and reconcile sector holdings to
-Z.1 totals. The forward runners build their own opening state as described above.
+sectors with SOMA holdings fixed by security, accrue FRN and TIPS interest, and
+reconcile sector holdings to Z.1 totals. The forward runners build their own
+opening state as described above.
 
 ## Accounting
 
@@ -118,10 +122,9 @@ The decomposition is checked row by row. Each flow is attributed to the account
 debited or credited at settlement. **DU** is the deposit perimeter: deposit
 claims of domestic nonbank holders. **RS** is the rest of the settlement system.
 Holders are banks, the Federal Reserve (`CB`), foreign holders and private
-holders. Private holdings are split into domestic nonbanks and money market
-funds (MMFs), and MMF flows reach deposits at a pass-through rate that defaults
-to 0.97. Bills settle at cash proceeds; TIPS and FRNs follow their own indexation
-and payment rules.
+holders. Private holdings are split into domestic nonbanks and MMFs, and MMF
+flows reach deposits at a pass-through rate that defaults to 0.97. Bills settle
+at cash proceeds; TIPS and FRNs follow their own indexation and payment rules.
 
 **Treasury component of reserves (TRC).** The same events can also be routed to
 bank reserves. Enable this with `trc_routing` in a configuration or
@@ -165,7 +168,7 @@ supersedes it. Columns containing `ru_flow` hold RS flows.
 - [RateWall](https://github.com/smkwray/ratewall) consumes verified CBO-runner
   exports.
 - [WAMEST](https://github.com/smkwray/wamest) estimates the maturity mix of
-  Treasury holdings by sector.
+  Treasury holdings by sector and supplies the opening holder split.
 - [TDCest](https://github.com/smkwray/tdcest) measures the TDC from public data.
 - [EA-TDC](https://github.com/smkwray/ea-tdc) projects deposits conditional on
   the TDC.
