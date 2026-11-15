@@ -402,3 +402,24 @@ def test_fed_holdings_change_ramps_over_the_window_and_holds() -> None:
     assert values[3] == values[4] == 3500.0
     with pytest.raises(ValueError, match="turn negative"):
         fed_holdings_rows(rows, size_bil=-5000.0, build=["2026-10-01", "2028-09-30"])
+
+
+def test_a_money_fund_shift_leaves_domestic_nonbank_bills_at_baseline_dollars() -> None:
+    # Money funds paying from deposits or from ON RRP must take the whole added position;
+    # if part leaked to the domestic-nonbank route, the money-fund cases would mix two buyers.
+    import pandas as pd
+
+    stock = [(pd.Timestamp("2026-06-21"), 8000.0)]
+    rows = bill_buyer_rows(
+        BASE["bills"], holder="Private", size_bil=500.0, build=["2026-10-01", "2028-09-30"],
+        bill_stock_by_date=stock, private_route="mmf_cash_fund_route", baseline_route_share=0.4,
+    )
+    final = rows[-1]
+    private_dollars = final["shares"]["Private"] * 8000.0
+    routes = final["private_routes"]
+    assert sum(routes.values()) == pytest.approx(1.0)
+    assert private_dollars * routes["domestic_nonbank_deposit_funded"] == pytest.approx(0.5 * 8000.0 * 0.6)
+    assert private_dollars * routes["mmf_cash_fund_route"] == pytest.approx(0.5 * 8000.0 * 0.4 + 500.0)
+    with pytest.raises(ValueError, match="holder Private"):
+        bill_buyer_rows(BASE["bills"], holder="Banks", size_bil=10.0, build=["2026-10-01", "2028-09-30"],
+                        bill_stock_by_date=stock, private_route="mmf_cash_fund_route", baseline_route_share=0.4)

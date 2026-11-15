@@ -41,7 +41,7 @@ for path in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
 
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
-from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES  # noqa: E402
+from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS  # noqa: E402
 from issuance_calibration import CALIBRATION_FILE, ISSUANCE_RULE_MODE, load_calibration, target_for_date  # noqa: E402
 from write_cbo_example_scenarios import _baseline_coupling, _scenario  # noqa: E402
 
@@ -227,8 +227,14 @@ def bill_buyer_rows(
     size_bil: float,
     build: list[str],
     bill_stock_by_date: list[tuple[pd.Timestamp, float]],
+    private_route: str | None = None,
+    baseline_route_share: float | None = None,
 ) -> list[dict[str, Any]]:
     """Dated bill shares that give ``holder`` ``size_bil`` of added bill holdings.
+
+    With ``private_route`` (Private only), the added holdings go to that private route:
+    the other route keeps its baseline bill dollars, so its fraction of Private bills
+    falls from 1 - m to (1 - m) * s / s', where m is the route's baseline bill fraction.
 
     Bills roll within a year, so a holder's share of bill auctions is close to its share
     of the bill stock. With baseline share s and expected bill stock B on a date, the
@@ -245,6 +251,12 @@ def bill_buyer_rows(
     others = 1.0 - bill_shares[holder]
     if others <= 0.0:
         raise ValueError(f"{holder} already takes every bill")
+    if private_route is not None:
+        if holder != "Private" or private_route not in PRIVATE_SUBBUCKETS:
+            raise ValueError(f"a private route needs holder Private and one of {list(PRIVATE_SUBBUCKETS)}")
+        if baseline_route_share is None or not 0.0 <= baseline_route_share <= 1.0:
+            raise ValueError("a private route needs its baseline bill route share in [0, 1]")
+        (other_route,) = [route for route in PRIVATE_SUBBUCKETS if route != private_route]
     stocks = sorted(bill_stock_by_date)
     start = pd.Timestamp(build[0]).normalize()
     dates = sorted({start, pd.Timestamp(build[1]).normalize()} | set(pd.date_range(start, stocks[-1][0], freq="ME")))
@@ -263,8 +275,25 @@ def bill_buyer_rows(
         }
         if abs(sum(shares.values()) - 1.0) > 1.0e-9:
             raise ValueError(f"bill shares do not sum to one on {day.date()}")
-        rows.append({"effective_date": day.date().isoformat(), "security_type": "bills", "shares": shares})
+        row: dict[str, Any] = {"effective_date": day.date().isoformat(), "security_type": "bills", "shares": shares}
+        if private_route is not None:
+            other = (1.0 - baseline_route_share) * bill_shares["Private"] / target
+            row["private_routes"] = {other_route: other, private_route: 1.0 - other}
+        rows.append(row)
     return rows
+
+
+def baseline_route_share(baseline: CboBaselinePackage, route: str, security_type: str = "bills") -> float:
+    """The package's baseline share of Private purchases of one security type that goes to ``route``."""
+
+    rows = [
+        row
+        for row in baseline_package_rows(baseline, HOLDER_PROFILE_FILE)
+        if row["holder_type"] == "Private" and row["holder_subbucket"] == route
+    ]
+    if len(rows) != 1:
+        raise ValueError(f"expected one baseline Private {route} profile row, found {len(rows)}")
+    return float(rows[0][f"{security_type}_route_share"])
 
 
 def expected_bill_stock(debt_rows: list[dict[str, str]], bill_share: float) -> list[tuple[pd.Timestamp, float]]:
@@ -464,7 +493,18 @@ def family_scenarios(
                     bill_stock_by_date=expected_bill_stock(
                         baseline_package_rows(baseline, DEBT_STOCK_FILE), base_bill_share
                     ),
+                    private_route=buyer.get("private_route"),
+                    baseline_route_share=(
+                        baseline_route_share(baseline, str(buyer["private_route"]))
+                        if buyer.get("private_route")
+                        else None
+                    ),
                 ),
+            }
+        if "mmf_deposit_pass_through" in item:
+            overrides["mmf_deposit_pass_through"] = {
+                "mode": "fixed_fraction",
+                "value": float(item["mmf_deposit_pass_through"]),
             }
         if item.get("fed_holdings_change"):
             if output_dir is None:

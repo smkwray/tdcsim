@@ -1,0 +1,41 @@
+{
+  "schema_version": "tdcsim_scenario_family_spec_v1",
+  "family_id": "drivers_onrrp_v1",
+  "as_of_date": "2026-11-15",
+  "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
+  "description": "Companion to drivers_v1 in a counterfactual state where money funds hold ON RRP balances and fund Treasury purchases from them rather than from deposits. Money funds get the same $500 billion of added bill holdings as in drivers_v1, built evenly over fiscal years 2027 and 2028 and held through 2036, measured against a baseline in the same state.",
+  "boundaries": [
+    "Illustrative scenario accounting, not a forecast or causal estimate",
+    "Counterfactual funding state: the opening money-fund ON RRP balance is set to the December 2022 peak of total ON RRP (an upper bound on money-fund use), although money funds held essentially no ON RRP at the 2026 opening",
+    "In this state money-fund purchases draw on ON RRP and money-fund receipts return to it, so money-fund flows pass nothing through to covered deposits",
+    "Every scenario puts the TGA on the operating-cash path at each fiscal-year end (within a year it sits below the path by issuance awaiting settlement), so financing-cost differences change the debt rather than the TGA",
+    "Compare each run with this family's baseline, not with drivers_v1's"
+  ],
+  "calibration": {
+    "size": "Same $500 billion position and FY2027-FY2028 build as drivers_v1.",
+    "funding_state": "Money-fund deposit pass-through 0 and the trc_routing_onrrp_available_v1.json routing (money-fund ON RRP share 1, opening balance from FRED RRPONTSYD on 2022-12-30)."
+  },
+  "scenarios": [
+    {
+      "role": "baseline",
+      "scenario_id": "tdcsim_drivers_onrrp_v1_baseline",
+      "label": "ON RRP-funded money-fund baseline",
+      "mmf_deposit_pass_through": 0.0
+    },
+    {
+      "role": "mmf_onrrp",
+      "scenario_id": "tdcsim_drivers_onrrp_v1_mmf_onrrp",
+      "label": "Money funds hold $500 billion more bills, paid from ON RRP",
+      "mmf_deposit_pass_through": 0.0,
+      "bill_buyer_shift": {
+        "holder": "Private",
+        "private_route": "mmf_cash_fund_route",
+        "size_bil": 500.0,
+        "build": [
+          "2026-10-01",
+          "2028-09-30"
+        ]
+      }
+    }
+  ]
+}
