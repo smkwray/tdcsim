@@ -17,6 +17,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -73,6 +74,7 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     TGA_FLOOR_TOLERANCE,
 )
+from tdcsim_cbo.bounded_output import BoundedResourceLimits, BoundedScenarioEvidenceSink
 from tips_indexation import (
     build_monthly_tips_cpi_path_rows,
     build_tips_real_yield_path_rows,
@@ -594,16 +596,31 @@ def build_forecast_bundle(
     )
 
 
+def _run_package_simulation(params: Mapping[str, Any], *, scenario_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run one full-horizon pass through the bounded evidence sink.
+
+    The package keeps only the results frame and final portfolio. Without a sink the engine
+    holds every accounting event in memory, tens of GB over the full horizon; the sink's
+    per-period evidence is written to a temporary directory and discarded.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="tdcsim-package-sink-") as sink_dir:
+        sink = BoundedScenarioEvidenceSink(Path(sink_dir), limits=BoundedResourceLimits())
+        return run_simulation(
+            copy.deepcopy(dict(params)),
+            SIMULATION_START_DATE,
+            SIMULATION_END_DATE,
+            freq="D",
+            scenario_name=scenario_name,
+            handoff_sink=sink,
+            require_bounded_handoff=True,
+        )
+
+
 def run_smoke(bundle: ForecastBundle) -> dict[str, Any]:
     """Run zero-residual and constant-real-TGA full-horizon smoke passes."""
 
-    zero_results, zero_portfolio = run_simulation(
-        copy.deepcopy(bundle.params),
-        SIMULATION_START_DATE,
-        SIMULATION_END_DATE,
-        freq="D",
-        scenario_name=bundle.scenario_id,
-    )
+    zero_results, zero_portfolio = _run_package_simulation(bundle.params, scenario_name=bundle.scenario_id)
     zero_summary = write_run_evidence(
         zero_results,
         zero_portfolio,
@@ -620,13 +637,7 @@ def run_smoke(bundle: ForecastBundle) -> dict[str, Any]:
 
     constant_params = copy.deepcopy(bundle.params)
     constant_params["baseline_input_paths"]["cash_reconciliation_residual_file"] = str(constant_residual_path)
-    constant_results, constant_portfolio = run_simulation(
-        constant_params,
-        SIMULATION_START_DATE,
-        SIMULATION_END_DATE,
-        freq="D",
-        scenario_name=bundle.scenario_id,
-    )
+    constant_results, constant_portfolio = _run_package_simulation(constant_params, scenario_name=bundle.scenario_id)
     constant_summary = write_run_evidence(
         constant_results,
         constant_portfolio,
@@ -662,13 +673,7 @@ def run_smoke(bundle: ForecastBundle) -> dict[str, Any]:
     nominal_params = copy.deepcopy(bundle.params)
     nominal_params["baseline_input_paths"]["operating_cash_path_file"] = str(nominal_operating_cash_path)
     nominal_params["baseline_input_paths"]["cash_reconciliation_residual_file"] = str(nominal_residual_path)
-    nominal_results, nominal_portfolio = run_simulation(
-        nominal_params,
-        SIMULATION_START_DATE,
-        SIMULATION_END_DATE,
-        freq="D",
-        scenario_name=bundle.scenario_id,
-    )
+    nominal_results, nominal_portfolio = _run_package_simulation(nominal_params, scenario_name=bundle.scenario_id)
     nominal_summary = write_run_evidence(
         nominal_results,
         nominal_portfolio,

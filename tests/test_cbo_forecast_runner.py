@@ -296,3 +296,31 @@ def test_runner_source_guardrail_requires_mts_table_9_net_interest_builder_contr
                 "current_fytd_rcpt_outly_amt": "168566800000.00",
             },
         )
+
+
+def test_package_build_runs_the_engine_through_the_bounded_sink(monkeypatch, tmp_path: Path) -> None:
+    # Without a sink the engine keeps every accounting event in memory, and a full-horizon
+    # package build needs tens of GB. All three package passes share this call path.
+    from types import SimpleNamespace
+
+    import scripts.run_cbo_forecast_smoke as smoke
+    from tdcsim_cbo.bounded_output import BoundedScenarioEvidenceSink
+
+    calls = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_run_simulation(params, start, end, **kwargs):
+        calls.append((start, end, kwargs))
+        raise _Stop
+
+    monkeypatch.setattr(smoke, "run_simulation", fake_run_simulation)
+    bundle = SimpleNamespace(params={}, scenario_id="package", output_dir=tmp_path, inputs_dir=tmp_path)
+    with pytest.raises(_Stop):
+        smoke.run_smoke(bundle)
+
+    (start, end, kwargs), = calls
+    assert (start, end) == (smoke.SIMULATION_START_DATE, smoke.SIMULATION_END_DATE)
+    assert isinstance(kwargs["handoff_sink"], BoundedScenarioEvidenceSink)
+    assert kwargs["require_bounded_handoff"] is True
