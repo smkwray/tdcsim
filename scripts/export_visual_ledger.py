@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Export a thin security ledger of one completed CBO scenario run for visualization.
 
-Writes opening_book.csv, issues.csv, daily.csv, README.md and receipt.json (USD billions).
+Writes opening_book.csv, issues.csv, daily.csv, fiscal.csv, README.md and receipt.json
+(USD billions).
 
 The opening book and the daily series come from the run tree. The bounded run outputs keep
 issuance only as daily aggregates by holder and maturity bucket, so the per-security issues
@@ -39,6 +40,7 @@ TRC = Path("outputs/tdcsim_trc_results.csv.gz")
 ISSUANCE_AGGREGATES = Path("outputs/tdcsim_period_issuance_aggregates.csv.gz")
 FINAL_PORTFOLIO = Path("outputs/final_portfolio_compact.csv.gz")
 RUN_MANIFEST = Path("tdcsim_cbo_run_manifest.json")
+FISCAL_POLICY = Path("compile/compiled/forecast_inputs/tdcsim_fiscal_incidence_policy.csv")
 TOLERANCE_BIL = 1e-6
 DAYS_PER_YEAR = 365.25
 
@@ -227,6 +229,46 @@ def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, iss
     return daily.reset_index().rename(columns={"Date": "date"})
 
 
+def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Daily net fiscal flow and its deposit, non-deposit and reserve incidence.
+
+    The run models the CBO primary deficit as one signed net flow (no separate gross outlays
+    and receipts); the active incidence policy splits it into a covered-deposit share and
+    shares settling outside covered deposits.
+    """
+
+    policies = pd.read_csv(run_dir / FISCAL_POLICY)
+    policy = policies[policies["policy_id"] == policy_id]
+    if len(policy) != 1:
+        raise SystemExit(f"fiscal incidence policy {policy_id!r} is not in the run's compiled inputs")
+    policy = policy.iloc[0]
+    if str(policy["incidence_basis"]) != "signed_net_primary_proxy":
+        raise SystemExit(f"unexpected fiscal incidence basis {policy['incidence_basis']!r}")
+    outside_share = float(policy["ru_share"]) + float(policy["foreign_share"]) + float(policy["other_share"])
+    trc = pd.read_csv(run_dir / TRC, parse_dates=["Date"]).set_index("Date")
+    fiscal = pd.DataFrame(index=results.index)
+    fiscal["primary_deficit"] = results["PrimaryDeficit"]
+    fiscal["fiscal_to_du"] = results["TDC_FiscalFlow"]
+    fiscal["fiscal_to_rs"] = outside_share * results["PrimaryDeficit"]
+    fiscal["trc_fiscal_flow"] = trc["TRC_FiscalFlow"].reindex(results.index)
+    if fiscal.isna().any().any():
+        raise SystemExit("fiscal series has gaps")
+    identity_gap = float((fiscal["fiscal_to_du"] + fiscal["fiscal_to_rs"] - fiscal["primary_deficit"]).abs().max())
+    if identity_gap > TOLERANCE_BIL:
+        raise SystemExit(f"fiscal incidence does not add up to the primary deficit (gap {identity_gap})")
+    checks = {
+        "fiscal_incidence_policy_id": policy_id,
+        "du_share": float(policy["du_share"]),
+        "outside_covered_deposits_share": outside_share,
+        "gross_outlays_and_receipts_modeled": bool(
+            pd.notna(policy["primary_outlays_bil"]) or pd.notna(policy["primary_receipts_bil"])
+        ),
+        "max_gap_du_plus_rs_minus_primary_deficit_bil": identity_gap,
+        "net_receipt_days": int((fiscal["primary_deficit"] < 0).sum()),
+    }
+    return fiscal.reset_index().rename(columns={"Date": "date"}), checks
+
+
 def check_against_aggregates(run_dir: Path, flows: list[dict[str, Any]]) -> float:
     """Largest gap between the recorded issuance and the run's registered issuance aggregates."""
 
@@ -275,6 +317,12 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   (`is_reopening` is always false). `settlement_day_kind` marks days when pending issuance was
   settled early to keep the TGA from going negative, or at the fiscal-year close.
   `model_tranche_ids` lists the model's per-holder rows.
+- `fiscal.csv`: one row per day. `primary_deficit` is the net fiscal flow out of the TGA
+  ({fiscal_note}). `fiscal_to_du` is the part landing in covered deposits (TDC_FiscalFlow);
+  `fiscal_to_rs` is the part settling outside covered deposits, here the reserve-settled share
+  of the run's fiscal incidence policy ({rs_share:.0%}; foreign and other shares are zero), so
+  the two sum to `primary_deficit` every day. `trc_fiscal_flow` is the reserve effect
+  (TRC_FiscalFlow). Gross outlays and receipts are not modeled separately.
 - `daily.csv`: one row per day. `cumulative_tdc` and `cumulative_trc` are net totals since the
   opening (no component legs). `tga`, `marketable_debt` (TIPS at par plus inflation
   compensation) and `pending_issuance` (issuance decided but awaiting its settlement date) are
@@ -326,6 +374,11 @@ def main(argv: list[str] | None = None) -> int:
     if (issues["face_fed"].abs() > TOLERANCE_BIL).any():
         raise SystemExit("an issue allocates face to the Federal Reserve at auction")
     opening = build_opening(run_dir)
+    manifest = json.loads((run_dir / RUN_MANIFEST).read_text(encoding="utf-8"))
+    scenario_id = (manifest.get("scenario") or {}).get("scenario_id")
+    if not scenario_id:
+        raise SystemExit("run manifest records no scenario.scenario_id")
+    fiscal, fiscal_checks = build_fiscal(run_dir, results, str(manifest.get("fiscal_incidence_policy_id") or ""))
     daily = build_daily(run_dir, results, opening, issues)
     opening_gap = abs(float(opening["debt_basis_total"].sum()) - float(results["TotalDebt_Agg"].iloc[0]))
     if opening_gap > 1e-6:
@@ -339,21 +392,29 @@ def main(argv: list[str] | None = None) -> int:
         "opening_book.csv": opening,
         "issues.csv": issues,
         "daily.csv": daily,
+        "fiscal.csv": fiscal,
     }
     for name, frame in outputs.items():
         frame.to_csv(args.out_dir / name, index=False, lineterminator="\n", date_format="%Y-%m-%d", float_format="%.9f")
-    manifest = json.loads((run_dir / RUN_MANIFEST).read_text(encoding="utf-8"))
-    scenario_id = (manifest.get("scenario") or {}).get("scenario_id")
-    if not scenario_id:
-        raise SystemExit("run manifest records no scenario.scenario_id")
     (args.out_dir / "README.md").write_text(
-        README.format(run_label=scenario_id, start=results.index[0].date()),
+        README.format(
+            run_label=scenario_id,
+            start=results.index[0].date(),
+            rs_share=fiscal_checks["outside_covered_deposits_share"],
+            fiscal_note=(
+                "CBO's primary deficit for each fiscal year spread evenly over its days, so it is"
+                " constant within a fiscal year and has no tax-date or payment-date seasonality"
+                if fiscal_checks["net_receipt_days"] == 0
+                else "negative on net-receipt days"
+            ),
+        ),
         encoding="utf-8",
     )
     from tdcsim_cbo.runtime_identity import distribution_identity, installed_archive_sha256
 
     inputs = {str(path): sha256(run_dir / path) for path in (
-        RUN_MANIFEST, OPENING_PORTFOLIO, OPENING_SOURCE, RESULTS, TRC, ISSUANCE_AGGREGATES, FINAL_PORTFOLIO)}
+        RUN_MANIFEST, OPENING_PORTFOLIO, OPENING_SOURCE, RESULTS, TRC, ISSUANCE_AGGREGATES, FINAL_PORTFOLIO,
+        FISCAL_POLICY)}
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "producer": {
@@ -382,11 +443,12 @@ def main(argv: list[str] | None = None) -> int:
             "opening_book_minus_opening_marketable_debt_bil": opening_gap,
             "max_daily_gap_issued_face_vs_new_debt_issued_bil": issue_gap,
             "issued_tranches_matched_to_final_portfolio_maturities": maturities_checked,
+            "fiscal": fiscal_checks,
         },
         "outputs": {
             name: {"sha256": sha256(args.out_dir / name), "bytes": (args.out_dir / name).stat().st_size,
                    **({"rows": len(outputs[name])} if name in outputs else {})}
-            for name in ("opening_book.csv", "issues.csv", "daily.csv", "README.md")
+            for name in ("opening_book.csv", "issues.csv", "daily.csv", "fiscal.csv", "README.md")
         },
         "units": "USD billions",
     }
