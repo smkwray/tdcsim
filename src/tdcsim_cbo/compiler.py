@@ -34,8 +34,11 @@ from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
 from .contract import CboScenarioSpec
+from sim_engine import CBO_FUNDING_MODE
+
 from .open04_campaign import (
     OPEN04_HOLDER_PROFILE_FILE,
+    scenario_funding_closure_mode,
     open04_expected_change_perimeter,
     parse_open04_campaign_marker,
     requires_open04_strict_execution,
@@ -80,9 +83,11 @@ _SOURCE_BASELINE_OPENING_DEFAULTS = {
     "tdc_level": 0.0,
 }
 
-# Fixed gross shares materialized for OPEN-04 campaign scenarios only: the frozen
-# OPEN-04 baseline binds this file's bytes. Every other scenario defaults to the
-# bill-share rule calibrated from the package's auction data.
+# Fixed gross shares materialized for the debt-path closures that predate the bill-share
+# rule: OPEN-04 campaign scenarios (whose frozen baseline binds this file's bytes) and
+# scenarios on cbo_public_debt_target, such as the RateWall marginal pairs. Every other
+# scenario defaults to the bill-share rule calibrated from the package's auction data;
+# any scenario can still choose it explicitly.
 _DEFAULT_ISSUANCE_SECURITY_SHARES = {
     "bills": 0.225,
     "notes": 0.495,
@@ -143,7 +148,14 @@ class CboScenarioCompiler:
         baseline: CboBaselinePackage,
         spec: CboScenarioSpec,
         work_dir: str | Path,
+        *,
+        funding_closure_mode: str | None = None,
     ) -> CboCompiledScenario:
+        """Compile ``spec``.
+
+        ``funding_closure_mode`` is the closure the run uses; it defaults to the
+        scenario's own. A verifier recompiling a recorded run passes the recorded mode.
+        """
         if not baseline.is_zip:
             raise CompilerError("CBO scenario compiler requires a release-bound zip baseline package")
         spec.assert_baseline_matches(baseline)
@@ -153,6 +165,8 @@ class CboScenarioCompiler:
         _validate_override_coupling(overrides, coupling)
         open04_marker = parse_open04_campaign_marker(scenario)
         open04_active = requires_open04_strict_execution(scenario)
+        if funding_closure_mode is None:
+            funding_closure_mode = scenario_funding_closure_mode(scenario)
 
         root = Path(work_dir).expanduser().resolve()
         baseline_dir = root / "baseline"
@@ -181,7 +195,9 @@ class CboScenarioCompiler:
             forecast_inputs_dir,
             baseline=baseline,
             overrides=overrides,
-            open04_fixed_share_default=open04_marker is not None,
+            fixed_share_default=(
+                open04_marker is not None or funding_closure_mode == CBO_FUNDING_MODE
+            ),
         )
         changed.update(adapter_changes)
         fixed_adapter_inputs = (
@@ -891,13 +907,13 @@ def _materialize_required_adapter_assumptions(
     *,
     baseline: CboBaselinePackage,
     overrides: Mapping[str, Any],
-    open04_fixed_share_default: bool,
+    fixed_share_default: bool,
 ) -> tuple[set[str], set[str]]:
     materialized: set[str] = set()
     changed: set[str] = set()
     issuance_path = forecast_inputs_dir / ISSUANCE_MIX_FILE
     if not issuance_path.exists():
-        if open04_fixed_share_default:
+        if fixed_share_default:
             _write_issuance_mix(issuance_path, None)
         else:
             _write_bill_share_mix(

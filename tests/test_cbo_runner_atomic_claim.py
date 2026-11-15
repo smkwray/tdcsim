@@ -230,7 +230,7 @@ def test_live_campaign_claim_blocks_a_second_scenario_writer(
     class StopFirstWriter(RuntimeError):
         pass
 
-    def inspect_live_claim_then_stop(self, baseline, spec, output_dir):
+    def inspect_live_claim_then_stop(self, baseline, spec, output_dir, **_options):
         nonlocal second_writer_was_blocked
         claim = json.loads(claim_path.read_text(encoding="utf-8"))
         assert claim["pid"] == os.getpid()

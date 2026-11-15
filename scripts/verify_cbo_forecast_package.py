@@ -32,7 +32,7 @@ from forecast_input_builder import (  # noqa: E402
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration  # noqa: E402
-from sim_engine import _settle_all_dates  # noqa: E402
+from sim_engine import _fiscal_year_close_dates  # noqa: E402
 from tips_indexation import (  # noqa: E402
     build_monthly_tips_cpi_path_rows,
     build_tips_real_yield_path_rows,
@@ -680,7 +680,7 @@ def _compute_run_metrics(
         "IssuanceNeedProceeds",
         "PendingIssuanceProceeds",
         "EarlySettlementProceeds",
-        "FiscalYearEndSettlementProceeds",
+        "FiscalYearCloseSettlementProceeds",
         "CashFinancingProceeds",
         "NewDebtIssued",
         "AuctionProceeds",
@@ -767,12 +767,22 @@ def _compute_run_metrics(
         )
     if not drifts:
         raise ValueError(f"{run_id} has no simulated periods")
+    for row_index in range(1, len(rows)):
+        previous, row = rows[row_index - 1], rows[row_index]
+        _assert_close(
+            f"{run_id} row {row_index + 1} pending issuance identity",
+            _float(row, "PendingIssuanceProceeds"),
+            _float(previous, "PendingIssuanceProceeds")
+            + _float(row, "IssuanceNeedProceeds")
+            - _float(row, "AuctionProceeds"),
+            NUMERIC_TOLERANCE,
+        )
     by_date = {row["Date"]: row for row in rows}
-    fiscal_year_ends = [
+    fiscal_year_closes = [
         day.date().isoformat()
-        for day in _settle_all_dates({"settlement_calendar": settlement_calendar}, dates[0], dates[-1])
+        for day in _fiscal_year_close_dates({"settlement_calendar": settlement_calendar}, dates[0], dates[-1])
     ]
-    for day in fiscal_year_ends:
+    for day in fiscal_year_closes:
         if abs(_float(by_date[day], "PendingIssuanceProceeds")) > NUMERIC_TOLERANCE:
             raise ValueError(f"{run_id} has pending issuance at the fiscal-year end {day}")
     fed_errors = [
@@ -792,12 +802,12 @@ def _compute_run_metrics(
             "min": min(drifts),
             "max": max(drifts),
             "fiscal_year_end": {
-                str(_fiscal_year(day)): _float(by_date[day], "DebtDriftFromReference") for day in fiscal_year_ends
+                str(_fiscal_year(day)): _float(by_date[day], "DebtDriftFromReference") for day in fiscal_year_closes
             },
         },
         "tga_minus_operating_cash_target_at_fiscal_year_end_bil": {
             str(_fiscal_year(day)): _float(by_date[day], "TGA") - _float(by_date[day], "CBOOperatingCashTarget")
-            for day in fiscal_year_ends
+            for day in fiscal_year_closes
         },
         "max_pending_issuance_bil": max(_float(row, "PendingIssuanceProceeds") for row in rows),
         "early_settlement_days": sum(1 for row in rows if _float(row, "EarlySettlementProceeds") > 1e-9),

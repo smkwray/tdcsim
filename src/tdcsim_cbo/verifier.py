@@ -24,6 +24,7 @@ from evaluated_nominal_curve import (
     normalize_open04_override,
 )
 from sim_engine import (
+    CBO_FUNDING_MODE,
     CASH_FINANCING_ISSUANCE_LEGS,
     CBO_OPERATING_CASH_TARGET_FINANCING_MODE,
     OPERATING_CASH_RESULT_COLUMNS,
@@ -932,9 +933,12 @@ def _manifest_funding_closure_mode(manifest: Mapping[str, Any]) -> str:
 
     open04 = manifest.get("open04_campaign")
     if open04 is None:
+        if "funding_closure_mode" not in manifest:
+            # Runs record the key for declared closures and for the operating-cash
+            # default; a run without it ran the hard debt-path closure, the default when
+            # it was written.
+            return CBO_FUNDING_MODE
         mode = str(manifest.get("funding_closure_mode") or "")
-        if not mode:
-            raise VerificationError("run manifest does not record its funding_closure_mode")
         if mode not in SCENARIO_FUNDING_CLOSURE_MODES:
             raise VerificationError("run manifest funding closure mode is unsupported")
         return mode
@@ -1293,7 +1297,12 @@ def _verify_scenario_copy(root: Path, manifest: dict[str, Any]) -> None:
     spec = CboScenarioSpec.from_file(path)
     if spec.canonical_sha256() != scenario.get("canonical_sha256"):
         raise VerificationError("run scenario canonical hash mismatch")
-    if scenario_funding_closure_mode(spec.data) != _manifest_funding_closure_mode(manifest):
+    recorded_mode = _manifest_funding_closure_mode(manifest)
+    if (
+        "funding_closure" in spec.data
+        or "open04_campaign" in manifest
+        or "funding_closure_mode" in manifest
+    ) and scenario_funding_closure_mode(spec.data) != recorded_mode:
         raise VerificationError("run manifest funding closure differs from the scenario declaration")
     _verify_manifest_artifacts(root, scenario.get("referenced_files", []), base=root)
     declared = _scenario_file_refs(spec.data)
@@ -1350,7 +1359,12 @@ def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: st
         raise VerificationError("run manifest requirements lock hash does not match baseline attestation")
     spec = CboScenarioSpec.from_file(root / scenario_rel)
     with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-recompile-") as tmp:
-        compiled = CboScenarioCompiler().compile(baseline, spec, Path(tmp) / "work")
+        compiled = CboScenarioCompiler().compile(
+            baseline,
+            spec,
+            Path(tmp) / "work",
+            funding_closure_mode=_manifest_funding_closure_mode(manifest),
+        )
         if compiled.compiled_inputs_digest != manifest.get("compiled_inputs_digest"):
             raise VerificationError("recompiled input digest mismatch")
         if _is_bounded_manifest(manifest):
@@ -1806,6 +1820,13 @@ def _verify_operating_cash_financing_results(results: pd.DataFrame) -> None:
     for column in OPERATING_CASH_RESULT_COLUMNS:
         if float(pd.to_numeric(results[column], errors="raise").min()) < -_BOUNDED_TARGET_TOLERANCE_BIL:
             raise VerificationError(f"operating-cash financing {column} must be nonnegative")
+    # pending(t) = pending(t-1) + need(t) - settled proceeds(t), from zero at the opening.
+    pending = pd.to_numeric(results["PendingIssuanceProceeds"], errors="raise").reset_index(drop=True)
+    need = pd.to_numeric(results["IssuanceNeedProceeds"], errors="raise").reset_index(drop=True)
+    settled = numeric["AuctionProceeds"].reset_index(drop=True)
+    previous = pending.shift(1, fill_value=0.0)
+    if float((pending - (previous + need - settled)).abs().max()) > _BOUNDED_TARGET_TOLERANCE_BIL:
+        raise VerificationError("operating-cash financing pending issuance identity failed")
 
 
 def _verify_bounded_result_limits(results: pd.DataFrame) -> dict[str, float]:

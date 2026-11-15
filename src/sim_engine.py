@@ -46,7 +46,7 @@ from issuance_calibration import (
     debt_base,
     is_rule_profile,
     rule_target_path,
-    settle_all_pending_rules,
+    fiscal_year_close_rules,
     settlement_rules,
     target_for_date,
 )
@@ -108,7 +108,7 @@ OPERATING_CASH_RESULT_COLUMNS = (
     'IssuanceNeedProceeds',
     'PendingIssuanceProceeds',
     'EarlySettlementProceeds',
-    'FiscalYearEndSettlementProceeds',
+    'FiscalYearCloseSettlementProceeds',
 )
 CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
@@ -2253,25 +2253,51 @@ def _build_bill_share_supply_schedule(
     ), target
 
 
-def _next_business_day(date_value):
+_FEDWIRE_CLOSED_DATES = None
+
+
+def _is_fedwire_business_day(date_value):
+    """Fedwire's calendar: closed weekends and federal holidays, but a holiday that falls
+    on a Saturday leaves the Friday open, and one on a Sunday closes the Monday."""
+
+    global _FEDWIRE_CLOSED_DATES
     day = pd.Timestamp(date_value).normalize()
-    while not _is_business_day(day):
+    if day.weekday() >= 5:
+        return False
+    if _FEDWIRE_CLOSED_DATES is None:
+        closed = set()
+        for rule in _US_FEDERAL_HOLIDAYS.rules:
+            if rule.offset is None and rule.day is not None:
+                # Fixed-date holidays: shift Sunday to Monday only.
+                for year in range(1900, 2101):
+                    if rule.start_date is not None and pd.Timestamp(year, rule.month, rule.day) < rule.start_date:
+                        continue
+                    actual = pd.Timestamp(year, rule.month, rule.day)
+                    if actual.weekday() == 6:
+                        closed.add((actual + pd.Timedelta(days=1)).date())
+                    elif actual.weekday() < 5:
+                        closed.add(actual.date())
+            else:
+                closed.update(
+                    pd.Timestamp(value).date()
+                    for value in rule.dates('1900-01-01', '2100-12-31')
+                )
+        _FEDWIRE_CLOSED_DATES = closed
+    return day.date() not in _FEDWIRE_CLOSED_DATES
+
+
+def _next_fedwire_business_day(date_value):
+    day = pd.Timestamp(date_value).normalize()
+    while not _is_fedwire_business_day(day):
         day += pd.Timedelta(days=1)
-    return day
-
-
-def _previous_business_day(date_value):
-    day = pd.Timestamp(date_value).normalize()
-    while not _is_business_day(day):
-        day -= pd.Timedelta(days=1)
     return day
 
 
 def _settlement_schedule(issuance_profile, start_date, end_date):
     """Map each settlement date in ``[start_date, end_date]`` to the securities settling.
 
-    Weekday and day-of-month dates move forward to the next business day; month-end
-    issues settle on the month's last business day.
+    Weekday, day-of-month and month-end dates that are not Fedwire business days roll
+    forward to the next business day, as Treasury settles them.
     """
 
     first = pd.Timestamp(start_date).normalize()
@@ -2285,12 +2311,11 @@ def _settlement_schedule(issuance_profile, start_date, end_date):
             while day <= last:
                 nominal.append(day)
                 day += pd.Timedelta(days=7)
-            dates = [_next_business_day(day) for day in nominal]
         elif kind == 'day_of_month':
-            dates = [_next_business_day(pd.Timestamp(month.year, month.month, value)) for month in months]
+            nominal = [pd.Timestamp(month.year, month.month, value) for month in months]
         else:
-            dates = [_previous_business_day(month.end_time.normalize()) for month in months]
-        for settle in dates:
+            nominal = [month.end_time.normalize() for month in months]
+        for settle in (_next_fedwire_business_day(day) for day in nominal):
             if first <= settle <= last:
                 by_date[settle].append(key)
     return dict(sorted(by_date.items()))
@@ -2430,24 +2455,18 @@ def _build_issuance_supply_schedule(
     return schedule
 
 
-def _settle_all_dates(issuance_profile, start_date, end_date):
-    """Dates in ``[start_date, end_date]`` on which every pending balance settles."""
+def _fiscal_year_close_dates(issuance_profile, start_date, end_date):
+    """Last calendar days of the close months in ``[start_date, end_date]``, whatever the
+    weekday: the books close and everything pending settles there."""
 
     first = pd.Timestamp(start_date).normalize()
     last = pd.Timestamp(end_date).normalize()
-    months = pd.period_range(first, last + pd.offsets.MonthEnd(0), freq='M')
-    dates = set()
-    for month_number, (kind, value) in settle_all_pending_rules(issuance_profile):
-        for month in months:
-            if month.month != month_number:
-                continue
-            if kind == 'day_of_month':
-                settle = _next_business_day(pd.Timestamp(month.year, month.month, value))
-            else:
-                settle = _previous_business_day(month.end_time.normalize())
-            if first <= settle <= last:
-                dates.add(settle)
-    return sorted(dates)
+    close_months = set(fiscal_year_close_rules(issuance_profile))
+    return [
+        month.end_time.normalize()
+        for month in pd.period_range(first, last + pd.offsets.MonthEnd(0), freq='M')
+        if month.month in close_months and first <= month.end_time.normalize() <= last
+    ]
 
 
 def _due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date):
@@ -2477,8 +2496,8 @@ def _decide_and_settle_pending(
     The split counts pending face as already issued. If settling only what is due would
     leave the TGA negative, every pending bill settles early the same day, and pending
     coupon securities too if the bills are not enough. Mutates ``pending``; returns the
-    settling allocations, the proceeds settled early and the proceeds settled by a
-    settle-all date (the fiscal-year end) that were not otherwise due.
+    settling allocations, the proceeds settled early and the proceeds settled by the
+    fiscal-year close (an accounting close) that were not otherwise due.
     """
 
     controlled_debt, controlled_bills = pre_issuance_position
@@ -3496,13 +3515,14 @@ def run_simulation(
         issuance_profile = copy.deepcopy(params.get('treasury_issuance_profile', {}))
         # Under operating-cash financing the bill-share rule decides daily but settles each
         # security on Treasury's calendar; decided amounts wait in pending balances.
-        batched_settlement = cbo_operating_cash_financing_mode and is_rule_profile(issuance_profile)
+        opening_issuance_rule = is_rule_profile(issuance_profile)
+        batched_settlement = cbo_operating_cash_financing_mode and opening_issuance_rule
         settlement_schedule = (
             _settlement_schedule(issuance_profile, dates[0], dates[-1]) if batched_settlement else {}
         )
         settlement_dates = list(settlement_schedule)
-        settle_all_dates = (
-            _settle_all_dates(issuance_profile, dates[0], dates[-1]) if batched_settlement else []
+        fiscal_year_close_dates = (
+            _fiscal_year_close_dates(issuance_profile, dates[0], dates[-1]) if batched_settlement else []
         )
         settlement_calendar_data = copy.deepcopy(issuance_profile.get('settlement_calendar'))
         pending_issuance = {}
@@ -4880,6 +4900,13 @@ def run_simulation(
             cbo_inputs=cbo_inputs,
             cbo_scenario_id=cbo_scenario_id,
         )
+        if is_rule_profile(issuance_profile) != opening_issuance_rule:
+            # Calendar settlement, pending balances and the row budget are fixed from the
+            # opening rule; switching rules mid-run would strand or double-count issuance.
+            raise ValueError(
+                f'the issuance rule changed during the run at {current_date.date()}; '
+                'events may not switch between the bill-share rule and fixed shares'
+            )
         # The bill-share rule measures debt after the day's maturities and before issuance.
         pre_issuance_position = (
             controlled_debt_and_bills(bond_portfolio)
@@ -4893,15 +4920,15 @@ def run_simulation(
         else:
             primary_issuance_leg = 'ordinary_issuance'
         early_settlement_proceeds = 0.0
-        fiscal_year_end_settlement_proceeds = 0.0
+        fiscal_year_close_settlement_proceeds = 0.0
         if batched_settlement:
             if issuance_profile.get('settlement_calendar') != settlement_calendar_data:
                 raise ValueError('the settlement calendar cannot change during a run')
-            settle_all_today = (
-                bisect.bisect_right(settle_all_dates, pd.Timestamp(current_date))
-                > bisect.bisect_right(settle_all_dates, pd.Timestamp(prev_date))
+            close_books_today = (
+                bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(current_date))
+                > bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(prev_date))
             )
-            settlement_allocations, early_settlement_proceeds, fiscal_year_end_settlement_proceeds = _decide_and_settle_pending(
+            settlement_allocations, early_settlement_proceeds, fiscal_year_close_settlement_proceeds = _decide_and_settle_pending(
                 pending_issuance,
                 need=total_issuance_target_period,
                 issuance_profile=issuance_profile,
@@ -4909,7 +4936,7 @@ def run_simulation(
                 due_keys=_due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date),
                 projected_tga_without_settlement=projected_tga_pre_issuance + cbo_cash_residual_period,
                 current_date=current_date,
-                settle_all=settle_all_today,
+                settle_all=close_books_today,
             )
             operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
             issuance_supply_schedule = _quote_rule_allocations(
@@ -5236,7 +5263,7 @@ def run_simulation(
                 item[3] for item in pending_issuance.values()
             )
             results.loc[current_date, 'EarlySettlementProceeds'] = early_settlement_proceeds
-            results.loc[current_date, 'FiscalYearEndSettlementProceeds'] = fiscal_year_end_settlement_proceeds
+            results.loc[current_date, 'FiscalYearCloseSettlementProceeds'] = fiscal_year_close_settlement_proceeds
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
             cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))

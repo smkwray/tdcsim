@@ -61,7 +61,7 @@ FIXTURE_COUPON_TERMS = [
 ]
 # The registry calendar restricted to the fixture's securities.
 FIXTURE_SETTLEMENT_CALENDAR = {
-    "settle_all_pending": SETTLEMENT_CALENDAR["settle_all_pending"],
+    "fiscal_year_close": SETTLEMENT_CALENDAR["fiscal_year_close"],
     "bills": [entry for entry in SETTLEMENT_CALENDAR["bills"] if entry["weeks"] in {4, 13, 26}],
     "coupons": [
         entry
@@ -418,17 +418,28 @@ ENGINE_START = "2026-06-30"
 ENGINE_END = "2026-09-30"
 
 
-def _engine_params(tmp_path: Path, *, profile, mode: str, rate_shift: float = 0.0) -> dict:
-    periods = build_simulation_calendar(ENGINE_START, ENGINE_END, "daily")
+def _engine_params(
+    tmp_path: Path,
+    *,
+    profile,
+    mode: str,
+    rate_shift: float = 0.0,
+    end: str = ENGINE_END,
+    later_fiscal_years: dict | None = None,
+    debt_target: float = 1_080.0,
+    primary_flow: float = 60.0,
+) -> dict:
+    periods = build_simulation_calendar(ENGINE_START, end, "daily")
     paths = _build_temp_forecast_inputs(
         tmp_path,
         periods=periods,
         period_start=ENGINE_START,
-        period_end=ENGINE_END,
-        cbo_public_debt_target_bil=1_080.0,
+        period_end=end,
+        cbo_public_debt_target_bil=debt_target,
         pre_issuance_controlled_debt_bil=1_000.0,
         base_cash_balance_bil=800.0,
-        signed_primary_flow_bil=60.0,
+        signed_primary_flow_bil=primary_flow,
+        later_fiscal_years=later_fiscal_years,
     )
     params = _minimal_engine_params(paths)
     params["initial_bonds_df"] = _portfolio(
@@ -581,7 +592,7 @@ def test_securities_settle_only_on_their_calendar_days(tmp_path: Path) -> None:
     multiplies portfolio rows and engine time without adding realism."""
 
     from issuance_calibration import settlement_rules
-    from sim_engine import _settle_all_dates, _settlement_schedule
+    from sim_engine import _fiscal_year_close_dates, _settlement_schedule
 
     params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
     results, portfolio = run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
@@ -589,7 +600,7 @@ def test_securities_settle_only_on_their_calendar_days(tmp_path: Path) -> None:
     schedule = _settlement_schedule(profile, ENGINE_START, ENGINE_END)
     allowed = {(day, key) for day, keys in schedule.items() for key in keys}
     # The fiscal-year end (Wednesday 2026-09-30) settles every pending balance.
-    assert _settle_all_dates(profile, ENGINE_START, ENGINE_END) == [pd.Timestamp("2026-09-30")]
+    assert _fiscal_year_close_dates(profile, ENGINE_START, ENGINE_END) == [pd.Timestamp("2026-09-30")]
     allowed |= {(pd.Timestamp("2026-09-30"), key) for key in settlement_rules(profile)}
     issued = _new_issues(portfolio)
     assert not issued.empty
@@ -609,7 +620,7 @@ def test_securities_settle_only_on_their_calendar_days(tmp_path: Path) -> None:
 def test_row_growth_is_bounded_by_the_calendar(tmp_path: Path) -> None:
     """Rows per year must scale with settlement events, not with days times securities."""
 
-    from sim_engine import _settle_all_dates, _settlement_schedule
+    from sim_engine import _fiscal_year_close_dates, _settlement_schedule
     from tdc_shared import HOLDER_TYPES
 
     params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
@@ -618,7 +629,7 @@ def test_row_growth_is_bounded_by_the_calendar(tmp_path: Path) -> None:
     schedule = _settlement_schedule(profile, ENGINE_START, ENGINE_END)
     events = sum(len(keys) for day, keys in schedule.items() if day > pd.Timestamp(ENGINE_START))
     # A fiscal-year end can settle every security once more.
-    events += len(_settle_all_dates(profile, ENGINE_START, ENGINE_END)) * (
+    events += len(_fiscal_year_close_dates(profile, ENGINE_START, ENGINE_END)) * (
         len(FIXTURE_BILL_TERMS) + len(FIXTURE_COUPON_TERMS)
     )
     issued = _new_issues(portfolio)
@@ -640,7 +651,7 @@ def test_pending_amounts_count_as_issued_for_cash_and_bill_share() -> None:
 
     profile = _rule_profile(0.2)
     pending = {("bill", 4.0): ["Fixed", 28 / 365.25, 28, 50.0]}
-    settled, early, _sweep = _decide_and_settle_pending(
+    settled, early, _close = _decide_and_settle_pending(
         pending,
         need=100.0,
         issuance_profile=profile,
@@ -655,7 +666,7 @@ def test_pending_amounts_count_as_issued_for_cash_and_bill_share() -> None:
     assert bills == pytest.approx(50.0 + 30.0)
     assert sum(item[3] for item in pending.values()) == pytest.approx(150.0)
 
-    settled, early, _sweep = _decide_and_settle_pending(
+    settled, early, _close = _decide_and_settle_pending(
         pending,
         need=0.0,
         issuance_profile=profile,
@@ -679,7 +690,7 @@ def test_pending_bills_settle_early_rather_than_overdraw_the_tga() -> None:
         ("bill", 13.0): ["Fixed", 91 / 365.25, 91, 40.0],
         ("Fixed", 10.0): ["Fixed", 10.0, None, 25.0],
     }
-    settled, early, _sweep = _decide_and_settle_pending(
+    settled, early, _close = _decide_and_settle_pending(
         pending,
         need=0.0,
         issuance_profile=_rule_profile(0.2),
@@ -697,7 +708,7 @@ def test_pending_bills_settle_early_rather_than_overdraw_the_tga() -> None:
         ("bill", 13.0): ["Fixed", 91 / 365.25, 91, 4.0],
         ("Fixed", 10.0): ["Fixed", 10.0, None, 25.0],
     }
-    settled, early, _sweep = _decide_and_settle_pending(
+    settled, early, _close = _decide_and_settle_pending(
         pending,
         need=0.0,
         issuance_profile=_rule_profile(0.2),
@@ -751,11 +762,250 @@ def test_fiscal_year_end_settles_everything_so_tga_matches_across_scenarios(tmp_
     for results in runs.values():
         row = results.loc[fiscal_year_end]
         assert row["PendingIssuanceProceeds"] == pytest.approx(0.0, abs=1e-9)
-        assert row["FiscalYearEndSettlementProceeds"] > 1.0
+        assert row["FiscalYearCloseSettlementProceeds"] > 1.0
         assert row["TGA"] == pytest.approx(row["CBOOperatingCashTarget"], abs=1e-6)
-        # Pending cash is nonzero just before, so the sweep is what closes the gap.
+        # Pending cash is nonzero just before, so the close is what clears it.
         assert results.loc["2026-09-29", "PendingIssuanceProceeds"] > 1.0
     assert runs[0.2].loc[fiscal_year_end, "TGA"] == pytest.approx(runs[0.4].loc[fiscal_year_end, "TGA"], abs=1e-6)
     assert runs[0.2].loc[fiscal_year_end, "ScenarioControlledDebt"] != pytest.approx(
         runs[0.4].loc[fiscal_year_end, "ScenarioControlledDebt"]
     )
+
+
+# --- Review follow-ups -------------------------------------------------------------------
+
+
+def _full_registry_profile(target: float = 0.2) -> dict:
+    from issuance_calibration import BILL_TERM_WEEKS, COUPON_TENORS
+
+    coupons = [(kind, tenor) for kind, tenors in COUPON_TENORS.items() for tenor in tenors]
+    return engine_rule_profile(
+        target_path=[{"date": None, "bill_share_target": target}],
+        bill_terms=[{"weeks": weeks, "share": 1.0 / len(BILL_TERM_WEEKS)} for weeks in BILL_TERM_WEEKS],
+        coupon_terms=[{"kind": kind, "tenor_years": tenor, "share": 1.0 / len(coupons)} for kind, tenor in coupons],
+        settlement_calendar=SETTLEMENT_CALENDAR,
+    )
+
+
+def test_month_ends_and_holidays_roll_forward_on_the_fedwire_calendar() -> None:
+    """Treasury settles a month-end issue on the next business day when the month end is
+    not one; the auction file shows 2-year notes issued 2025-09-02, 2025-12-01,
+    2026-03-02 and 2026-06-01. Business days are Fedwire's: open on the Friday before a
+    Saturday holiday, closed on the Monday after a Sunday holiday."""
+
+    from sim_engine import _is_fedwire_business_day, _settlement_schedule
+
+    assert _is_fedwire_business_day("2026-07-03")  # July 4 is a Saturday
+    assert _is_fedwire_business_day("2027-12-31")  # New Year's Day 2028 is a Saturday
+    assert not _is_fedwire_business_day("2027-07-05")  # July 4 is a Sunday
+    assert not _is_fedwire_business_day("2026-11-26")  # Thanksgiving
+
+    schedule = _settlement_schedule(_full_registry_profile(), "2025-08-01", "2027-12-31")
+    two_year = sorted(day for day, keys in schedule.items() if ("Fixed", 2.0) in keys)
+    for observed in ("2025-09-02", "2025-12-01", "2026-03-02", "2026-06-01"):
+        assert pd.Timestamp(observed) in two_year
+    assert pd.Timestamp("2026-11-02") in two_year  # 2026-10-31 is a Saturday
+    assert pd.Timestamp("2027-06-01") in two_year  # 2027-05-31 is Memorial Day
+    assert pd.Timestamp("2027-12-31") in two_year  # open under Fedwire
+    assert pd.Timestamp("2026-10-30") not in two_year
+    thursday_bills = {day for day, keys in schedule.items() if ("bill", 13.0) in keys}
+    assert pd.Timestamp("2026-11-27") in thursday_bills  # Thanksgiving Thursday rolls to Friday
+    assert pd.Timestamp("2026-11-26") not in thursday_bills
+
+
+def test_fiscal_year_close_settles_everything_on_a_weekend_september_30(tmp_path: Path) -> None:
+    """Needs and maturities still land on a Saturday September 30 (2028, 2029, 2034,
+    2035). The close is an accounting close on the last simulated day of the year, not a
+    market settlement, so it must clear what is pending whatever the weekday."""
+
+    from sim_engine import _fiscal_year_close_dates
+
+    profile = _full_registry_profile()
+    closes = _fiscal_year_close_dates(profile, "2028-06-01", "2035-12-31")
+    assert [day.date().isoformat() for day in closes][:2] == ["2028-09-30", "2029-09-30"]
+    assert closes[0].weekday() == 5 and closes[1].weekday() == 6
+
+    # Run the mechanics on a Saturday close inside a fixture window: move the close month
+    # to October, whose last day in 2026 is a Saturday.
+    rule = _rule_profile(0.3)
+    rule["settlement_calendar"] = {**rule["settlement_calendar"], "fiscal_year_close": [
+        {"month": 10, "day_of_month": "last_calendar_day"}
+    ]}
+    params = _engine_params(
+        tmp_path,
+        profile=rule,
+        mode="cbo_operating_cash_target_financing_v1",
+        end="2026-11-04",
+        later_fiscal_years={2027: (1_200.0, 70.0)},
+    )
+    results, portfolio = run_simulation(params, ENGINE_START, "2026-11-04", freq="D", scenario_name="baseline")
+    close = results.loc["2026-10-31"]
+    assert pd.Timestamp("2026-10-31").weekday() == 5
+    assert results.loc["2026-10-30", "PendingIssuanceProceeds"] > 1.0
+    assert close["IssuanceNeedProceeds"] > 0.0
+    assert close["PendingIssuanceProceeds"] == pytest.approx(0.0, abs=1e-9)
+    assert close["FiscalYearCloseSettlementProceeds"] > 1.0
+    assert close["TGA"] == pytest.approx(close["CBOOperatingCashTarget"], abs=1e-6)
+    assert (pd.to_datetime(portfolio["IssueDate"]) == pd.Timestamp("2026-10-31")).any()
+
+
+def test_an_event_may_not_switch_the_issuance_rule_mid_run(tmp_path: Path) -> None:
+    """Calendar settlement and pending balances are set up from the opening rule; an
+    event that swaps in fixed shares would strand pending issuance."""
+
+    params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
+    params["events"] = [
+        {"date": "2026-07-15", "actions": [{"parameter_path": "treasury_issuance_profile", "new_value": _fixed_share_profile()}]}
+    ]
+    with pytest.raises(ValueError, match="issuance rule changed during the run"):
+        run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+
+
+def test_reference_mode_row_budget_covers_both_daily_legs(tmp_path: Path) -> None:
+    """The reference closure can issue a debt-path leg and a TGA-floor leg on the same
+    day. Here a note matures every day, so the debt path calls for a reference leg each
+    day and the bill discount leaves the TGA short, calling for a floor leg too; with
+    fourteen securities over five holder routes, a cap sized for one leg is exceeded."""
+
+    from issuance_calibration import BILL_TERM_WEEKS, COUPON_TENORS
+    from tdcsim_cbo.runner import _portfolio_row_budget
+
+    # Every bill term and every nominal coupon (TIPS and FRN need curves this fixture lacks).
+    profile = engine_rule_profile(
+        target_path=[{"date": None, "bill_share_target": 0.3}],
+        bill_terms=[{"weeks": weeks, "share": 1.0 / len(BILL_TERM_WEEKS)} for weeks in BILL_TERM_WEEKS],
+        coupon_terms=[
+            {"kind": "nominal", "tenor_years": tenor, "share": 1.0 / len(COUPON_TENORS["nominal"])}
+            for tenor in COUPON_TENORS["nominal"]
+        ],
+        settlement_calendar={
+            "fiscal_year_close": SETTLEMENT_CALENDAR["fiscal_year_close"],
+            "bills": SETTLEMENT_CALENDAR["bills"],
+            "coupons": [entry for entry in SETTLEMENT_CALENDAR["coupons"] if entry["kind"] == "nominal"],
+        },
+    )
+    end = "2026-07-30"
+    params = _engine_params(
+        tmp_path,
+        profile=profile,
+        mode="cbo_debt_reference_plus_tga_floor_financing_v1",
+        debt_target=1_080.0,
+        primary_flow=-70.0,
+    )
+    # Each day a bill and a note mature in the target proportion, so both legs split
+    # across bills and coupons; the opening book sits on the 30% target.
+    maturing = []
+    for day in range(1, 31):
+        maturity = (pd.Timestamp(ENGINE_START) + pd.Timedelta(days=day)).date().isoformat()
+        maturing.append(_portfolio_row(100 + day, security_type="Fixed", years=91 / 365.25, face=6.0, maturity=maturity))
+        maturing.append(_portfolio_row(200 + day, security_type="Fixed", years=2.0, face=14.0, maturity=maturity))
+    params["initial_bonds_df"] = _portfolio(
+        [
+            _portfolio_row(1, security_type="Fixed", years=182 / 365.25, maturity="2026-11-30", face=120.0),
+            _portfolio_row(2, security_type="Fixed", years=2.0, maturity="2027-09-30", face=280.0),
+            *maturing,
+        ]
+    )
+    # A small surplus offsets the coupon and discount cash so both legs persist daily.
+    params["initial_values"]["tga"] = 0.0
+    shares = {"bills_pct": 0.25, "notes_pct": 0.25, "bonds_pct": 0.25}
+    params["sector_preferences"] = {
+        holder: (shares if holder in {"Banks", "CB", "Foreign", "Private"} else {"bills_pct": 0.0, "notes_pct": 0.0, "bonds_pct": 0.0})
+        for holder in ("Banks", "CB", "Foreign", "Private", "FedInternal", "TrustFunds")
+    }
+    split = {"domestic_nonbank_deposit_funded": 0.5, "mmf_cash_fund_route": 0.5}
+    params["sector_preferences"]["__private_subbucket_shares__"] = {
+        category: dict(split) for category in ("bills", "notes", "bonds")
+    }
+    results, portfolio = run_simulation(params, ENGINE_START, end, freq="D", scenario_name="baseline")
+    running = results.iloc[1:]
+    assert (running["CashFinancingProceeds"] > 0.0).mean() > 0.9
+    assert (running["NewDebtIssued"] > running["CashFinancingFaceIssued"] + 1.0).mean() > 0.9
+    one_leg = dict(params, funding_rule={**params["funding_rule"], "mode": "cbo_operating_cash_target_financing_v1"})
+    rows = len(portfolio)
+    assert rows > _portfolio_row_budget(one_leg, start=ENGINE_START, end=end)
+    assert rows <= _portfolio_row_budget(params, start=ENGINE_START, end=end)
+
+
+def test_controlled_debt_measures_raise_on_rows_they_cannot_classify() -> None:
+    """A Fixed row without an original maturity is not known to be a bill, and a TIPS
+    row without adjusted principal is not worth its face; guessing either moves the
+    bill share the rule steers by."""
+
+    from issuance_calibration import bill_mask, debt_base
+
+    fixed = _portfolio([_portfolio_row(1, security_type="Fixed", years=0.5, maturity="2026-12-01", face=10.0)])
+    fixed["OriginalMaturityYears"] = float("nan")
+    with pytest.raises(IssuanceCalibrationError, match="no original maturity"):
+        bill_mask(fixed)
+    tips = _portfolio([_portfolio_row(1, security_type="TIPS", years=10.0, maturity="2030-01-15", face=10.0)])
+    tips["AdjustedPrincipal"] = float("nan")
+    with pytest.raises(IssuanceCalibrationError, match="no adjusted principal"):
+        debt_base(tips)
+
+
+def _closing(**values) -> dict:
+    row = {
+        "TGA": 900.0,
+        "PendingIssuanceProceeds": 100.0,
+        "CBOOperatingCashTarget": 1000.0,
+        "IssuanceNeedProceeds": 20.0,
+        "AuctionProceeds": 30.0,
+    }
+    row.update(values)
+    return row
+
+
+@pytest.mark.parametrize(
+    "bridge, closing, message",
+    [
+        ({"funding_mode": "cbo_public_debt_target", "target_error_bil": 0.5}, _closing(), "missed the CBO debt target"),
+        (
+            {"funding_mode": "cbo_debt_reference_plus_tga_floor_financing_v1", "debt_drift_from_reference_bil": -1.0},
+            _closing(),
+            "fell below the CBO debt reference",
+        ),
+        ({"funding_mode": "cbo_operating_cash_target_financing_v1"}, _closing(TGA=890.0), "off its operating-cash target"),
+        (
+            {"funding_mode": "cbo_operating_cash_target_financing_v1"},
+            _closing(PendingIssuanceProceeds=95.0, TGA=905.0),
+            "pending issuance identity",
+        ),
+    ],
+)
+def test_period_close_rejects_each_modes_violation(bridge, closing, message) -> None:
+    """Each funding mode's closure rule fails the period that breaks it. The opening
+    pending of 110 plus a need of 20 less 30 settled leaves 100 pending."""
+
+    from tdcsim_cbo.bounded_output import BoundedEvidenceError, _validate_funding_mode_close
+
+    opening = {"PendingIssuanceProceeds": 110.0}
+    _validate_funding_mode_close({"funding_mode": "cbo_operating_cash_target_financing_v1"}, _closing(), opening)
+    with pytest.raises(BoundedEvidenceError, match=message):
+        _validate_funding_mode_close(bridge, closing, opening)
+
+
+@pytest.mark.parametrize(
+    "column, value, message",
+    [
+        ("DebtDriftFromReference", 5.0, "debt drift identity"),
+        ("CashFinancingProceeds", 1.0, "all issuance is operating-cash financing"),
+        ("CBOControlledDebtTargetError", 1.0, "binding CBO debt target error"),
+        ("PendingIssuanceProceeds", 7.0, "pending issuance identity"),
+        ("EarlySettlementProceeds", -1.0, "must be nonnegative"),
+    ],
+)
+def test_operating_cash_results_verifier_rejects_each_broken_claim(tmp_path: Path, column, value, message) -> None:
+    """The verifier recomputes the operating-cash claims from a real run's results; each
+    tampered column must fail with its own reason."""
+
+    from tdcsim_cbo.verifier import VerificationError, _verify_operating_cash_financing_results
+
+    params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
+    results, _ = run_simulation(params, ENGINE_START, "2026-07-20", freq="D", scenario_name="baseline")
+    _verify_operating_cash_financing_results(results)
+    tampered = results.copy()
+    row = tampered.index[5]
+    tampered.loc[row, column] = (tampered.loc[row, column] + value) if column != "EarlySettlementProceeds" else value
+    with pytest.raises(VerificationError, match=message):
+        _verify_operating_cash_financing_results(tampered)

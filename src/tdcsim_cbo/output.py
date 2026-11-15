@@ -39,7 +39,7 @@ SUMMARY_COLUMNS = [
     "IssuanceNeedProceeds",
     "PendingIssuanceProceeds",
     "EarlySettlementProceeds",
-    "FiscalYearEndSettlementProceeds",
+    "FiscalYearCloseSettlementProceeds",
     "CBOCashReconciliationResidual",
     "CBOCashResidualStatus",
     "CBOFedHoldingsTarget",

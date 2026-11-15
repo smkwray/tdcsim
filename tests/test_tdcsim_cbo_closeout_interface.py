@@ -199,6 +199,32 @@ def test_run_cbo_scenario_supports_mmf_and_operating_cash_beta_knobs(tmp_path: P
     assert set(cash["inflation_beta"]) == {0.5}
 
 
+def test_debt_path_runs_record_the_manifest_they_always_did(tmp_path: Path) -> None:
+    """A hard debt-path run's manifest must keep main's shape: no operating-cash checks
+    or funding key in boundary_checks, and the fixed-share mix it always used. The
+    operating-cash default records its mode so a reader never mistakes it for hard."""
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    hard = read_json(scenarios["noop"])
+    hard["funding_closure"] = {"mode": "cbo_public_debt_target"}
+    write_json(scenarios["noop"], hard)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-hard")
+    assert "funding_closure_mode" not in run.run_manifest["boundary_checks"]
+    assert "tga_follows_operating_cash_target" not in {
+        item["id"] for item in run.run_manifest["validation"]["invariants"]
+    }
+    issuance = read_json(run.compiled.forecast_inputs_dir / "tdcsim_issuance_mix_assumptions.json")
+    assert issuance["mode"] == "default_tdcsim_cbo_runner_profile"
+
+    del hard["funding_closure"]
+    write_json(scenarios["noop"], hard)
+    default = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-default")
+    assert default.run_manifest["funding_closure_mode"] == "cbo_operating_cash_target_financing_v1"
+    assert default.run_manifest["boundary_checks"]["funding_closure_mode"] == (
+        "cbo_operating_cash_target_financing_v1"
+    )
+
+
 def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -900,6 +900,44 @@ def test_bill_share_override_replaces_only_the_target(tmp_path: Path, target, ex
     assert [term["weeks"] for term in profile["bill_terms"]] == [4, 13, 26]
 
 
+def test_hard_debt_path_closure_keeps_the_fixed_share_default(tmp_path: Path) -> None:
+    """Runs on cbo_public_debt_target (the RateWall marginal pairs) predate the
+    bill-share rule and must keep the fixed-share mix they were built on, also on a
+    package without an auction calibration; OPEN-04 does the same."""
+
+    package, attestation = _write_compiler_package(tmp_path, include_issuance_calibration=False)
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    scenario = _scenario_mapping(baseline)
+    scenario["funding_closure"] = {"mode": "cbo_public_debt_target"}
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "hard")
+    payload = json.loads((compiled.forecast_inputs_dir / ISSUANCE_MIX_FILE).read_text(encoding="utf-8"))
+    assert payload["mode"] == "default_tdcsim_cbo_runner_profile"
+    assert payload["security_shares"] == {"bills": 0.225, "notes": 0.495, "bonds": 0.18, "tips": 0.06, "frn": 0.04}
+
+    # A verifier recompiling a recorded hard-mode run gets the same bytes.
+    undeclared = CboScenarioCompiler().compile(
+        baseline,
+        CboScenarioSpec.from_mapping(_scenario_mapping(baseline)),
+        tmp_path / "recompile",
+        funding_closure_mode="cbo_public_debt_target",
+    )
+    assert sha256_file(undeclared.forecast_inputs_dir / ISSUANCE_MIX_FILE) == sha256_file(
+        compiled.forecast_inputs_dir / ISSUANCE_MIX_FILE
+    )
+
+
+def test_hard_debt_path_closure_can_opt_into_the_bill_share_rule(tmp_path: Path) -> None:
+    """The fixed-share default is a default only; an explicit rule still applies."""
+
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["funding_closure"] = {"mode": "cbo_public_debt_target"}
+    scenario["overrides"] = {"issuance_mix": {"mode": "bill_share_target_v1", "bill_share_target": 0.25}}
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+    payload = json.loads((compiled.forecast_inputs_dir / ISSUANCE_MIX_FILE).read_text(encoding="utf-8"))
+    assert payload["mode"] == "bill_share_target_v1"
+
+
 def test_bill_share_rule_requires_the_package_calibration(tmp_path: Path) -> None:
     """Without auction data there is no measured mix; compiling must not invent one."""
 

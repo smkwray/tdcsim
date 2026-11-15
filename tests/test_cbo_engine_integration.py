@@ -322,7 +322,9 @@ def _build_temp_forecast_inputs(
     cash_residual_bil: float = 0.0,
     signed_primary_flow_bil: float = 40.0,
     cbo_net_interest_bil: float = 120.0,
+    later_fiscal_years: dict[int, tuple[float, float]] | None = None,
 ) -> dict[str, Path]:
+    """``later_fiscal_years`` maps a fiscal year after 2026 to (debt target, primary flow)."""
     periods = periods or _single_period(period_start, period_end)
     debt_rows = build_debt_stock_path_rows(
         scenario_id=scenario_id,
@@ -331,7 +333,10 @@ def _build_temp_forecast_inputs(
         opening_cbo_federal_debt_held_public_bil=pre_issuance_controlled_debt_bil
         + public_nonmarketable_bil
         + definition_residual_bil,
-        cbo_fy_end_public_debt_targets_bil={2026: cbo_public_debt_target_bil},
+        cbo_fy_end_public_debt_targets_bil={
+            2026: cbo_public_debt_target_bil,
+            **{year: values[0] for year, values in (later_fiscal_years or {}).items()},
+        },
         public_nonmarketable_treasury_bil=public_nonmarketable_bil,
         non_treasury_and_definition_residual_bil=definition_residual_bil,
         observation_date="2026-09-20",
@@ -340,7 +345,10 @@ def _build_temp_forecast_inputs(
     primary_rows = build_primary_deficit_path_rows(
         scenario_id=scenario_id,
         periods=periods,
-        primary_deficit_by_fiscal_year_bil={2026: signed_primary_flow_bil},
+        primary_deficit_by_fiscal_year_bil={
+            2026: signed_primary_flow_bil,
+            **{year: values[1] for year, values in (later_fiscal_years or {}).items()},
+        },
     )
     operating_cash_rows = build_operating_cash_path_rows(
         scenario_id=scenario_id,

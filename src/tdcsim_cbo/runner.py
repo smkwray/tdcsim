@@ -36,7 +36,11 @@ from issuance_calibration import (
     load_calibration,
     normalize_target_path,
 )
-from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, run_simulation
+from sim_engine import (
+    CBO_DEBT_REFERENCE_FINANCING_MODE,
+    CBO_OPERATING_CASH_TARGET_FINANCING_MODE,
+    run_simulation,
+)
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
@@ -295,7 +299,7 @@ def run_cbo_scenario(
                 },
             )
         compiled = CboScenarioCompiler().compile(
-            baseline, spec, staging / "compile"
+            baseline, spec, staging / "compile", funding_closure_mode=funding_closure_mode
         )
         scenario_path = staging / "scenario.json"
         write_json(scenario_path, spec.data)
@@ -481,7 +485,12 @@ def run_cbo_scenario(
                 ),
             ),
         )
-        if open04_marker is None:
+        # A declared closure is recorded (as before); the operating-cash default is always
+        # recorded, since a manifest without the key reads as cbo_public_debt_target.
+        if open04_marker is None and (
+            "funding_closure" in spec.data
+            or funding_closure_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE
+        ):
             run_manifest["funding_closure_mode"] = funding_closure_mode
         if open04_marker is not None:
             run_manifest["open04_campaign"] = {
@@ -1084,10 +1093,10 @@ def validate_run_boundaries(
 def funding_mode_cash_checks(results: pd.DataFrame, funding_closure_mode: str) -> dict[str, Any]:
     """Return the mode-specific cash checks recorded in boundary_checks."""
 
-    checks: dict[str, Any] = {"funding_closure_mode": funding_closure_mode}
-    if funding_closure_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
-        checks.update(operating_cash_financing_checks(results))
-    return checks
+    if funding_closure_mode != CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
+        # Debt-path runs record exactly the checks they always have.
+        return {}
+    return {"funding_closure_mode": funding_closure_mode, **operating_cash_financing_checks(results)}
 
 
 def operating_cash_financing_checks(results: pd.DataFrame) -> dict[str, Any]:
@@ -2325,8 +2334,12 @@ def _portfolio_row_budget(params: Mapping[str, Any], *, start: str, end: str) ->
         profile = {}
     supply_rows = 0
     if is_rule_profile(profile):
-        # One supply item per bill term and per coupon security, every issuing day.
+        # One supply item per bill term and per coupon security per issuance leg; the
+        # reference closure issues a debt-path leg and a TGA-floor leg every day.
         supply_rows = len(profile["bill_terms"]) + len(profile["coupon_terms"])
+        funding_rule = params.get("funding_rule", {})
+        if isinstance(funding_rule, Mapping) and funding_rule.get("mode") == CBO_DEBT_REFERENCE_FINANCING_MODE:
+            supply_rows *= 2
     else:
         for category in ("bills", "notes", "bonds"):
             section = profile.get(category, {})

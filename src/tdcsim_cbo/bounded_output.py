@@ -712,7 +712,9 @@ class _DeterministicCsvGzip:
 
 
 def _validate_funding_mode_close(
-    bridge: Mapping[str, Any], closing_result: Mapping[str, Any]
+    bridge: Mapping[str, Any],
+    closing_result: Mapping[str, Any],
+    opening_result: Mapping[str, Any],
 ) -> None:
     """Check each period against its own funding mode's closure rule."""
 
@@ -733,6 +735,14 @@ def _validate_funding_mode_close(
         decided = float(closing_result["IssuanceNeedProceeds"]) > CASH_TOLERANCE_BIL
         if excess < -CASH_TOLERANCE_BIL or (decided and abs(excess) > CASH_TOLERANCE_BIL):
             raise BoundedEvidenceError(f"TGA off its operating-cash target at period close: {excess}")
+        # Pending issuance only grows by decided need and shrinks by what settles.
+        pending_error = float(closing_result["PendingIssuanceProceeds"]) - (
+            float(opening_result.get("PendingIssuanceProceeds", 0.0) or 0.0)
+            + float(closing_result["IssuanceNeedProceeds"])
+            - float(closing_result["AuctionProceeds"])
+        )
+        if abs(pending_error) > CASH_TOLERANCE_BIL:
+            raise BoundedEvidenceError(f"pending issuance identity failed at period close: {pending_error}")
 
 
 class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
@@ -1192,6 +1202,7 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
             financing=financing,
             closing_result=closing_result,
             debt_bridge=raw["tdcsim_debt_target_bridge"],
+            opening_result=self._opening_result or {},
         )
 
         commitment = {
@@ -1615,6 +1626,7 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
         financing: Mapping[str, Any],
         closing_result: Mapping[str, Any],
         debt_bridge: list[Mapping[str, Any]],
+        opening_result: Mapping[str, Any],
     ) -> None:
         if len(accounting) != 1:
             raise BoundedEvidenceError("period accounting closure must contain one row")
@@ -1665,7 +1677,7 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
         if tga < TGA_MINIMUM_BIL:
             raise BoundedEvidenceError(f"negative TGA at period close: {tga}")
         for bridge in debt_bridge:
-            _validate_funding_mode_close(bridge, closing_result)
+            _validate_funding_mode_close(bridge, closing_result, opening_result)
 
     def _update_annual(
         self,

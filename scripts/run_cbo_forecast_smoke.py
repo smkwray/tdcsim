@@ -67,7 +67,7 @@ from forecast_input_builder import (
 )
 from frn_indexation import build_forward_frn_rate_path_rows, enrich_opening_frn_from_daily_indexes
 from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration, engine_rule_profile
-from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _settle_all_dates, run_simulation
+from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _fiscal_year_close_dates, run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
@@ -205,7 +205,7 @@ RESULT_COLUMNS = [
     "IssuanceNeedProceeds",
     "PendingIssuanceProceeds",
     "EarlySettlementProceeds",
-    "FiscalYearEndSettlementProceeds",
+    "FiscalYearCloseSettlementProceeds",
     "CashFinancingProceeds",
     "NewDebtIssued",
     "AuctionProceeds",
@@ -656,7 +656,7 @@ def run_smoke(bundle: ForecastBundle) -> dict[str, Any]:
         portfolio,
         bundle.output_dir / BASELINE_EXPORT_DIR,
         cash_residual_file=str(bundle.inputs_dir / "tdcsim_cash_reconciliation_residual.csv"),
-        fiscal_year_end_dates=_settle_all_dates(
+        fiscal_year_end_dates=_fiscal_year_close_dates(
             bundle.params["treasury_issuance_profile"], results.index.min(), results.index.max()
         ),
     )
@@ -940,7 +940,7 @@ def build_manifest(
                 "DebtDriftFromReference",
                 "PendingIssuanceProceeds",
                 "EarlySettlementProceeds",
-                "FiscalYearEndSettlementProceeds",
+                "FiscalYearCloseSettlementProceeds",
             ],
         },
         "holder_preferences": holder_profile_from_opening_weights(opening_portfolio_metadata["noncb_weights"])[0],

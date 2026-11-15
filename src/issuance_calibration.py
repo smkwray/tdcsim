@@ -49,14 +49,16 @@ COUPON_TENORS = {
 # is not a reopening this registry knows and raises.
 REOPENING_MAX_SHORTFALL_YEARS = 1.0
 CONTROLLED_SECURITY_TYPES = ("Fixed", "TIPS", "FRN")
-# Treasury's settlement calendar for the bill-share rule's securities. Weekday and
-# day-of-month dates move to the next business day; month-end issues settle on the
-# month's last business day. On the last business day of each federal fiscal year
-# every pending balance settles, so fiscal-year-end stocks carry no pending cash.
-# Packaged in the calibration and read back through settlement_rules() and
-# settle_all_pending_rules().
+# Treasury's settlement calendar for the bill-share rule's securities, on the Fedwire
+# business-day calendar. Weekday, day-of-month and month-end dates that are not business
+# days roll forward to the next business day (a month-end issue for a Saturday month end
+# settles the following Monday). Separately, the books close on the last calendar day of
+# each federal fiscal year: everything pending settles that day whatever the weekday, an
+# accounting close rather than a market settlement, so fiscal-year-end stocks carry no
+# pending cash. Packaged in the calibration and read back through settlement_rules() and
+# fiscal_year_close_rules().
 SETTLEMENT_CALENDAR = {
-    "settle_all_pending": [{"month": 9, "day_of_month": "last_business_day"}],
+    "fiscal_year_close": [{"month": 9, "day_of_month": "last_calendar_day"}],
     "bills": [
         {"weeks": 4, "weekday": "Tuesday"},
         {"weeks": 8, "weekday": "Tuesday"},
@@ -70,14 +72,14 @@ SETTLEMENT_CALENDAR = {
         {"kind": "nominal", "tenor_years": 3, "day_of_month": 15},
         {"kind": "nominal", "tenor_years": 10, "day_of_month": 15},
         {"kind": "nominal", "tenor_years": 30, "day_of_month": 15},
-        {"kind": "nominal", "tenor_years": 2, "day_of_month": "last_business_day"},
-        {"kind": "nominal", "tenor_years": 5, "day_of_month": "last_business_day"},
-        {"kind": "nominal", "tenor_years": 7, "day_of_month": "last_business_day"},
-        {"kind": "nominal", "tenor_years": 20, "day_of_month": "last_business_day"},
-        {"kind": "frn", "tenor_years": 2, "day_of_month": "last_business_day"},
-        {"kind": "tips", "tenor_years": 5, "day_of_month": "last_business_day"},
-        {"kind": "tips", "tenor_years": 10, "day_of_month": "last_business_day"},
-        {"kind": "tips", "tenor_years": 30, "day_of_month": "last_business_day"},
+        {"kind": "nominal", "tenor_years": 2, "day_of_month": "month_end"},
+        {"kind": "nominal", "tenor_years": 5, "day_of_month": "month_end"},
+        {"kind": "nominal", "tenor_years": 7, "day_of_month": "month_end"},
+        {"kind": "nominal", "tenor_years": 20, "day_of_month": "month_end"},
+        {"kind": "frn", "tenor_years": 2, "day_of_month": "month_end"},
+        {"kind": "tips", "tenor_years": 5, "day_of_month": "month_end"},
+        {"kind": "tips", "tenor_years": 10, "day_of_month": "month_end"},
+        {"kind": "tips", "tenor_years": 30, "day_of_month": "month_end"},
     ],
 }
 _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
@@ -351,18 +353,28 @@ def controlled_marketable_mask(frame: pd.DataFrame) -> pd.Series:
 def bill_mask(frame: pd.DataFrame) -> pd.Series:
     """Bills are Fixed securities with an original term of at most one year."""
 
-    original_years = pd.to_numeric(frame["OriginalMaturityYears"], errors="coerce").fillna(0.0)
-    return frame["SecurityType"].astype(str).eq("Fixed") & (
-        original_years <= BILL_CUTOFF_YEARS + TGA_FLOOR_TOLERANCE
-    )
+    original_years = pd.to_numeric(frame["OriginalMaturityYears"], errors="coerce")
+    fixed = frame["SecurityType"].astype(str).eq("Fixed")
+    unknown = fixed & original_years.isna()
+    if unknown.any():
+        raise IssuanceCalibrationError(
+            f"{int(unknown.sum())} Fixed rows have no original maturity; cannot tell bills from coupons"
+        )
+    return fixed & (original_years <= BILL_CUTOFF_YEARS + TGA_FLOOR_TOLERANCE)
 
 
 def debt_base(frame: pd.DataFrame) -> pd.Series:
     """Face value, with TIPS at adjusted principal."""
 
     face = pd.to_numeric(frame["FaceValue"], errors="coerce")
-    adjusted = pd.to_numeric(frame["AdjustedPrincipal"], errors="coerce").fillna(face)
-    values = np.where(frame["SecurityType"].astype(str).eq("TIPS"), adjusted, face.fillna(0.0))
+    adjusted = pd.to_numeric(frame["AdjustedPrincipal"], errors="coerce")
+    tips = frame["SecurityType"].astype(str).eq("TIPS")
+    missing = tips & adjusted.isna()
+    if missing.any():
+        raise IssuanceCalibrationError(
+            f"{int(missing.sum())} TIPS rows have no adjusted principal; face would understate them"
+        )
+    values = np.where(tips, adjusted, face.fillna(0.0))
     return pd.Series(values, index=frame.index).fillna(0.0)
 
 
@@ -560,28 +572,32 @@ def validate_rule_profile(profile: Mapping[str, Any], label: str = "treasury_iss
 
 
 def _day_rule(day: Any) -> tuple[str, int | None]:
-    if day == "last_business_day":
-        return ("last_business_day", None)
+    if day == "month_end":
+        return ("month_end", None)
     if isinstance(day, int) and not isinstance(day, bool) and 1 <= day <= 28:
         return ("day_of_month", day)
     raise IssuanceCalibrationError(f"settlement_calendar day_of_month is malformed: {day!r}")
 
 
-def settle_all_pending_rules(profile: Mapping[str, Any]) -> list[tuple[int, tuple[str, int | None]]]:
-    """Return the ``(month, day rule)`` dates on which every pending balance settles."""
+def fiscal_year_close_rules(profile: Mapping[str, Any]) -> list[int]:
+    """Months whose last calendar day closes the books: everything pending settles."""
 
-    entries = profile["settlement_calendar"].get("settle_all_pending")
-    if not isinstance(entries, list):
-        raise IssuanceCalibrationError("settlement_calendar settle_all_pending must be a list")
-    rules = []
+    entries = profile["settlement_calendar"].get("fiscal_year_close")
+    if not isinstance(entries, list) or not entries:
+        raise IssuanceCalibrationError("settlement_calendar fiscal_year_close must be a nonempty list")
+    months = []
     for entry in entries:
-        if not isinstance(entry, Mapping) or set(entry) != {"month", "day_of_month"}:
-            raise IssuanceCalibrationError(f"settle_all_pending entry is malformed: {entry!r}")
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"month", "day_of_month"}
+            or entry["day_of_month"] != "last_calendar_day"
+        ):
+            raise IssuanceCalibrationError(f"fiscal_year_close entry is malformed: {entry!r}")
         month = entry["month"]
         if not isinstance(month, int) or isinstance(month, bool) or not 1 <= month <= 12:
-            raise IssuanceCalibrationError(f"settle_all_pending month is malformed: {month!r}")
-        rules.append((month, _day_rule(entry["day_of_month"])))
-    return rules
+            raise IssuanceCalibrationError(f"fiscal_year_close month is malformed: {month!r}")
+        months.append(month)
+    return months
 
 
 def bill_supply_key(weeks: int) -> tuple[str, float]:
@@ -595,17 +611,17 @@ def coupon_supply_key(security_type: str, tenor_years: float) -> tuple[str, floa
 def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tuple[str, int | None]]:
     """Return each rule security's settlement rule, keyed like the supply items.
 
-    A rule is ``("weekday", 0-4)``, ``("day_of_month", 1-28)`` or
-    ``("last_business_day", None)``. Raises unless every bill term and coupon security in
+    A rule is ``("weekday", 0-4)``, ``("day_of_month", 1-28)`` or ``("month_end", None)``;
+    each date rolls forward to the next business day. Raises unless every bill term and coupon security in
     the profile has exactly one rule and every rule names a profile security.
     """
 
     calendar = profile.get("settlement_calendar")
-    if not isinstance(calendar, Mapping) or set(calendar) != {"bills", "coupons", "settle_all_pending"}:
+    if not isinstance(calendar, Mapping) or set(calendar) != {"bills", "coupons", "fiscal_year_close"}:
         raise IssuanceCalibrationError(
-            "settlement_calendar must have exactly bills, coupons and settle_all_pending"
+            "settlement_calendar must have exactly bills, coupons and fiscal_year_close"
         )
-    settle_all_pending_rules(profile)
+    fiscal_year_close_rules(profile)
     rules: dict[tuple[str, float], tuple[str, int | None]] = {}
 
     def add(key: tuple[str, float], rule: tuple[str, int | None]) -> None:

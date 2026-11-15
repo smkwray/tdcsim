@@ -26,7 +26,7 @@ from forecast_input_builder import (
 )
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
 from issuance_calibration import SETTLEMENT_CALENDAR, build_issuance_calibration
-from sim_engine import _settle_all_dates
+from sim_engine import _fiscal_year_close_dates
 from test_issuance_rule import _fixture_auctions, _write_auctions
 
 
@@ -61,7 +61,7 @@ RESULT_COLUMNS = [
     "IssuanceNeedProceeds",
     "PendingIssuanceProceeds",
     "EarlySettlementProceeds",
-    "FiscalYearEndSettlementProceeds",
+    "FiscalYearCloseSettlementProceeds",
     "CashFinancingProceeds",
     "NewDebtIssued",
     "AuctionProceeds",
@@ -148,6 +148,24 @@ def test_cbo_package_verifier_rejects_semantic_results_tampering_with_refreshed_
         verify_package(package)
 
 
+def test_cbo_package_verifier_rejects_pending_issuance_that_appears_from_nowhere(tmp_path: Path) -> None:
+    """Pending issuance only grows by decided need and shrinks by what settles; a pending
+    balance that jumps (with the TGA moved to hide it) is fabricated cash."""
+
+    package = _write_valid_package(tmp_path / "pkg")
+    results_path = package / "exports_baseline" / "results_compact.csv"
+    rows = _read_csv(results_path)
+    rows[10]["PendingIssuanceProceeds"] = "5.0"
+    rows[10]["TGA"] = str(float(rows[10]["CBOOperatingCashTarget"]) - 5.0)
+    rows[10]["CBOCashResidual"] = "-5.0"
+    _write_csv(results_path, list(rows[0]), rows)
+    _rewrite_summary(results_path, package / "exports_baseline" / "summary.json")
+    _refresh_manifest_hashes(package)
+
+    with pytest.raises(ValueError, match="pending issuance identity"):
+        verify_package(package)
+
+
 def test_cbo_package_verifier_rejects_pending_cash_at_a_fiscal_year_end(tmp_path: Path) -> None:
     """Fiscal-year-end stocks are what scenarios compare; pending cash there must be zero."""
 
@@ -155,9 +173,13 @@ def test_cbo_package_verifier_rejects_pending_cash_at_a_fiscal_year_end(tmp_path
     results_path = package / "exports_baseline" / "results_compact.csv"
     rows = _read_csv(results_path)
     index = next(i for i, row in enumerate(rows) if row["Date"] == "2027-09-30")
+    # A run that skipped the close: three units stay pending, consistently booked.
     rows[index]["PendingIssuanceProceeds"] = "3.0"
     rows[index]["TGA"] = str(float(rows[index]["CBOOperatingCashTarget"]) - 3.0)
     rows[index]["CBOCashResidual"] = "-3.0"
+    for column in ("AuctionProceeds", "CashFinancingProceeds"):
+        rows[index][column] = "1.0"
+    rows[index + 1]["IssuanceNeedProceeds"] = "1.0"
     _write_csv(results_path, list(rows[0]), rows)
     _rewrite_summary(results_path, package / "exports_baseline" / "summary.json")
     _refresh_manifest_hashes(package)
@@ -1263,7 +1285,7 @@ OPERATING_CASH_TARGET = 981.113
 
 
 def _fiscal_year_end_dates() -> set[str]:
-    days = _settle_all_dates({"settlement_calendar": SETTLEMENT_CALENDAR}, "2026-06-21", "2036-09-30")
+    days = _fiscal_year_close_dates({"settlement_calendar": SETTLEMENT_CALENDAR}, "2026-06-21", "2036-09-30")
     return {day.date().isoformat() for day in days}
 
 
@@ -1273,6 +1295,7 @@ def _result_rows(debt_rows: list[dict[str, str]], *, opening_cb_holdings: float)
 
     start = date(2026, 6, 21)
     fiscal_year_ends = _fiscal_year_end_dates()
+    previous_pending = 0.0
     rows = []
     for index in range(RUN_ROWS):
         current = start + timedelta(days=index)
@@ -1285,6 +1308,11 @@ def _result_rows(debt_rows: list[dict[str, str]], *, opening_cb_holdings: float)
         fed_purchase = fed_end - fed_begin
         residual = 0.0
         pending = 0.0 if index == 0 or current.isoformat() in fiscal_year_ends else 3.0
+        # One unit settles a day; the need refills pending after a close and the close
+        # settles what was pending, so pending(t) = pending(t-1) + need - settled.
+        settled = 0.0 if index == 0 else 1.0 + max(0.0, previous_pending - pending)
+        need = 0.0 if index == 0 else settled + pending - previous_pending
+        previous_pending = pending
         tga = OPERATING_CASH_TARGET - pending
         scenario_debt = debt - 5.0
         row = {
@@ -1298,13 +1326,13 @@ def _result_rows(debt_rows: list[dict[str, str]], *, opening_cb_holdings: float)
             "CBOControlledDebtPostIssuance": scenario_debt,
             "CBOControlledDebtTargetError": 0.0,
             "CBORequiredFaceIssuance": 0.0,
-            "IssuanceNeedProceeds": 0.0 if index == 0 else 1.0,
+            "IssuanceNeedProceeds": need,
             "PendingIssuanceProceeds": pending,
             "EarlySettlementProceeds": 0.0,
-            "FiscalYearEndSettlementProceeds": 0.0,
-            "CashFinancingProceeds": 0.0 if index == 0 else 0.99,
+            "FiscalYearCloseSettlementProceeds": 0.0,
+            "CashFinancingProceeds": settled,
             "NewDebtIssued": 0.0 if index == 0 else 1.0,
-            "AuctionProceeds": 0.0 if index == 0 else 0.99,
+            "AuctionProceeds": settled,
             "IssueDiscountCost_Period": 0.0 if index == 0 else 0.01,
             "InterestPaid_Bonds": 0.0 if index == 0 else 0.2,
             "NonMarketableInterestCapitalized_Period": 0.0,

@@ -443,8 +443,6 @@ def _package(
     manifest: dict[str, Any] = {
         "schema_version": "tdcsim_cbo_scenario_run_manifest_v2",
         "run_id": "test-bounded-run",
-        # The fixture rows hold the CBO debt path exactly, so they are hard-target runs.
-        "funding_closure_mode": "cbo_public_debt_target",
         "status": "complete",
         "verification_grade": "bounded_replay_v1",
         "generated_at_utc": "2026-07-29T00:00:00+00:00",
@@ -1381,3 +1379,16 @@ def test_bounded_replay_uses_sink_and_compares_compact_commitments(
     replay_summary["event_root_sha256"] = "9" * 64
     with pytest.raises(VerificationError, match="event_root_sha256"):
         _verify_bounded_engine_replay(root, manifest, tmp_path / "inputs")
+
+
+def test_main_format_manifest_without_a_funding_mode_reads_as_hard_target(tmp_path: Path) -> None:
+    """Runs written before the operating-cash default record no funding_closure_mode;
+    they ran the hard debt-path closure and must still verify as such. The fixture
+    manifest above is in that format and passes the full bounded verification."""
+
+    from tdcsim_cbo.verifier import _manifest_funding_closure_mode
+
+    _root, manifest, _results, _rows = _package(tmp_path)
+    assert "funding_closure_mode" not in manifest
+    assert "funding_closure_mode" not in manifest["boundary_checks"]
+    assert _manifest_funding_closure_mode(manifest) == "cbo_public_debt_target"
