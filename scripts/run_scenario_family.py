@@ -24,8 +24,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from run_open04_reproduction import (  # noqa: E402
-    BASELINE_ATTESTATION,
-    BASELINE_PACKAGE,
     _assert_installed_distribution_import,
     _fail,
 )
@@ -75,7 +73,7 @@ def stage_run(args: argparse.Namespace) -> int:
         run_dir.parent.mkdir(parents=True)
         command = [
             sys.executable, "-B", "-m", "tdcsim_cbo.cli", "run",
-            "--baseline", str(BASELINE_PACKAGE), "--attestation", str(BASELINE_ATTESTATION),
+            "--baseline", str(Path(args.baseline).resolve()), "--attestation", str(Path(args.attestation).resolve()),
             "--scenario", str(scenario), "--output-dir", str(run_dir), "--trc-routing", routing,
         ]
         log = (root / role / "run.log").open("ab")
@@ -100,7 +98,7 @@ def stage_verify_one(args: argparse.Namespace) -> int:
     from tdcsim_cbo.verifier import verify_scenario_run
 
     result = verify_scenario_run(
-        args.run_dir, baseline_package=BASELINE_PACKAGE, attestation=BASELINE_ATTESTATION
+        args.run_dir, baseline_package=Path(args.baseline), attestation=Path(args.attestation)
     )
     Path(args.out).write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     return 0 if result.get("status") == "pass" else 1
@@ -118,6 +116,7 @@ def stage_verify(args: argparse.Namespace) -> int:
         command = [
             sys.executable, "-B", str(Path(__file__).resolve()), "verify-one",
             "--run-dir", str(root / role / "run"), "--out", str(out),
+            "--baseline", str(Path(args.baseline).resolve()), "--attestation", str(Path(args.attestation).resolve()),
         ]
         log = (root / role / "verify.log").open("ab")
         processes[role] = (subprocess.Popen(
@@ -197,12 +196,16 @@ def main(argv: list[str] | None = None) -> int:
             stage.add_argument("--trc-routing", required=True)
         if name in {"run", "verify"}:
             stage.add_argument("--roles", help="comma-separated subset of family roles")
+            stage.add_argument("--baseline", required=True, help="baseline package zip the scenarios were written for")
+            stage.add_argument("--attestation", required=True)
         if name == "export":
             stage.add_argument("--out-dir", required=True)
         stage.set_defaults(handler=handler)
     one = sub.add_parser("verify-one")
     one.add_argument("--run-dir", required=True)
     one.add_argument("--out", required=True)
+    one.add_argument("--baseline", required=True)
+    one.add_argument("--attestation", required=True)
     one.set_defaults(handler=stage_verify_one)
     args = parser.parse_args(argv)
     return args.handler(args)

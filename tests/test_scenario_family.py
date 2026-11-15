@@ -245,12 +245,15 @@ def test_runner_gives_each_role_its_own_parent(tmp_path: Path, monkeypatch) -> N
 
     def fake_popen(command, **kwargs):
         launched.append(Path(command[command.index("--output-dir") + 1]))
+        # Roles run against the package the scenarios were written for, not a fixed path.
+        assert command[command.index("--baseline") + 1] == str((tmp_path / "package.zip").resolve())
         return FakeProcess()
 
     monkeypatch.setattr(runner, "_assert_installed_distribution_import", lambda: None)
     monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
     args = argparse.Namespace(family_spec=str(spec), scenario_dir=str(scenario_dir),
-                              output_root=str(tmp_path / "runs"), trc_routing=str(spec), roles=None)
+                              output_root=str(tmp_path / "runs"), trc_routing=str(spec), roles=None,
+                              baseline=str(tmp_path / "package.zip"), attestation=str(tmp_path / "attestation.json"))
     from run_open04_reproduction import ReproductionError
 
     with pytest.raises(ReproductionError, match="missing"):
