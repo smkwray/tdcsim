@@ -506,6 +506,20 @@ def get_payment_date(year, month, day):
         except ValueError:
             raise ValueError(f'Invalid year/month combination for payment date: {year}-{month}')
 
+def coupon_payment_date(maturity_date, year, month):
+    """Return the coupon date in a coupon month, following the maturity date.
+
+    Treasury pays coupons on the maturity date's day of the month, or on the last
+    day of each coupon month when the security matures on a month end. Anchoring on
+    any earlier coupon date instead would put a February 28 or April 30 day into a
+    month-end schedule and pay a regular coupon days before the final one.
+    """
+    maturity_date = pd.Timestamp(maturity_date)
+    if maturity_date.is_month_end:
+        return pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+    return get_payment_date(year, month, maturity_date.day)
+
+
 def get_coupon_dates_in_period(
     issue_date,
     maturity_date,
@@ -539,9 +553,8 @@ def get_coupon_dates_in_period(
         - Coupon dates ON the maturity date are excluded (the maturity handler
           pays the final coupon + principal separately).
         - Coupon dates ON or before the issue date are excluded.
-        - The day-of-month follows FirstInterestPaymentDate when supplied.
-          Otherwise it follows the maturity date's month/day, with fallback to
-          month-end for invalid days (e.g., Feb 29 in non-leap years).
+        - Coupon dates follow the maturity date (see coupon_payment_date);
+          FirstInterestPaymentDate only sets when payments start.
     """
     if pd.isna(issue_date) or pd.isna(maturity_date):
         return []
@@ -556,20 +569,13 @@ def get_coupon_dates_in_period(
         if first_interest_payment_date is not None and not pd.isna(first_interest_payment_date)
         else pd.NaT
     )
-    anchor = first_interest if not pd.isna(first_interest) else maturity_date
-    anchor_month = anchor.month
-    anchor_day = anchor.day
-    coupon_months = set()
-    for i in range(frequency):
-        m = (anchor_month + months_between * i - 1) % 12 + 1
-        coupon_months.add(m)
+    coupon_months = {
+        (maturity_date.month + months_between * i - 1) % 12 + 1 for i in range(frequency)
+    }
     dates_in_period = []
     for year in range(prev_date.year, current_date.year + 1):
         for month in coupon_months:
-            try:
-                pmt_date = get_payment_date(year, month, anchor_day)
-            except ValueError:
-                continue
+            pmt_date = coupon_payment_date(maturity_date, year, month)
             if (
                 pmt_date > issue_date
                 and pmt_date < maturity_date

@@ -2486,13 +2486,17 @@ def _daily_coupon_due_indices(tranches, current_date, frequency):
         else pd.Series(np.nan, index=tranches.index)
     ).fillna(float(frequency)).round().astype(int)
     period_months = (12 / payment_frequency.replace(0, frequency)).round().astype(int)
-    anchor_dates = first_interest.where(first_interest.notna(), maturity_dates)
-    months_between = (current.year - anchor_dates.dt.year) * 12 + (current.month - anchor_dates.dt.month)
-    expected_day = np.minimum(anchor_dates.dt.day.fillna(0).astype(int), current.days_in_month)
+    # Coupon dates follow the maturity date (sim_pricing.coupon_payment_date); the
+    # first interest date only sets when payments start.
+    months_between = (current.year - maturity_dates.dt.year) * 12 + (current.month - maturity_dates.dt.month)
+    expected_day = np.where(
+        maturity_dates.dt.is_month_end.fillna(False),
+        current.days_in_month,
+        np.minimum(maturity_dates.dt.day.fillna(0).astype(int), current.days_in_month),
+    )
     due = (
         issue_dates.notna()
         & maturity_dates.notna()
-        & anchor_dates.notna()
         & (current > issue_dates)
         & (current < maturity_dates)
         & (first_interest.isna() | (current >= first_interest))
