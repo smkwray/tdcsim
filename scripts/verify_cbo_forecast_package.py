@@ -32,6 +32,7 @@ from forecast_input_builder import (  # noqa: E402
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration  # noqa: E402
+from sim_engine import _settle_all_dates  # noqa: E402
 from tips_indexation import (  # noqa: E402
     build_monthly_tips_cpi_path_rows,
     build_tips_real_yield_path_rows,
@@ -52,10 +53,7 @@ REQUIRED_FILES = {
     "forecast_inputs/tdcsim_debt_stock_path.csv",
     "forecast_inputs/tdcsim_primary_deficit_path.csv",
     "forecast_inputs/tdcsim_operating_cash_path.csv",
-    "forecast_inputs/tdcsim_operating_cash_path_constant_nominal.csv",
     "forecast_inputs/tdcsim_cash_reconciliation_residual.csv",
-    "forecast_inputs/tdcsim_cash_reconciliation_residual_constant_real_tga.csv",
-    "forecast_inputs/tdcsim_cash_reconciliation_residual_constant_nominal_tga.csv",
     "forecast_inputs/tdcsim_macro_forecast_path.csv",
     "forecast_inputs/tdcsim_yield_curve_surface.csv",
     "forecast_inputs/tdcsim_frn_rate_path.csv",
@@ -67,19 +65,10 @@ REQUIRED_FILES = {
     "forecast_inputs/tdcsim_holder_profile_assumptions.csv",
     "forecast_inputs/tdcsim_issuance_calibration.json",
     "forecast_inputs/tdcsim_net_interest_bridge.csv",
-    "exports_zero_residual/summary.json",
-    "exports_zero_residual/results_compact.csv",
-    "exports_zero_residual/final_portfolio_active.csv",
-    "exports_zero_residual/maturity_ledger.csv",
-    "exports_constant_real_tga/summary.json",
-    "exports_constant_real_tga/results_compact.csv",
-    "exports_constant_real_tga/final_portfolio_active.csv",
-    "exports_constant_real_tga/maturity_ledger.csv",
-    "exports_constant_nominal_tga/summary.json",
-    "exports_constant_nominal_tga/results_compact.csv",
-    "exports_constant_nominal_tga/final_portfolio_active.csv",
-    "exports_constant_nominal_tga/maturity_ledger.csv",
-    "cash_sensitivity_comparison.csv",
+    "exports_baseline/summary.json",
+    "exports_baseline/results_compact.csv",
+    "exports_baseline/final_portfolio_active.csv",
+    "exports_baseline/maturity_ledger.csv",
     "tdcsim_partial_interest_financing_diagnostic.csv",
     "sources/source_manifest.json",
     "sources/cbo/51118-2026-02-Budget-Projections.xlsx",
@@ -117,13 +106,7 @@ EXPECTED_SOURCE_PACKAGE_FILES = {
 }
 
 APPROVED_OUTPUT_PATHS = {
-    "zero_residual_summary": "exports_zero_residual/summary.json",
-    "constant_real_tga_summary": "exports_constant_real_tga/summary.json",
-    "constant_real_tga_cash_residual_file": "forecast_inputs/tdcsim_cash_reconciliation_residual_constant_real_tga.csv",
-    "constant_nominal_tga_summary": "exports_constant_nominal_tga/summary.json",
-    "constant_nominal_tga_cash_residual_file": "forecast_inputs/tdcsim_cash_reconciliation_residual_constant_nominal_tga.csv",
-    "constant_nominal_tga_operating_cash_file": "forecast_inputs/tdcsim_operating_cash_path_constant_nominal.csv",
-    "cash_sensitivity_comparison": "cash_sensitivity_comparison.csv",
+    "baseline_summary": "exports_baseline/summary.json",
     "partial_interest_financing_diagnostic": "tdcsim_partial_interest_financing_diagnostic.csv",
 }
 
@@ -261,7 +244,7 @@ APPROVED_TOP_LEVEL_MANIFEST_KEYS = {
     "rate_unit_declaration",
     "opening_portfolio_construction",
     "issuance_mix",
-    "negative_issuance_policy",
+    "funding_closure",
     "holder_preferences",
     "fed_holdings_path",
     "tips_forward_paths",
@@ -423,24 +406,9 @@ FORBIDDEN_CLAIM_PHRASES = (
     "complete cbo budgetary net-interest replication",
 )
 
-RUN_DIRS = {
-    "zero_residual": "exports_zero_residual",
-    "constant_real_tga": "exports_constant_real_tga",
-    "constant_nominal_tga": "exports_constant_nominal_tga",
-}
-
-RESULT_INVARIANT_COLUMNS = (
-    "TotalDebt_Agg",
-    "CBOControlledDebtTarget",
-    "CBORequiredFaceIssuance",
-    "NewDebtIssued",
-    "AuctionProceeds",
-    "CBOFedHoldingsTarget",
-    "DebtHeld_Banks",
-    "DebtHeld_CentralBank",
-    "DebtHeld_Foreign",
-    "DebtHeld_DomesticNonBanks",
-)
+# The package's one pass runs the default operating-cash closure on Treasury's calendar.
+RUN_DIRS = {"baseline": "exports_baseline"}
+PACKAGE_CASH_ROLE = "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path"
 
 LOCAL_PATH_PATTERNS = (
     re.compile(r"(?<![\w.:-])/(?:Users|home|Volumes|mnt|var/folders|tmp|private/tmp)/[^\s\"',;)]+"),
@@ -578,8 +546,8 @@ def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:
             raise ValueError(f"missing run summary: {run_id}")
         if int(summary.get("rows", -1)) != 3755:
             raise ValueError(f"{run_id} rows must be 3755")
-        if abs(float(summary.get("max_abs_target_error_bil", 1.0))) > 1e-6:
-            raise ValueError(f"{run_id} target error exceeds tolerance")
+        if not isinstance(summary.get("debt_drift_from_cbo_reference_bil"), Mapping):
+            raise ValueError(f"{run_id} summary must record the debt drift from CBO's path")
         if abs(float(summary.get("final_cbo_fed_holdings_error_bil", 1.0))) > 1e-6:
             raise ValueError(f"{run_id} final Fed holdings error exceeds tolerance")
 
@@ -591,12 +559,13 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
         raise ValueError("manifest run_summaries must be populated")
 
     debt_targets = _verify_debt_stock_path(root, manifest)
+    calendar = _read_json(root / "forecast_inputs" / CALIBRATION_FILE)["settlement_calendar"]
     for run_id, run_dir in RUN_DIRS.items():
         results = _read_csv_dicts(root / run_dir / "results_compact.csv")
         summary = _read_json(root / run_dir / "summary.json")
         if not isinstance(summary, Mapping):
             raise ValueError(f"{run_id} summary must be a JSON object")
-        metrics = _compute_run_metrics(run_id, results, debt_targets)
+        metrics = _compute_run_metrics(run_id, results, debt_targets, calendar)
         _verify_run_summary(run_id, summary, metrics)
         manifest_summary = manifest_summaries.get(run_id)
         if not isinstance(manifest_summary, Mapping):
@@ -604,9 +573,7 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
         _verify_run_summary(f"manifest {run_id}", manifest_summary, metrics)
         run_metrics[run_id] = metrics
 
-    _verify_cash_invariance(run_metrics)
-    _verify_cash_sensitivity_comparison(root, run_metrics)
-    _verify_partial_interest_financing_diagnostic(root, run_metrics["zero_residual"])
+    _verify_partial_interest_financing_diagnostic(root, run_metrics["baseline"])
     _verify_opening_portfolio(root, manifest)
     _verify_tips_forward_paths(root, manifest)
     _verify_frn_rate_path(root, manifest)
@@ -648,17 +615,32 @@ def _compute_run_metrics(
     run_id: str,
     rows: list[dict[str, str]],
     debt_targets: Mapping[str, Mapping[str, float]],
+    settlement_calendar: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Recompute an operating-cash pass's claims from its results.
+
+    The TGA plus issuance decided but not yet settled holds the operating-cash target on
+    every day with a need and never falls below it; the TGA never goes negative; every
+    pending balance has settled at each fiscal-year end; and debt drift is the scenario's
+    controlled debt less CBO's path, which is reported, not enforced.
+    """
     if not rows:
         raise ValueError(f"{run_id} results_compact.csv has no data rows")
     required = {
         "Date",
         "TotalDebt_Agg",
         "CBOControlledDebtTarget",
+        "CBOControlledDebtReference",
+        "ScenarioControlledDebt",
+        "DebtDriftFromReference",
         "CBOControlledDebtTargetApplicable",
         "CBOControlledDebtPostIssuance",
         "CBOControlledDebtTargetError",
-        "CBORequiredFaceIssuance",
+        "IssuanceNeedProceeds",
+        "PendingIssuanceProceeds",
+        "EarlySettlementProceeds",
+        "FiscalYearEndSettlementProceeds",
+        "CashFinancingProceeds",
         "NewDebtIssued",
         "AuctionProceeds",
         "IssueDiscountCost_Period",
@@ -710,36 +692,53 @@ def _compute_run_metrics(
         raise ValueError(f"{run_id} results_compact.csv dates are not sorted")
     final = rows[-1]
     cash_residuals = [_float(row, "CBOCashReconciliationResidual") for row in rows]
-    target_errors = []
-    for row_index, row in enumerate(rows, start=1):
-        if _float(row, "CBOControlledDebtTargetApplicable") <= 0.5:
-            continue
+    drifts = []
+    for row_index, row in enumerate(rows[1:], start=2):
         target_row = debt_targets.get(row["Date"])
         if target_row is None:
-            raise ValueError(f"{run_id} row {row_index} has no debt-stock target for {row['Date']}")
-        path_target = target_row["marketable_treasury_public_target_bil"]
-        post_issuance = _float(row, "CBOControlledDebtPostIssuance")
-        recomputed_error = post_issuance - path_target
-        target_errors.append(recomputed_error)
+            raise ValueError(f"{run_id} row {row_index} has no debt-stock reference for {row['Date']}")
+        reference = target_row["marketable_treasury_public_target_bil"]
+        for column in ("CBOControlledDebtTarget", "CBOControlledDebtReference"):
+            _assert_close(f"{run_id} row {row_index} {column} vs debt stock path", _float(row, column), reference, NUMERIC_TOLERANCE)
         _assert_close(
-            f"{run_id} row {row_index} CBOControlledDebtTarget vs debt stock path",
-            _float(row, "CBOControlledDebtTarget"),
-            path_target,
+            f"{run_id} row {row_index} scenario debt vs post-issuance debt",
+            _float(row, "ScenarioControlledDebt"),
+            _float(row, "CBOControlledDebtPostIssuance"),
             NUMERIC_TOLERANCE,
         )
+        drift = _float(row, "ScenarioControlledDebt") - reference
+        _assert_close(f"{run_id} row {row_index} debt drift identity", _float(row, "DebtDriftFromReference"), drift, NUMERIC_TOLERANCE)
+        drifts.append(drift)
+        if _float(row, "CBOControlledDebtTargetApplicable") != 0.0 or abs(_float(row, "CBOControlledDebtTargetError")) > NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} row {row_index} reports a binding CBO debt target")
+        tga = _float(row, "TGA")
+        pending = _float(row, "PendingIssuanceProceeds")
+        excess = tga + pending - _float(row, "CBOOperatingCashTarget")
+        if tga < -NUMERIC_TOLERANCE or pending < -NUMERIC_TOLERANCE or excess < -NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} row {row_index} TGA is negative or below target beyond pending issuance")
+        if _float(row, "IssuanceNeedProceeds") > NUMERIC_TOLERANCE and abs(excess) > NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} row {row_index} TGA plus pending issuance is off target on a need day")
         _assert_close(
-            f"{run_id} row {row_index} reported debt target error",
-            _float(row, "CBOControlledDebtTargetError"),
-            recomputed_error,
+            f"{run_id} row {row_index} all issuance is operating-cash financing",
+            _float(row, "CashFinancingProceeds"),
+            _float(row, "AuctionProceeds"),
             NUMERIC_TOLERANCE,
         )
+    if not drifts:
+        raise ValueError(f"{run_id} has no simulated periods")
+    by_date = {row["Date"]: row for row in rows}
+    fiscal_year_ends = [
+        day.date().isoformat()
+        for day in _settle_all_dates({"settlement_calendar": settlement_calendar}, dates[0], dates[-1])
+    ]
+    for day in fiscal_year_ends:
+        if abs(_float(by_date[day], "PendingIssuanceProceeds")) > NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} has pending issuance at the fiscal-year end {day}")
     fed_errors = [
         _float(row, "CBOFedHoldingsTargetError")
         for row in rows
         if _float(row, "CBOFedHoldingsTargetApplicable") > 0.5
     ]
-    if not target_errors:
-        raise ValueError(f"{run_id} has no applicable controlled-debt target rows")
     if not fed_errors:
         raise ValueError(f"{run_id} has no applicable Fed holdings target rows")
     _verify_fed_stock_bridge(run_id, rows)
@@ -747,13 +746,25 @@ def _compute_run_metrics(
         "rows": len(rows),
         "start_date": dates[0],
         "final_date": dates[-1],
-        "max_abs_target_error_bil": max(abs(value) for value in target_errors),
+        "debt_drift_from_cbo_reference_bil": {
+            "final": drifts[-1],
+            "min": min(drifts),
+            "max": max(drifts),
+            "fiscal_year_end": {
+                str(_fiscal_year(day)): _float(by_date[day], "DebtDriftFromReference") for day in fiscal_year_ends
+            },
+        },
+        "tga_minus_operating_cash_target_at_fiscal_year_end_bil": {
+            str(_fiscal_year(day)): _float(by_date[day], "TGA") - _float(by_date[day], "CBOOperatingCashTarget")
+            for day in fiscal_year_ends
+        },
+        "max_pending_issuance_bil": max(_float(row, "PendingIssuanceProceeds") for row in rows),
+        "early_settlement_days": sum(1 for row in rows if _float(row, "EarlySettlementProceeds") > 1e-9),
         "max_abs_cbo_fed_holdings_error_bil": max(abs(value) for value in fed_errors),
         "final_cbo_fed_holdings_error_bil": _float(final, "CBOFedHoldingsTargetError"),
         "final_cbo_fed_holdings_target_bil": _float(final, "CBOFedHoldingsTarget"),
-        "final_cbo_target_bil": _float(final, "CBOControlledDebtTarget"),
+        "final_cbo_reference_bil": _float(final, "CBOControlledDebtReference"),
         "final_total_debt_bil": _float(final, "TotalDebt_Agg"),
-        "final_cbo_post_issuance_bil": _float(final, "CBOControlledDebtPostIssuance"),
         "final_tga_bil": _float(final, "TGA"),
         "final_operating_cash_target_bil": _float(final, "CBOOperatingCashTarget"),
         "final_cash_residual_bil": _float(final, "CBOCashResidual"),
@@ -762,7 +773,7 @@ def _compute_run_metrics(
         "positive_cash_reconciliation_residual_bil": sum(value for value in cash_residuals if value > 0.0),
         "negative_cash_reconciliation_residual_bil": sum(value for value in cash_residuals if value < 0.0),
         "nonzero_cash_reconciliation_residual_days": sum(1 for value in cash_residuals if abs(value) > 1e-12),
-        "total_required_face_issuance_bil": _sum(rows, "CBORequiredFaceIssuance"),
+        "total_face_issued_bil": _sum(rows, "NewDebtIssued"),
         "total_auction_proceeds_bil": _sum(rows, "AuctionProceeds"),
         "total_issue_discount_cost_bil": _sum(rows, "IssueDiscountCost_Period"),
         "total_primary_deficit_bil": _sum(rows, "PrimaryDeficit"),
@@ -770,24 +781,12 @@ def _compute_run_metrics(
         "tips_inflation_accretion_cumulative_bil": _float(final, "TIPSInflationAccretion_Cumulative"),
         "rows_by_date": rows,
     }
-    if metrics["max_abs_target_error_bil"] > NUMERIC_TOLERANCE:
-        raise ValueError(f"{run_id} recomputed max debt target error exceeds tolerance")
+    if metrics["total_cbo_buyback_face_retired_bil"] > NUMERIC_TOLERANCE:
+        raise ValueError(f"{run_id} retires debt, which the operating-cash closure never does")
     if metrics["max_abs_cbo_fed_holdings_error_bil"] > NUMERIC_TOLERANCE:
         raise ValueError(f"{run_id} recomputed max Fed holdings error exceeds tolerance")
     if abs(metrics["final_cbo_fed_holdings_error_bil"]) > NUMERIC_TOLERANCE:
         raise ValueError(f"{run_id} recomputed final Fed holdings error exceeds tolerance")
-    _assert_close(
-        f"{run_id} final controlled debt target",
-        metrics["final_total_debt_bil"],
-        metrics["final_cbo_target_bil"],
-        NUMERIC_TOLERANCE,
-    )
-    _assert_close(
-        f"{run_id} final post-issuance controlled debt target",
-        metrics["final_cbo_post_issuance_bil"],
-        metrics["final_cbo_target_bil"],
-        NUMERIC_TOLERANCE,
-    )
     return metrics
 
 
@@ -923,12 +922,12 @@ def _verify_run_summary(run_id: str, summary: Mapping[str, Any], metrics: Mappin
         if summary.get(field) != metrics[field]:
             raise ValueError(f"{run_id} {field} does not match parsed results")
     for field in (
-        "max_abs_target_error_bil",
         "max_abs_cbo_fed_holdings_error_bil",
         "final_cbo_fed_holdings_error_bil",
         "final_cbo_fed_holdings_target_bil",
-        "final_cbo_target_bil",
+        "final_cbo_reference_bil",
         "final_total_debt_bil",
+        "max_pending_issuance_bil",
         "final_tga_bil",
         "final_operating_cash_target_bil",
         "final_cash_residual_bil",
@@ -936,7 +935,7 @@ def _verify_run_summary(run_id: str, summary: Mapping[str, Any], metrics: Mappin
         "gross_abs_cash_reconciliation_residual_bil",
         "positive_cash_reconciliation_residual_bil",
         "negative_cash_reconciliation_residual_bil",
-        "total_required_face_issuance_bil",
+        "total_face_issued_bil",
         "total_auction_proceeds_bil",
         "total_issue_discount_cost_bil",
         "total_primary_deficit_bil",
@@ -945,6 +944,10 @@ def _verify_run_summary(run_id: str, summary: Mapping[str, Any], metrics: Mappin
     ):
         if field in summary:
             _assert_close(f"{run_id} {field}", float(summary[field]), float(metrics[field]), NUMERIC_TOLERANCE)
+    for field in ("debt_drift_from_cbo_reference_bil", "tga_minus_operating_cash_target_at_fiscal_year_end_bil"):
+        _assert_nested_close(f"{run_id} {field}", summary.get(field), metrics[field])
+    if int(summary.get("early_settlement_days", -1)) != int(metrics["early_settlement_days"]):
+        raise ValueError(f"{run_id} early settlement day count does not match parsed results")
     if "nonzero_cash_reconciliation_residual_days" in summary:
         if int(summary["nonzero_cash_reconciliation_residual_days"]) != int(
             metrics["nonzero_cash_reconciliation_residual_days"]
@@ -952,74 +955,17 @@ def _verify_run_summary(run_id: str, summary: Mapping[str, Any], metrics: Mappin
             raise ValueError(f"{run_id} nonzero cash residual day count does not match parsed results")
 
 
-def _verify_cash_invariance(run_metrics: Mapping[str, Mapping[str, Any]]) -> None:
-    baseline = run_metrics["zero_residual"]["rows_by_date"]
-    for run_id in ("constant_real_tga", "constant_nominal_tga"):
-        rows = run_metrics[run_id]["rows_by_date"]
-        if len(rows) != len(baseline):
-            raise ValueError(f"{run_id} row count differs from zero_residual")
-        for index, (base_row, row) in enumerate(zip(baseline, rows)):
-            if row["Date"] != base_row["Date"]:
-                raise ValueError(f"{run_id} date sequence differs from zero_residual at row {index + 1}")
-            for column in RESULT_INVARIANT_COLUMNS:
-                _assert_close(
-                    f"{run_id} cash-invariant {column} row {index + 1}",
-                    _float(row, column),
-                    _float(base_row, column),
-                    STRICT_TOLERANCE,
-                )
+def _assert_nested_close(label: str, actual: Any, expected: Any) -> None:
+    if isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping) or set(actual) != set(expected):
+            raise ValueError(f"{label} keys do not match parsed results")
+        for key, value in expected.items():
+            _assert_nested_close(f"{label}.{key}", actual[key], value)
+        return
+    _assert_close(label, float(actual), float(expected), NUMERIC_TOLERANCE)
 
 
-def _verify_cash_sensitivity_comparison(root: Path, run_metrics: Mapping[str, Mapping[str, Any]]) -> None:
-    rows = _read_csv_dicts(root / "cash_sensitivity_comparison.csv")
-    by_run = {row.get("run_id"): row for row in rows}
-    for run_id, metrics in run_metrics.items():
-        row = by_run.get(run_id)
-        if row is None:
-            raise ValueError(f"cash_sensitivity_comparison.csv missing row for {run_id}")
-        if int(float(row.get("rows", "-1"))) != metrics["rows"]:
-            raise ValueError(f"cash sensitivity row count mismatch for {run_id}")
-        _assert_close(
-            f"{run_id} cash sensitivity final_tga_bil",
-            _csv_float(row, "final_tga_bil"),
-            float(metrics["final_tga_bil"]),
-            NUMERIC_TOLERANCE,
-        )
-        _assert_close(
-            f"{run_id} cash sensitivity final_operating_cash_target_bil",
-            _csv_float(row, "final_operating_cash_target_bil"),
-            float(metrics["final_operating_cash_target_bil"]),
-            NUMERIC_TOLERANCE,
-        )
-        _assert_close(
-            f"{run_id} cash sensitivity net_cash_reconciliation_residual_bil",
-            _csv_float(row, "net_cash_reconciliation_residual_bil"),
-            float(metrics["net_cash_reconciliation_residual_bil"]),
-            NUMERIC_TOLERANCE,
-        )
-        _assert_close(
-            f"{run_id} cash sensitivity gross_abs_cash_reconciliation_residual_bil",
-            _csv_float(row, "gross_abs_cash_reconciliation_residual_bil"),
-            float(metrics["gross_abs_cash_reconciliation_residual_bil"]),
-            NUMERIC_TOLERANCE,
-        )
-        for column in RESULT_INVARIANT_COLUMNS:
-            comparison_column = f"max_abs_delta_{column}"
-            if comparison_column in row:
-                expected_delta = _max_abs_delta(
-                    run_metrics["zero_residual"]["rows_by_date"],
-                    metrics["rows_by_date"],
-                    column,
-                )
-                _assert_close(
-                    f"{run_id} cash sensitivity {comparison_column}",
-                    _csv_float(row, comparison_column),
-                    expected_delta,
-                    STRICT_TOLERANCE,
-                )
-
-
-def _verify_partial_interest_financing_diagnostic(root: Path, zero_metrics: Mapping[str, Any]) -> None:
+def _verify_partial_interest_financing_diagnostic(root: Path, run_metrics: Mapping[str, Any]) -> None:
     modeled_path = root / "tdcsim_modeled_net_interest_diagnostic.csv"
     partial_path = root / "tdcsim_partial_interest_financing_diagnostic.csv"
     if modeled_path.exists():
@@ -1055,7 +1001,7 @@ def _verify_partial_interest_financing_diagnostic(root: Path, zero_metrics: Mapp
         raise ValueError("net-interest diagnostic fiscal years are not sorted")
     if fiscal_years[0] != 2026 or fiscal_years[-1] != 2036:
         raise ValueError("net-interest diagnostic must cover fiscal years 2026 through 2036")
-    result_rows = zero_metrics["rows_by_date"]
+    result_rows = run_metrics["rows_by_date"]
     grouped: dict[int, list[dict[str, str]]] = {}
     for result_row in result_rows:
         fiscal_year = _fiscal_year(result_row["Date"])
@@ -1064,7 +1010,7 @@ def _verify_partial_interest_financing_diagnostic(root: Path, zero_metrics: Mapp
         fiscal_year = int(float(row["fiscal_year"]))
         source_rows = grouped.get(fiscal_year)
         if not source_rows:
-            raise ValueError(f"net-interest diagnostic fiscal year has no zero-residual rows: {fiscal_year}")
+            raise ValueError(f"net-interest diagnostic fiscal year has no baseline-pass rows: {fiscal_year}")
         coupon_cash = _sum(source_rows, "InterestPaid_Bonds")
         bill_discount = _sum(source_rows, "IssueDiscountCost_Period")
         tips_indexation = _sum(source_rows, "TIPSInflationAccretion_Period")
@@ -1727,7 +1673,7 @@ def _verify_claim_boundary(manifest: Mapping[str, Any]) -> None:
         "package_role": "cbo_baseline_forecast_evidence_package",
         "net_interest_role": "partial_interest_financing_diagnostic_only",
         "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
-        "cash_role": "operating_cash_sensitivity_only_not_debt_or_issuance_driver",
+        "cash_role": PACKAGE_CASH_ROLE,
     }
     for key, expected_value in expected.items():
         if boundary.get(key) != expected_value:
@@ -2171,10 +2117,6 @@ def _is_blank_or_nan(value: Any) -> bool:
 
 def _sum(rows: list[dict[str, str]], column: str) -> float:
     return sum(_float(row, column) for row in rows)
-
-
-def _max_abs_delta(left_rows: list[dict[str, str]], right_rows: list[dict[str, str]], column: str) -> float:
-    return max(abs(_float(left, column) - _float(right, column)) for left, right in zip(left_rows, right_rows))
 
 
 def _opening_debt_base(row: Mapping[str, str]) -> float:

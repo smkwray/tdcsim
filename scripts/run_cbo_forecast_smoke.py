@@ -67,7 +67,7 @@ from forecast_input_builder import (
 )
 from frn_indexation import build_forward_frn_rate_path_rows, enrich_opening_frn_from_daily_indexes
 from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration, engine_rule_profile
-from sim_engine import run_simulation
+from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _settle_all_dates, run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
@@ -120,6 +120,9 @@ SOURCE_PACKAGE_INPUTS = {
 }
 
 SCENARIO_ID = "cbo_full_horizon_local_smoke_3m"
+BASELINE_RUN_ID = "baseline"
+BASELINE_EXPORT_DIR = "exports_baseline"
+PACKAGE_CASH_ROLE = "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path"
 SIMULATION_START_DATE = "2026-06-21"
 SIMULATION_END_DATE = "2036-09-30"
 ACTUALS_AVAILABLE_AS_OF = "2026-06-17"
@@ -192,10 +195,18 @@ RESULT_COLUMNS = [
     "Date",
     "TotalDebt_Agg",
     "CBOControlledDebtTarget",
+    "CBOControlledDebtReference",
+    "ScenarioControlledDebt",
+    "DebtDriftFromReference",
     "CBOControlledDebtTargetApplicable",
     "CBOControlledDebtPostIssuance",
     "CBOControlledDebtTargetError",
     "CBORequiredFaceIssuance",
+    "IssuanceNeedProceeds",
+    "PendingIssuanceProceeds",
+    "EarlySettlementProceeds",
+    "FiscalYearEndSettlementProceeds",
+    "CashFinancingProceeds",
     "NewDebtIssued",
     "AuctionProceeds",
     "IssueDiscountCost_Period",
@@ -632,124 +643,42 @@ def _run_package_simulation(params: Mapping[str, Any], *, scenario_name: str) ->
 
 
 def run_smoke(bundle: ForecastBundle) -> dict[str, Any]:
-    """Run zero-residual and constant-real-TGA full-horizon smoke passes."""
+    """Run the package's one full-horizon pass under the default operating-cash closure.
 
-    zero_results, zero_portfolio = _run_package_simulation(bundle.params, scenario_name=bundle.scenario_id)
-    zero_summary = write_run_evidence(
-        zero_results,
-        zero_portfolio,
-        bundle.output_dir / "exports_zero_residual",
+    The pass is the path scenario runs take: issuance keeps the TGA on the operating-cash
+    path and settles on Treasury's calendar, and debt drifts from CBO's path. Its summary
+    records that drift and the TGA against target at each fiscal-year end.
+    """
+
+    results, portfolio = _run_package_simulation(bundle.params, scenario_name=bundle.scenario_id)
+    summary = write_run_evidence(
+        results,
+        portfolio,
+        bundle.output_dir / BASELINE_EXPORT_DIR,
         cash_residual_file=str(bundle.inputs_dir / "tdcsim_cash_reconciliation_residual.csv"),
+        fiscal_year_end_dates=_settle_all_dates(
+            bundle.params["treasury_issuance_profile"], results.index.min(), results.index.max()
+        ),
     )
-
-    constant_residual_rows = derive_constant_real_tga_residual_rows(
-        zero_results,
-        bundle.inputs_dir / "tdcsim_cash_reconciliation_residual.csv",
-    )
-    constant_residual_path = bundle.inputs_dir / "tdcsim_cash_reconciliation_residual_constant_real_tga.csv"
-    write_forecast_rows_csv(constant_residual_path, constant_residual_rows)
-
-    constant_params = copy.deepcopy(bundle.params)
-    constant_params["baseline_input_paths"]["cash_reconciliation_residual_file"] = str(constant_residual_path)
-    constant_results, constant_portfolio = _run_package_simulation(constant_params, scenario_name=bundle.scenario_id)
-    constant_summary = write_run_evidence(
-        constant_results,
-        constant_portfolio,
-        bundle.output_dir / "exports_constant_real_tga",
-        cash_residual_file=str(constant_residual_path),
-        extra={
-            "total_cash_reconciliation_residual_bil": float(
-                constant_results["CBOCashReconciliationResidual"].sum()
-            ),
-            "min_tga_bil": float(constant_results["TGA"].min()),
-            "max_tga_bil": float(constant_results["TGA"].max()),
-            "residual_derivation": "period_flow_derived_from_zero_residual_tga_path_and_cumulative_prior_residuals",
-        },
-    )
-
-    nominal_operating_cash_path = bundle.inputs_dir / "tdcsim_operating_cash_path_constant_nominal.csv"
-    nominal_operating_cash_rows = derive_constant_nominal_operating_cash_rows(
-        bundle.inputs_dir / "tdcsim_operating_cash_path.csv"
-    )
-    write_forecast_rows_csv(nominal_operating_cash_path, nominal_operating_cash_rows)
-    nominal_target_by_period_end = {
-        pd.Timestamp(row["period_end"]): float(row["operating_cash_target_bil"])
-        for row in nominal_operating_cash_rows
-    }
-    nominal_residual_rows = derive_target_tga_residual_rows(
-        zero_results,
-        bundle.inputs_dir / "tdcsim_cash_reconciliation_residual.csv",
-        nominal_target_by_period_end=nominal_target_by_period_end,
-        source_status="derived_constant_nominal_tga_reconciliation_residual_local_smoke",
-    )
-    nominal_residual_path = bundle.inputs_dir / "tdcsim_cash_reconciliation_residual_constant_nominal_tga.csv"
-    write_forecast_rows_csv(nominal_residual_path, nominal_residual_rows)
-    nominal_params = copy.deepcopy(bundle.params)
-    nominal_params["baseline_input_paths"]["operating_cash_path_file"] = str(nominal_operating_cash_path)
-    nominal_params["baseline_input_paths"]["cash_reconciliation_residual_file"] = str(nominal_residual_path)
-    nominal_results, nominal_portfolio = _run_package_simulation(nominal_params, scenario_name=bundle.scenario_id)
-    nominal_summary = write_run_evidence(
-        nominal_results,
-        nominal_portfolio,
-        bundle.output_dir / "exports_constant_nominal_tga",
-        cash_residual_file=str(nominal_residual_path),
-        extra={
-            "total_cash_reconciliation_residual_bil": float(
-                nominal_results["CBOCashReconciliationResidual"].sum()
-            ),
-            "min_tga_bil": float(nominal_results["TGA"].min()),
-            "max_tga_bil": float(nominal_results["TGA"].max()),
-            "operating_cash_path_file": _package_relative_path(bundle.output_dir, nominal_operating_cash_path),
-            "residual_derivation": "period_flow_derived_from_zero_residual_tga_path_and_constant_nominal_tga_target",
-        },
-    )
-
-    comparison = build_cash_sensitivity_comparison(
-        {
-            "zero_residual": zero_results,
-            "constant_real_tga": constant_results,
-            "constant_nominal_tga": nominal_results,
-        }
-    )
-    write_rows_csv_union(bundle.output_dir / "cash_sensitivity_comparison.csv", comparison)
     net_interest_diagnostic = build_modeled_net_interest_diagnostics(
-        zero_results,
+        results,
         bundle.inputs_dir / "tdcsim_cbo_fiscal_baseline.csv",
-        run_id="zero_residual",
+        run_id=BASELINE_RUN_ID,
     )
     write_rows_csv_union(bundle.output_dir / "tdcsim_partial_interest_financing_diagnostic.csv", net_interest_diagnostic)
 
     manifest = dict(bundle.manifest)
     manifest["outputs"] = {
-        "zero_residual_summary": _package_relative_path(
+        "baseline_summary": _package_relative_path(
             bundle.output_dir,
-            bundle.output_dir / "exports_zero_residual" / "summary.json",
-        ),
-        "constant_real_tga_summary": _package_relative_path(
-            bundle.output_dir,
-            bundle.output_dir / "exports_constant_real_tga" / "summary.json",
-        ),
-        "constant_real_tga_cash_residual_file": _package_relative_path(bundle.output_dir, constant_residual_path),
-        "constant_nominal_tga_summary": _package_relative_path(
-            bundle.output_dir,
-            bundle.output_dir / "exports_constant_nominal_tga" / "summary.json",
-        ),
-        "constant_nominal_tga_operating_cash_file": _package_relative_path(bundle.output_dir, nominal_operating_cash_path),
-        "constant_nominal_tga_cash_residual_file": _package_relative_path(bundle.output_dir, nominal_residual_path),
-        "cash_sensitivity_comparison": _package_relative_path(
-            bundle.output_dir,
-            bundle.output_dir / "cash_sensitivity_comparison.csv",
+            bundle.output_dir / BASELINE_EXPORT_DIR / "summary.json",
         ),
         "partial_interest_financing_diagnostic": _package_relative_path(
             bundle.output_dir,
             bundle.output_dir / "tdcsim_partial_interest_financing_diagnostic.csv"
         ),
     }
-    manifest["run_summaries"] = {
-        "zero_residual": zero_summary,
-        "constant_real_tga": constant_summary,
-        "constant_nominal_tga": nominal_summary,
-    }
+    manifest["run_summaries"] = {BASELINE_RUN_ID: summary}
     manifest["artifact_hashes"] = hash_artifacts(bundle.output_dir)
     _write_json(bundle.output_dir / "manifest.json", manifest)
     _write_json(bundle.inputs_dir / "source_contract_smoke.json", manifest)
@@ -1002,11 +931,17 @@ def build_manifest(
             "rule": "bills_fill_toward_outstanding_bill_share_target_remainder_split_by_auction_coupon_shares",
             "nonmarketable": 0.0,
         },
-        "negative_issuance_policy": {
-            "negative_required_issuance_action": "retire_shortest_public_marketable",
-            "cash_treatment": "par_cash_buyback_or_early_retirement_drains_tga",
-            "selection_order": "shortest_public_marketable_maturity_first",
-            "runtime_columns": ["CBOBuybackFaceRetired", "CBOBuybackCashPaid"],
+        "funding_closure": {
+            "mode": CBO_OPERATING_CASH_TARGET_FINANCING_MODE,
+            "issuance_sizing": "proceeds_that_keep_tga_plus_pending_issuance_on_operating_cash_path",
+            "settlement": "treasury_calendar_from_issuance_calibration_all_pending_settles_at_fiscal_year_end",
+            "debt_path_role": "cbo_debt_path_is_a_reference_drift_reported_not_enforced",
+            "runtime_columns": [
+                "DebtDriftFromReference",
+                "PendingIssuanceProceeds",
+                "EarlySettlementProceeds",
+                "FiscalYearEndSettlementProceeds",
+            ],
         },
         "holder_preferences": holder_profile_from_opening_weights(opening_portfolio_metadata["noncb_weights"])[0],
         "fed_holdings_path": {
@@ -1063,7 +998,7 @@ def build_manifest(
             "package_role": "cbo_baseline_forecast_evidence_package",
             "net_interest_role": "partial_interest_financing_diagnostic_only",
             "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
-            "cash_role": "operating_cash_sensitivity_only_not_debt_or_issuance_driver",
+            "cash_role": PACKAGE_CASH_ROLE,
             "excluded_claims": sorted(
                 [
                     "does_not_claim_exact_historical_replay",
@@ -1149,83 +1084,6 @@ def validate_yield_surface_rate_units(rows: Sequence[Mapping[str, Any]]) -> None
             raise ValueError("yield surface nominal_rate_decimal is outside plausible decimal bounds")
 
 
-def derive_constant_real_tga_residual_rows(
-    zero_results: pd.DataFrame,
-    zero_residual_path: str | Path,
-) -> list[dict[str, Any]]:
-    target_by_period_end = {
-        pd.Timestamp(index): float(row["CBOOperatingCashTarget"])
-        for index, row in zero_results.iterrows()
-    }
-    return derive_target_tga_residual_rows(
-        zero_results,
-        zero_residual_path,
-        nominal_target_by_period_end=target_by_period_end,
-        source_status="derived_constant_real_tga_reconciliation_residual_local_smoke",
-    )
-
-
-def derive_target_tga_residual_rows(
-    zero_results: pd.DataFrame,
-    zero_residual_path: str | Path,
-    *,
-    nominal_target_by_period_end: Mapping[pd.Timestamp, float],
-    source_status: str,
-) -> list[dict[str, Any]]:
-    residual_rows = pd.read_csv(zero_residual_path).to_dict("records")
-    cumulative_residual = 0.0
-    for row in residual_rows:
-        period_end = pd.Timestamp(row["period_end"])
-        target = float(nominal_target_by_period_end[period_end])
-        zero_tga = float(zero_results.loc[period_end, "TGA"])
-        period_residual = target - zero_tga - cumulative_residual
-        row["cash_reconciliation_residual_bil"] = period_residual
-        row["source_status"] = source_status
-        cumulative_residual += period_residual
-    return residual_rows
-
-
-def derive_constant_nominal_operating_cash_rows(path: str | Path) -> list[dict[str, Any]]:
-    rows = pd.read_csv(path).to_dict("records")
-    if not rows:
-        raise ValueError("operating cash path is empty")
-    base_balance = float(rows[0]["base_balance_bil"])
-    for row in rows:
-        row["operating_cash_target_bil"] = base_balance
-        row["tga_target_bil"] = base_balance
-        row["ttl_target_bil"] = 0.0
-        row["other_operating_cash_target_bil"] = 0.0
-        row["construction_mode"] = "constant_nominal"
-        row["inflation_scalar"] = 0.0
-        row["source_status"] = "dts_tga_opening_balance_constant_nominal_sensitivity"
-    return rows
-
-
-def build_cash_sensitivity_comparison(results_by_name: Mapping[str, pd.DataFrame]) -> list[dict[str, Any]]:
-    baseline = results_by_name["zero_residual"]
-    rows = []
-    invariant_columns = [
-        "CBOControlledDebtTarget",
-        "CBORequiredFaceIssuance",
-        "NewDebtIssued",
-        "AuctionProceeds",
-        "DebtHeld_Banks",
-        "DebtHeld_CentralBank",
-        "DebtHeld_Foreign",
-        "DebtHeld_DomesticNonBanks",
-    ]
-    for name, results in results_by_name.items():
-        row: dict[str, Any] = {"run_id": name, "rows": int(len(results))}
-        for column in invariant_columns:
-            row[f"max_abs_delta_{column}"] = float((results[column] - baseline[column]).abs().max())
-        row["final_tga_bil"] = float(results.iloc[-1]["TGA"])
-        row["final_operating_cash_target_bil"] = float(results.iloc[-1]["CBOOperatingCashTarget"])
-        row["net_cash_reconciliation_residual_bil"] = float(results["CBOCashReconciliationResidual"].sum())
-        row["gross_abs_cash_reconciliation_residual_bil"] = float(results["CBOCashReconciliationResidual"].abs().sum())
-        rows.append(row)
-    return rows
-
-
 def build_modeled_net_interest_diagnostics(
     results: pd.DataFrame,
     fiscal_baseline_path: str | Path,
@@ -1298,7 +1156,7 @@ def write_run_evidence(
     outdir: str | Path,
     *,
     cash_residual_file: str,
-    extra: Mapping[str, Any] | None = None,
+    fiscal_year_end_dates: Sequence[pd.Timestamp],
 ) -> dict[str, Any]:
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1326,13 +1184,18 @@ def write_run_evidence(
         "start_date": str(results.index.min().date()),
         "final_date": str(results.index.max().date()),
         "final_total_debt_bil": float(results.iloc[-1]["TotalDebt_Agg"]),
-        "final_cbo_target_bil": float(results.iloc[-1]["CBOControlledDebtTarget"]),
-        "max_abs_target_error_bil": float(results["CBOControlledDebtTargetError"].abs().max()),
-        "total_required_face_issuance_bil": float(results["CBORequiredFaceIssuance"].sum()),
+        "final_cbo_reference_bil": float(results.iloc[-1]["CBOControlledDebtReference"]),
+        "debt_drift_from_cbo_reference_bil": _debt_drift_summary(results, fiscal_year_end_dates),
+        "tga_minus_operating_cash_target_at_fiscal_year_end_bil": {
+            str(_fiscal_year_of(day)): float(
+                results.loc[day, "TGA"] - results.loc[day, "CBOOperatingCashTarget"]
+            )
+            for day in fiscal_year_end_dates
+        },
+        "max_pending_issuance_bil": float(results["PendingIssuanceProceeds"].max()),
+        "early_settlement_days": int((results["EarlySettlementProceeds"] > 1e-9).sum()),
+        "total_face_issued_bil": float(results["NewDebtIssued"].sum()),
         "total_auction_proceeds_bil": float(results["AuctionProceeds"].sum()),
-        "weighted_proceeds_to_face": float(
-            results["AuctionProceeds"].sum() / results["CBORequiredFaceIssuance"].sum()
-        ),
         "total_issue_discount_cost_bil": float(results["IssueDiscountCost_Period"].sum()),
         "total_primary_deficit_bil": float(results["PrimaryDeficit"].sum()),
         "final_tga_bil": float(results.iloc[-1]["TGA"]),
@@ -1395,10 +1258,28 @@ def write_run_evidence(
         "cash_residual_file": _package_relative_path(out.parent, cash_residual_file),
         "claim_boundary": CLAIM_BOUNDARY,
     }
-    if extra:
-        summary.update(dict(extra))
     _write_json(out / "summary.json", summary)
     return summary
+
+
+def _fiscal_year_of(day: Any) -> int:
+    day = pd.Timestamp(day)
+    return day.year + 1 if day.month >= 10 else day.year
+
+
+def _debt_drift_summary(results: pd.DataFrame, fiscal_year_end_dates: Sequence[pd.Timestamp]) -> dict[str, Any]:
+    """Debt drift from CBO's path: final, extremes and at each fiscal-year end."""
+
+    running = results.iloc[1:]["DebtDriftFromReference"]
+    return {
+        "final": float(running.iloc[-1]),
+        "min": float(running.min()),
+        "max": float(running.max()),
+        "fiscal_year_end": {
+            str(_fiscal_year_of(day)): float(results.loc[day, "DebtDriftFromReference"])
+            for day in fiscal_year_end_dates
+        },
+    }
 
 
 def load_opening_portfolio(
@@ -1875,10 +1756,11 @@ def build_engine_params(
         "initial_bonds_df": initial_portfolio,
         "events": [],
         "funding_rule": {
-            "mode": "cbo_public_debt_target",
+            "mode": CBO_OPERATING_CASH_TARGET_FINANCING_MODE,
             "target_enforcement": "every_period",
-            "negative_required_issuance_action": "retire_shortest_public_marketable",
+            "negative_required_issuance_action": "error",
             "target_tolerance_bil": 0.000001,
+            "validation_floor_bil": -0.000001,
         },
         "baseline_input_paths": dict(baseline_input_paths),
         "data_vintage": {"actuals_available_as_of": ACTUALS_AVAILABLE_AS_OF, "allow_lookahead": False},

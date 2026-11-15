@@ -25,7 +25,8 @@ from forecast_input_builder import (
     parse_cbo_economic_quarterly_source_contract,
 )
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
-from issuance_calibration import build_issuance_calibration
+from issuance_calibration import SETTLEMENT_CALENDAR, build_issuance_calibration
+from sim_engine import _settle_all_dates
 from test_issuance_rule import _fixture_auctions, _write_auctions
 
 
@@ -50,10 +51,18 @@ RESULT_COLUMNS = [
     "Date",
     "TotalDebt_Agg",
     "CBOControlledDebtTarget",
+    "CBOControlledDebtReference",
+    "ScenarioControlledDebt",
+    "DebtDriftFromReference",
     "CBOControlledDebtTargetApplicable",
     "CBOControlledDebtPostIssuance",
     "CBOControlledDebtTargetError",
     "CBORequiredFaceIssuance",
+    "IssuanceNeedProceeds",
+    "PendingIssuanceProceeds",
+    "EarlySettlementProceeds",
+    "FiscalYearEndSettlementProceeds",
+    "CashFinancingProceeds",
     "NewDebtIssued",
     "AuctionProceeds",
     "IssueDiscountCost_Period",
@@ -126,21 +135,34 @@ def test_cbo_package_verifier_checks_hashes_required_files_semantics_and_zip_unp
 
 def test_cbo_package_verifier_rejects_semantic_results_tampering_with_refreshed_hashes(tmp_path: Path) -> None:
     package = _write_valid_package(tmp_path / "pkg")
+    # A drift that does not equal scenario debt less CBO's path is a fabricated diagnostic.
     _mutate_csv_cell(
-        package / "exports_zero_residual" / "results_compact.csv",
+        package / "exports_baseline" / "results_compact.csv",
         row_index=1,
-        column="CBOControlledDebtPostIssuance",
-        value="999.0",
-    )
-    _mutate_csv_cell(
-        package / "exports_zero_residual" / "results_compact.csv",
-        row_index=1,
-        column="CBOControlledDebtTargetError",
+        column="DebtDriftFromReference",
         value="-2.0",
     )
     _refresh_manifest_hashes(package)
 
-    with pytest.raises(ValueError, match="reported debt target error|recomputed max debt target error"):
+    with pytest.raises(ValueError, match="debt drift identity"):
+        verify_package(package)
+
+
+def test_cbo_package_verifier_rejects_pending_cash_at_a_fiscal_year_end(tmp_path: Path) -> None:
+    """Fiscal-year-end stocks are what scenarios compare; pending cash there must be zero."""
+
+    package = _write_valid_package(tmp_path / "pkg")
+    results_path = package / "exports_baseline" / "results_compact.csv"
+    rows = _read_csv(results_path)
+    index = next(i for i, row in enumerate(rows) if row["Date"] == "2027-09-30")
+    rows[index]["PendingIssuanceProceeds"] = "3.0"
+    rows[index]["TGA"] = str(float(rows[index]["CBOOperatingCashTarget"]) - 3.0)
+    rows[index]["CBOCashResidual"] = "-3.0"
+    _write_csv(results_path, list(rows[0]), rows)
+    _rewrite_summary(results_path, package / "exports_baseline" / "summary.json")
+    _refresh_manifest_hashes(package)
+
+    with pytest.raises(ValueError, match="pending issuance at the fiscal-year end"):
         verify_package(package)
 
 
@@ -169,7 +191,7 @@ def test_cbo_package_verifier_rejects_source_tampering_with_refreshed_manifests_
 def test_cbo_package_verifier_rejects_fed_bridge_tampering_with_refreshed_hashes(tmp_path: Path) -> None:
     package = _write_valid_package(tmp_path / "pkg")
     _mutate_csv_cell(
-        package / "exports_zero_residual" / "results_compact.csv",
+        package / "exports_baseline" / "results_compact.csv",
         row_index=1,
         column="CBOFedSecondaryPurchaseFace",
         value="999.0",
@@ -183,7 +205,7 @@ def test_cbo_package_verifier_rejects_fed_bridge_tampering_with_refreshed_hashes
 def test_cbo_package_verifier_rejects_remittance_overclaim_with_refreshed_hashes(tmp_path: Path) -> None:
     package = _write_valid_package(tmp_path / "pkg")
     _mutate_csv_cell(
-        package / "exports_zero_residual" / "results_compact.csv",
+        package / "exports_baseline" / "results_compact.csv",
         row_index=1,
         column="CB_Remittance",
         value="1.0",
@@ -205,15 +227,10 @@ def test_cbo_package_verifier_rejects_deprecated_net_interest_file_with_refreshe
 
 def test_cbo_package_verifier_rejects_coordinated_debt_target_path_mutation(tmp_path: Path) -> None:
     package = _write_valid_package(tmp_path / "pkg")
-    for run_dir in ("exports_zero_residual", "exports_constant_real_tga", "exports_constant_nominal_tga"):
+    for run_dir in ("exports_baseline",):
         results_path = package / run_dir / "results_compact.csv"
-        _mutate_csv_cell(results_path, row_index=RUN_ROWS - 1, column="CBOControlledDebtTarget", value="999999.0")
-        _mutate_csv_cell(
-            results_path,
-            row_index=RUN_ROWS - 1,
-            column="CBOControlledDebtPostIssuance",
-            value="999999.0",
-        )
+        for column in ("CBOControlledDebtTarget", "CBOControlledDebtReference"):
+            _mutate_csv_cell(results_path, row_index=RUN_ROWS - 1, column=column, value="999999.0")
         _rewrite_summary(results_path, package / run_dir / "summary.json")
     debt_path = package / "forecast_inputs" / "tdcsim_debt_stock_path.csv"
     _mutate_csv_cell(
@@ -377,10 +394,10 @@ def test_cbo_package_verifier_rejects_coherent_nominal_and_tips_yield_mutation(t
 
 def test_cbo_package_verifier_rejects_rehashed_interior_debt_path_and_results_mutation(tmp_path: Path) -> None:
     package = _write_valid_package(tmp_path / "pkg")
-    for run_dir in ("exports_zero_residual", "exports_constant_real_tga", "exports_constant_nominal_tga"):
+    for run_dir in ("exports_baseline",):
         results_path = package / run_dir / "results_compact.csv"
-        _mutate_csv_cell(results_path, row_index=100, column="CBOControlledDebtTarget", value="999999.0")
-        _mutate_csv_cell(results_path, row_index=100, column="CBOControlledDebtPostIssuance", value="999999.0")
+        for column in ("CBOControlledDebtTarget", "CBOControlledDebtReference"):
+            _mutate_csv_cell(results_path, row_index=100, column=column, value="999999.0")
         _rewrite_summary(results_path, package / run_dir / "summary.json")
     debt_path = package / "forecast_inputs" / "tdcsim_debt_stock_path.csv"
     _mutate_csv_cell(
@@ -559,29 +576,24 @@ def _write_valid_package(package: Path) -> Path:
     package.mkdir(parents=True)
     lock_path = package / "requirements.lock.txt"
     lock_path.write_text("locked test dependencies\n", encoding="utf-8")
-    runs = {
-        "zero_residual": ("exports_zero_residual", 783.093, 1239.186, 0.0),
-        "constant_real_tga": ("exports_constant_real_tga", 1239.186, 1239.186, 456.0),
-        "constant_nominal_tga": ("exports_constant_nominal_tga", 981.113, 981.113, 198.0),
-    }
+    runs = {"baseline": "exports_baseline"}
 
     _write_opening_files(package)
     _write_auxiliary_required_files(package)
     debt_rows = _read_csv(package / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
     run_summaries = {}
     run_rows = {}
-    for run_id, (run_dir, final_tga, final_cash_target, residual_total) in runs.items():
-        rows = _result_rows(final_tga, final_cash_target, residual_total, debt_rows)
+    for run_id, run_dir in runs.items():
+        rows = _result_rows(debt_rows)
         run_rows[run_id] = rows
         _write_csv(package / run_dir / "results_compact.csv", RESULT_COLUMNS, rows)
         summary = _summary(rows)
         run_summaries[run_id] = summary
         _write_json(package / run_dir / "summary.json", summary)
 
-    _write_csv(package / "exports_zero_residual" / "final_portfolio_active.csv", ["col"], [{"col": "value"}])
-    _write_csv(package / "exports_zero_residual" / "maturity_ledger.csv", ["col"], [{"col": "value"}])
-    _write_cash_sensitivity(package, run_rows)
-    _write_net_interest_diagnostic(package, run_rows["zero_residual"])
+    _write_csv(package / "exports_baseline" / "final_portfolio_active.csv", ["col"], [{"col": "value"}])
+    _write_csv(package / "exports_baseline" / "maturity_ledger.csv", ["col"], [{"col": "value"}])
+    _write_net_interest_diagnostic(package, run_rows["baseline"])
     source_package = _write_source_package(package)
     calibration = build_issuance_calibration(
         package / "sources" / "fiscaldata" / "auctions_query.csv",
@@ -639,13 +651,7 @@ def _write_valid_package(package: Path) -> Path:
         "claim_boundary": _claim_boundary(),
         "trust_anchor": _trust_anchor(lock_path),
         "outputs": {
-            "zero_residual_summary": "exports_zero_residual/summary.json",
-            "constant_real_tga_summary": "exports_constant_real_tga/summary.json",
-            "constant_real_tga_cash_residual_file": "forecast_inputs/tdcsim_cash_reconciliation_residual_constant_real_tga.csv",
-            "constant_nominal_tga_summary": "exports_constant_nominal_tga/summary.json",
-            "constant_nominal_tga_cash_residual_file": "forecast_inputs/tdcsim_cash_reconciliation_residual_constant_nominal_tga.csv",
-            "constant_nominal_tga_operating_cash_file": "forecast_inputs/tdcsim_operating_cash_path_constant_nominal.csv",
-            "cash_sensitivity_comparison": "cash_sensitivity_comparison.csv",
+            "baseline_summary": "exports_baseline/summary.json",
             "partial_interest_financing_diagnostic": "tdcsim_partial_interest_financing_diagnostic.csv",
         },
         "artifacts": {
@@ -680,7 +686,7 @@ def _claim_boundary() -> dict:
         "package_role": "cbo_baseline_forecast_evidence_package",
         "net_interest_role": "partial_interest_financing_diagnostic_only",
         "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
-        "cash_role": "operating_cash_sensitivity_only_not_debt_or_issuance_driver",
+        "cash_role": "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path",
         "excluded_claims": [
             "does_not_claim_exact_historical_replay",
             "does_not_claim_full_soma_transaction_replay",
@@ -1232,14 +1238,20 @@ def _frozen_treasury_observations() -> dict:
     }
 
 
-def _result_rows(
-    final_tga: float,
-    final_cash_target: float,
-    residual_total: float,
-    debt_rows: list[dict[str, str]],
-) -> list[dict[str, str]]:
+OPERATING_CASH_TARGET = 981.113
+
+
+def _fiscal_year_end_dates() -> set[str]:
+    days = _settle_all_dates({"settlement_calendar": SETTLEMENT_CALENDAR}, "2026-06-21", "2036-09-30")
+    return {day.date().isoformat() for day in days}
+
+
+def _result_rows(debt_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """An operating-cash pass: one unit of need a day, settling with three units pending
+    except at fiscal-year ends, and debt five below CBO's path."""
+
     start = date(2026, 6, 21)
-    residual_step = residual_total / (RUN_ROWS - 1) if residual_total else 0.0
+    fiscal_year_ends = _fiscal_year_end_dates()
     rows = []
     for index in range(RUN_ROWS):
         current = start + timedelta(days=index)
@@ -1248,24 +1260,35 @@ def _result_rows(
         fed_begin = 0.0 if index <= 1 else 100.0 + index - 1
         fed_end = fed_target
         fed_purchase = fed_end - fed_begin
-        residual = 0.0 if index == 0 else residual_step
+        residual = 0.0
+        pending = 0.0 if index == 0 or current.isoformat() in fiscal_year_ends else 3.0
+        tga = OPERATING_CASH_TARGET - pending
+        scenario_debt = debt - 5.0
         row = {
             "Date": current.isoformat(),
-            "TotalDebt_Agg": debt,
+            "TotalDebt_Agg": scenario_debt,
             "CBOControlledDebtTarget": debt,
-            "CBOControlledDebtTargetApplicable": 0.0 if index == 0 else 1.0,
-            "CBOControlledDebtPostIssuance": debt,
+            "CBOControlledDebtReference": debt,
+            "ScenarioControlledDebt": scenario_debt,
+            "DebtDriftFromReference": scenario_debt - debt,
+            "CBOControlledDebtTargetApplicable": 0.0,
+            "CBOControlledDebtPostIssuance": scenario_debt,
             "CBOControlledDebtTargetError": 0.0,
-            "CBORequiredFaceIssuance": 0.0 if index == 0 else 1.0,
+            "CBORequiredFaceIssuance": 0.0,
+            "IssuanceNeedProceeds": 0.0 if index == 0 else 1.0,
+            "PendingIssuanceProceeds": pending,
+            "EarlySettlementProceeds": 0.0,
+            "FiscalYearEndSettlementProceeds": 0.0,
+            "CashFinancingProceeds": 0.0 if index == 0 else 0.99,
             "NewDebtIssued": 0.0 if index == 0 else 1.0,
             "AuctionProceeds": 0.0 if index == 0 else 0.99,
             "IssueDiscountCost_Period": 0.0 if index == 0 else 0.01,
             "InterestPaid_Bonds": 0.0 if index == 0 else 0.2,
             "NonMarketableInterestCapitalized_Period": 0.0,
             "PrimaryDeficit": 0.0 if index == 0 else 0.5,
-            "TGA": final_tga,
-            "CBOOperatingCashTarget": final_cash_target,
-            "CBOCashResidual": final_tga - final_cash_target,
+            "TGA": tga,
+            "CBOOperatingCashTarget": OPERATING_CASH_TARGET,
+            "CBOCashResidual": tga - OPERATING_CASH_TARGET,
             "CBOCashReconciliationResidual": residual,
             "CBORemittanceCashEffect": 0.0,
             "CBOFedHoldingsTarget": fed_target,
@@ -1332,11 +1355,27 @@ def _summary(rows: list[dict[str, str]]) -> dict:
         "rows": len(rows),
         "start_date": rows[0]["Date"],
         "final_date": final["Date"],
-        "max_abs_target_error_bil": max(abs(float(row["CBOControlledDebtTargetError"])) for row in rows),
+        "debt_drift_from_cbo_reference_bil": {
+            "final": float(final["DebtDriftFromReference"]),
+            "min": min(float(row["DebtDriftFromReference"]) for row in rows[1:]),
+            "max": max(float(row["DebtDriftFromReference"]) for row in rows[1:]),
+            "fiscal_year_end": {
+                str(int(row["Date"][:4])): float(row["DebtDriftFromReference"])
+                for row in rows
+                if row["Date"] in _fiscal_year_end_dates()
+            },
+        },
+        "tga_minus_operating_cash_target_at_fiscal_year_end_bil": {
+            str(int(row["Date"][:4])): float(row["TGA"]) - float(row["CBOOperatingCashTarget"])
+            for row in rows
+            if row["Date"] in _fiscal_year_end_dates()
+        },
+        "max_pending_issuance_bil": max(float(row["PendingIssuanceProceeds"]) for row in rows),
+        "early_settlement_days": sum(1 for row in rows if float(row["EarlySettlementProceeds"]) > 1e-9),
         "max_abs_cbo_fed_holdings_error_bil": max(abs(float(row["CBOFedHoldingsTargetError"])) for row in rows),
         "final_cbo_fed_holdings_error_bil": float(final["CBOFedHoldingsTargetError"]),
         "final_cbo_fed_holdings_target_bil": float(final["CBOFedHoldingsTarget"]),
-        "final_cbo_target_bil": float(final["CBOControlledDebtTarget"]),
+        "final_cbo_reference_bil": float(final["CBOControlledDebtReference"]),
         "final_total_debt_bil": float(final["TotalDebt_Agg"]),
         "final_tga_bil": float(final["TGA"]),
         "final_operating_cash_target_bil": float(final["CBOOperatingCashTarget"]),
@@ -1346,7 +1385,7 @@ def _summary(rows: list[dict[str, str]]) -> dict:
         "positive_cash_reconciliation_residual_bil": sum(value for value in residuals if value > 0.0),
         "negative_cash_reconciliation_residual_bil": sum(value for value in residuals if value < 0.0),
         "nonzero_cash_reconciliation_residual_days": sum(1 for value in residuals if abs(value) > 1e-12),
-        "total_required_face_issuance_bil": sum(float(row["CBORequiredFaceIssuance"]) for row in rows),
+        "total_face_issued_bil": sum(float(row["NewDebtIssued"]) for row in rows),
         "total_auction_proceeds_bil": sum(float(row["AuctionProceeds"]) for row in rows),
         "total_issue_discount_cost_bil": sum(float(row["IssueDiscountCost_Period"]) for row in rows),
         "total_primary_deficit_bil": sum(float(row["PrimaryDeficit"]) for row in rows),
@@ -1436,47 +1475,6 @@ def _opening_manifest(opening_path: Path) -> dict:
     }
 
 
-def _write_cash_sensitivity(package: Path, run_rows: dict[str, list[dict[str, str]]]) -> None:
-    columns = [
-        "run_id",
-        "rows",
-        "max_abs_delta_CBOControlledDebtTarget",
-        "max_abs_delta_CBORequiredFaceIssuance",
-        "max_abs_delta_NewDebtIssued",
-        "max_abs_delta_AuctionProceeds",
-        "max_abs_delta_DebtHeld_Banks",
-        "max_abs_delta_DebtHeld_CentralBank",
-        "max_abs_delta_DebtHeld_Foreign",
-        "max_abs_delta_DebtHeld_DomesticNonBanks",
-        "final_tga_bil",
-        "final_operating_cash_target_bil",
-        "net_cash_reconciliation_residual_bil",
-        "gross_abs_cash_reconciliation_residual_bil",
-    ]
-    rows = []
-    for run_id, results in run_rows.items():
-        residuals = [float(row["CBOCashReconciliationResidual"]) for row in results]
-        rows.append(
-            {
-                "run_id": run_id,
-                "rows": str(len(results)),
-                "max_abs_delta_CBOControlledDebtTarget": "0.0",
-                "max_abs_delta_CBORequiredFaceIssuance": "0.0",
-                "max_abs_delta_NewDebtIssued": "0.0",
-                "max_abs_delta_AuctionProceeds": "0.0",
-                "max_abs_delta_DebtHeld_Banks": "0.0",
-                "max_abs_delta_DebtHeld_CentralBank": "0.0",
-                "max_abs_delta_DebtHeld_Foreign": "0.0",
-                "max_abs_delta_DebtHeld_DomesticNonBanks": "0.0",
-                "final_tga_bil": results[-1]["TGA"],
-                "final_operating_cash_target_bil": results[-1]["CBOOperatingCashTarget"],
-                "net_cash_reconciliation_residual_bil": str(sum(residuals)),
-                "gross_abs_cash_reconciliation_residual_bil": str(sum(abs(value) for value in residuals)),
-            }
-        )
-    _write_csv(package / "cash_sensitivity_comparison.csv", columns, rows)
-
-
 def _write_net_interest_diagnostic(package: Path, rows: list[dict[str, str]]) -> None:
     grouped: dict[int, list[dict[str, str]]] = {}
     for row in rows:
@@ -1495,7 +1493,7 @@ def _write_net_interest_diagnostic(package: Path, rows: list[dict[str, str]]) ->
         cbo = modeled + 1.0
         output.append(
             {
-                "run_id": "zero_residual",
+                "run_id": "baseline",
                 "fiscal_year": str(fiscal_year),
                 "cbo_net_interest_bil": str(cbo),
                 "residual_bil": "1.0",

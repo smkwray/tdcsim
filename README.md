@@ -64,6 +64,12 @@ tdcsim-cbo run --help
 tdcsim-cbo verify --help
 ```
 
+`scripts/run_cbo_forecast_smoke.py` builds the baseline package from CBO's
+workbooks and Treasury data, and runs one full-horizon baseline pass under these
+rules. The pass summary records the debt's drift from CBO's path (final, minimum,
+maximum and at each fiscal-year end); `scripts/verify_cbo_forecast_package.py`
+recomputes it from the pass's results.
+
 The [downstream quick start](examples/cbo_downstream_quickstart.md) covers package
 inputs, example scenarios, output files and scenario controls. Each step:
 
@@ -95,7 +101,9 @@ inputs, example scenarios, output files and scenario controls. Each step:
   issuance tops it up; when receipts lift it above, nothing is issued until
   spending draws it back. Between settlement dates the TGA runs below the path by
   the issuance decided but not yet settled; if it would otherwise go negative,
-  pending bills (then, if needed, pending notes and bonds) settle early that day. A scenario that costs more therefore ends with more debt
+  pending bills (then, if needed, pending notes and bonds) settle early that day.
+  Everything pending settles on the last business day of each fiscal year, so the
+  TGA is on the path at every fiscal-year end. A scenario that costs more therefore ends with more debt
   and the same cash. CBO's debt path is reported alongside, with the scenario's
   drift from it. Every cash flow is booked on both sides, and a run fails if the
   TGA goes negative. A scenario can instead hold debt exactly on CBO's path

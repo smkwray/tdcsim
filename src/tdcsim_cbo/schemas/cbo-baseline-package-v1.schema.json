@@ -291,7 +291,7 @@
           "const": "tdcsim_assumption_not_cbo_prescription"
         },
         "cash_role": {
-          "const": "operating_cash_sensitivity_not_debt_or_issuance_driver"
+          "const": "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path"
         },
         "fed_holdings_role": {
           "const": "beneficial_holder_with_model_dirty_value_settlement"
