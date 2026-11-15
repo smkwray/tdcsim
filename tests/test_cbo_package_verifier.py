@@ -583,8 +583,11 @@ def _write_valid_package(package: Path) -> Path:
     debt_rows = _read_csv(package / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
     run_summaries = {}
     run_rows = {}
+    opening_cb_holdings = _opening_manifest(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")[
+        "holder_totals_bil"
+    ]["CB"]
     for run_id, run_dir in runs.items():
-        rows = _result_rows(debt_rows)
+        rows = _result_rows(debt_rows, opening_cb_holdings=opening_cb_holdings)
         run_rows[run_id] = rows
         _write_csv(package / run_dir / "results_compact.csv", RESULT_COLUMNS, rows)
         summary = _summary(rows)
@@ -716,6 +719,28 @@ def _trust_anchor(lock_path: Path) -> dict:
         "dependency_lock_status": "requirements_lock_txt_present",
         "requirements_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
     }
+
+
+FIXTURE_PRESTART_ROLLFORWARD_ROWS = 35
+
+
+def _write_source_opening_book(package: Path) -> None:
+    """The packaged source book behind the fixture opening portfolio: every opening row,
+    with the first 35 fixed rows standing in for securities that matured before the start
+    and were rolled into pre-start bills."""
+
+    rows = []
+    counters: dict[str, int] = {}
+    for index, row in enumerate(_read_csv(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")):
+        security_type = row["SecurityType"]
+        number = counters.get(security_type, 0)
+        counters[security_type] = number + 1
+        cusip = {"TIPS": f"TIPS{number % 53:03d}", "FRN": f"FRN{number % 8:03d}"}.get(security_type, f"FIX{number:04d}")
+        source_row = {**row, "cusip_or_synthetic_id": cusip}
+        if security_type == "Fixed" and number < FIXTURE_PRESTART_ROLLFORWARD_ROWS:
+            source_row["MaturityDate"] = "2026-06-10"
+        rows.append(source_row)
+    _write_csv(package / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv", list(rows[0]), rows)
 
 
 def _write_opening_files(package: Path) -> None:
@@ -1130,11 +1155,7 @@ def _write_source_package(package: Path) -> dict:
         ["record_date", "debt_held_public_amt"],
         [{"record_date": "2026-05-29", "debt_held_public_amt": "31515369798622.98"}],
     )
-    _write_csv(
-        package / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv",
-        ["cohort_id", "status"],
-        [{"cohort_id": "fixture", "status": "package_fixture"}],
-    )
+    _write_source_opening_book(package)
     _write_json(
         package / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json",
         {"status": "package_fixture"},
@@ -1246,7 +1267,7 @@ def _fiscal_year_end_dates() -> set[str]:
     return {day.date().isoformat() for day in days}
 
 
-def _result_rows(debt_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+def _result_rows(debt_rows: list[dict[str, str]], *, opening_cb_holdings: float) -> list[dict[str, str]]:
     """An operating-cash pass: one unit of need a day, settling with three units pending
     except at fiscal-year ends, and debt five below CBO's path."""
 
@@ -1256,9 +1277,11 @@ def _result_rows(debt_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     for index in range(RUN_ROWS):
         current = start + timedelta(days=index)
         debt = float(debt_rows[index]["marketable_treasury_public_target_bil"])
-        fed_target = 0.0 if index == 0 else 100.0 + index
-        fed_begin = 0.0 if index <= 1 else 100.0 + index - 1
-        fed_end = fed_target
+        # The opening row is the engine's nonsettling identity: the target equals the
+        # opening book's Fed holdings and nothing moves.
+        fed_target = opening_cb_holdings + index
+        fed_begin = 0.0 if index == 0 else opening_cb_holdings + index - 1
+        fed_end = 0.0 if index == 0 else fed_target
         fed_purchase = fed_end - fed_begin
         residual = 0.0
         pending = 0.0 if index == 0 or current.isoformat() in fiscal_year_ends else 3.0
@@ -1292,7 +1315,7 @@ def _result_rows(debt_rows: list[dict[str, str]]) -> list[dict[str, str]]:
             "CBOCashReconciliationResidual": residual,
             "CBORemittanceCashEffect": 0.0,
             "CBOFedHoldingsTarget": fed_target,
-            "CBOFedHoldingsTargetApplicable": 0.0 if index == 0 else 1.0,
+            "CBOFedHoldingsTargetApplicable": 1.0,
             "CBOFedHoldingsTargetError": 0.0,
             "CBOFedAuctionShare": 0.0,
             "CBOFedSecondaryPurchaseFace": 0.0 if index == 0 else fed_purchase,
@@ -1320,7 +1343,9 @@ def _result_rows(debt_rows: list[dict[str, str]]) -> list[dict[str, str]]:
                 "synthetic_cb_treasury_stock_target_beneficial_holder" if index > 0 else ""
             ),
             "CBOFedSettlementScope": (
-                "beneficial_holder_with_model_dirty_value_settlement" if index > 0 else ""
+                "beneficial_holder_with_model_dirty_value_settlement"
+                if index > 0
+                else "opening_stock_target_match_nonsettling"
             ),
             "CBORemittanceStatus": "not_modeled_cbo_primary_deficit_embeds_baseline_revenues",
             "CB_TreasuryInterestCashReceived": 0.0,
@@ -1331,7 +1356,7 @@ def _result_rows(debt_rows: list[dict[str, str]]) -> list[dict[str, str]]:
             "CBOTotalDeficitDiagnostic": 0.0,
             "NetInterestDiagnosticStatus": "cbo_reported_check_only",
             "DebtHeld_Banks": 10.0 + index,
-            "DebtHeld_CentralBank": fed_end,
+            "DebtHeld_CentralBank": fed_target,
             "DebtHeld_Foreign": 30.0 + index,
             "DebtHeld_DomesticNonBanks": 40.0 + index,
             "DebtHeldByType_Fixed": 50.0 + index,
@@ -1466,6 +1491,7 @@ def _opening_manifest(opening_path: Path) -> dict:
         "opening_frn_accrued_interest_bil": 4.0,
         "security_type_totals_bil": security_totals,
         "holder_totals_bil": holder_totals,
+        "opening_cb_holdings_bil": holder_totals["CB"],
         "claim_boundary": (
             "prebuilt_mspd_table3_market_derived_cohort_book; "
             "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "

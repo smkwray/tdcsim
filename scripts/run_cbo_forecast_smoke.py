@@ -2298,15 +2298,31 @@ def _resolve_output_dir(output_dir: str | Path) -> Path:
     return path
 
 
+def _main_checkout() -> Path:
+    """The repository's main checkout: this checkout, or the one a linked worktree belongs to.
+
+    Package paths are written relative to the main checkout and the folder holding it, so
+    a package built from a linked worktree records the same portable paths as one built
+    from the main checkout.
+    """
+
+    common_dir = _git_output(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    return Path(common_dir).resolve().parent if common_dir else PROJECT_ROOT
+
+
+def _portable_roots() -> tuple[Path, ...]:
+    main = _main_checkout()
+    return (PROJECT_ROOT, main, main.parent)
+
+
 def _portable_path(path: str | Path) -> str:
     resolved = Path(path).expanduser().resolve()
-    try:
-        return str(resolved.relative_to(PROJECT_ROOT))
-    except ValueError:
+    for root in _portable_roots():
         try:
-            return str(resolved.relative_to(PROJECT_ROOT.parent))
+            return str(resolved.relative_to(root))
         except ValueError:
-            return str(resolved)
+            continue
+    return str(resolved)
 
 
 def _package_relative_path(package_root: str | Path, path: str | Path) -> str:
@@ -2327,16 +2343,13 @@ def _package_path_or_portable(package_root: str | Path, path: str | Path) -> str
 
 def _source_origin_label(path: str | Path, rel: str) -> str:
     resolved = Path(path).expanduser().resolve()
-    try:
-        resolved.relative_to(PROJECT_ROOT)
-        return _portable_path(resolved)
-    except ValueError:
-        pass
-    try:
-        resolved.relative_to(PROJECT_ROOT.parent)
-        return _portable_path(resolved)
-    except ValueError:
-        return f"external_source_package/{rel}"
+    for root in _portable_roots():
+        try:
+            resolved.relative_to(root)
+            return _portable_path(resolved)
+        except ValueError:
+            continue
+    return f"external_source_package/{rel}"
 
 
 def _portableize_metadata_paths(value: Any) -> Any:

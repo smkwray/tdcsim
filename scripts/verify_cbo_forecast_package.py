@@ -517,17 +517,6 @@ def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:
         raise ValueError("unexpected simulation_end_date")
 
     opening = manifest.get("opening_portfolio_construction", {})
-    expected_opening = {
-        "row_count": 2290,
-        "prestart_rollforward_rows": 35,
-        "tips_rows_enriched": 265,
-        "tips_unique_cusips_enriched": 53,
-        "frn_rows_enriched": 40,
-        "frn_unique_cusips_enriched": 8,
-    }
-    for key, expected in expected_opening.items():
-        if int(opening.get(key, -1)) != expected:
-            raise ValueError(f"opening_portfolio_construction.{key} expected {expected}, found {opening.get(key)}")
     if abs(float(opening.get("opening_rollforward_debt_base_delta_bil", 1.0))) > 1e-9:
         raise ValueError("opening rollforward debt base delta is not zero")
     if "no_same_day_cusip_level_mspd_table3_book_available" not in str(
@@ -552,6 +541,47 @@ def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:
             raise ValueError(f"{run_id} final Fed holdings error exceeds tolerance")
 
 
+def _verify_opening_counts_against_source_book(root: Path, manifest: Mapping[str, Any]) -> None:
+    """Rebuild the opening book's counts from the packaged source book.
+
+    Every source row is loaded; rows maturing on or before the simulation start are
+    replaced one for one by pre-start roll-forward bills; TIPS and FRN rows (and their
+    CUSIPs) are the source's surviving TIPS and FRN rows. Comparing the manifest with
+    these catches a truncated or partially enriched book for any correctly sourced book,
+    without pinning one book's counts.
+    """
+
+    opening = manifest.get("opening_portfolio_construction", {})
+    source = _read_csv_dicts(root / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv")
+    if not source:
+        raise ValueError("packaged opening source book has no rows")
+    start = str(manifest.get("date_range", {}).get("simulation_start_date") or "")
+    inactive = [row for row in source if (row.get("Status") or "Active") != "Active"]
+    if inactive:
+        raise ValueError("packaged opening source book contains non-active rows")
+    expired = [row for row in source if row["MaturityDate"][:10] <= start]
+    kept = [row for row in source if row["MaturityDate"][:10] > start]
+
+    def cusips(security_type: str) -> set[str]:
+        return {row["cusip_or_synthetic_id"] for row in kept if row["SecurityType"] == security_type}
+
+    expected = {
+        "source_rows_loaded": len(source),
+        "prestart_rollforward_rows": len(expired),
+        "row_count": len(kept) + len(expired),
+        "tips_rows_enriched": sum(1 for row in kept if row["SecurityType"] == "TIPS"),
+        "tips_unique_cusips_enriched": len(cusips("TIPS")),
+        "frn_rows_enriched": sum(1 for row in kept if row["SecurityType"] == "FRN"),
+        "frn_unique_cusips_enriched": len(cusips("FRN")),
+    }
+    for key, value in expected.items():
+        if int(opening.get(key, -1)) != value:
+            raise ValueError(
+                f"opening_portfolio_construction.{key} is {opening.get(key)}, "
+                f"but the packaged source book gives {value}"
+            )
+
+
 def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
     run_metrics = {}
     manifest_summaries = manifest.get("run_summaries", {})
@@ -565,7 +595,15 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
         summary = _read_json(root / run_dir / "summary.json")
         if not isinstance(summary, Mapping):
             raise ValueError(f"{run_id} summary must be a JSON object")
-        metrics = _compute_run_metrics(run_id, results, debt_targets, calendar)
+        metrics = _compute_run_metrics(
+            run_id,
+            results,
+            debt_targets,
+            calendar,
+            opening_cb_holdings=_manifest_float(
+                manifest.get("opening_portfolio_construction", {}), "opening_cb_holdings_bil"
+            ),
+        )
         _verify_run_summary(run_id, summary, metrics)
         manifest_summary = manifest_summaries.get(run_id)
         if not isinstance(manifest_summary, Mapping):
@@ -574,6 +612,7 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
         run_metrics[run_id] = metrics
 
     _verify_partial_interest_financing_diagnostic(root, run_metrics["baseline"])
+    _verify_opening_counts_against_source_book(root, manifest)
     _verify_opening_portfolio(root, manifest)
     _verify_tips_forward_paths(root, manifest)
     _verify_frn_rate_path(root, manifest)
@@ -616,6 +655,8 @@ def _compute_run_metrics(
     rows: list[dict[str, str]],
     debt_targets: Mapping[str, Mapping[str, float]],
     settlement_calendar: Mapping[str, Any],
+    *,
+    opening_cb_holdings: float,
 ) -> dict[str, Any]:
     """Recompute an operating-cash pass's claims from its results.
 
@@ -741,7 +782,7 @@ def _compute_run_metrics(
     ]
     if not fed_errors:
         raise ValueError(f"{run_id} has no applicable Fed holdings target rows")
-    _verify_fed_stock_bridge(run_id, rows)
+    _verify_fed_stock_bridge(run_id, rows, opening_cb_holdings=opening_cb_holdings)
     metrics: dict[str, Any] = {
         "rows": len(rows),
         "start_date": dates[0],
@@ -790,9 +831,64 @@ def _compute_run_metrics(
     return metrics
 
 
-def _verify_fed_stock_bridge(run_id: str, rows: list[dict[str, str]]) -> None:
+_OPENING_FED_FLOW_COLUMNS = (
+    "CBOFedBeginStock",
+    "CBOFedEndStock",
+    "CBOFedMaturitiesAndRedemptions",
+    "CBOFedTipsPrincipalIndexation",
+    "CBOFedAuctionRolloverAddons",
+    "CBOFedSyntheticSecondaryPurchases",
+    "CBOFedSyntheticSecondarySales",
+    "CBOFedSecondaryPurchaseFace",
+    "CBOFedSecondaryPurchaseCash",
+    "CBOFedSecondaryPurchaseReserveEffect",
+    "CBOFedSecondaryPurchaseDepositEffect",
+    "CBOFedSecondarySaleCash",
+    "CBOFedSecondarySaleReserveEffect",
+    "CBOFedSecondarySaleDepositEffect",
+    "CBOFedGrossStockFlow",
+    "CBOFedNetStockChange",
+    "CBOFedPrivateMaturityTDC",
+)
+
+
+def _verify_opening_fed_identity(run_id: str, row: Mapping[str, str], *, opening_cb_holdings: float) -> None:
+    """The opening row states the Fed target equals the opening book's Fed holdings.
+
+    The engine writes it at the opening date when the Fed path starts there: a
+    restatement that the opening stock already meets the target, with no trade and no
+    cash. It must match the book's SOMA-based holdings and move nothing.
+    """
+
+    if row["CBOFedSettlementScope"] != "opening_stock_target_match_nonsettling":
+        raise ValueError(f"{run_id} opening Fed row is applicable but not the nonsettling opening identity")
+    target = _float(row, "CBOFedHoldingsTarget")
+    _assert_close(f"{run_id} opening Fed target vs opening book holdings", target, opening_cb_holdings, NUMERIC_TOLERANCE)
+    _assert_close(f"{run_id} opening Fed stock vs target", _float(row, "DebtHeld_CentralBank"), target, NUMERIC_TOLERANCE)
+    _assert_close(f"{run_id} opening Fed target error", _float(row, "CBOFedHoldingsTargetError"), 0.0, NUMERIC_TOLERANCE)
+    for column in _OPENING_FED_FLOW_COLUMNS:
+        if abs(_float(row, column)) > NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} opening Fed identity row moves {column}")
+
+
+def _verify_fed_stock_bridge(
+    run_id: str,
+    rows: list[dict[str, str]],
+    *,
+    opening_cb_holdings: float,
+) -> None:
     for row_index, row in enumerate(rows, start=1):
         target_applicable = _float(row, "CBOFedHoldingsTargetApplicable") > 0.5
+        if row_index == 1 and target_applicable:
+            _verify_opening_fed_identity(run_id, row, opening_cb_holdings=opening_cb_holdings)
+            continue
+        if row_index == 2 and _float(rows[0], "CBOFedHoldingsTargetApplicable") > 0.5:
+            _assert_close(
+                f"{run_id} first Fed bridge begins at the opening Fed stock",
+                _float(row, "CBOFedBeginStock"),
+                _float(rows[0], "DebtHeld_CentralBank"),
+                NUMERIC_TOLERANCE,
+            )
         if not target_applicable:
             if _float(row, "CBOFedHoldingsTarget") != 0.0 or _float(row, "CBOFedHoldingsTargetError") != 0.0:
                 raise ValueError(f"{run_id} row {row_index} has opening/nonapplicable Fed target sentinels")
