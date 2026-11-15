@@ -9,7 +9,7 @@
     "Foreign holdings decline through reduced auction participation and maturity runoff; no secondary-market foreign sales are simulated",
     "TDCSim represents foreign official and private holders as one Foreign sector with one maturity profile, settling through US banks",
     "Each rate path is computed once from the matching quantity-only run and imposed on the scenario; it is not re-solved for the extra issuance that higher interest requires",
-    "Every scenario holds the TGA on the baseline operating-cash path, so additional interest is financed by additional issuance from the start"
+    "Every scenario puts the TGA on the operating-cash path at each fiscal-year end (within a year it sits below the path by issuance awaiting settlement), so additional interest is financed by additional issuance from the start"
   ],
   "calibration": {
     "holder_shift": "Official share of foreign bills 0.2419; official share of foreign coupon securities 0.4392 (TIC SLT Table 3, July 2026). Gradual retreat multiplier = 1 - 0.5 x official share; exit multiplier = 1 - official share; rounded to three decimals",

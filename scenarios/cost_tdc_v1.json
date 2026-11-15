@@ -8,7 +8,7 @@
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "The 10-year yield shift is a stated assumption, not an estimated response to the issuance change",
     "Holder shares are assumptions about who absorbs the change in the bill stock, not estimated demand",
-    "Every scenario holds the TGA on the baseline operating-cash path, so financing-cost differences change the debt rather than the TGA",
+    "Every scenario puts the TGA on the operating-cash path at each fiscal-year end (within a year it sits below the path by issuance awaiting settlement), so financing-cost differences change the debt rather than the TGA",
     "Foreign holders settle through US banks; banks pay for securities with reserves"
   ],
   "calibration": {
