@@ -32,6 +32,7 @@ from issuance_calibration import (
     ISSUANCE_RULE_MODE,
     IssuanceCalibrationError,
     engine_rule_profile,
+    is_rule_profile,
     load_calibration,
     normalize_target_path,
 )
@@ -2313,17 +2314,21 @@ def _portfolio_row_budget(params: Mapping[str, Any], *, start: str, end: str) ->
     if not isinstance(profile, Mapping):
         profile = {}
     supply_rows = 0
-    for category in ("bills", "notes", "bonds"):
-        section = profile.get(category, {})
-        if isinstance(section, Mapping):
+    if is_rule_profile(profile):
+        # One supply item per bill term and per coupon security, every issuing day.
+        supply_rows = len(profile["bill_terms"]) + len(profile["coupon_terms"])
+    else:
+        for category in ("bills", "notes", "bonds"):
+            section = profile.get(category, {})
+            if isinstance(section, Mapping):
+                supply_rows += max(1, len(section.get("maturities", []) or []))
+        for category in ("TIPS", "FRN", "NonMarketable"):
+            section = profile.get(category, {})
+            if not isinstance(section, Mapping):
+                continue
+            if float(section.get("target_percentage", 0.0) or 0.0) <= 0.0:
+                continue
             supply_rows += max(1, len(section.get("maturities", []) or []))
-    for category in ("TIPS", "FRN", "NonMarketable"):
-        section = profile.get(category, {})
-        if not isinstance(section, Mapping):
-            continue
-        if float(section.get("target_percentage", 0.0) or 0.0) <= 0.0:
-            continue
-        supply_rows += max(1, len(section.get("maturities", []) or []))
     # Each supply item can allocate across all beneficial holders; Private can split
     # across its two declared cash routes.  Fed target transfers are allowed a separate
     # conservative 32-row split envelope per period.  The live cap is enforced before

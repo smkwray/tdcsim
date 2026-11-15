@@ -519,3 +519,18 @@ def test_operating_cash_mode_fails_on_negative_tga(tmp_path: Path) -> None:
     frame.to_csv(operating_cash, index=False)
     with pytest.raises(RuntimeError, match="TGA-floor financing failed"):
         run_simulation(params, ENGINE_START, "2026-07-10", freq="D", scenario_name="baseline")
+
+
+def test_runner_row_budget_covers_every_rule_supply_item() -> None:
+    """The bounded runner caps portfolio rows up front; a cap sized for five fixed-share
+    categories aborts a long rule run partway (it did, 360 days into a 15-month run)."""
+
+    from tdcsim_cbo.runner import _portfolio_row_budget
+    from tdc_shared import HOLDER_TYPES
+
+    profile = _rule_profile(0.2)
+    params = {"initial_bonds_df": _portfolio([]), "treasury_issuance_profile": profile}
+    budget = _portfolio_row_budget(params, start="2026-06-21", end="2027-09-30")
+    days = len(pd.date_range("2026-06-21", "2027-09-30", freq="D")) - 1
+    items = len(profile["bill_terms"]) + len(profile["coupon_terms"])
+    assert budget >= days * items * (len(HOLDER_TYPES) + 1)
