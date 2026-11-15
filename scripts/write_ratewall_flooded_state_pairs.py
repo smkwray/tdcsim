@@ -666,8 +666,10 @@ def _scenario(
     end_date: str,
     overrides: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # Marginal pairs compare runs on the same debt path, so they hold debt to CBO's path.
     return {
         "schema_version": "tdcsim_cbo_scenario_v1",
+        "funding_closure": {"mode": "cbo_public_debt_target"},
         "scenario_id": scenario_id,
         "title": title,
         "baseline": {

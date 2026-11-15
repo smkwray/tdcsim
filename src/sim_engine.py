@@ -32,6 +32,19 @@ from tdc_shared import (
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
 )
+from issuance_calibration import (
+    active_special_categories,
+    bill_days,
+    bill_issuance_amount,
+    bill_mask,
+    bill_maturity_years,
+    controlled_debt_and_bills,
+    controlled_marketable_mask,
+    debt_base,
+    is_rule_profile,
+    rule_target_path,
+    target_for_date,
+)
 from sim_helpers import OUTPUT_COLUMN_RENAMES, apply_event_actions, validate_run_params
 from sim_pricing import (
     calculate_coupon_rate,
@@ -81,6 +94,12 @@ from yield_curve_path import curve_for_date, load_yield_curve_surface
 
 CBO_FUNDING_MODE = 'cbo_public_debt_target'
 CBO_DEBT_REFERENCE_FINANCING_MODE = 'cbo_debt_reference_plus_tga_floor_financing_v1'
+CBO_OPERATING_CASH_TARGET_FINANCING_MODE = 'cbo_operating_cash_target_financing_v1'
+CBO_FUNDING_MODES = frozenset(
+    {CBO_FUNDING_MODE, CBO_DEBT_REFERENCE_FINANCING_MODE, CBO_OPERATING_CASH_TARGET_FINANCING_MODE}
+)
+# Issuance legs whose proceeds are sized to a cash need rather than a debt path.
+CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
 _US_FEDERAL_HOLIDAYS = USFederalHolidayCalendar()
 _BUSINESS_DAY_CACHE = {}
@@ -91,10 +110,7 @@ def _is_cbo_funding_mode(params):
     funding_rule = params.get('funding_rule', {})
     if not isinstance(funding_rule, dict):
         return False
-    return str(funding_rule.get('mode', '')).strip() in {
-        CBO_FUNDING_MODE,
-        CBO_DEBT_REFERENCE_FINANCING_MODE,
-    }
+    return str(funding_rule.get('mode', '')).strip() in CBO_FUNDING_MODES
 
 
 def _evaluated_nominal_shock_from_config(yield_surface_cfg):
@@ -1087,21 +1103,10 @@ def _handoff_weighted_metrics(rows, *, short_cutoff_years=1.0):
 def _handoff_outstanding_metrics(active_bonds, current_date, *, short_cutoff_years=1.0):
     if active_bonds is None or active_bonds.empty:
         return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
-    frame = active_bonds.copy()
-    controlled = (
-        frame['Status'].astype(str).eq('Active')
-        & frame['SecurityType'].astype(str).isin(['Fixed', 'TIPS', 'FRN'])
-        & ~frame['HolderType'].astype(str).isin(INTRAGOV_HOLDERS)
-    )
-    frame = frame.loc[controlled].copy()
+    frame = active_bonds.loc[controlled_marketable_mask(active_bonds)].copy()
     if frame.empty:
         return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
-    debt_base = np.where(
-        frame['SecurityType'].astype(str).eq('TIPS'),
-        pd.to_numeric(frame['AdjustedPrincipal'], errors='coerce').fillna(pd.to_numeric(frame['FaceValue'], errors='coerce')),
-        pd.to_numeric(frame['FaceValue'], errors='coerce').fillna(0.0),
-    )
-    weights = pd.Series(debt_base, index=frame.index).fillna(0.0)
+    weights = debt_base(frame)
     years = (pd.to_datetime(frame['MaturityDate'], errors='coerce') - pd.Timestamp(current_date)).dt.total_seconds() / (
         DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60
     )
@@ -1109,9 +1114,7 @@ def _handoff_outstanding_metrics(active_bonds, current_date, *, short_cutoff_yea
     denom = float(weights.sum())
     if denom <= TGA_FLOOR_TOLERANCE:
         return {'wam_years': 0.0, 'bill_share': 0.0, 'short_maturity_share': 0.0}
-    original_years = pd.to_numeric(frame.get('OriginalMaturityYears', np.nan), errors='coerce').fillna(0.0)
-    security_type = frame['SecurityType'].astype(str)
-    bills = security_type.eq('Fixed') & (original_years <= 1.0 + TGA_FLOOR_TOLERANCE)
+    bills = bill_mask(frame)
     short = years <= short_cutoff_years + TGA_FLOOR_TOLERANCE
     return {
         'wam_years': float((weights * years).sum() / denom),
@@ -2011,12 +2014,102 @@ def _quote_issuance(
     )
 
 
-def _build_issuance_supply_schedule(
-    amount,
+def _quote_supply_item(
+    security_type,
+    maturity_years,
+    target,
     *,
     face_target_mode,
     issuance_leg,
-    issuance_profile,
+    current_date,
+    bill_term_days,
+    pricing,
+):
+    """Price one issuance item; the caller dates it.
+
+    A bill with ``bill_term_days`` equal to the 91-day CBO bill is quoted on the CBO
+    3-month discount rate in CBO mode; other bills price off the nominal curve.
+    """
+
+    tips_real_curve_years = pricing['tips_real_curve_years']
+    tips_real_curve_rates = pricing['tips_real_curve_rates']
+    current_yield_curve_years = pricing['current_yield_curve_years']
+    current_yield_curve_rates = pricing['current_yield_curve_rates']
+    yield_interpolation_method = pricing['yield_interpolation_method']
+    yield_floor_zero = pricing['yield_floor_zero']
+    if security_type == 'TIPS':
+        if not tips_real_curve_years or not tips_real_curve_rates:
+            raise ValueError('TIPS issuance requires an explicit real yield curve.')
+        issue_yield = get_yield_for_maturity(
+            maturity_years,
+            tips_real_curve_years,
+            tips_real_curve_rates,
+            method=yield_interpolation_method,
+            floor_zero=False,
+        )
+        coupon = calculate_coupon_rate('TIPS', maturity_years, issue_yield, pricing['tips_real_coupon'])
+        face, proceeds, price = _quote_issuance(
+            'TIPS', maturity_years, coupon, issue_yield, target, face_target_mode
+        )
+        item = {
+            'type': 'TIPS', 'maturity': maturity_years, 'face_amount': face,
+            'proceeds': proceeds, 'coupon': coupon, 'issue_price_ratio': price,
+            'issue_yield': issue_yield, 'issuance_leg': issuance_leg,
+        }
+    elif security_type == 'FRN':
+        face, proceeds, price = _quote_issuance(
+            'FRN', maturity_years, 0.0, np.nan, target, face_target_mode
+        )
+        item = {
+            'type': 'FRN', 'maturity': maturity_years, 'face_amount': face,
+            'proceeds': proceeds, 'spread': pricing['frn_spread'], 'issue_price_ratio': price,
+            'issue_yield': np.nan, 'issuance_leg': issuance_leg,
+        }
+    elif security_type == 'Fixed':
+        issue_yield = evaluate_nominal_yield(
+            maturity_years,
+            current_yield_curve_years,
+            current_yield_curve_rates,
+            method=yield_interpolation_method,
+            floor_zero=yield_floor_zero,
+            shock=pricing['evaluated_nominal_shock'],
+        )
+        coupon = calculate_coupon_rate('Fixed', maturity_years, issue_yield, 0)
+        bill_discount_rate = None
+        if (
+            pricing['cbo_funding_mode']
+            and bill_term_days == CBO_3M_BILL_DAYS
+            and coupon <= TGA_FLOOR_TOLERANCE
+        ):
+            quote_pct = _cbo_macro_value(
+                pricing['cbo_inputs'],
+                pricing['cbo_scenario_id'],
+                current_date,
+                'cbo_3m_tbill_rate_pct',
+                np.nan,
+            )
+            if not pd.isna(quote_pct):
+                bill_discount_rate = float(quote_pct) / 100.0
+            elif not pd.isna(issue_yield):
+                bill_discount_rate = 360.0 * float(issue_yield) / (
+                    365.0 + float(issue_yield) * CBO_3M_BILL_DAYS
+                )
+        face, proceeds, price = _quote_issuance(
+            'Fixed', maturity_years, coupon, issue_yield, target, face_target_mode,
+            bill_discount_rate=bill_discount_rate,
+        )
+        item = {
+            'type': 'Fixed', 'maturity': maturity_years, 'face_amount': face,
+            'proceeds': proceeds, 'coupon': coupon, 'issue_price_ratio': price,
+            'issue_yield': issue_yield, 'issuance_leg': issuance_leg,
+        }
+    else:
+        raise ValueError(f'Unsupported marketable issuance type: {security_type!r}')
+    return item
+
+
+def _issuance_pricing_context(
+    *,
     tips_real_curve_years,
     tips_real_curve_rates,
     current_yield_curve_years,
@@ -2029,9 +2122,104 @@ def _build_issuance_supply_schedule(
     cbo_funding_mode,
     cbo_inputs,
     cbo_scenario_id,
-    current_date,
 ):
-    """Build one priced issuance leg without mutating portfolio or cash state."""
+    return {
+        'tips_real_curve_years': tips_real_curve_years,
+        'tips_real_curve_rates': tips_real_curve_rates,
+        'current_yield_curve_years': current_yield_curve_years,
+        'current_yield_curve_rates': current_yield_curve_rates,
+        'yield_interpolation_method': yield_interpolation_method,
+        'yield_floor_zero': yield_floor_zero,
+        'evaluated_nominal_shock': evaluated_nominal_shock,
+        'tips_real_coupon': tips_real_coupon,
+        'frn_spread': frn_spread,
+        'cbo_funding_mode': cbo_funding_mode,
+        'cbo_inputs': cbo_inputs,
+        'cbo_scenario_id': cbo_scenario_id,
+    }
+
+
+def _build_bill_share_supply_schedule(
+    amount,
+    *,
+    face_target_mode,
+    issuance_leg,
+    issuance_profile,
+    controlled_debt,
+    controlled_bills,
+    current_date,
+    pricing,
+):
+    """Split one issuance amount by the bill-share rule and price it.
+
+    ``controlled_debt`` and ``controlled_bills`` are face (TIPS at adjusted principal)
+    after the day's maturities and any issuance already scheduled that day. When
+    ``face_target_mode`` is false, ``amount`` is cash proceeds and enters the rule as if
+    it were face: bills issue at a discount of about the bill yield times its term
+    (under 5 bp for a four-week bill, about 2% for a 52-week bill at 4%), so the bill
+    face issued exceeds the rule's bill amount by that discount and the realized share
+    lands slightly above the target. The tests bound this approximation.
+    """
+
+    amount = float(amount or 0.0)
+    if amount <= TGA_FLOOR_TOLERANCE:
+        return [], 0.0
+    target = target_for_date(rule_target_path(issuance_profile), current_date)
+    bills_amount = bill_issuance_amount(
+        amount,
+        target=target,
+        controlled_debt=controlled_debt,
+        bill_face=controlled_bills,
+    )
+    coupon_amount = amount - bills_amount
+    allocations = []
+    for term in issuance_profile['bill_terms']:
+        weeks = int(term['weeks'])
+        allocations.append(
+            ('Fixed', bill_maturity_years(weeks), bill_days(weeks), bills_amount * float(term['share']))
+        )
+    for term in issuance_profile['coupon_terms']:
+        allocations.append(
+            (str(term['security_type']), float(term['maturity_years']), None, coupon_amount * float(term['share']))
+        )
+    residual = amount - sum(target for *_, target in allocations)
+    if abs(residual) > max(TGA_FLOOR_TOLERANCE, abs(amount) * 1.0e-12):
+        raise ValueError(f'Bill-share issuance allocation does not close: residual={residual}')
+    schedule = []
+    for security_type, maturity_years, weekly_days, target_amount in allocations:
+        if target_amount <= TGA_FLOOR_TOLERANCE:
+            continue
+        item = _quote_supply_item(
+            security_type,
+            maturity_years,
+            target_amount,
+            face_target_mode=face_target_mode,
+            issuance_leg=issuance_leg,
+            current_date=current_date,
+            bill_term_days=weekly_days,
+            pricing=pricing,
+        )
+        # Bills mature a whole number of weeks after issue (a 4-week bill in 28 days);
+        # coupon securities on the same calendar date ``tenor`` years later.
+        item['maturity_date'] = (
+            pd.Timestamp(current_date) + timedelta(days=weekly_days)
+            if weekly_days is not None
+            else _maturity_date_from_years(current_date, maturity_years)
+        )
+        schedule.append(item)
+    return schedule, target
+
+
+def _build_issuance_supply_schedule(
+    amount,
+    *,
+    face_target_mode,
+    issuance_leg,
+    issuance_profile,
+    current_date,
+    pricing,
+):
+    """Build one priced issuance leg from fixed gross shares, without mutating state."""
 
     amount = float(amount or 0.0)
     if amount <= TGA_FLOOR_TOLERANCE:
@@ -2039,7 +2227,7 @@ def _build_issuance_supply_schedule(
     tips_pct = issuance_profile.get('TIPS', {}).get('target_percentage', 0.0)
     frn_pct = issuance_profile.get('FRN', {}).get('target_percentage', 0.0)
     nonmkt_pct = issuance_profile.get('NonMarketable', {}).get('target_percentage', 0.0)
-    if cbo_funding_mode:
+    if pricing['cbo_funding_mode']:
         nonmkt_pct = 0.0
     issued_tips = amount * tips_pct
     issued_frn = amount * frn_pct
@@ -2069,47 +2257,35 @@ def _build_issuance_supply_schedule(
             raise ValueError(f'{label} issuance weights must sum to a positive value.')
         return maturities, [value / total for value in distribution]
 
-    tips_profile = issuance_profile.get('TIPS', {})
+    def _quote(security_type, maturity_years, target, bill_term_days=None):
+        item = _quote_supply_item(
+            security_type,
+            maturity_years,
+            target,
+            face_target_mode=face_target_mode,
+            issuance_leg=issuance_leg,
+            current_date=current_date,
+            bill_term_days=bill_term_days,
+            pricing=pricing,
+        )
+        item['maturity_date'] = _maturity_date_from_years(current_date, maturity_years)
+        return item
+
     if issued_tips > TGA_FLOOR_TOLERANCE:
-        maturities, normalized = _profile_terms(tips_profile, 'TIPS')
+        maturities, normalized = _profile_terms(issuance_profile.get('TIPS', {}), 'TIPS')
         for maturity_years, weight in zip(maturities, normalized):
             target = issued_tips * weight
             if target <= TGA_FLOOR_TOLERANCE:
                 continue
-            if not tips_real_curve_years or not tips_real_curve_rates:
-                raise ValueError('TIPS issuance requires an explicit real yield curve.')
-            issue_yield = get_yield_for_maturity(
-                maturity_years,
-                tips_real_curve_years,
-                tips_real_curve_rates,
-                method=yield_interpolation_method,
-                floor_zero=False,
-            )
-            coupon = calculate_coupon_rate('TIPS', maturity_years, issue_yield, tips_real_coupon)
-            face, proceeds, price = _quote_issuance(
-                'TIPS', maturity_years, coupon, issue_yield, target, face_target_mode
-            )
-            schedule.append({
-                'type': 'TIPS', 'maturity': maturity_years, 'face_amount': face,
-                'proceeds': proceeds, 'coupon': coupon, 'issue_price_ratio': price,
-                'issue_yield': issue_yield, 'issuance_leg': issuance_leg,
-            })
+            schedule.append(_quote('TIPS', maturity_years, target))
 
     if issued_frn > TGA_FLOOR_TOLERANCE:
-        frn_profile = issuance_profile.get('FRN', {})
-        maturities, normalized = _profile_terms(frn_profile, 'FRN')
+        maturities, normalized = _profile_terms(issuance_profile.get('FRN', {}), 'FRN')
         for maturity_years, weight in zip(maturities, normalized):
             target = issued_frn * weight
             if target <= TGA_FLOOR_TOLERANCE:
                 continue
-            face, proceeds, price = _quote_issuance(
-                'FRN', maturity_years, 0.0, np.nan, target, face_target_mode
-            )
-            schedule.append({
-                'type': 'FRN', 'maturity': maturity_years, 'face_amount': face,
-                'proceeds': proceeds, 'spread': frn_spread, 'issue_price_ratio': price,
-                'issue_yield': np.nan, 'issuance_leg': issuance_leg,
-            })
+            schedule.append(_quote('FRN', maturity_years, target))
 
     fixed_allocations = {}
     fixed_category_shares = {
@@ -2147,43 +2323,10 @@ def _build_issuance_supply_schedule(
     for maturity_years, target in fixed_allocations.items():
         if target <= TGA_FLOOR_TOLERANCE:
             continue
-        issue_yield = evaluate_nominal_yield(
-            maturity_years,
-            current_yield_curve_years,
-            current_yield_curve_rates,
-            method=yield_interpolation_method,
-            floor_zero=yield_floor_zero,
-            shock=evaluated_nominal_shock,
-        )
-        coupon = calculate_coupon_rate('Fixed', maturity_years, issue_yield, 0)
-        bill_discount_rate = None
-        if (
-            cbo_funding_mode
-            and abs(float(maturity_years) - 0.25) <= 1e-12
-            and coupon <= TGA_FLOOR_TOLERANCE
-        ):
-            quote_pct = _cbo_macro_value(
-                cbo_inputs,
-                cbo_scenario_id,
-                current_date,
-                'cbo_3m_tbill_rate_pct',
-                np.nan,
-            )
-            if not pd.isna(quote_pct):
-                bill_discount_rate = float(quote_pct) / 100.0
-            elif not pd.isna(issue_yield):
-                bill_discount_rate = 360.0 * float(issue_yield) / (
-                    365.0 + float(issue_yield) * CBO_3M_BILL_DAYS
-                )
-        face, proceeds, price = _quote_issuance(
-            'Fixed', maturity_years, coupon, issue_yield, target, face_target_mode,
-            bill_discount_rate=bill_discount_rate,
-        )
-        schedule.append({
-            'type': 'Fixed', 'maturity': maturity_years, 'face_amount': face,
-            'proceeds': proceeds, 'coupon': coupon, 'issue_price_ratio': price,
-            'issue_yield': issue_yield, 'issuance_leg': issuance_leg,
-        })
+        # Month-tenor profiles date a 0.25-year bill three calendar months out but quote it
+        # as the 91-day CBO bill; the weekly-term rule dates bills by days instead.
+        quote_days = CBO_3M_BILL_DAYS if abs(float(maturity_years) - 0.25) <= 1e-12 else None
+        schedule.append(_quote('Fixed', maturity_years, target, bill_term_days=quote_days))
 
     if issued_nonmkt > TGA_FLOOR_TOLERANCE:
         maturity_years = issuance_profile.get('NonMarketable', {}).get(
@@ -2196,7 +2339,54 @@ def _build_issuance_supply_schedule(
             'type': 'NonMarketable', 'maturity': maturity_years, 'face_amount': face,
             'proceeds': proceeds, 'coupon': 0.0, 'issue_price_ratio': price,
             'issue_yield': np.nan, 'issuance_leg': issuance_leg,
+            'maturity_date': _maturity_date_from_years(current_date, maturity_years),
         })
+    return schedule
+
+
+def _schedule_issuance_leg(
+    amount,
+    *,
+    face_target_mode,
+    issuance_leg,
+    issuance_profile,
+    current_date,
+    pricing,
+    pre_issuance_position,
+    scheduled,
+):
+    """Build one issuance leg under the profile's rule.
+
+    For the bill-share rule, items already ``scheduled`` that day count toward debt and
+    bills, so a second leg sees the first leg's issuance.
+    """
+
+    if not is_rule_profile(issuance_profile):
+        return _build_issuance_supply_schedule(
+            amount,
+            face_target_mode=face_target_mode,
+            issuance_leg=issuance_leg,
+            issuance_profile=issuance_profile,
+            current_date=current_date,
+            pricing=pricing,
+        )
+    controlled_debt, controlled_bills = pre_issuance_position
+    for item in scheduled:
+        if item['type'] not in {'Fixed', 'TIPS', 'FRN'}:
+            continue
+        controlled_debt += float(item['face_amount'])
+        if item['type'] == 'Fixed' and float(item['maturity']) <= 1.0 + TGA_FLOOR_TOLERANCE:
+            controlled_bills += float(item['face_amount'])
+    schedule, _target = _build_bill_share_supply_schedule(
+        amount,
+        face_target_mode=face_target_mode,
+        issuance_leg=issuance_leg,
+        issuance_profile=issuance_profile,
+        controlled_debt=controlled_debt,
+        controlled_bills=controlled_bills,
+        current_date=current_date,
+        pricing=pricing,
+    )
     return schedule
 
 
@@ -2210,6 +2400,8 @@ def _get_weighted_average_maturity(category, issuance_profile, frn_benchmark_mat
     }
     if category == 'frn':
         return max(0.0, float(frn_benchmark_mat))
+    if is_rule_profile(issuance_profile):
+        raise ValueError('rate-sensitive demand is not supported with the bill-share issuance rule')
     source_key = category if category in MATURITY_CATEGORIES else category.upper()
     cfg = issuance_profile.get(source_key, {}) if isinstance(issuance_profile, dict) else {}
     maturities = cfg.get('maturities', defaults[category][0])
@@ -2321,11 +2513,7 @@ def _build_dynamic_secondary_preferences(
     if not isinstance(rate_sensitive_params.get('secondary', {}), dict) or not rate_sensitive_params.get('secondary'):
         return copy.deepcopy(base_secondary_prefs)
 
-    active_categories = ['bills', 'notes', 'bonds']
-    if float(issuance_profile.get('TIPS', {}).get('target_percentage', 0.0) or 0.0) > TGA_FLOOR_TOLERANCE:
-        active_categories.append('tips')
-    if float(issuance_profile.get('FRN', {}).get('target_percentage', 0.0) or 0.0) > TGA_FLOOR_TOLERANCE:
-        active_categories.append('frn')
+    active_categories = _get_active_preference_categories(issuance_profile)
 
     anchor_yield, curve_slope = _get_curve_reference_levels(
         rate_sensitive_params,
@@ -2362,12 +2550,8 @@ def _build_dynamic_secondary_preferences(
 
 
 def _get_active_preference_categories(issuance_profile):
-    active_categories = ['bills', 'notes', 'bonds']
-    if float(issuance_profile.get('TIPS', {}).get('target_percentage', 0.0) or 0.0) > TGA_FLOOR_TOLERANCE:
-        active_categories.append('tips')
-    if float(issuance_profile.get('FRN', {}).get('target_percentage', 0.0) or 0.0) > TGA_FLOOR_TOLERANCE:
-        active_categories.append('frn')
-    return active_categories
+    special = active_special_categories(issuance_profile)
+    return ['bills', 'notes', 'bonds', *[category for category in ('tips', 'frn') if category in special]]
 
 
 def _compute_preference_shift_summary(base_prefs, effective_prefs, categories):
@@ -2874,13 +3058,15 @@ def run_simulation(
     validate_run_params(params, scenario_name=scenario_name)
     funding_rule_cfg = params.get('funding_rule', {})
     funding_rule_mode = str(funding_rule_cfg.get('mode', '')).strip()
-    cbo_funding_mode = funding_rule_mode in {
-        CBO_FUNDING_MODE,
-        CBO_DEBT_REFERENCE_FINANCING_MODE,
-    }
+    cbo_funding_mode = funding_rule_mode in CBO_FUNDING_MODES
     cbo_reference_financing_mode = (
         funding_rule_mode == CBO_DEBT_REFERENCE_FINANCING_MODE
     )
+    cbo_operating_cash_financing_mode = (
+        funding_rule_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE
+    )
+    # Only the hard-target mode issues (or retires) to land on the CBO debt path.
+    cbo_debt_target_mode = funding_rule_mode == CBO_FUNDING_MODE
     yield_interpolation_method = str(
         yield_surface_cfg.get('interpolation_method', 'pchip' if cbo_funding_mode else 'linear')
     ).strip().lower()
@@ -4274,7 +4460,7 @@ def run_simulation(
             )
             raw_required_issuance = cbo_controlled_debt_target - cbo_pre_issuance_controlled_debt
             if (
-                not cbo_reference_financing_mode
+                cbo_debt_target_mode
                 and raw_required_issuance < -target_tolerance
                 and negative_issuance_action in {
                 'retire_shortest_public_marketable',
@@ -4379,19 +4565,22 @@ def run_simulation(
                     + total_principal_paid_period
                     + total_interest_paid_period
                 )
-            total_issuance_target_period = (
-                max(0.0, raw_required_issuance)
-                if cbo_reference_financing_mode
-                else calculate_required_face_issuance(
+            if cbo_reference_financing_mode:
+                total_issuance_target_period = max(0.0, raw_required_issuance)
+            elif cbo_debt_target_mode:
+                total_issuance_target_period = calculate_required_face_issuance(
                     cbo_controlled_debt_target,
                     cbo_pre_issuance_controlled_debt,
                     strict=True,
                     tolerance=target_tolerance,
                 )
-            )
-            cbo_face_target_mode = True
+            else:
+                # Sized below, once the operating-cash target and the day's cash
+                # reconciliation residual are known; it is a proceeds amount.
+                total_issuance_target_period = 0.0
+            cbo_face_target_mode = not cbo_operating_cash_financing_mode
             results.loc[current_date, 'CBOControlledDebtTargetApplicable'] = (
-                0.0 if cbo_reference_financing_mode else 1.0
+                1.0 if cbo_debt_target_mode else 0.0
             )
             if isinstance(cbo_inputs.get('operating_cash'), pd.DataFrame) and not cbo_inputs['operating_cash'].empty:
                 cbo_operating_cash_row = _cbo_exact_date_row(
@@ -4416,6 +4605,19 @@ def run_simulation(
                 )
                 cbo_cash_reconciliation_residual_input = float(cbo_cash_residual_row['cash_reconciliation_residual_bil'])
                 cbo_cash_residual_period = cbo_cash_reconciliation_residual_input
+            if cbo_operating_cash_financing_mode:
+                if cbo_cash_residual_status != 'operating_cash_target_loaded':
+                    raise ValueError(
+                        f'{CBO_OPERATING_CASH_TARGET_FINANCING_MODE} requires an operating cash path '
+                        f'covering {current_date.date()}.'
+                    )
+                # The TGA lands on its target whenever it would otherwise fall short;
+                # above target nothing is issued and the surplus stays in cash.
+                total_issuance_target_period = max(
+                    0.0,
+                    cbo_operating_cash_target
+                    - (projected_tga_pre_issuance + cbo_cash_residual_period),
+                )
             cbo_fed_row = _cbo_optional_exact_date_row(
                 cbo_inputs.get('fed_holdings'),
                 cbo_scenario_id,
@@ -4427,7 +4629,10 @@ def run_simulation(
                 cbo_fed_allocation_override_active = True
                 cbo_fed_holdings_target = float(cbo_fed_row['cbo_fed_holdings_target_bil'])
                 results.loc[current_date, 'CBOFedHoldingsTargetApplicable'] = 1.0
-            results.loc[current_date, 'CBORequiredFaceIssuance'] = total_issuance_target_period
+            # The operating-cash mode sizes proceeds, not face; its need is CashFinancingProceeds.
+            results.loc[current_date, 'CBORequiredFaceIssuance'] = (
+                total_issuance_target_period if cbo_face_target_mode else 0.0
+            )
             results.loc[current_date, 'CBOBuybackFaceRetired'] = cbo_buyback_face_retired
             results.loc[current_date, 'CBOBuybackCashPaid'] = cbo_buyback_cash_paid
             results.loc[current_date, 'CBOFedHoldingsTarget'] = cbo_fed_holdings_target
@@ -4461,15 +4666,7 @@ def run_simulation(
             )
         else:
             tips_real_curve_years, tips_real_curve_rates = _generic_tips_real_curve(tips_p)
-        issuance_supply_schedule = _build_issuance_supply_schedule(
-            total_issuance_target_period,
-            face_target_mode=cbo_face_target_mode,
-            issuance_leg=(
-                'cbo_reference_face_issuance'
-                if cbo_reference_financing_mode
-                else 'ordinary_issuance'
-            ),
-            issuance_profile=issuance_profile,
+        issuance_pricing = _issuance_pricing_context(
             tips_real_curve_years=tips_real_curve_years,
             tips_real_curve_rates=tips_real_curve_rates,
             current_yield_curve_years=current_yield_curve_years,
@@ -4482,7 +4679,28 @@ def run_simulation(
             cbo_funding_mode=cbo_funding_mode,
             cbo_inputs=cbo_inputs,
             cbo_scenario_id=cbo_scenario_id,
+        )
+        # The bill-share rule measures debt after the day's maturities and before issuance.
+        pre_issuance_position = (
+            controlled_debt_and_bills(bond_portfolio)
+            if is_rule_profile(issuance_profile)
+            else None
+        )
+        if cbo_operating_cash_financing_mode:
+            primary_issuance_leg = 'operating_cash_target_financing'
+        elif cbo_reference_financing_mode:
+            primary_issuance_leg = 'cbo_reference_face_issuance'
+        else:
+            primary_issuance_leg = 'ordinary_issuance'
+        issuance_supply_schedule = _schedule_issuance_leg(
+            total_issuance_target_period,
+            face_target_mode=cbo_face_target_mode,
+            issuance_leg=primary_issuance_leg,
+            issuance_profile=issuance_profile,
             current_date=current_date,
+            pricing=issuance_pricing,
+            pre_issuance_position=pre_issuance_position,
+            scheduled=(),
         )
         if cbo_reference_financing_mode:
             reference_cash_proceeds = sum(
@@ -4499,24 +4717,15 @@ def run_simulation(
             cash_financing_proceeds_target = max(
                 0.0, cash_closure_target - projected_after_reference
             )
-            financing_schedule = _build_issuance_supply_schedule(
+            financing_schedule = _schedule_issuance_leg(
                 cash_financing_proceeds_target,
                 face_target_mode=False,
                 issuance_leg='tga_floor_cash_financing',
                 issuance_profile=issuance_profile,
-                tips_real_curve_years=tips_real_curve_years,
-                tips_real_curve_rates=tips_real_curve_rates,
-                current_yield_curve_years=current_yield_curve_years,
-                current_yield_curve_rates=current_yield_curve_rates,
-                yield_interpolation_method=yield_interpolation_method,
-                yield_floor_zero=yield_floor_zero,
-                evaluated_nominal_shock=evaluated_nominal_shock,
-                tips_real_coupon=tips_real_coupon,
-                frn_spread=frn_spread,
-                cbo_funding_mode=cbo_funding_mode,
-                cbo_inputs=cbo_inputs,
-                cbo_scenario_id=cbo_scenario_id,
                 current_date=current_date,
+                pricing=issuance_pricing,
+                pre_issuance_position=pre_issuance_position,
+                scheduled=issuance_supply_schedule,
             )
             expected_cash_financing_face = sum(
                 float(item['face_amount']) for item in financing_schedule
@@ -4659,7 +4868,7 @@ def run_simulation(
                     for holder_subbucket, route_face_value in route_face_values:
                         if route_face_value < TGA_FLOOR_TOLERANCE:
                             continue
-                        maturity_date = _maturity_date_from_years(current_date, mat_yrs)
+                        maturity_date = details['maturity_date']
                         coupon_rate_val = details.get('coupon', 0.0)
                         fixed_spread_val = details.get('spread', 0.0) if sec_type == 'FRN' else 0.0
                         issue_price_ratio_val = details.get('issue_price_ratio', 1.0)
@@ -4714,7 +4923,7 @@ def run_simulation(
                         actual_issued_amount += route_face_value
                         actual_auction_proceeds += issue_proceeds_val
                         issue_price_cash_gap += route_face_value - issue_proceeds_val
-                        if issuance_leg_val == 'tga_floor_cash_financing':
+                        if issuance_leg_val in CASH_FINANCING_ISSUANCE_LEGS:
                             cash_financing_face_issued += route_face_value
                             cash_financing_proceeds += issue_proceeds_val
                         if not is_noncash_intragovernmental_issuance:
@@ -4774,6 +4983,22 @@ def run_simulation(
             if abs(cash_financing_face_issued - expected_cash_financing_face) > target_tolerance:
                 raise RuntimeError(
                     f"TGA-floor financing face allocation miss at {current_date.date()}"
+                )
+            results.loc[current_date, 'CashFinancingFaceIssued'] = cash_financing_face_issued
+            results.loc[current_date, 'CashFinancingProceeds'] = cash_financing_proceeds
+        if cbo_operating_cash_financing_mode:
+            if abs(cash_financing_proceeds - total_issuance_target_period) > target_tolerance:
+                raise RuntimeError(
+                    f"Operating-cash financing cash settlement miss at {current_date.date()}: "
+                    f"target={total_issuance_target_period:.12f}, "
+                    f"actual={cash_financing_proceeds:.12f}"
+                )
+            expected_cash_financing_face = sum(
+                float(item['face_amount']) for item in issuance_supply_schedule
+            )
+            if abs(cash_financing_face_issued - expected_cash_financing_face) > target_tolerance:
+                raise RuntimeError(
+                    f"Operating-cash financing face allocation miss at {current_date.date()}"
                 )
             results.loc[current_date, 'CashFinancingFaceIssued'] = cash_financing_face_issued
             results.loc[current_date, 'CashFinancingProceeds'] = cash_financing_proceeds
@@ -5136,10 +5361,7 @@ def run_simulation(
             cbo_post_issuance_controlled_debt = _controlled_public_marketable_debt_from_portfolio(active_bonds_final)
             cbo_target_error = cbo_post_issuance_controlled_debt - cbo_controlled_debt_target
             target_tolerance = float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001)
-            if (
-                not cbo_reference_financing_mode
-                and abs(cbo_target_error) > target_tolerance
-            ):
+            if cbo_debt_target_mode and abs(cbo_target_error) > target_tolerance:
                 raise RuntimeError(
                     f"CBO controlled debt target miss at {current_date.date()}: "
                     f"target={cbo_controlled_debt_target:.12f}, "
@@ -5154,7 +5376,7 @@ def run_simulation(
             results.loc[current_date, 'CBOControlledDebtPreIssuance'] = cbo_pre_issuance_controlled_debt
             results.loc[current_date, 'CBOControlledDebtPostIssuance'] = cbo_post_issuance_controlled_debt
             results.loc[current_date, 'CBOControlledDebtTargetError'] = (
-                0.0 if cbo_reference_financing_mode else cbo_target_error
+                cbo_target_error if cbo_debt_target_mode else 0.0
             )
             results.loc[current_date, 'CBOOperatingCashTarget'] = cbo_operating_cash_target
             results.loc[current_date, 'CBOCashReconciliationResidual'] = cbo_cash_reconciliation_residual_input
@@ -5336,7 +5558,7 @@ def run_simulation(
                 f"shortfall={tga_discrepancy:.12f}"
             )
         current_tga = projected_tga
-        if cbo_reference_financing_mode:
+        if cbo_reference_financing_mode or cbo_operating_cash_financing_mode:
             validation_floor = float(
                 funding_rule_cfg.get('validation_floor_bil', -0.000001)
             )
@@ -5344,6 +5566,15 @@ def run_simulation(
                 raise RuntimeError(
                     f"TGA-floor financing failed at {current_date.date()}: "
                     f"TGA={current_tga:.12f}, floor={validation_floor:.12f}"
+                )
+        if cbo_operating_cash_financing_mode:
+            # Any cash flow booked after issuance would leave the TGA off its target.
+            shortfall = cbo_operating_cash_target - current_tga
+            off_target = abs(shortfall) if cash_financing_proceeds > target_tolerance else max(0.0, shortfall)
+            if off_target > target_tolerance:
+                raise RuntimeError(
+                    f"Operating-cash financing left the TGA off target at {current_date.date()}: "
+                    f"TGA={current_tga:.12f}, target={cbo_operating_cash_target:.12f}"
                 )
         if cbo_funding_mode:
             results.loc[current_date, 'CBOCashResidual'] = current_tga - cbo_operating_cash_target

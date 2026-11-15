@@ -83,6 +83,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         baseline_scenario = example_scenarios(baseline_package, simulation=simulation)[
             "00_baseline_noop.json"
         ]
+        # Marginal pairs compare runs on the same debt path, so they hold debt to CBO's path.
+        baseline_scenario["funding_closure"] = {"mode": "cbo_public_debt_target"}
         write_json(baseline_scenario_path, baseline_scenario)
         baseline_spec = CboScenarioSpec.from_file(baseline_scenario_path)
         baseline_spec.assert_baseline_matches(baseline_package)

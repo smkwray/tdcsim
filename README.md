@@ -67,10 +67,16 @@ tdcsim-cbo verify --help
 The [downstream quick start](examples/cbo_downstream_quickstart.md) covers package
 inputs, example scenarios, output files and scenario controls. Each step:
 
-- **Issuance.** Debt held by the public follows CBO's projected path, interpolated
-  to the day. New securities settle on the day the path requires them, split by
-  the scenario's security-type shares and maturity distribution. The runner
-  issues on that daily need, without Treasury's auction calendar.
+- **Issuance.** Each day the runner issues what the Treasury needs to keep its
+  cash on the operating-cash path (see **Cash**), without Treasury's auction
+  calendar. Bills fill toward a target share of outstanding marketable debt: by
+  default the opening book's bill share, and scenarios can set a constant or a
+  dated path. Because bills mature within a year, holding that share takes most
+  gross issuance. The rest is split across notes, bonds, TIPS and FRNs in the
+  shares the public bought at Treasury auctions over the twelve months before the
+  start, and bills are split across 4- to 52-week terms the same way. The package
+  build measures these shares from Treasury's auction results, excluding cash
+  management bills and the Fed's allocations.
 - **Holders of new issuance.** New bills are divided among banks, foreign holders,
   money market funds (MMFs) and other domestic holders in proportion to their bill
   holdings in the opening book; other security types follow holdings of longer
@@ -81,8 +87,15 @@ inputs, example scenarios, output files and scenario controls. Each step:
 - **Payments.** Coupons, principal, floating-rate note (FRN) interest and
   Treasury Inflation-Protected Securities (TIPS) inflation adjustments are paid
   on each security's own dates to its current holder.
-- **Cash.** The TGA opens at its Daily Treasury Statement balance. Every cash flow
-  is booked on both sides, and a run fails if the TGA goes negative.
+- **Cash.** The TGA opens at its Daily Treasury Statement balance and follows the
+  package's operating-cash path. When spending would take it below the path, new
+  issuance tops it up; when receipts lift it above, nothing is issued until
+  spending draws it back. A scenario that costs more therefore ends with more debt
+  and the same cash. CBO's debt path is reported alongside, with the scenario's
+  drift from it. Every cash flow is booked on both sides, and a run fails if the
+  TGA goes negative. A scenario can instead hold debt exactly on CBO's path
+  (`cbo_public_debt_target`) or follow that path and borrow only to keep the TGA
+  from going negative (`cbo_debt_reference_plus_tga_floor_financing_v1`).
 
 **Opening portfolio.** `src/ratewall_input_builder.py` builds the opening book
 from Treasury's Monthly Statement of the Public Debt (MSPD). It takes every
@@ -160,7 +173,8 @@ supersedes it. Columns containing `ru_flow` hold RS flows.
 
 - Yield curves are inputs. A change in holders or issuance moves rates only when
   the scenario also changes the curve.
-- CBO net interest is reported for comparison. Issuance follows the debt path.
+- CBO net interest and CBO's debt path are reported for comparison. By default
+  issuance follows the Treasury's cash need.
 - The configuration runner's secondary trading reallocates holdings toward
   configured holder preferences once per step.
 - TIPS inflation accretion enters financing cost when

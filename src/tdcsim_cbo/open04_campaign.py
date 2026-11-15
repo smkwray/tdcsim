@@ -27,6 +27,7 @@ from evaluated_nominal_curve import (
     OPEN04_OUTPUT_CONTRACT,
     normalize_open04_override,
 )
+from sim_engine import CBO_FUNDING_MODE, CBO_OPERATING_CASH_TARGET_FINANCING_MODE
 from tdc_shared import MARKETABLE_PREFERENCE_CATEGORIES
 
 from ._json import (
@@ -525,9 +526,15 @@ class Open04CampaignMarker:
     funding_closure_mode: str
 
 
-DEFAULT_FUNDING_CLOSURE_MODE = "cbo_public_debt_target"
+# Non-OPEN-04 scenarios default to keeping the TGA on its operating-cash path and
+# letting debt absorb cost differences; the debt-path modes stay selectable.
+DEFAULT_FUNDING_CLOSURE_MODE = CBO_OPERATING_CASH_TARGET_FINANCING_MODE
 SCENARIO_FUNDING_CLOSURE_MODES = frozenset(
-    {DEFAULT_FUNDING_CLOSURE_MODE, OPEN04_FUNDING_CLOSURE_MODE}
+    {
+        DEFAULT_FUNDING_CLOSURE_MODE,
+        CBO_FUNDING_MODE,
+        OPEN04_FUNDING_CLOSURE_MODE,
+    }
 )
 
 

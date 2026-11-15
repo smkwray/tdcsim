@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections.abc
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+from issuance_calibration import active_special_categories, is_rule_profile, validate_rule_profile
 from tdc_shared import HOLDER_TYPES, MATURITY_CATEGORIES, PREFERENCE_CATEGORIES, TGA_FLOOR_TOLERANCE
 
 VALID_OVERRIDE_KEYS = frozenset({
@@ -331,6 +332,8 @@ def validate_issuance_profile(issuance_profile: dict, label: str = 'treasury_iss
     errors: List[str] = []
     if not isinstance(issuance_profile, collections.abc.Mapping):
         return [f"{label} must be a mapping."]
+    if is_rule_profile(issuance_profile):
+        return validate_rule_profile(issuance_profile, label=label)
 
     fixed_remainder_sum = 0.0
     for cat in MATURITY_CATEGORIES:
@@ -453,7 +456,13 @@ def validate_sector_preferences(
     if isinstance(issuance_profile, collections.abc.Mapping):
         # Only insist on unit sums for categories that are actually present or can be traded.
         active_categories = {'bills', 'notes', 'bonds'}
-        for special_cat, pref_key in [('TIPS', 'tips'), ('FRN', 'frn'), ('NonMarketable', 'nonmarketable')]:
+        if is_rule_profile(issuance_profile):
+            active_categories |= active_special_categories(issuance_profile)
+        for special_cat, pref_key in (
+            [('NonMarketable', 'nonmarketable')]
+            if is_rule_profile(issuance_profile)
+            else [('TIPS', 'tips'), ('FRN', 'frn'), ('NonMarketable', 'nonmarketable')]
+        ):
             cfg = issuance_profile.get(special_cat, {})
             if isinstance(cfg, collections.abc.Mapping):
                 try:

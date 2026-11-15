@@ -170,6 +170,19 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
             _validate_by_mode(name, override, mode, {"official_cbo_baseline": (("role",), ())})
         elif name == "mmf_deposit_pass_through":
             _validate_by_mode(name, override, mode, {"fixed_fraction": (("value",), ())})
+        elif name == "issuance_mix":
+            _validate_by_mode(
+                name,
+                override,
+                mode,
+                {
+                    "replace_shares": (
+                        ("tips_share", "frn_share", "fixed_remainder_shares", "maturity_distributions"),
+                        ("negative_issuance_action",),
+                    ),
+                    "bill_share_target_v1": (("bill_share_target",), ()),
+                },
+            )
     _validate_open04_evaluated_nominal_contract(data, overrides)
 
 

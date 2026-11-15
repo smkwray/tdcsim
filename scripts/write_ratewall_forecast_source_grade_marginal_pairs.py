@@ -316,8 +316,10 @@ def _prepare_path(path: Path, *, force: bool, make_dir: bool) -> None:
 
 
 def _baseline_pair_scenario(baseline: CboBaselinePackage, year: int, window: Any) -> dict[str, Any]:
+    # Marginal pairs compare runs on the same debt path, so they hold debt to CBO's path.
     return {
         "schema_version": "tdcsim_cbo_scenario_v1",
+        "funding_closure": {"mode": "cbo_public_debt_target"},
         "scenario_id": f"ratewall_forecast_{year}_baseline_source_grade_v1",
         "title": f"RateWall forecast {year} source-grade baseline",
         "baseline": {

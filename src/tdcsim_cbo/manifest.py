@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE
+
 from .baseline import CboBaselinePackage
 from .compiler import CboCompiledScenario
 from .contract import CboScenarioSpec
@@ -386,6 +388,25 @@ def cash_closure_validation_invariants(boundary_checks: Mapping[str, Any]) -> li
                 f"targeted_periods={boundary_checks.get('operating_cash_targeted_periods', '')}"
             ),
         },
+        *_operating_cash_financing_invariants(boundary_checks),
+    ]
+
+
+def _operating_cash_financing_invariants(boundary_checks: Mapping[str, Any]) -> list[dict[str, Any]]:
+    # The operating-cash financing mode issues exactly what keeps the TGA on its target,
+    # so a TGA below target, or off target on a day that issued, is a failed run.
+    if boundary_checks.get("funding_closure_mode") != CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
+        return []
+    return [
+        {
+            "id": "tga_follows_operating_cash_target",
+            "status": "pass" if boundary_checks.get("tga_follows_operating_cash_target") is True else "fail",
+            "observed": (
+                f"below_target_periods={boundary_checks.get('tga_below_operating_cash_target_periods', '')};"
+                f"issuance_periods_off_target={boundary_checks.get('issuance_periods_off_operating_cash_target', '')};"
+                f"max_excess_bil={boundary_checks.get('max_tga_excess_over_operating_cash_target_bil', '')}"
+            ),
+        }
     ]
 
 

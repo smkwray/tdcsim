@@ -28,20 +28,20 @@ This writes twenty-three ready-to-run examples:
 
 - `00_baseline_noop.json`: run the baseline without scenario changes.
 - `01_rates_inflation_frn_tips.json`: change the nominal curve, inflation, FRN benchmark, TIPS real yield, and real operating cash.
-- `02_issuance_maturity_mix.json`: change issuance shares and maturity mix.
+- `02_issuance_maturity_mix.json`: raise the bill-share target from 22% to 28% between 2027 and the end of 2028.
 - `03_sector_holders.json`: change sector holder preferences from a future date forward.
 - `04_fiscal_fed_cash.json`: change primary deficit scale, Fed stock target handling, cash residual, operating cash, and fiscal incidence.
 - `05_rate_down_25bp.json`: matched nominal-rate down case with linked FRN benchmark.
 - `06_rate_up_25bp.json`: matched nominal-rate up case with linked FRN benchmark.
-- `07_issuance_shorter.json`: matched shorter issuance mix, holding TIPS/FRN shares fixed against the longer case.
-- `08_issuance_longer.json`: matched longer issuance mix, holding TIPS/FRN shares fixed against the shorter case.
+- `07_issuance_shorter.json`: matched shorter case, a 30% bill-share target.
+- `08_issuance_longer.json`: matched longer case, a 15% bill-share target.
 - `09_private_holder_high.json`: high private new-issuance holder share.
 - `10_private_holder_low.json`: low private new-issuance holder share.
 - `11_primary_deficit_down_1pct.json`: matched primary-deficit down case.
 - `12_primary_deficit_up_1pct.json`: matched primary-deficit up case.
 - `13_operating_cash_inflation_beta_50.json`: operating-cash-only inflation-beta scenario.
 - `14_fed_holdings_scale_1.json`: Fed-holdings-only passthrough scenario.
-- `15_empirical_issuance_shorter_uncoupled.json`: moderate empirical shorter-issuance control.
+- `15_empirical_issuance_shorter_uncoupled.json`: moderate empirical shorter-issuance control (fixed gross issuance shares; see Scenario Knobs).
 - `16_empirical_issuance_longer_uncoupled.json`: moderate empirical longer-issuance control.
 - `17_empirical_shorter_termprem_down_cons.json`: shorter issuance plus conservative long-end rate decline.
 - `18_empirical_shorter_termprem_down_central.json`: shorter issuance plus central long-end rate decline.
@@ -155,7 +155,9 @@ The CBO scenario interface supports the main downstream controls:
 
 - Yield curve shocks, including key-rate shocks on generated curve tenors.
 - Inflation, FRN benchmark, and TIPS real-yield assumptions.
-- Issuance shares and maturity mix, including weighted-average-maturity changes through the maturity distributions. FRNs remain two-year securities in this lane.
+- The outstanding bill-share target: `{"mode": "bill_share_target_v1", "bill_share_target": 0.25}`, or a dated path such as `[{"date": "2027-01-01", "bill_share_target": 0.22}, {"date": "2028-12-31", "bill_share_target": 0.28}]` (linear between dates, flat before the first and after the last). Bill terms and the split across notes, bonds, TIPS and FRNs stay those measured from the package's auction data. FRNs remain two-year securities in this lane.
+- `replace_shares` instead fixes each security type's share of gross issuance. Bills then run off as they mature, so the outstanding bill share falls well below its opening level within a year; the empirical examples (15–22) use this mode.
+- The funding closure: `{"funding_closure": {"mode": "..."}}` with `cbo_operating_cash_target_financing_v1` (default), `cbo_public_debt_target` or `cbo_debt_reference_plus_tga_floor_financing_v1`.
 - Future-dated holder preference changes for newly issued marketable debt, by security category: bills, notes, bonds, TIPS, and FRNs.
 - MMF deposit pass-through, defaulting to `0.97`.
 - Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
@@ -164,9 +166,10 @@ The CBO scenario interface supports the main downstream controls:
 
 ## Model Rules
 
-- Issuance follows CBO's debt path. CBO net interest is reported for comparison.
-- Operating-cash and cash-residual settings move the TGA path; issuance still follows the debt path.
+- By default each day issues what keeps the TGA on its operating-cash path, net of the cash residual; above the path nothing is issued. Debt absorbs cost differences, and `DebtDriftFromReference` reports the gap to CBO's debt path. CBO net interest is reported for comparison.
+- Each day's issuance first moves bills toward the bill-share target, then splits the rest across coupon securities by the auction shares.
+- Under `cbo_public_debt_target` debt follows CBO's path exactly and operating-cash settings move only the TGA; under `cbo_debt_reference_plus_tga_floor_financing_v1` debt follows the path and extra borrowing starts only when the TGA would go negative.
 - The Fed meets its holdings path by buying or selling existing securities at market value and receives no allocation of new issuance.
 - Fed remittances and deferred assets are outside this runner.
 - Holder-preference changes apply to new issuance from their effective date; the existing stock keeps its holders.
-- A day that requires negative issuance stops the run, unless the scenario selects at-par retirement of the shortest public marketable securities.
+- Under `cbo_public_debt_target`, a day that requires negative issuance stops the run, unless the scenario selects at-par retirement of the shortest public marketable securities.

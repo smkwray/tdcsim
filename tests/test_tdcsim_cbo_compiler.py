@@ -24,6 +24,8 @@ from tdcsim_cbo.compiler import (
     _open04_change_perimeter,
     digest_input_tree,
 )
+import tdcsim_cbo.runner as runner_module
+from test_issuance_rule import write_fixture_issuance_calibration
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
 
 
@@ -54,9 +56,15 @@ def test_noop_compile_materializes_explicit_defaults_without_marking_csv_rows(tm
             encoding="utf-8"
         )
     )
+    # The default issuance rule comes from the package's auction calibration: the
+    # opening bill share as target, bound to the calibration bytes it was read from.
+    assert issuance["mode"] == "bill_share_target_v1"
     assert issuance["selection_status"] == "configured_default"
     assert issuance["negative_issuance_action"] == "error"
-    assert sum(issuance["security_shares"].values()) == pytest.approx(1.0)
+    assert issuance["bill_share_target_path"] == [{"date": None, "bill_share_target": 0.2}]
+    assert issuance["calibration_sha256"] == sha256_file(
+        compiled.forecast_inputs_dir / "tdcsim_issuance_calibration.json"
+    )
     assert runtime["fiscal_incidence_policy_id"] == "central"
     assert runtime["fiscal_incidence_policy_status"] == "configured_default"
     assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.97)
@@ -856,6 +864,69 @@ def test_issuance_mix_override_materializes_hashed_compiled_artifact(tmp_path: P
     assert compiled.manifest["materialized_default_count"] == 2
 
 
+@pytest.mark.parametrize(
+    "target, expected_path",
+    [
+        (0.25, [{"date": None, "bill_share_target": 0.25}]),
+        (
+            [
+                {"date": "2027-01-01", "bill_share_target": 0.2},
+                {"date": "2027-06-30", "bill_share_target": 0.3},
+            ],
+            [
+                {"date": "2027-01-01", "bill_share_target": 0.2},
+                {"date": "2027-06-30", "bill_share_target": 0.3},
+            ],
+        ),
+    ],
+)
+def test_bill_share_override_replaces_only_the_target(tmp_path: Path, target, expected_path) -> None:
+    """A scenario moves the bill share; the auction-measured term shares stay those of
+    the package, so the runtime profile must carry the scenario path over them."""
+
+    baseline = _compiler_baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    scenario["overrides"] = {"issuance_mix": {"mode": "bill_share_target_v1", "bill_share_target": target}}
+
+    compiled = CboScenarioCompiler().compile(baseline, CboScenarioSpec.from_mapping(scenario), tmp_path / "work")
+
+    payload = json.loads((compiled.forecast_inputs_dir / ISSUANCE_MIX_FILE).read_text(encoding="utf-8"))
+    assert payload["selection_status"] == "scenario_override"
+    assert payload["bill_share_target_path"] == expected_path
+    assert ISSUANCE_MIX_FILE not in compiled.manifest["materialized_defaults"]
+    profile = runner_module._issuance_profile(compiled.forecast_inputs_dir)
+    assert profile["mode"] == "bill_share_target_v1"
+    assert profile["bill_share_target_path"] == expected_path
+    assert [term["weeks"] for term in profile["bill_terms"]] == [4, 13, 26]
+
+
+def test_bill_share_rule_requires_the_package_calibration(tmp_path: Path) -> None:
+    """Without auction data there is no measured mix; compiling must not invent one."""
+
+    package, attestation = _write_compiler_package(tmp_path, include_issuance_calibration=False)
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+
+    with pytest.raises(CompilerError, match="issuance calibration is missing"):
+        CboScenarioCompiler().compile(
+            baseline, CboScenarioSpec.from_mapping(_scenario_mapping(baseline)), tmp_path / "work"
+        )
+
+
+def test_runner_rejects_rule_whose_calibration_bytes_changed(tmp_path: Path) -> None:
+    """The compiled rule binds the calibration it was built from."""
+
+    baseline = _compiler_baseline(tmp_path)
+    compiled = CboScenarioCompiler().compile(
+        baseline, CboScenarioSpec.from_mapping(_scenario_mapping(baseline)), tmp_path / "work"
+    )
+    calibration = compiled.forecast_inputs_dir / "tdcsim_issuance_calibration.json"
+    payload = json.loads(calibration.read_text(encoding="utf-8"))
+    payload["bill_share_target"] = 0.9
+    calibration.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(runner_module.RunnerError, match="does not match the calibration bytes"):
+        runner_module._issuance_profile(compiled.forecast_inputs_dir)
+
+
 def test_derived_mmf_override_preserves_inherited_fiscal_selector_and_status(
     tmp_path: Path,
 ) -> None:
@@ -1142,10 +1213,13 @@ def _write_compiler_package(
     scenario_id: str = "compiler_fixture",
     fiscal_policy_ids: tuple[str, ...] = ("central",),
     include_opening_fed_target: bool = True,
+    include_issuance_calibration: bool = True,
 ) -> tuple[Path, Path]:
     package_dir = tmp_path / "compiler_pkg"
     inputs = package_dir / "forecast_inputs"
     inputs.mkdir(parents=True)
+    if include_issuance_calibration:
+        write_fixture_issuance_calibration(inputs)
     (package_dir / "requirements.lock.txt").write_text("pandas==0\n", encoding="utf-8")
     lock_sha = sha256_file(package_dir / "requirements.lock.txt")
 

@@ -271,6 +271,7 @@
     },
     "funding_closure_mode": {
       "enum": [
+        "cbo_operating_cash_target_financing_v1",
         "cbo_public_debt_target",
         "cbo_debt_reference_plus_tga_floor_financing_v1"
       ]

@@ -29,6 +29,7 @@ from test_cbo_engine_integration import (
     _write_macro_path,
     _write_tips_forward_paths,
 )
+from test_issuance_rule import write_fixture_issuance_calibration
 from test_tdcsim_cbo_baseline import RELEASE_SHA, VERIFIER_SHA
 
 
@@ -202,7 +203,14 @@ def test_run_cbo_scenario_preserves_cash_non_sizing_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Under the debt-path mode a residual must not resize issuance. (The operating-cash
+    # mode sizes issuance on cash, residual included, so a nonzero residual there is
+    # caught only by the hard cash-closure invariant below.)
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    for name in ("noop", "cash"):
+        data = read_json(scenarios[name])
+        data["funding_closure"] = {"mode": "cbo_public_debt_target"}
+        write_json(scenarios[name], data)
 
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
     captured: dict[str, pd.DataFrame] = {}
@@ -337,10 +345,12 @@ def test_explicit_retirement_routes_cb_principal_to_current_holder(tmp_path: Pat
         fed_holdings_target_bil=0.0,
     )
     baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    # At-par retirement exists only where debt is held to the CBO path.
     scenario = _write_scenario(
         tmp_path / "explicit-retirement-route.json",
         baseline,
         overrides={"issuance_mix": _bill_only_issuance_mix_override()},
+        funding_closure="cbo_public_debt_target",
     )
 
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-retirement-route")
@@ -561,8 +571,8 @@ def test_cash_closure_invariants_fail_an_unbooked_residual(
     captured: dict[str, object] = {}
     production_validate = runner_module.validate_run_boundaries
 
-    def capture_boundaries(results, inputs_dir):
-        boundaries = production_validate(results, inputs_dir)
+    def capture_boundaries(results, inputs_dir, **kwargs):
+        boundaries = production_validate(results, inputs_dir, **kwargs)
         captured.update(boundaries)
         return boundaries
 
@@ -587,13 +597,18 @@ def test_cash_closure_invariant_fails_a_negative_tga(tmp_path: Path) -> None:
     results = pd.read_csv(run.results_path)
     inputs_dir = run.compiled.forecast_inputs_dir
 
-    clean = validate_run_boundaries(results, inputs_dir)
+    mode = run.run_manifest["funding_closure_mode"]
+    clean = validate_run_boundaries(results, inputs_dir, funding_closure_mode=mode)
     assert clean["tga_nonnegative"] is True
     assert clean["negative_tga_periods"] == 0
+    assert clean["tga_follows_operating_cash_target"] is True
 
     overdrawn = results.copy()
     overdrawn.loc[overdrawn.index[-1], "TGA"] = -1_500.0
-    breached = validate_run_boundaries(overdrawn, inputs_dir)
+    breached = validate_run_boundaries(overdrawn, inputs_dir, funding_closure_mode=mode)
+    # An overdraft is also a TGA below its operating-cash target.
+    assert breached["tga_follows_operating_cash_target"] is False
+    assert breached["tga_below_operating_cash_target_periods"] == 1
     assert breached["tga_nonnegative"] is False
     assert breached["negative_tga_periods"] == 1
     assert breached["min_tga"] == pytest.approx(-1_500.0)
@@ -619,12 +634,15 @@ def test_run_boundary_validation_rejects_missing_or_malformed_evidence(tmp_path:
             runner_module.validate_run_boundaries(
                 results.drop(columns=[column]),
                 inputs_dir,
+                funding_closure_mode=run.run_manifest["funding_closure_mode"],
             )
     malformed = results.copy()
     malformed["TGA"] = malformed["TGA"].astype(object)
     malformed.loc[malformed.index[-1], "TGA"] = "not-a-number"
     with pytest.raises(RunnerError, match="malformed TGA"):
-        runner_module.validate_run_boundaries(malformed, inputs_dir)
+        runner_module.validate_run_boundaries(
+            malformed, inputs_dir, funding_closure_mode=run.run_manifest["funding_closure_mode"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -689,6 +707,11 @@ def test_verifier_tolerates_float_repr_noise_in_invariant_observations(tmp_path:
     """
 
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    # Under the debt-path mode the TGA drifts off its target, so the operating-cash gap
+    # observation is a non-integer float to perturb (the default mode holds it at zero).
+    data = read_json(scenarios["noop"])
+    data["funding_closure"] = {"mode": "cbo_public_debt_target"}
+    write_json(scenarios["noop"], data)
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
     manifest = read_json(run.manifest_path)
     perturbed = False
@@ -1246,10 +1269,17 @@ def _write_cash_residual_override(path: Path) -> Path:
     return path
 
 
-def _write_scenario(path: Path, baseline: CboBaselinePackage, *, overrides: dict) -> Path:
+def _write_scenario(
+    path: Path,
+    baseline: CboBaselinePackage,
+    *,
+    overrides: dict,
+    funding_closure: str | None = None,
+) -> Path:
     write_json(
         path,
         {
+            **({"funding_closure": {"mode": funding_closure}} if funding_closure else {}),
             "schema_version": "tdcsim_cbo_scenario_v1",
             "scenario_id": path.stem.replace("-", "_") + "_v1",
             "baseline": {
@@ -1283,6 +1313,7 @@ def _write_runner_package(
     package_dir = tmp_path / "runner_pkg"
     inputs = package_dir / "forecast_inputs"
     inputs.mkdir(parents=True)
+    write_fixture_issuance_calibration(inputs)
     (package_dir / "requirements.lock.txt").write_text("pandas==0\n", encoding="utf-8")
     lock_sha = sha256_file(package_dir / "requirements.lock.txt")
     periods = build_simulation_calendar("2026-09-20", "2026-09-30", "daily")

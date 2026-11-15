@@ -264,9 +264,12 @@ def test_runner_gives_each_role_its_own_parent(tmp_path: Path, monkeypatch) -> N
 def test_funding_closure_rules() -> None:
     from tdcsim_cbo.open04_campaign import Open04CampaignError, scenario_funding_closure_mode
 
-    assert scenario_funding_closure_mode({}) == "cbo_public_debt_target"
+    # Undeclared scenarios keep the TGA on its operating-cash path; debt-path modes stay selectable.
+    assert scenario_funding_closure_mode({}) == "cbo_operating_cash_target_financing_v1"
     floor = "cbo_debt_reference_plus_tga_floor_financing_v1"
     assert scenario_funding_closure_mode({"funding_closure": {"mode": floor}}) == floor
+    exact = "cbo_public_debt_target"
+    assert scenario_funding_closure_mode({"funding_closure": {"mode": exact}}) == exact
     for bad in ({"funding_closure": {"mode": "plug"}}, {"funding_closure": {"mode": floor, "x": 1}}):
         with pytest.raises(Open04CampaignError):
             scenario_funding_closure_mode(bad)

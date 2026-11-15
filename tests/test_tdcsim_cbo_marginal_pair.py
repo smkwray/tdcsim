@@ -915,6 +915,10 @@ def test_secondary_settlement_is_admitted_as_non_interest(tmp_path: Path) -> Non
 
 def test_replay_campaign_verifies_after_relocation(tmp_path: Path) -> None:
     baseline_package, scenarios = _runner_baseline_and_scenarios(tmp_path / "inputs")
+    # A marginal pair holds the debt path fixed across baseline and shock.
+    noop = read_json(scenarios["noop"])
+    noop["funding_closure"] = {"mode": "cbo_public_debt_target"}
+    write_json(scenarios["noop"], noop)
     work = tmp_path / "work"
     baseline_run = run_cbo_scenario(
         baseline_package,

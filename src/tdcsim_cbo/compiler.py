@@ -23,6 +23,12 @@ from evaluated_nominal_curve import (
     evaluated_nominal_contract_metadata,
     normalize_open04_override,
 )
+from issuance_calibration import (
+    CALIBRATION_FILE,
+    ISSUANCE_RULE_MODE,
+    IssuanceCalibrationError,
+    load_calibration,
+)
 from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
@@ -44,6 +50,7 @@ from .transforms.fiscal import (
 from .transforms.portfolio import (
     apply_fed_holdings_override,
     compile_holder_preference_events,
+    compile_bill_share_target_override,
     compile_issuance_mix_override,
     validate_holder_preferences,
 )
@@ -73,6 +80,9 @@ _SOURCE_BASELINE_OPENING_DEFAULTS = {
     "tdc_level": 0.0,
 }
 
+# Fixed gross shares materialized for OPEN-04 campaign scenarios only: the frozen
+# OPEN-04 baseline binds this file's bytes. Every other scenario defaults to the
+# bill-share rule calibrated from the package's auction data.
 _DEFAULT_ISSUANCE_SECURITY_SHARES = {
     "bills": 0.225,
     "notes": 0.495,
@@ -171,6 +181,7 @@ class CboScenarioCompiler:
             forecast_inputs_dir,
             baseline=baseline,
             overrides=overrides,
+            open04_fixed_share_default=open04_marker is not None,
         )
         changed.update(adapter_changes)
         fixed_adapter_inputs = (
@@ -843,8 +854,16 @@ def _apply_overrides(
             changed.add(OPEN04_HOLDER_PROFILE_FILE)
 
     if "issuance_mix" in overrides:
-        issuance_mix = compile_issuance_mix_override(_override_mapping(overrides["issuance_mix"]))
-        _write_issuance_mix(forecast_inputs_dir / ISSUANCE_MIX_FILE, issuance_mix)
+        issuance_override = _override_mapping(overrides["issuance_mix"])
+        if issuance_override.get("mode") == ISSUANCE_RULE_MODE:
+            _write_bill_share_mix(
+                forecast_inputs_dir,
+                target_path=compile_bill_share_target_override(issuance_override),
+                selection_status="scenario_override",
+            )
+        else:
+            issuance_mix = compile_issuance_mix_override(issuance_override)
+            _write_issuance_mix(forecast_inputs_dir / ISSUANCE_MIX_FILE, issuance_mix)
         changed.add(ISSUANCE_MIX_FILE)
 
     if "net_interest_comparator" in overrides:
@@ -872,12 +891,20 @@ def _materialize_required_adapter_assumptions(
     *,
     baseline: CboBaselinePackage,
     overrides: Mapping[str, Any],
+    open04_fixed_share_default: bool,
 ) -> tuple[set[str], set[str]]:
     materialized: set[str] = set()
     changed: set[str] = set()
     issuance_path = forecast_inputs_dir / ISSUANCE_MIX_FILE
     if not issuance_path.exists():
-        _write_issuance_mix(issuance_path, None)
+        if open04_fixed_share_default:
+            _write_issuance_mix(issuance_path, None)
+        else:
+            _write_bill_share_mix(
+                forecast_inputs_dir,
+                target_path=None,
+                selection_status="configured_default",
+            )
         materialized.add(ISSUANCE_MIX_FILE)
         changed.add(ISSUANCE_MIX_FILE)
     runtime_path = forecast_inputs_dir / RUNTIME_ASSUMPTIONS_FILE
@@ -1431,6 +1458,44 @@ def _write_issuance_mix(path: Path, issuance_mix: Any) -> None:
             "claim_boundary": "issuance_mix_is_tdcsim_scenario_assumption_not_cbo_prescription",
         }
     write_json(path, payload)
+
+
+def _write_bill_share_mix(
+    forecast_inputs_dir: Path,
+    *,
+    target_path: list[dict[str, Any]] | None,
+    selection_status: str,
+) -> None:
+    """Write the bill-share rule; ``target_path=None`` takes the calibrated opening share."""
+
+    calibration_path = forecast_inputs_dir / CALIBRATION_FILE
+    try:
+        calibration = load_calibration(calibration_path)
+    except IssuanceCalibrationError as exc:
+        raise CompilerError(
+            f"the bill-share issuance rule needs the package issuance calibration: {exc}"
+        ) from exc
+    if target_path is None:
+        target_path = [{"date": None, "bill_share_target": float(calibration["bill_share_target"])}]
+    write_json(
+        forecast_inputs_dir / ISSUANCE_MIX_FILE,
+        {
+            "schema_version": "tdcsim_cbo_issuance_mix_assumptions_v1",
+            "mode": ISSUANCE_RULE_MODE,
+            "selection_status": selection_status,
+            "bill_share_target_path": target_path,
+            "calibration_file": CALIBRATION_FILE,
+            "calibration_sha256": sha256_file(calibration_path),
+            "negative_issuance_action": "error",
+            "source_role": (
+                "package_auction_calibration"
+                if selection_status == "configured_default"
+                else "scenario_assumption"
+            ),
+            "runtime_role": "issuance_rule",
+            "claim_boundary": "issuance_mix_is_tdcsim_scenario_assumption_not_cbo_prescription",
+        },
+    )
 
 
 def _read_csv(path: Path) -> tuple[list[dict[str, str]], list[str]]:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from issuance_calibration import ISSUANCE_RULE_MODE, IssuanceCalibrationError, normalize_target_path
 from tdc_shared import HOLDER_EVENT_ORDER, HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES
 
 MARKETABLE_SECURITY_TYPES = MARKETABLE_PREFERENCE_CATEGORIES
@@ -27,11 +28,24 @@ class IssuanceMix:
     negative_issuance_action: str
 
 
+def compile_bill_share_target_override(override: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Validate a bill-share target override: a constant or a dated linear path."""
+
+    if override.get("mode") != ISSUANCE_RULE_MODE or set(override) != {"mode", "bill_share_target"}:
+        raise PortfolioTransformError(
+            f"issuance_mix mode {ISSUANCE_RULE_MODE} takes exactly mode and bill_share_target"
+        )
+    try:
+        return normalize_target_path(override["bill_share_target"], label="issuance_mix.bill_share_target")
+    except IssuanceCalibrationError as exc:
+        raise PortfolioTransformError(str(exc)) from exc
+
+
 def compile_issuance_mix_override(override: Mapping[str, Any]) -> IssuanceMix:
     """Validate and summarize a replace-shares issuance-mix override."""
 
     if override.get("mode") != "replace_shares":
-        raise PortfolioTransformError("issuance_mix mode must be replace_shares")
+        raise PortfolioTransformError(f"issuance_mix mode must be replace_shares or {ISSUANCE_RULE_MODE}")
     tips_share = float(override["tips_share"])
     frn_share = float(override["frn_share"])
     if tips_share + frn_share > 1.0 + 1e-12:

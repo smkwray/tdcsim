@@ -82,22 +82,16 @@ def example_scenarios(
         "02_issuance_maturity_mix.json": _scenario(
             baseline,
             scenario_id="cbo_issuance_maturity_mix_v1",
-            label="Issuance mix and maturity stress",
+            label="Bill share phased up over two years",
             simulation=simulation,
             coupling=_baseline_coupling(),
             overrides={
                 "issuance_mix": {
-                    "mode": "replace_shares",
-                    "tips_share": 0.08,
-                    "frn_share": 0.04,
-                    "fixed_remainder_shares": {"bills": 0.25, "notes": 0.50, "bonds": 0.25},
-                    "maturity_distributions": {
-                        "bills": [{"maturity_years": 0.5, "share": 1.0}],
-                        "notes": [{"maturity_years": 5.0, "share": 0.65}, {"maturity_years": 10.0, "share": 0.35}],
-                        "bonds": [{"maturity_years": 20.0, "share": 0.40}, {"maturity_years": 30.0, "share": 0.60}],
-                        "tips": [{"maturity_years": 10.0, "share": 0.70}, {"maturity_years": 30.0, "share": 0.30}],
-                        "frn": [{"maturity_years": 2.0, "share": 1.0}],
-                    },
+                    "mode": "bill_share_target_v1",
+                    "bill_share_target": [
+                        {"date": "2027-01-01", "bill_share_target": 0.22},
+                        {"date": "2028-12-31", "bill_share_target": 0.28},
+                    ],
                 }
             },
         ),
@@ -491,33 +485,12 @@ def _empirical_issuance_mix(kind: str) -> dict[str, Any]:
 
 
 def _matched_issuance_mix(kind: str) -> dict[str, Any]:
-    if kind == "shorter":
-        fixed_remainder_shares = {"bills": 0.55, "notes": 0.40, "bonds": 0.05}
-        maturity_distributions = {
-            "bills": [{"maturity_years": 0.25, "share": 0.50}, {"maturity_years": 0.5, "share": 0.50}],
-            "notes": [{"maturity_years": 2.0, "share": 0.70}, {"maturity_years": 5.0, "share": 0.30}],
-            "bonds": [{"maturity_years": 20.0, "share": 0.50}, {"maturity_years": 30.0, "share": 0.50}],
-            "tips": [{"maturity_years": 5.0, "share": 0.60}, {"maturity_years": 10.0, "share": 0.40}],
-            "frn": [{"maturity_years": 2.0, "share": 1.0}],
-        }
-    elif kind == "longer":
-        fixed_remainder_shares = {"bills": 0.10, "notes": 0.45, "bonds": 0.45}
-        maturity_distributions = {
-            "bills": [{"maturity_years": 0.5, "share": 1.0}],
-            "notes": [{"maturity_years": 7.0, "share": 0.45}, {"maturity_years": 10.0, "share": 0.55}],
-            "bonds": [{"maturity_years": 20.0, "share": 0.35}, {"maturity_years": 30.0, "share": 0.65}],
-            "tips": [{"maturity_years": 10.0, "share": 0.45}, {"maturity_years": 30.0, "share": 0.55}],
-            "frn": [{"maturity_years": 2.0, "share": 1.0}],
-        }
-    else:
+    """Matched bill-share targets around the opening share of about 22%."""
+
+    targets = {"shorter": 0.30, "longer": 0.15}
+    if kind not in targets:
         raise ValueError(f"unknown issuance mix kind: {kind}")
-    return {
-        "mode": "replace_shares",
-        "tips_share": 0.06,
-        "frn_share": 0.06,
-        "fixed_remainder_shares": fixed_remainder_shares,
-        "maturity_distributions": maturity_distributions,
-    }
+    return {"mode": "bill_share_target_v1", "bill_share_target": targets[kind]}
 
 
 def _matched_holder_rows(*, private_share: float, effective_date: str | None = None) -> list[dict[str, Any]]:

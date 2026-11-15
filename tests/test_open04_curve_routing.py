@@ -66,7 +66,7 @@ _DIRECT_BASELINE_YIELD_CALLS = {
     ): "frn_fail_closed_fallback",
     (
         "src/sim_engine.py",
-        "_build_issuance_supply_schedule",
+        "_quote_supply_item",
         ("maturity_years", "tips_real_curve_years", "tips_real_curve_rates"),
         (("method", "yield_interpolation_method"), ("floor_zero", "False")),
     ): "tips_real",

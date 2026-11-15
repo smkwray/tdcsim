@@ -27,7 +27,15 @@ from forecast_paths import (
     load_cbo_fiscal_baseline,
     load_frn_rate_path,
 )
-from sim_engine import run_simulation
+from issuance_calibration import (
+    CALIBRATION_FILE,
+    ISSUANCE_RULE_MODE,
+    IssuanceCalibrationError,
+    engine_rule_profile,
+    load_calibration,
+    normalize_target_path,
+)
+from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, run_simulation
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     HOLDER_TYPES,
@@ -68,6 +76,7 @@ from .manifest import (
     validation_from_boundary_checks,
 )
 from .open04_campaign import (
+    DEFAULT_FUNDING_CLOSURE_MODE,
     parse_open04_campaign_marker,
     scenario_funding_closure_mode,
     requires_open04_strict_execution,
@@ -187,7 +196,7 @@ def run_cbo_scenario(
     handoff_path = _watchdog_handoff_path(out, watchdog_handoff)
     open04_marker = None
     open04_active = False
-    funding_closure_mode = "cbo_public_debt_target"
+    funding_closure_mode = DEFAULT_FUNDING_CLOSURE_MODE
     release_source_identity: Mapping[str, Any] | None = None
     out.parent.mkdir(parents=True, exist_ok=True)
     progress_path = _watchdog_progress_path(out, handoff_path)
@@ -419,7 +428,9 @@ def run_cbo_scenario(
             if not isinstance(trc_metadata, Mapping):
                 raise RunnerError("TRC routing was supplied but the engine returned no TRC metadata")
             results.attrs["trc_metadata"] = {**dict(trc_metadata), "routing_source": trc_routing_source}
-        boundaries = validate_run_boundaries(results, inputs)
+        boundaries = validate_run_boundaries(
+            results, inputs, funding_closure_mode=funding_closure_mode
+        )
         _assert_hard_boundaries_pass(boundaries)
         outputs = write_bounded_scenario_outputs(
             results,
@@ -469,7 +480,7 @@ def run_cbo_scenario(
                 ),
             ),
         )
-        if open04_marker is None and "funding_closure" in spec.data:
+        if open04_marker is None:
             run_manifest["funding_closure_mode"] = funding_closure_mode
         if open04_marker is not None:
             run_manifest["open04_campaign"] = {
@@ -785,7 +796,7 @@ def build_runtime_params(
     simulation_start_date: str | None = None,
     simulation_end_date: str | None = None,
     scenario_id: str | None = None,
-    funding_closure_mode: str = "cbo_public_debt_target",
+    funding_closure_mode: str = DEFAULT_FUNDING_CLOSURE_MODE,
 ) -> dict[str, Any]:
     """Build simulator params from compiled forecast inputs and scenario config."""
 
@@ -1013,8 +1024,18 @@ def _engine_runtime_params(params: Mapping[str, Any]) -> dict[str, Any]:
     return engine_params
 
 
-def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> dict[str, Any]:
-    """Compute hard boundary checks for CBO scenario runs."""
+def validate_run_boundaries(
+    results: pd.DataFrame,
+    inputs_dir: str | Path,
+    *,
+    funding_closure_mode: str,
+) -> dict[str, Any]:
+    """Compute hard boundary checks for CBO scenario runs.
+
+    Checks common to every funding mode are always computed; the operating-cash
+    financing mode adds its TGA-on-target checks. Debt-path checks belong to the
+    debt-referenced modes and are verified from the results and debt bridge.
+    """
 
     _validate_boundary_result_evidence(results)
     inputs = Path(inputs_dir)
@@ -1055,6 +1076,42 @@ def validate_run_boundaries(results: pd.DataFrame, inputs_dir: str | Path) -> di
         "remittance_deferred_asset_status": "unsupported_in_cbo_scenario_lane",
         **cash_closure,
         **omf,
+        **funding_mode_cash_checks(results, funding_closure_mode),
+    }
+
+
+def funding_mode_cash_checks(results: pd.DataFrame, funding_closure_mode: str) -> dict[str, Any]:
+    """Return the mode-specific cash checks recorded in boundary_checks."""
+
+    checks: dict[str, Any] = {"funding_closure_mode": funding_closure_mode}
+    if funding_closure_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
+        checks.update(operating_cash_financing_checks(results))
+    return checks
+
+
+def operating_cash_financing_checks(results: pd.DataFrame) -> dict[str, Any]:
+    """Measure whether the TGA followed its operating-cash target.
+
+    Under ``cbo_operating_cash_target_financing_v1`` the TGA never ends a day below its
+    target, and on every day that issues it ends exactly on target: issuance tops cash
+    up to the target, and a day that opens above target issues nothing.
+    """
+
+    running = results.iloc[1:]
+    if running.empty:
+        raise RunnerError("operating-cash financing checks need at least one simulated period")
+    statuses = running["CBOCashResidualStatus"].astype("string")
+    if not statuses.eq("operating_cash_target_loaded").all():
+        raise RunnerError("operating-cash financing requires a loaded operating-cash target every period")
+    excess = _numeric_column(running, "TGA") - _numeric_column(running, "CBOOperatingCashTarget")
+    issued = _numeric_column(running, "AuctionProceeds") > CASH_CLOSURE_TOLERANCE
+    below = int((excess < -CASH_CLOSURE_TOLERANCE).sum())
+    off_on_issue = int((issued & (excess.abs() > CASH_CLOSURE_TOLERANCE)).sum())
+    return {
+        "tga_below_operating_cash_target_periods": below,
+        "issuance_periods_off_operating_cash_target": off_on_issue,
+        "max_tga_excess_over_operating_cash_target_bil": float(excess.max()),
+        "tga_follows_operating_cash_target": below == 0 and off_on_issue == 0,
     }
 
 
@@ -1606,6 +1663,8 @@ def _holder_preference_events(path: Path) -> list[dict[str, Any]]:
 def _issuance_profile(inputs: Path) -> dict[str, Any]:
     payload = _issuance_assumptions(inputs)
     mode = payload.get("mode")
+    if mode == ISSUANCE_RULE_MODE:
+        return _bill_share_rule_profile(inputs, payload)
     if mode not in {"default_tdcsim_cbo_runner_profile", "replace_shares"}:
         raise RunnerError(f"unsupported compiled issuance mix mode: {mode!r}")
     shares = payload.get("security_shares")
@@ -1649,6 +1708,35 @@ def _issuance_profile(inputs: Path) -> dict[str, Any]:
         "NonMarketable": {"target_percentage": 0.0, "maturities": [30.0], "maturity_distribution": [1.0]},
         "remainder_maturity_years": 1.0,
     }
+
+
+def _bill_share_rule_profile(inputs: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    calibration_path = inputs / CALIBRATION_FILE
+    if payload.get("calibration_file") != CALIBRATION_FILE:
+        raise RunnerError("compiled bill-share issuance rule must name the package calibration file")
+    try:
+        calibration = load_calibration(calibration_path)
+    except IssuanceCalibrationError as exc:
+        raise RunnerError(str(exc)) from exc
+    if sha256_file(calibration_path) != payload.get("calibration_sha256"):
+        raise RunnerError("compiled bill-share issuance rule does not match the calibration bytes")
+    raw_path = payload.get("bill_share_target_path")
+    try:
+        if not isinstance(raw_path, list) or not raw_path:
+            raise IssuanceCalibrationError("bill_share_target_path must be a nonempty list")
+        if len(raw_path) == 1 and isinstance(raw_path[0], Mapping) and raw_path[0].get("date") is None:
+            target_path = normalize_target_path(
+                raw_path[0].get("bill_share_target"), label="bill_share_target_path"
+            )
+        else:
+            target_path = normalize_target_path(raw_path, label="bill_share_target_path")
+        return engine_rule_profile(
+            target_path=target_path,
+            bill_terms=calibration["bill_terms"],
+            coupon_terms=calibration["coupon_terms"],
+        )
+    except IssuanceCalibrationError as exc:
+        raise RunnerError(f"compiled bill-share issuance rule is malformed: {exc}") from exc
 
 
 def _fixed_profile(share: float, rows: list[Mapping[str, Any]], *, cutoff: float) -> dict[str, Any]:
@@ -1774,15 +1862,16 @@ def _issuance_assumptions(inputs: Path) -> Mapping[str, Any]:
         raise RunnerError("compiled issuance mix assumptions has an unsupported schema_version")
     mode = payload.get("mode")
     expected_status = {
-        "default_tdcsim_cbo_runner_profile": "configured_default",
-        "replace_shares": "scenario_override",
+        "default_tdcsim_cbo_runner_profile": {"configured_default"},
+        "replace_shares": {"scenario_override"},
+        ISSUANCE_RULE_MODE: {"configured_default", "scenario_override"},
     }.get(mode)
     if expected_status is None:
         raise RunnerError(f"unsupported compiled issuance mix mode: {mode!r}")
     status = _assumption_status(payload.get("selection_status"), label="issuance selection_status")
-    if status != expected_status:
+    if status not in expected_status:
         raise RunnerError(
-            f"compiled issuance mix mode {mode!r} requires selection_status={expected_status!r}"
+            f"compiled issuance mix mode {mode!r} requires selection_status in {sorted(expected_status)}"
         )
     return payload
 

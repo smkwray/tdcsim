@@ -172,10 +172,15 @@ def test_transformed_rollforward_export_carries_one_verified_world(tmp_path: Pat
             "tdc_level": float(continued_closing["TDC_Level"]),
         }
     )
-    for state_key in ("tga", "reserves", "tdc_level"):
-        assert continued_opening["initial_values"][state_key] != pytest.approx(
-            opening_state["initial_values"][state_key]
-        )
+    # The continued run's close carries forward, not the first export's opening. The TGA
+    # is held on its (flat) operating-cash target, so Treasury's net cash flow to banks
+    # nets to zero and reserves stay put with the Fed stock unchanged; deposits still move.
+    assert continued_opening["initial_values"]["tdc_level"] != pytest.approx(
+        opening_state["initial_values"]["tdc_level"]
+    )
+    assert continued_opening["initial_values"]["tga"] == pytest.approx(
+        float(continued_closing["CBOOperatingCashTarget"])
+    )
     for filename in (
         "tdcsim_primary_deficit_path.csv",
         "tdcsim_debt_stock_path.csv",

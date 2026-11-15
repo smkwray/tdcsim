@@ -443,6 +443,8 @@ def _package(
     manifest: dict[str, Any] = {
         "schema_version": "tdcsim_cbo_scenario_run_manifest_v2",
         "run_id": "test-bounded-run",
+        # The fixture rows hold the CBO debt path exactly, so they are hard-target runs.
+        "funding_closure_mode": "cbo_public_debt_target",
         "status": "complete",
         "verification_grade": "bounded_replay_v1",
         "generated_at_utc": "2026-07-29T00:00:00+00:00",

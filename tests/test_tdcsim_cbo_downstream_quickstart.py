@@ -178,16 +178,10 @@ def _assert_matched_scenario_boundaries(scenarios_dir: Path) -> None:
     longer = scenarios["08_issuance_longer.json"]["overrides"]
     assert set(shorter) == {"issuance_mix"}
     assert set(longer) == {"issuance_mix"}
-    assert shorter["issuance_mix"]["tips_share"] == longer["issuance_mix"]["tips_share"]
-    assert shorter["issuance_mix"]["frn_share"] == longer["issuance_mix"]["frn_share"]
-    assert (
-        shorter["issuance_mix"]["fixed_remainder_shares"]["bills"]
-        > longer["issuance_mix"]["fixed_remainder_shares"]["bills"]
-    )
-    assert (
-        shorter["issuance_mix"]["fixed_remainder_shares"]["bonds"]
-        < longer["issuance_mix"]["fixed_remainder_shares"]["bonds"]
-    )
+    # The matched pair differs only in the outstanding bill-share target; term and
+    # coupon shares stay the package's auction calibration in both.
+    assert shorter["issuance_mix"] == {"mode": "bill_share_target_v1", "bill_share_target": 0.30}
+    assert longer["issuance_mix"] == {"mode": "bill_share_target_v1", "bill_share_target": 0.15}
 
     high_private = scenarios["09_private_holder_high.json"]["overrides"]
     low_private = scenarios["10_private_holder_low.json"]["overrides"]

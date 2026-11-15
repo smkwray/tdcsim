@@ -9,6 +9,7 @@ import yaml
 from csv_gen import generate_initial_portfolio
 from sim_engine import (
     _build_issuance_supply_schedule,
+    _issuance_pricing_context,
     _handoff_append_holder_stocks,
     _handoff_maturity_bucket,
 )
@@ -1650,19 +1651,21 @@ class TestStrictConfigValidation:
             face_target_mode=True,
             issuance_leg='test',
             issuance_profile=profile,
-            tips_real_curve_years=[],
-            tips_real_curve_rates=[],
-            current_yield_curve_years=[1.0, 10.0],
-            current_yield_curve_rates=[0.04, 0.05],
-            yield_interpolation_method='linear',
-            yield_floor_zero=True,
-            evaluated_nominal_shock=None,
-            tips_real_coupon=0.0,
-            frn_spread=0.001,
-            cbo_funding_mode=False,
-            cbo_inputs={},
-            cbo_scenario_id='test',
             current_date=pd.Timestamp('2025-01-01'),
+            pricing=_issuance_pricing_context(
+                tips_real_curve_years=[],
+                tips_real_curve_rates=[],
+                current_yield_curve_years=[1.0, 10.0],
+                current_yield_curve_rates=[0.04, 0.05],
+                yield_interpolation_method='linear',
+                yield_floor_zero=True,
+                evaluated_nominal_shock=None,
+                tips_real_coupon=0.0,
+                frn_spread=0.001,
+                cbo_funding_mode=False,
+                cbo_inputs={},
+                cbo_scenario_id='test',
+            ),
         )
 
         frn_rows = [row for row in schedule if row['type'] == 'FRN']

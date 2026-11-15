@@ -66,6 +66,7 @@ from forecast_input_builder import (
     write_forecast_rows_csv,
 )
 from frn_indexation import build_forward_frn_rate_path_rows, enrich_opening_frn_from_daily_indexes
+from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration, engine_rule_profile
 from sim_engine import run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar
 from tdc_shared import (
@@ -98,6 +99,7 @@ DEFAULT_MSPD_TABLE_3_MARKET = (
     PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mspd_table_3_market.csv"
 )
 DEFAULT_DEBT_OUTSTANDING = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "debt_outstanding.csv"
+DEFAULT_AUCTIONS_QUERY = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "auctions_query.csv"
 FRN_INDEX_SOURCE_AVAILABLE_AS_OF = "2026-06-17"
 
 SOURCE_PACKAGE_INPUTS = {
@@ -107,6 +109,7 @@ SOURCE_PACKAGE_INPUTS = {
     "ratewall_input_manifest": "opening/tdcsim_ratewall_input_manifest.json",
     "tips_cpi_detail": "fiscaldata/tips_cpi_data_detail.csv",
     "frn_daily_indexes": "fiscaldata/frn_daily_indexes.csv",
+    "auctions_query": "fiscaldata/auctions_query.csv",
     "mts_table_1": "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "mts_table_9_net_interest": "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
     "dts_operating_cash_balance": "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
@@ -272,6 +275,7 @@ def build_forecast_bundle(
     ratewall_input_manifest: str | Path = DEFAULT_RATEWALL_INPUT_MANIFEST,
     tips_cpi_detail: str | Path = DEFAULT_TIPS_CPI_DETAIL,
     frn_daily_indexes: str | Path = DEFAULT_FRN_DAILY_INDEXES,
+    auctions_query: str | Path = DEFAULT_AUCTIONS_QUERY,
     mts_table_1: str | Path = DEFAULT_MTS_TABLE_1,
     dts_operating_cash_balance: str | Path = DEFAULT_DTS_OPERATING_CASH_BALANCE,
     mspd_table_1: str | Path = DEFAULT_MSPD_TABLE_1,
@@ -312,6 +316,7 @@ def build_forecast_bundle(
         ratewall_input_manifest=ratewall_manifest_path,
         tips_cpi_detail=tips_cpi_detail_path,
         frn_daily_indexes=frn_daily_indexes_path,
+        auctions_query=Path(auctions_query),
         mts_table_1=mts_table_1_path,
         dts_operating_cash_balance=dts_operating_cash_balance_path,
         mspd_table_1=mspd_table_1_path,
@@ -485,6 +490,13 @@ def build_forecast_bundle(
         private_subbucket_shares=private_subbucket_shares,
     )
     write_rows_csv_union(inputs / "tdcsim_holder_profile_assumptions.csv", holder_profile_rows)
+    issuance_calibration = build_issuance_calibration(
+        packaged_sources["auctions_query"],
+        simulation_start_date=SIMULATION_START_DATE,
+        source_relative_path=f"sources/{SOURCE_PACKAGE_INPUTS['auctions_query']}",
+        opening_portfolio=initial_portfolio,
+    )
+    _write_json(inputs / CALIBRATION_FILE, issuance_calibration)
     manifest_entry = source_package["source_files"].get(SOURCE_PACKAGE_INPUTS["ratewall_input_manifest"], {})
     opening_portfolio_metadata["source_manifest_original_sha256"] = manifest_entry.get("original_sha256")
     opening_portfolio_metadata["source_manifest_portable_sha256"] = manifest_entry.get("sha256")
@@ -573,6 +585,7 @@ def build_forecast_bundle(
         tips_real_yield_rows=tips_real_yield_rows,
         opening_portfolio_metadata=opening_portfolio_metadata,
         source_package=source_package,
+        issuance_calibration=issuance_calibration,
     )
     _write_json(out / "manifest.json", manifest)
     _write_json(inputs / "source_contract_smoke.json", manifest)
@@ -583,6 +596,7 @@ def build_forecast_bundle(
         initial_portfolio,
         base_tga_bil,
         sector_preferences={**holder_preferences, "__private_subbucket_shares__": private_subbucket_shares},
+        issuance_calibration=issuance_calibration,
     )
     return ForecastBundle(
         output_dir=out,
@@ -768,6 +782,7 @@ def build_manifest(
     tips_real_yield_rows: Sequence[Mapping[str, Any]],
     opening_portfolio_metadata: Mapping[str, Any],
     source_package: Mapping[str, Any],
+    issuance_calibration: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the exact manifest required by the local smoke contract."""
 
@@ -976,13 +991,15 @@ def build_manifest(
             "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
         },
         "issuance_mix": {
-            "mode": "scenario_assumption_mixed_marketable_security_profile",
-            "fixed_remainder_shares": {"bills": 0.25, "notes": 0.55, "bonds": 0.20},
-            "bills": {"0.5y": 1.0},
-            "notes": {"5.0y": 1.0},
-            "bonds": {"20.0y": 1.0},
-            "tips": {"target_percentage": 0.06, "10.0y": 1.0},
-            "frn": {"target_percentage": 0.04, "2.0y": 1.0},
+            "mode": "bill_share_target_v1",
+            "calibration_file": f"forecast_inputs/{CALIBRATION_FILE}",
+            "calibration_sha256": _sha256_file(inputs_dir / CALIBRATION_FILE),
+            "bill_share_target": float(issuance_calibration["bill_share_target"]),
+            "auction_window": dict(issuance_calibration["window"]),
+            "public_bill_share_of_gross_auction_volume": float(
+                issuance_calibration["public_bill_share_of_gross_volume"]
+            ),
+            "rule": "bills_fill_toward_outstanding_bill_share_target_remainder_split_by_auction_coupon_shares",
             "nonmarketable": 0.0,
         },
         "negative_issuance_policy": {
@@ -1809,6 +1826,7 @@ def build_engine_params(
     base_tga_bil: float,
     *,
     sector_preferences: Mapping[str, Any],
+    issuance_calibration: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "initial_values": {"reserves": 3000.0, "tdc_level": 0.0, "tga": base_tga_bil},
@@ -1824,42 +1842,13 @@ def build_engine_params(
             "cb_net_expense": 0.0,
             "money_minting_transfers": 0.0,
         },
-        "treasury_issuance_profile": {
-            "bills": {
-                "category_cutoff_years": 1.0,
-                "target_percentage_of_remainder": 0.25,
-                "maturities": [0.5],
-                "maturity_distribution": [1.0],
-            },
-            "notes": {
-                "category_cutoff_years": 10.0,
-                "target_percentage_of_remainder": 0.55,
-                "maturities": [5.0],
-                "maturity_distribution": [1.0],
-            },
-            "bonds": {
-                "category_cutoff_years": 999.0,
-                "target_percentage_of_remainder": 0.20,
-                "maturities": [20.0],
-                "maturity_distribution": [1.0],
-            },
-            "TIPS": {
-                "target_percentage": 0.06,
-                "maturities": [10.0],
-                "maturity_distribution": [1.0],
-            },
-            "FRN": {
-                "target_percentage": 0.04,
-                "maturities": [2.0],
-                "maturity_distribution": [1.0],
-            },
-            "NonMarketable": {
-                "target_percentage": 0.0,
-                "maturities": [30.0],
-                "maturity_distribution": [1.0],
-            },
-            "remainder_maturity_years": 1.0,
-        },
+        "treasury_issuance_profile": engine_rule_profile(
+            target_path=[
+                {"date": None, "bill_share_target": float(issuance_calibration["bill_share_target"])}
+            ],
+            bill_terms=issuance_calibration["bill_terms"],
+            coupon_terms=issuance_calibration["coupon_terms"],
+        ),
         "yield_curve": {
             "use_static": True,
             "years": [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0],
@@ -1989,6 +1978,7 @@ def write_source_package(
     ratewall_input_manifest: Path,
     tips_cpi_detail: Path,
     frn_daily_indexes: Path,
+    auctions_query: Path,
     mts_table_1: Path,
     dts_operating_cash_balance: Path,
     mspd_table_1: Path,
@@ -2007,6 +1997,7 @@ def write_source_package(
         "opening/tdcsim_ratewall_input_manifest.json": ratewall_input_manifest,
         "fiscaldata/tips_cpi_data_detail.csv": tips_cpi_detail,
         "fiscaldata/frn_daily_indexes.csv": frn_daily_indexes,
+        SOURCE_PACKAGE_INPUTS["auctions_query"]: auctions_query,
     }
     for rel, source in file_map.items():
         source_path = Path(source)
@@ -2586,6 +2577,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ratewall-input-manifest", default=str(DEFAULT_RATEWALL_INPUT_MANIFEST))
     parser.add_argument("--tips-cpi-detail", default=str(DEFAULT_TIPS_CPI_DETAIL))
     parser.add_argument("--frn-daily-indexes", default=str(DEFAULT_FRN_DAILY_INDEXES))
+    parser.add_argument(
+        "--auctions-query",
+        default=str(DEFAULT_AUCTIONS_QUERY),
+        help="Fiscaldata Treasury securities auctions CSV used to calibrate the issuance mix.",
+    )
     parser.add_argument("--mts-table-1", default=str(DEFAULT_MTS_TABLE_1))
     parser.add_argument("--dts-operating-cash-balance", default=str(DEFAULT_DTS_OPERATING_CASH_BALANCE))
     parser.add_argument("--mspd-table-1", default=str(DEFAULT_MSPD_TABLE_1))
@@ -2613,6 +2609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ratewall_input_manifest=source_paths.get("ratewall_input_manifest", Path(args.ratewall_input_manifest)),
         tips_cpi_detail=source_paths.get("tips_cpi_detail", Path(args.tips_cpi_detail)),
         frn_daily_indexes=source_paths.get("frn_daily_indexes", Path(args.frn_daily_indexes)),
+        auctions_query=source_paths.get("auctions_query", Path(args.auctions_query)),
         mts_table_1=source_paths.get("mts_table_1", Path(args.mts_table_1)),
         dts_operating_cash_balance=source_paths.get(
             "dts_operating_cash_balance",

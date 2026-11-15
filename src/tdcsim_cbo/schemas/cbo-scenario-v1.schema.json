@@ -260,6 +260,7 @@
       "properties": {
         "mode": {
           "enum": [
+            "cbo_operating_cash_target_financing_v1",
             "cbo_public_debt_target",
             "cbo_debt_reference_plus_tga_floor_financing_v1"
           ]
@@ -1239,15 +1240,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "mode",
-        "tips_share",
-        "frn_share",
-        "fixed_remainder_shares",
-        "maturity_distributions"
+        "mode"
       ],
       "properties": {
         "mode": {
-          "const": "replace_shares"
+          "enum": [
+            "replace_shares",
+            "bill_share_target_v1"
+          ]
         },
         "tips_share": {
           "type": "number",
@@ -1338,6 +1338,37 @@
             "error",
             "retire_shortest_public_marketable"
           ]
+        },
+        "bill_share_target": {
+          "type": [
+            "number",
+            "array"
+          ],
+          "minimum": 0,
+          "maximum": 1,
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/billShareTargetPoint"
+          }
+        }
+      }
+    },
+    "billShareTargetPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "date",
+        "bill_share_target"
+      ],
+      "properties": {
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "bill_share_target": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
         }
       }
     },

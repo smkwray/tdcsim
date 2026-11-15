@@ -23,13 +23,18 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
-from sim_engine import run_simulation
+from sim_engine import (
+    CASH_FINANCING_ISSUANCE_LEGS,
+    CBO_OPERATING_CASH_TARGET_FINANCING_MODE,
+    run_simulation,
+)
 
 from ._json import read_json, sha256_file
 from .baseline import CboBaselinePackage
 from .bounded_output import (
     AGGREGATION_CLOCK_ID,
     ANNUAL_COLUMNS,
+    BOUNDED_HANDOFF_TAXONOMY,
     BoundedResourceLimits,
     BoundedScenarioEvidenceSink,
     CASH_TOLERANCE_BIL,
@@ -66,7 +71,6 @@ from .curve_runtime import (
 )
 from .manifest import RUN_CLAIM_BOUNDARY, RUN_UNSUPPORTED_COMPONENTS, cash_closure_validation_invariants
 from .open04_campaign import (
-    DEFAULT_FUNDING_CLOSURE_MODE,
     OPEN04_FUNDING_CLOSURE_MODE,
     SCENARIO_FUNDING_CLOSURE_MODES,
     open04_expected_change_perimeter,
@@ -923,11 +927,13 @@ def _is_bounded_manifest(manifest: Mapping[str, Any]) -> bool:
 
 
 def _manifest_funding_closure_mode(manifest: Mapping[str, Any]) -> str:
-    """Return the declared OPEN-04 mode; generic runs retain the legacy mode."""
+    """Return the run's funding closure: the OPEN-04 marker's or the recorded mode."""
 
     open04 = manifest.get("open04_campaign")
     if open04 is None:
-        mode = str(manifest.get("funding_closure_mode") or DEFAULT_FUNDING_CLOSURE_MODE)
+        mode = str(manifest.get("funding_closure_mode") or "")
+        if not mode:
+            raise VerificationError("run manifest does not record its funding_closure_mode")
         if mode not in SCENARIO_FUNDING_CLOSURE_MODES:
             raise VerificationError("run manifest funding closure mode is unsupported")
         return mode
@@ -1587,7 +1593,19 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         omf_comparison = runner_module.omf_reconciliation(results, inputs_dir)
     except Exception as exc:
         raise VerificationError(f"operating-cash comparison could not be recomputed: {exc}") from exc
-    recomputed_cash = {**cash_closure, **omf_comparison}
+    try:
+        mode_checks = runner_module.funding_mode_cash_checks(
+            results, _manifest_funding_closure_mode(manifest)
+        )
+    except runner_module.RunnerError as exc:
+        raise VerificationError(f"funding-mode cash checks could not be recomputed: {exc}") from exc
+    recomputed_cash = {**cash_closure, **omf_comparison, **mode_checks}
+    if recomputed_cash.get("tga_follows_operating_cash_target") is False:
+        raise VerificationError(
+            "TGA left its operating-cash target under operating-cash financing: "
+            f"below={recomputed_cash['tga_below_operating_cash_target_periods']}, "
+            f"off_on_issue={recomputed_cash['issuance_periods_off_operating_cash_target']}"
+        )
     _verify_recomputed_cash_claims(manifest, recomputed_cash)
     bounded_limits = (
         _verify_bounded_result_limits(results)
@@ -1613,6 +1631,8 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
             results,
             require_target_applicable=not _is_bounded_manifest(manifest),
         )
+    elif funding_closure_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
+        _verify_operating_cash_financing_results(results)
     if fed_share > 1e-12 or fed_face > 1e-12:
         raise VerificationError(f"Fed auction boundary failed: share={fed_share}, face={fed_face}")
     if remittance_cash > 1e-12:
@@ -1727,6 +1747,59 @@ def _verify_cbo_reference_financing_results(
     if float(numeric["CBOControlledDebtTargetError"].abs().max()) > tolerance:
         raise VerificationError(
             "reference-financing legacy target-error field must remain inapplicable"
+        )
+
+
+def _verify_operating_cash_financing_results(results: pd.DataFrame) -> None:
+    """Debt is reported against the CBO reference without being held to it."""
+
+    columns = (
+        "CBOControlledDebtReference",
+        "ScenarioControlledDebt",
+        "DebtDriftFromReference",
+        "CashFinancingProceeds",
+        "IssuePriceCashGap",
+        "CBOControlledDebtTarget",
+        "CBOControlledDebtPostIssuance",
+        "CBOControlledDebtTargetError",
+        "NewDebtIssued",
+        "AuctionProceeds",
+    )
+    _require_columns(results, columns, label="operating-cash financing results")
+    numeric = {
+        column: pd.to_numeric(results[column], errors="raise")
+        for column in columns
+    }
+    identities = (
+        (
+            numeric["CBOControlledDebtReference"] - numeric["CBOControlledDebtTarget"],
+            "CBO debt reference alias",
+        ),
+        (
+            numeric["ScenarioControlledDebt"] - numeric["CBOControlledDebtPostIssuance"],
+            "scenario debt/post-issuance debt",
+        ),
+        (
+            numeric["DebtDriftFromReference"]
+            - (numeric["ScenarioControlledDebt"] - numeric["CBOControlledDebtReference"]),
+            "debt drift identity",
+        ),
+        (
+            numeric["IssuePriceCashGap"]
+            - (numeric["NewDebtIssued"] - numeric["AuctionProceeds"]),
+            "signed issue-price cash-gap identity",
+        ),
+        (
+            numeric["CashFinancingProceeds"] - numeric["AuctionProceeds"],
+            "all issuance is operating-cash financing",
+        ),
+    )
+    for error, label in identities:
+        if float(error.abs().max()) > _BOUNDED_TARGET_TOLERANCE_BIL:
+            raise VerificationError(f"operating-cash financing {label} failed")
+    if float(numeric["CBOControlledDebtTargetError"].abs().max()) > _BOUNDED_TARGET_TOLERANCE_BIL:
+        raise VerificationError(
+            "operating-cash financing must not report a binding CBO debt target error"
         )
 
 
@@ -1918,10 +1991,9 @@ def _verify_bounded_outputs(
     )
     funding_closure_mode = _manifest_funding_closure_mode(manifest)
     expected_bridge_funding_modes = (
-        {funding_closure_mode}
-        if funding_closure_mode
-        == "cbo_debt_reference_plus_tga_floor_financing_v1"
-        else {"cbo_public_debt_target", "cbo_target"}
+        {"cbo_public_debt_target", "cbo_target"}
+        if funding_closure_mode == "cbo_public_debt_target"
+        else {funding_closure_mode}
     )
     _verify_bounded_debt_bridge(
         root,
@@ -3715,11 +3787,7 @@ def _verify_bounded_issuance(
         instrument = str(row.get("instrument_type") or "")
         maturity_bucket = str(row.get("maturity_bucket") or "")
         issuance_leg = str(row.get("issuance_leg") or "ordinary_issuance")
-        if issuance_leg not in {
-            "ordinary_issuance",
-            "cbo_reference_face_issuance",
-            "tga_floor_cash_financing",
-        }:
+        if issuance_leg not in BOUNDED_HANDOFF_TAXONOMY["tdcsim_period_issuance_flows"]["issuance_legs"]:
             raise VerificationError("bounded issuance has unknown issuance-leg taxonomy")
         if holder not in _ALLOWED_HOLDERS:
             raise VerificationError("bounded issuance has unknown holder taxonomy")
@@ -3751,7 +3819,7 @@ def _verify_bounded_issuance(
         period_totals[period]["cash_proceeds_bil"] += cash
         period_totals[period]["discount_or_premium_bil"] += discount
         period_totals[period]["issue_discount_cost_bil"] += max(0.0, discount)
-        if issuance_leg == "tga_floor_cash_financing":
+        if issuance_leg in CASH_FINANCING_ISSUANCE_LEGS:
             period_totals[period]["cash_financing_face_issued_bil"] += face
             period_totals[period]["cash_financing_proceeds_bil"] += cash
         for column in (
@@ -4065,14 +4133,17 @@ def _verify_bounded_debt_bridge(
             funding_mode
             == "cbo_debt_reference_plus_tga_floor_financing_v1"
         )
+        cash_financing_mode = reference_financing_mode or (
+            funding_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE
+        )
         if (
-            not reference_financing_mode
+            not cash_financing_mode
             and abs(values["target_error_bil"]) > _BOUNDED_TARGET_TOLERANCE_BIL
         ):
             raise VerificationError(
                 "bounded controlled-debt target error exceeds 1e-6 bil"
             )
-        if reference_financing_mode:
+        if cash_financing_mode:
             _bounded_close(
                 values["cbo_controlled_debt_reference_bil"],
                 values["controlled_public_marketable_target_bil"],
@@ -4089,8 +4160,11 @@ def _verify_bounded_debt_bridge(
                 - values["cbo_controlled_debt_reference_bil"],
                 label="bounded debt-drift identity",
             )
+            # Only the reference mode holds debt at or above the CBO path; the
+            # operating-cash mode lets debt drift either way.
             if (
-                values["debt_drift_from_reference_bil"]
+                reference_financing_mode
+                and values["debt_drift_from_reference_bil"]
                 < -_BOUNDED_TARGET_TOLERANCE_BIL
             ):
                 raise VerificationError(

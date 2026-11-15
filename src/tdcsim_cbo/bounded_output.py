@@ -276,6 +276,7 @@ BOUNDED_HANDOFF_TAXONOMY = {
                 "ordinary_issuance",
                 "cbo_reference_face_issuance",
                 "tga_floor_cash_financing",
+                "operating_cash_target_financing",
             }
         ),
     },
@@ -329,6 +330,12 @@ BOUNDED_HANDOFF_TAXONOMY = {
                 ),
                 (
                     "cbo_debt_reference_plus_tga_floor_financing_v1",
+                    "excluded_from_public_debt",
+                    "included_in_public_debt",
+                    "explicit_bridge_not_marketable_issuance",
+                ),
+                (
+                    "cbo_operating_cash_target_financing_v1",
                     "excluded_from_public_debt",
                     "included_in_public_debt",
                     "explicit_bridge_not_marketable_issuance",
@@ -702,6 +709,27 @@ class _DeterministicCsvGzip:
         os.fsync(self._raw.fileno())
         self._raw.close()
         self._closed = True
+
+
+def _validate_funding_mode_close(
+    bridge: Mapping[str, Any], closing_result: Mapping[str, Any]
+) -> None:
+    """Check each period against its own funding mode's closure rule."""
+
+    mode = str(bridge.get("funding_mode") or "")
+    if mode == "cbo_public_debt_target":
+        if abs(float(bridge.get("target_error_bil", 0.0) or 0.0)) > CASH_TOLERANCE_BIL:
+            raise BoundedEvidenceError("controlled debt missed the CBO debt target at period close")
+    elif mode == "cbo_debt_reference_plus_tga_floor_financing_v1":
+        if float(bridge.get("debt_drift_from_reference_bil", 0.0) or 0.0) < -CASH_TOLERANCE_BIL:
+            raise BoundedEvidenceError("controlled debt fell below the CBO debt reference")
+    elif mode == "cbo_operating_cash_target_financing_v1":
+        excess = float(closing_result.get("TGA", 0.0) or 0.0) - float(
+            closing_result.get("CBOOperatingCashTarget", 0.0) or 0.0
+        )
+        issued = float(bridge.get("cash_financing_proceeds_bil", 0.0) or 0.0) > CASH_TOLERANCE_BIL
+        if excess < -CASH_TOLERANCE_BIL or (issued and abs(excess) > CASH_TOLERANCE_BIL):
+            raise BoundedEvidenceError(f"TGA off its operating-cash target at period close: {excess}")
 
 
 class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
@@ -1160,6 +1188,7 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
             tdc=tdc,
             financing=financing,
             closing_result=closing_result,
+            debt_bridge=raw["tdcsim_debt_target_bridge"],
         )
 
         commitment = {
@@ -1582,6 +1611,7 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
         tdc: Mapping[str, list[dict[str, Any]]],
         financing: Mapping[str, Any],
         closing_result: Mapping[str, Any],
+        debt_bridge: list[Mapping[str, Any]],
     ) -> None:
         if len(accounting) != 1:
             raise BoundedEvidenceError("period accounting closure must contain one row")
@@ -1631,6 +1661,8 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
         tga = float(closing_result.get("TGA", 0.0) or 0.0)
         if tga < TGA_MINIMUM_BIL:
             raise BoundedEvidenceError(f"negative TGA at period close: {tga}")
+        for bridge in debt_bridge:
+            _validate_funding_mode_close(bridge, closing_result)
 
     def _update_annual(
         self,
