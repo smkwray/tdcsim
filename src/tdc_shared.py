@@ -31,6 +31,8 @@ MARKETABLE_PREFERENCE_CATEGORIES = ('bills', 'notes', 'bonds', 'tips', 'frn')
 PREFERENCE_CATEGORIES = [*MARKETABLE_PREFERENCE_CATEGORIES, 'nonmarketable']
 PRIVATE_SUBBUCKET_DOMESTIC_NONBANK = 'domestic_nonbank_deposit_funded'
 PRIVATE_SUBBUCKET_MMF = 'mmf_cash_fund_route'
+# Key under which holder-preference blocks carry the private route split of each category.
+PRIVATE_SUBBUCKET_SHARES_KEY = '__private_subbucket_shares__'
 PRIVATE_SUBBUCKETS = [
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,

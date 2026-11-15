@@ -9,7 +9,15 @@ import collections.abc
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from issuance_calibration import active_special_categories, is_rule_profile, validate_rule_profile
-from tdc_shared import HOLDER_TYPES, MATURITY_CATEGORIES, PREFERENCE_CATEGORIES, TGA_FLOOR_TOLERANCE
+from tdc_shared import (
+    HOLDER_TYPES,
+    MARKETABLE_PREFERENCE_CATEGORIES,
+    MATURITY_CATEGORIES,
+    PREFERENCE_CATEGORIES,
+    PRIVATE_SUBBUCKET_SHARES_KEY,
+    PRIVATE_SUBBUCKETS,
+    TGA_FLOOR_TOLERANCE,
+)
 
 VALID_OVERRIDE_KEYS = frozenset({
     'fiscal_params', 'tga_params', 'yield_curve', 'treasury_issuance_profile',
@@ -252,8 +260,16 @@ def validate_event_path(path_keys: Sequence[str]) -> Tuple[bool, str]:
             f"Valid keys: {sorted(VALID_EVENT_LEAF_KEYS[root])}"
         )
 
-    # Holder preference blocks: holder.category_pct
+    # Holder preference blocks: holder.category_pct, or the private route split
+    # <key>.<marketable category>.<private route>
     if root in HOLDER_PREF_BLOCKS:
+        if (
+            len(path_keys) == 4
+            and path_keys[1] == PRIVATE_SUBBUCKET_SHARES_KEY
+            and path_keys[2] in MARKETABLE_PREFERENCE_CATEGORIES
+            and path_keys[3] in PRIVATE_SUBBUCKETS
+        ):
+            return True, ""
         if len(path_keys) == 2 and path_keys[1] in _HOLDER_TYPES_SET:
             return True, ""
         if len(path_keys) == 3:
@@ -433,7 +449,7 @@ def validate_sector_preferences(
         return [f"{label} must be a mapping."]
 
     for holder, holder_cfg in sector_preferences.items():
-        if holder == "__private_subbucket_shares__":
+        if holder == PRIVATE_SUBBUCKET_SHARES_KEY:
             continue
         if holder not in HOLDER_TYPES:
             errors.append(f"{label} contains unknown holder '{holder}'.")

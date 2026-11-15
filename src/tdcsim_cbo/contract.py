@@ -347,7 +347,7 @@ def _validate_holder_preference_rows(name: str, override: Mapping[str, Any], mod
     allowed = set(required)
     if mode == "dated_static_shares":
         required.add("effective_date")
-        allowed.add("effective_date")
+        allowed.update({"effective_date", "private_routes"})
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             continue

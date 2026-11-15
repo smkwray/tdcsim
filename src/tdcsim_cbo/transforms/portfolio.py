@@ -8,7 +8,13 @@ from datetime import date
 from typing import Any
 
 from issuance_calibration import ISSUANCE_RULE_MODE, IssuanceCalibrationError, normalize_target_path
-from tdc_shared import HOLDER_EVENT_ORDER, HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES
+from tdc_shared import (
+    HOLDER_EVENT_ORDER,
+    HOLDER_TYPES,
+    MARKETABLE_PREFERENCE_CATEGORIES,
+    PRIVATE_SUBBUCKET_SHARES_KEY,
+    PRIVATE_SUBBUCKETS,
+)
 
 MARKETABLE_SECURITY_TYPES = MARKETABLE_PREFERENCE_CATEGORIES
 SCENARIO_SOURCE_ROLE = "scenario_assumption"
@@ -199,6 +205,11 @@ def validate_holder_preferences(
             _assert_unit_sum(normalized.values(), label=f"{security_type} holder shares")
         if fed_stock_target_active and security_type != "nonmarketable" and normalized["CB"] != 0.0:
             raise PortfolioTransformError("CB auction share must be zero when Fed stock target is active")
+        private_routes = None
+        if "private_routes" in row:
+            if mode != "dated_static_shares":
+                raise PortfolioTransformError("private_routes is supported only in dated_static_shares rows")
+            private_routes = _private_routes(row["private_routes"], private_share=normalized["Private"], label=key)
         out.append(
             {
                 "mode": mode,
@@ -206,6 +217,7 @@ def validate_holder_preferences(
                 "effective_quarter": effective_quarter or None,
                 "security_type": security_type,
                 "shares": normalized,
+                "private_routes": private_routes,
                 "source_role": SCENARIO_SOURCE_ROLE,
                 "runtime_role": "runtime_event" if mode == "dated_static_shares" else "memo_only",
                 "claim_boundary": "holder preference profile not exact holder ownership",
@@ -240,6 +252,18 @@ def compile_holder_preference_events(
                     "claim_boundary": row["claim_boundary"],
                 }
             )
+        for route, share in (row["private_routes"] or {}).items():
+            actions.append(
+                {
+                    "parameter_path": (
+                        f"sector_preferences.{PRIVATE_SUBBUCKET_SHARES_KEY}.{row['security_type']}.{route}"
+                    ),
+                    "new_value": share,
+                    "source_role": row["source_role"],
+                    "runtime_role": row["runtime_role"],
+                    "claim_boundary": row["claim_boundary"],
+                }
+            )
     return [
         {
             "id": f"cbo_holder_preferences_{event_date}",
@@ -248,6 +272,23 @@ def compile_holder_preference_events(
         }
         for event_date, actions in sorted(actions_by_date.items())
     ]
+
+
+def _private_routes(raw: Any, *, private_share: float, label: tuple[str, str]) -> dict[str, float]:
+    """Validate a row's split of the Private share across the registered private routes."""
+
+    if not isinstance(raw, Mapping) or set(raw) != set(PRIVATE_SUBBUCKETS):
+        raise PortfolioTransformError(f"private_routes for {label} must have exactly {list(PRIVATE_SUBBUCKETS)}")
+    if private_share <= 0.0:
+        raise PortfolioTransformError(f"private_routes for {label} requires a positive Private share")
+    routes = {}
+    for route in PRIVATE_SUBBUCKETS:
+        value = raw[route]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+            raise PortfolioTransformError(f"private_routes.{route} for {label} must be a number in [0, 1]")
+        routes[route] = float(value)
+    _assert_unit_sum(routes.values(), label=f"private_routes for {label}")
+    return routes
 
 
 def reject_non_fed_stock_targets(targets: Mapping[str, Any]) -> None:
