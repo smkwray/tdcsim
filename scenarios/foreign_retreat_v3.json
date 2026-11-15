@@ -1,15 +1,15 @@
 {
   "schema_version": "tdcsim_scenario_family_spec_v1",
-  "family_id": "foreign_retreat_v2",
+  "family_id": "foreign_retreat_v3",
   "as_of_date": "2026-10-08",
-  "funding_closure_mode": "cbo_debt_reference_plus_tga_floor_financing_v1",
+  "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
   "description": "Illustrative foreign official retreat from Treasury auctions over the CBO baseline horizon. Foreign auction shares are scaled by security type so that the removed participation equals the official share of foreign holdings in TIC SLT Table 3 for July 2026: official 354.4 of 1,464.9 billion dollars of bills and 3,418.7 of 7,783.2 billion dollars of notes, bonds and other coupon securities. The gradual retreat halves official participation; the official exit removes it. Released shares go to domestic nonbanks or to banks. Rate paths are imposed from a published long-run coefficient applied to the simulated foreign shortfall, not model outputs.",
   "boundaries": [
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "Foreign holdings decline through reduced auction participation and maturity runoff; no secondary-market foreign sales are simulated",
     "TDCSim represents foreign official and private holders as one Foreign sector with one maturity profile, settling through US banks",
     "Each rate path is computed once from the matching quantity-only run and imposed on the scenario; it is not re-solved for the extra issuance that higher interest requires",
-    "Every scenario uses the CBO debt reference plus TGA-floor financing closure, so additional interest is financed by additional issuance"
+    "Every scenario holds the TGA on the baseline operating-cash path, so additional interest is financed by additional issuance from the start"
   ],
   "calibration": {
     "holder_shift": "Official share of foreign bills 0.2419; official share of foreign coupon securities 0.4392 (TIC SLT Table 3, July 2026). Gradual retreat multiplier = 1 - 0.5 x official share; exit multiplier = 1 - official share; rounded to three decimals",
@@ -22,12 +22,12 @@
   "scenarios": [
     {
       "role": "baseline",
-      "scenario_id": "tdcsim_foreign_retreat_v2_baseline",
+      "scenario_id": "tdcsim_foreign_retreat_v3_baseline",
       "label": "Foreign retreat family baseline"
     },
     {
       "role": "gradual_nonbank_0bp",
-      "scenario_id": "tdcsim_foreign_retreat_v2_gradual_nonbank_0bp",
+      "scenario_id": "tdcsim_foreign_retreat_v3_gradual_nonbank_0bp",
       "label": "Gradual official retreat absorbed by domestic nonbanks, no rate response",
       "holder_shift": {
         "holder": "Foreign",
@@ -45,7 +45,7 @@
     },
     {
       "role": "exit_nonbank_0bp",
-      "scenario_id": "tdcsim_foreign_retreat_v2_exit_nonbank_0bp",
+      "scenario_id": "tdcsim_foreign_retreat_v3_exit_nonbank_0bp",
       "label": "Official exit absorbed by domestic nonbanks, no rate response",
       "holder_shift": {
         "holder": "Foreign",
@@ -63,7 +63,7 @@
     },
     {
       "role": "gradual_nonbank_rates",
-      "scenario_id": "tdcsim_foreign_retreat_v2_gradual_nonbank_rates",
+      "scenario_id": "tdcsim_foreign_retreat_v3_gradual_nonbank_rates",
       "label": "Gradual official retreat absorbed by domestic nonbanks, central rate path",
       "holder_shift": {
         "holder": "Foreign",
@@ -99,7 +99,7 @@
     },
     {
       "role": "gradual_nonbank_rates_high",
-      "scenario_id": "tdcsim_foreign_retreat_v2_gradual_nonbank_rates_high",
+      "scenario_id": "tdcsim_foreign_retreat_v3_gradual_nonbank_rates_high",
       "label": "Gradual official retreat absorbed by domestic nonbanks, high rate path",
       "holder_shift": {
         "holder": "Foreign",
@@ -135,7 +135,7 @@
     },
     {
       "role": "gradual_bank_rates",
-      "scenario_id": "tdcsim_foreign_retreat_v2_gradual_bank_rates",
+      "scenario_id": "tdcsim_foreign_retreat_v3_gradual_bank_rates",
       "label": "Gradual official retreat absorbed by banks, central rate path",
       "holder_shift": {
         "holder": "Foreign",
@@ -171,7 +171,7 @@
     },
     {
       "role": "exit_nonbank_rates",
-      "scenario_id": "tdcsim_foreign_retreat_v2_exit_nonbank_rates",
+      "scenario_id": "tdcsim_foreign_retreat_v3_exit_nonbank_rates",
       "label": "Official exit absorbed by domestic nonbanks, central rate path",
       "holder_shift": {
         "holder": "Foreign",
