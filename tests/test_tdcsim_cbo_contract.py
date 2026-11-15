@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tdc_shared import HOLDER_TYPES, PREFERENCE_CATEGORIES
+from tdc_shared import HOLDER_TYPES, PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec
 from tdcsim_cbo._json import write_json
 from test_tdcsim_cbo_baseline import _write_release_package
@@ -25,6 +25,8 @@ def test_scenario_schema_taxonomy_matches_shared_registry() -> None:
         definitions['holderPreferenceRow']['properties']['security_type']['enum']
     ) == tuple(PREFERENCE_CATEGORIES)
     assert set(definitions['holderShares']['properties']) == set(HOLDER_TYPES)
+    assert set(definitions['privateRouteShares']['properties']) == set(PRIVATE_SUBBUCKETS)
+    assert set(definitions['privateRouteShares']['required']) == set(PRIVATE_SUBBUCKETS)
 
 
 def test_scenario_spec_canonical_hash_is_stable(tmp_path: Path) -> None:
@@ -371,6 +373,29 @@ def test_scenario_spec_rejects_effective_date_on_static_holder_rows(tmp_path: Pa
     }
 
     with pytest.raises(ValueError, match="mode-inapplicable fields.*effective_date"):
+        CboScenarioSpec.from_mapping(scenario)
+
+
+def test_scenario_spec_allows_private_routes_only_on_dated_rows(tmp_path: Path) -> None:
+    baseline = _baseline(tmp_path)
+    scenario = _scenario_mapping(baseline)
+    row = {
+        "effective_date": "2030-01-15",
+        "security_type": "bills",
+        "shares": {"Banks": 0.1, "CB": 0.0, "Foreign": 0.2, "Private": 0.7, "TrustFunds": 0.0, "FedInternal": 0.0},
+        "private_routes": {"domestic_nonbank_deposit_funded": 0.25, "mmf_cash_fund_route": 0.75},
+    }
+    scenario["overrides"]["holder_preferences"] = {"mode": "dated_static_shares", "rows": [row]}
+    CboScenarioSpec.from_mapping(scenario)
+
+    static_row = {key: value for key, value in row.items() if key != "effective_date"}
+    scenario["overrides"]["holder_preferences"] = {"mode": "static_shares", "rows": [static_row]}
+    with pytest.raises(ValueError, match="mode-inapplicable fields.*private_routes"):
+        CboScenarioSpec.from_mapping(scenario)
+
+    row["private_routes"] = {"domestic_nonbank_deposit_funded": 0.25, "money_funds": 0.75}
+    scenario["overrides"]["holder_preferences"] = {"mode": "dated_static_shares", "rows": [row]}
+    with pytest.raises(ValueError):
         CboScenarioSpec.from_mapping(scenario)
 
 

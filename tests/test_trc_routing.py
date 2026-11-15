@@ -348,3 +348,18 @@ def test_cbo_run_with_trc_routing_keeps_legacy_outputs_byte_identical(tmp_path: 
     metadata = json.loads((routed.output_dir / "outputs" / "tdcsim_trc_metadata.json").read_text())
     assert metadata["routing_source"]["sha256"] == sha256_file(routing_path)
     assert verify_scenario_run(routed.output_dir)["status"] == "pass"
+
+
+def test_committed_onrrp_available_policy_requires_zero_deposit_pass_through() -> None:
+    # The ON RRP money-fund case is defined as pass-through 0 with every money-fund flow
+    # settling through ON RRP; the policy must refuse a run that still sends 97 percent of
+    # money-fund flows through deposits, so the companion baseline cannot silently differ.
+    config = json.loads((Path(__file__).resolve().parents[1] / "trc_routing_onrrp_available_v1.json").read_text())
+
+    policy = parse_trc_routing(config, mmf_deposit_pass_through=0.0)
+
+    assert policy.routes_for("Private", PRIVATE_SUBBUCKET_MMF) == (("on_rrp_mmf", 1.0),)
+    assert policy.reserve_share("Private", PRIVATE_SUBBUCKET_MMF) == 0.0
+    assert policy.opening_balances["ONRRP_MMF"] > 0.0
+    with pytest.raises(TrcRoutingError, match="cannot exceed the non-deposit share"):
+        parse_trc_routing(config, mmf_deposit_pass_through=0.97)

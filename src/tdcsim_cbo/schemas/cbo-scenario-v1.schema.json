@@ -1597,6 +1597,29 @@
         },
         "shares": {
           "$ref": "#/$defs/holderShares"
+        },
+        "private_routes": {
+          "$ref": "#/$defs/privateRouteShares"
+        }
+      }
+    },
+    "privateRouteShares": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "domestic_nonbank_deposit_funded",
+        "mmf_cash_fund_route"
+      ],
+      "properties": {
+        "domestic_nonbank_deposit_funded": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "mmf_cash_fund_route": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
         }
       }
     },

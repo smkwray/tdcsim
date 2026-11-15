@@ -10,11 +10,14 @@ import pytest
 from simulation_core import run_simulation
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
+    HOLDER_TYPES,
     MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
     PORTFOLIO_DTYPES,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
+    PRIVATE_SUBBUCKET_SHARES_KEY,
 )
+from tdcsim_cbo.transforms.portfolio import compile_holder_preference_events
 from test_engine_and_validation import make_bond_row, minimal_params
 
 
@@ -262,3 +265,70 @@ def test_mmf_du_effect_is_monotone_over_sensitivity_grid(tmp_path):
         abs=1e-9,
         rel=0.0,
     )
+
+
+def _route_event_run(events: list[dict]) -> pd.DataFrame:
+    # Legacy sector_preferences carry the route split, as the CBO runner builds them.
+    params = minimal_params()
+    params["fiscal_params"]["initial_weekly_spending"] = 20.0
+    for holder in HOLDER_TYPES:
+        params["sector_preferences"].setdefault(holder, _prefs())
+    params["sector_preferences"][PRIVATE_SUBBUCKET_SHARES_KEY] = {
+        "bills": {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 0.5, PRIVATE_SUBBUCKET_MMF: 0.5}
+    }
+    params["events"] = events
+    _, portfolio = run_simulation(params, "2025-01-01", "2025-03-05", freq="W", scenario_name="route_event")
+    bills = portfolio.loc[(portfolio["HolderType"] == "Private") & (portfolio["MaturityCategory"] == "bills")]
+    face = bills.groupby([pd.to_datetime(bills["IssueDate"]), "HolderSubBucket"])["FaceValue"].sum().unstack(fill_value=0.0)
+    return face[PRIVATE_SUBBUCKET_MMF] / face.sum(axis=1)
+
+
+def test_dated_private_route_event_moves_new_bills_to_money_funds_from_its_date() -> None:
+    # A money-fund demand scenario routes the extra Private bills to the money-fund route.
+    # The dated route event must change who buys new bills from its date onward, and
+    # must not reach back to bills issued before it.
+    shares = {"Banks": 0.0, "CB": 0.0, "Foreign": 0.0, "Private": 1.0, "TrustFunds": 0.0, "FedInternal": 0.0}
+    events = compile_holder_preference_events(
+        {
+            "mode": "dated_static_shares",
+            "rows": [
+                {
+                    "effective_date": "2025-02-05",
+                    "security_type": "bills",
+                    "shares": shares,
+                    "private_routes": {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 0.0, PRIVATE_SUBBUCKET_MMF: 1.0},
+                }
+            ],
+        }
+    )
+
+    shifted = _route_event_run(events)
+    unshifted = _route_event_run([])
+
+    event_date = pd.Timestamp("2025-02-05")
+    assert (shifted.index < event_date).sum() >= 3
+    assert (shifted.index > event_date).sum() >= 3
+    assert shifted[shifted.index < event_date].tolist() == pytest.approx([0.5] * (shifted.index < event_date).sum())
+    assert shifted[shifted.index > event_date].tolist() == pytest.approx([1.0] * (shifted.index > event_date).sum())
+    assert unshifted.tolist() == pytest.approx([0.5] * len(unshifted))
+
+
+def test_private_route_event_for_a_category_without_route_shares_raises() -> None:
+    # Setting a route share the run never defined must fail, not silently add a category.
+    shares = {"Banks": 0.0, "CB": 0.0, "Foreign": 0.0, "Private": 1.0, "TrustFunds": 0.0, "FedInternal": 0.0}
+    events = compile_holder_preference_events(
+        {
+            "mode": "dated_static_shares",
+            "rows": [
+                {
+                    "effective_date": "2025-02-05",
+                    "security_type": "notes",
+                    "shares": shares,
+                    "private_routes": {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 0.0, PRIVATE_SUBBUCKET_MMF: 1.0},
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="__private_subbucket_shares__.notes"):
+        _route_event_run(events)

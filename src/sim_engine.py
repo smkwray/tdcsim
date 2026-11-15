@@ -30,6 +30,7 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
     PRIVATE_SUBBUCKETS,
+    PRIVATE_SUBBUCKET_SHARES_KEY,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
 )
@@ -2818,7 +2819,7 @@ def _tdc_principal_holder(row_or_mapping) -> dict[str, str]:
 
 
 def _private_subbucket_split(preferences: dict, category: str) -> dict[str, float]:
-    subbucket_map = preferences.get('__private_subbucket_shares__', {}) if isinstance(preferences, dict) else {}
+    subbucket_map = preferences.get(PRIVATE_SUBBUCKET_SHARES_KEY, {}) if isinstance(preferences, dict) else {}
     category_map = subbucket_map.get(category, {}) if isinstance(subbucket_map, dict) else {}
     raw = {
         PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: max(

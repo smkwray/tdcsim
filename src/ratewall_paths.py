@@ -18,6 +18,7 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
     PRIVATE_SUBBUCKETS,
+    PRIVATE_SUBBUCKET_SHARES_KEY,
 )
 
 
@@ -157,7 +158,7 @@ def load_holder_absorption_path(config: dict, *, base_dir: str | os.PathLike[str
                     / total,
                 }
             if shares_by_category:
-                lookup[scenario_id][quarter]["__private_subbucket_shares__"] = shares_by_category
+                lookup[scenario_id][quarter][PRIVATE_SUBBUCKET_SHARES_KEY] = shares_by_category
     return lookup
 
 
@@ -243,9 +244,9 @@ def holder_preferences_for_period(
             warning_cache.add(key)
     prefs = {holder: dict(fallback_preferences.get(holder, {})) for holder in HOLDER_TYPES}
     for holder, holder_prefs in scenario_rows[quarter].items():
-        if holder == "__private_subbucket_shares__":
+        if holder == PRIVATE_SUBBUCKET_SHARES_KEY:
             continue
         prefs.setdefault(holder, {}).update(holder_prefs)
-    if "__private_subbucket_shares__" in scenario_rows[quarter]:
-        prefs["__private_subbucket_shares__"] = scenario_rows[quarter]["__private_subbucket_shares__"]
+    if PRIVATE_SUBBUCKET_SHARES_KEY in scenario_rows[quarter]:
+        prefs[PRIVATE_SUBBUCKET_SHARES_KEY] = scenario_rows[quarter][PRIVATE_SUBBUCKET_SHARES_KEY]
     return prefs

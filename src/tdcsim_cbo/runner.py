@@ -48,6 +48,7 @@ from tdc_shared import (
     MATURITY_CATEGORIES,
     PORTFOLIO_DTYPES,
     PRIVATE_SUBBUCKETS,
+    PRIVATE_SUBBUCKET_SHARES_KEY,
     SECURITY_TYPES,
 )
 from tdc_validation import validate_events
@@ -1594,7 +1595,7 @@ def _holder_preferences(path: Path) -> dict[str, dict[str, float]]:
     _assert_holder_preference_sums(prefs)
     private_subbucket_shares = _private_subbucket_shares(frame)
     if private_subbucket_shares:
-        prefs["__private_subbucket_shares__"] = private_subbucket_shares
+        prefs[PRIVATE_SUBBUCKET_SHARES_KEY] = private_subbucket_shares
     return prefs
 
 

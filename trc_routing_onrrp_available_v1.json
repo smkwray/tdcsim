@@ -1,0 +1,24 @@
+{
+  "schema_version": "tdcsim_trc_routing_v1",
+  "description": "ON RRP-available policy for money-fund scenarios and their companion baseline. Money-fund route flows settle entirely through the Federal Reserve's ON RRP facility: money funds pay for Treasury purchases from ON RRP balances and place redemptions and interest there, so those flows move neither reserves nor deposits. It requires a run with mmf_deposit_pass_through 0 (scenario override fixed_fraction 0.0); with any positive pass-through the on_rrp_share of 1 is rejected. The opening money-fund ON RRP balance is a counterfactual assumption, not the observed opening state: it restores the facility's historical peak so the money-fund ON RRP balance can fund purchases without going negative. The TRC ledger fails the run if that balance would close any period below zero. Foreign holders settle through US banks, as in the OPEN-04 policy.",
+  "assumption_status": "scenario_assumption_counterfactual_onrrp_availability",
+  "foreign_settlement_mix": {
+    "foreign_bank_settled": 1.0,
+    "foreign_official_deposit": 0.0,
+    "foreign_official_rrp": 0.0
+  },
+  "mmf_cash_fund_route": {
+    "on_rrp_share": 1.0,
+    "source": "Scenario assumption: every money-fund route cash flow settles through ON RRP, so purchases draw down ON RRP balances instead of bank deposits; paired with mmf_deposit_pass_through 0"
+  },
+  "opening_fed_nonreserve_balances_bil": {
+    "ONRRP_MMF": 2553.716,
+    "ForeignOfficialFedDeposits": 9.44,
+    "ForeignOfficialFedRRP": 328.797
+  },
+  "opening_balance_sources": {
+    "ONRRP_MMF": "Assumption, counterfactual: FRED RRPONTSYD peak of 2553.716 billion dollars on 2022-12-30 (overnight reverse repurchase agreements, Treasury securities sold by the Federal Reserve). That series counts all ON RRP counterparties, so attributing the whole balance to money funds is an upper bound; the money-fund share at that date was not verified here",
+    "ForeignOfficialFedDeposits": "FRED WDFOL H.4.1 foreign official deposits, Wednesday level 2026-06-17",
+    "ForeignOfficialFedRRP": "FRED WLRRAFOIAL H.4.1 foreign official and international reverse repurchase agreements, Wednesday level 2026-06-17"
+  }
+}
