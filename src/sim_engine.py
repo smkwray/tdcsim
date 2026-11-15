@@ -46,6 +46,7 @@ from issuance_calibration import (
     debt_base,
     is_rule_profile,
     rule_target_path,
+    settle_all_pending_rules,
     settlement_rules,
     target_for_date,
 )
@@ -107,6 +108,7 @@ OPERATING_CASH_RESULT_COLUMNS = (
     'IssuanceNeedProceeds',
     'PendingIssuanceProceeds',
     'EarlySettlementProceeds',
+    'FiscalYearEndSettlementProceeds',
 )
 CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
@@ -2428,6 +2430,26 @@ def _build_issuance_supply_schedule(
     return schedule
 
 
+def _settle_all_dates(issuance_profile, start_date, end_date):
+    """Dates in ``[start_date, end_date]`` on which every pending balance settles."""
+
+    first = pd.Timestamp(start_date).normalize()
+    last = pd.Timestamp(end_date).normalize()
+    months = pd.period_range(first, last + pd.offsets.MonthEnd(0), freq='M')
+    dates = set()
+    for month_number, (kind, value) in settle_all_pending_rules(issuance_profile):
+        for month in months:
+            if month.month != month_number:
+                continue
+            if kind == 'day_of_month':
+                settle = _next_business_day(pd.Timestamp(month.year, month.month, value))
+            else:
+                settle = _previous_business_day(month.end_time.normalize())
+            if first <= settle <= last:
+                dates.add(settle)
+    return sorted(dates)
+
+
 def _due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date):
     """Securities whose settlement date falls in ``(prev_date, current_date]``."""
 
@@ -2448,13 +2470,15 @@ def _decide_and_settle_pending(
     due_keys,
     projected_tga_without_settlement,
     current_date,
+    settle_all=False,
 ):
     """Add the day's split to pending balances and release the ones due today.
 
     The split counts pending face as already issued. If settling only what is due would
     leave the TGA negative, every pending bill settles early the same day, and pending
     coupon securities too if the bills are not enough. Mutates ``pending``; returns the
-    settling allocations and the proceeds settled early.
+    settling allocations, the proceeds settled early and the proceeds settled by a
+    settle-all date (the fiscal-year end) that were not otherwise due.
     """
 
     controlled_debt, controlled_bills = pre_issuance_position
@@ -2477,6 +2501,12 @@ def _decide_and_settle_pending(
         else:
             pending[key] = [security_type, maturity_years, weekly_days, amount]
     settling = [key for key in due_keys if key in pending]
+    sweep = 0.0
+    if settle_all:
+        for key, item in pending.items():
+            if key not in settling:
+                settling.append(key)
+                sweep += item[3]
     settled_cash = sum(pending[key][3] for key in settling)
     early = 0.0
     # Bills first; coupon securities settle early only if the bills cannot keep the TGA
@@ -2492,7 +2522,7 @@ def _decide_and_settle_pending(
     for key in settling:
         security_type, maturity_years, weekly_days, amount = pending.pop(key)
         settled.append((key, security_type, maturity_years, weekly_days, amount))
-    return settled, early
+    return settled, early, sweep
 
 
 def _schedule_issuance_leg(
@@ -3471,6 +3501,9 @@ def run_simulation(
             _settlement_schedule(issuance_profile, dates[0], dates[-1]) if batched_settlement else {}
         )
         settlement_dates = list(settlement_schedule)
+        settle_all_dates = (
+            _settle_all_dates(issuance_profile, dates[0], dates[-1]) if batched_settlement else []
+        )
         settlement_calendar_data = copy.deepcopy(issuance_profile.get('settlement_calendar'))
         pending_issuance = {}
         current_sector_prefs = copy.deepcopy(params.get('sector_preferences', {}))
@@ -4860,10 +4893,15 @@ def run_simulation(
         else:
             primary_issuance_leg = 'ordinary_issuance'
         early_settlement_proceeds = 0.0
+        fiscal_year_end_settlement_proceeds = 0.0
         if batched_settlement:
             if issuance_profile.get('settlement_calendar') != settlement_calendar_data:
                 raise ValueError('the settlement calendar cannot change during a run')
-            settlement_allocations, early_settlement_proceeds = _decide_and_settle_pending(
+            settle_all_today = (
+                bisect.bisect_right(settle_all_dates, pd.Timestamp(current_date))
+                > bisect.bisect_right(settle_all_dates, pd.Timestamp(prev_date))
+            )
+            settlement_allocations, early_settlement_proceeds, fiscal_year_end_settlement_proceeds = _decide_and_settle_pending(
                 pending_issuance,
                 need=total_issuance_target_period,
                 issuance_profile=issuance_profile,
@@ -4871,6 +4909,7 @@ def run_simulation(
                 due_keys=_due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date),
                 projected_tga_without_settlement=projected_tga_pre_issuance + cbo_cash_residual_period,
                 current_date=current_date,
+                settle_all=settle_all_today,
             )
             operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
             issuance_supply_schedule = _quote_rule_allocations(
@@ -5197,6 +5236,7 @@ def run_simulation(
                 item[3] for item in pending_issuance.values()
             )
             results.loc[current_date, 'EarlySettlementProceeds'] = early_settlement_proceeds
+            results.loc[current_date, 'FiscalYearEndSettlementProceeds'] = fiscal_year_end_settlement_proceeds
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
             cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))

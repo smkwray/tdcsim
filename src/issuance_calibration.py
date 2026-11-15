@@ -51,9 +51,12 @@ REOPENING_MAX_SHORTFALL_YEARS = 1.0
 CONTROLLED_SECURITY_TYPES = ("Fixed", "TIPS", "FRN")
 # Treasury's settlement calendar for the bill-share rule's securities. Weekday and
 # day-of-month dates move to the next business day; month-end issues settle on the
-# month's last business day. Packaged in the calibration and read back through
-# settlement_rules(), the one loader.
+# month's last business day. On the last business day of each federal fiscal year
+# every pending balance settles, so fiscal-year-end stocks carry no pending cash.
+# Packaged in the calibration and read back through settlement_rules() and
+# settle_all_pending_rules().
 SETTLEMENT_CALENDAR = {
+    "settle_all_pending": [{"month": 9, "day_of_month": "last_business_day"}],
     "bills": [
         {"weeks": 4, "weekday": "Tuesday"},
         {"weeks": 8, "weekday": "Tuesday"},
@@ -556,6 +559,31 @@ def validate_rule_profile(profile: Mapping[str, Any], label: str = "treasury_iss
     return errors
 
 
+def _day_rule(day: Any) -> tuple[str, int | None]:
+    if day == "last_business_day":
+        return ("last_business_day", None)
+    if isinstance(day, int) and not isinstance(day, bool) and 1 <= day <= 28:
+        return ("day_of_month", day)
+    raise IssuanceCalibrationError(f"settlement_calendar day_of_month is malformed: {day!r}")
+
+
+def settle_all_pending_rules(profile: Mapping[str, Any]) -> list[tuple[int, tuple[str, int | None]]]:
+    """Return the ``(month, day rule)`` dates on which every pending balance settles."""
+
+    entries = profile["settlement_calendar"].get("settle_all_pending")
+    if not isinstance(entries, list):
+        raise IssuanceCalibrationError("settlement_calendar settle_all_pending must be a list")
+    rules = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != {"month", "day_of_month"}:
+            raise IssuanceCalibrationError(f"settle_all_pending entry is malformed: {entry!r}")
+        month = entry["month"]
+        if not isinstance(month, int) or isinstance(month, bool) or not 1 <= month <= 12:
+            raise IssuanceCalibrationError(f"settle_all_pending month is malformed: {month!r}")
+        rules.append((month, _day_rule(entry["day_of_month"])))
+    return rules
+
+
 def bill_supply_key(weeks: int) -> tuple[str, float]:
     return ("bill", float(weeks))
 
@@ -573,8 +601,11 @@ def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tupl
     """
 
     calendar = profile.get("settlement_calendar")
-    if not isinstance(calendar, Mapping) or set(calendar) != {"bills", "coupons"}:
-        raise IssuanceCalibrationError("settlement_calendar must have exactly bills and coupons")
+    if not isinstance(calendar, Mapping) or set(calendar) != {"bills", "coupons", "settle_all_pending"}:
+        raise IssuanceCalibrationError(
+            "settlement_calendar must have exactly bills, coupons and settle_all_pending"
+        )
+    settle_all_pending_rules(profile)
     rules: dict[tuple[str, float], tuple[str, int | None]] = {}
 
     def add(key: tuple[str, float], rule: tuple[str, int | None]) -> None:
@@ -593,14 +624,7 @@ def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tupl
         kind = entry["kind"]
         if kind not in COUPON_KIND_SECURITY_TYPE:
             raise IssuanceCalibrationError(f"settlement_calendar has unknown coupon kind {kind!r}")
-        day = entry["day_of_month"]
-        if day == "last_business_day":
-            rule: tuple[str, int | None] = ("last_business_day", None)
-        elif isinstance(day, int) and not isinstance(day, bool) and 1 <= day <= 28:
-            rule = ("day_of_month", day)
-        else:
-            raise IssuanceCalibrationError(f"settlement_calendar day_of_month is malformed: {day!r}")
-        add(coupon_supply_key(COUPON_KIND_SECURITY_TYPE[kind], entry["tenor_years"]), rule)
+        add(coupon_supply_key(COUPON_KIND_SECURITY_TYPE[kind], entry["tenor_years"]), _day_rule(entry["day_of_month"]))
     securities = {bill_supply_key(term["weeks"]) for term in profile["bill_terms"]} | {
         coupon_supply_key(term["security_type"], term["maturity_years"]) for term in profile["coupon_terms"]
     }
