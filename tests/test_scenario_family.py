@@ -14,6 +14,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from write_scenario_family import (  # noqa: E402
     FAMILY_SPEC_SCHEMA,
+    bill_holder_rows,
+    bill_share_target_path,
     family_scenarios,
     rate_path_surface,
     shifted_holder_rows,
@@ -303,3 +305,49 @@ def test_declared_closure_is_recorded_replayed_and_bound(tmp_path: Path, monkeyp
     write_json(manifest_path, manifest)
     with pytest.raises(VerificationError):
         verify_scenario_run(run.output_dir)
+
+
+def _bill_dollars(shares: dict[str, float], target: float) -> dict[str, float]:
+    return {holder: share * target for holder, share in shares.items()}
+
+
+@pytest.mark.parametrize("change", [0.05, -0.05])
+def test_only_the_named_holders_take_up_a_change_in_the_bill_stock(change) -> None:
+    # The deposit effect of an issuance change depends on who buys or gives up the bills.
+    # Every other holder must keep its baseline bill holdings, or the scenario would
+    # mix a holder-composition change into the issuance change.
+    base_target = 0.225
+    path = bill_share_target_path(
+        base_target, [{"date": "2026-06-21", "change": 0.0}, {"date": "2027-06-30", "change": change}]
+    )
+    rows = bill_holder_rows(BASE["bills"], base_target=base_target, target_path=path, absorbers=["Banks", "Foreign"])
+
+    assert rows[0]["effective_date"] == "2026-06-21"
+    assert rows[-1]["effective_date"] == "2027-06-30"
+    assert {row["security_type"] for row in rows} == {"bills"}
+    final = rows[-1]["shares"]
+    baseline = _bill_dollars(BASE["bills"], base_target)
+    scenario = _bill_dollars(final, base_target + change)
+    assert sum(final.values()) == pytest.approx(1.0)
+    assert scenario["Private"] == pytest.approx(baseline["Private"])
+    absorbed = {holder: scenario[holder] - baseline[holder] for holder in ("Banks", "Foreign")}
+    assert sum(absorbed.values()) == pytest.approx(change)
+    # Absorbers split the change in proportion to their baseline bill shares.
+    assert absorbed["Banks"] / absorbed["Foreign"] == pytest.approx(0.2 / 0.3)
+
+
+def test_bill_holder_shift_rejects_a_cut_larger_than_the_absorbers_hold() -> None:
+    path = bill_share_target_path(0.225, [{"date": "2026-06-21", "change": -0.2}])
+    with pytest.raises(ValueError, match="hold too few bills"):
+        bill_holder_rows(BASE["bills"], base_target=0.225, target_path=path, absorbers=["Banks"])
+
+
+def test_bill_share_changes_are_relative_to_the_package_opening_share() -> None:
+    # The family spec states changes, so the opening share is read from the package rather than restated.
+    path = bill_share_target_path(0.2252, [{"date": "2026-06-21", "change": 0.0}, {"date": "2027-06-30", "change": 0.05}])
+    assert path == [
+        {"date": "2026-06-21", "bill_share_target": 0.2252},
+        {"date": "2027-06-30", "bill_share_target": pytest.approx(0.2752)},
+    ]
+    with pytest.raises(ValueError, match="exactly date and change"):
+        bill_share_target_path(0.2252, [{"date": "2026-06-21", "target": 0.3}])

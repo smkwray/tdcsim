@@ -3,7 +3,10 @@
 
 Each scenario may scale one holder's auction-absorption share by a multiplier
 (one number, or one per marketable security type) and reassign the released
-share to named absorbers in fixed proportions. A scenario may also impose a
+share to named absorbers in fixed proportions. A scenario may move the
+bill-share target by dated changes from the package's opening bill share, and
+may name the holders whose bill holdings absorb that change (the others keep
+their baseline bill holdings in dollars). A scenario may also impose a
 nominal curve shift: either a constant key-rate shock, or a dated rate path
 derived from a completed quantity-only run of the family, in which the 10-year
 shift at each curve date is proportional to the shifted holder's shortfall as a
@@ -27,6 +30,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for path in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(path) not in sys.path:
@@ -35,6 +40,7 @@ for path in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
 from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES  # noqa: E402
+from issuance_calibration import CALIBRATION_FILE, ISSUANCE_RULE_MODE, load_calibration, target_for_date  # noqa: E402
 from write_cbo_example_scenarios import _baseline_coupling, _scenario  # noqa: E402
 
 FAMILY_SPEC_SCHEMA = "tdcsim_scenario_family_spec_v1"
@@ -105,6 +111,81 @@ def shifted_holder_rows(
         if abs(sum(new.values()) - 1.0) > 1.0e-9:
             raise ValueError(f"{security_type} shares do not sum to one after the shift")
         rows.append({"security_type": security_type, "shares": {h: new[h] for h in HOLDER_TYPES}})
+    return rows
+
+
+def baseline_bill_share(baseline: CboBaselinePackage) -> float:
+    """Return the package's opening bill share, the bill-share rule's baseline target."""
+
+    with tempfile.TemporaryDirectory(prefix="tdcsim-family-calibration-") as tmp:
+        root = baseline.materialize(Path(tmp) / "baseline")
+        matches = list(root.rglob(CALIBRATION_FILE))
+        if len(matches) != 1:
+            raise ValueError(f"expected one baseline {CALIBRATION_FILE}, found {len(matches)}")
+        return float(load_calibration(matches[0])["bill_share_target"])
+
+
+def bill_share_target_path(base_target: float, changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Dated bill-share targets: the package's opening share plus each dated change."""
+
+    if not changes:
+        raise ValueError("bill_share_change needs at least one dated point")
+    path = []
+    for point in changes:
+        if set(point) != {"date", "change"}:
+            raise ValueError("bill_share_change points must have exactly date and change")
+        target = base_target + float(point["change"])
+        if not 0.0 < target < 1.0:
+            raise ValueError(f"bill-share target {target} on {point['date']} is outside (0, 1)")
+        path.append({"date": str(point["date"]), "bill_share_target": target})
+    return path
+
+
+def bill_holder_rows(
+    bill_shares: dict[str, float],
+    *,
+    base_target: float,
+    target_path: list[dict[str, Any]],
+    absorbers: list[str],
+) -> list[dict[str, Any]]:
+    """Dated bill shares under which only ``absorbers`` take up the change in the bill stock.
+
+    Auction shares apply to all bills sold, and bills roll within a year, so a holder's
+    share of bill auctions is close to its share of the bill stock. With baseline shares
+    s, opening bill share b and target t, every other holder keeps its baseline bill
+    holdings in dollars (share s * b / t), and the absorbers split the change t - b in
+    proportion to their baseline shares. Rows are written monthly from the first to the
+    last target date so the shares follow the target path.
+    """
+
+    unknown = set(absorbers) - set(HOLDER_TYPES)
+    if not absorbers or unknown:
+        raise ValueError(f"bill absorbers must name known holders, got {absorbers}")
+    absorber_share = sum(bill_shares[holder] for holder in absorbers)
+    if absorber_share <= 0.0:
+        raise ValueError("bill absorbers hold no bills in the baseline")
+    points = [(pd.Timestamp(point["date"]).normalize(), float(point["bill_share_target"])) for point in target_path]
+    dates = sorted({point[0] for point in points} | set(pd.date_range(points[0][0], points[-1][0], freq="ME")))
+    rows = []
+    for day in dates:
+        target = target_for_date(points, day)
+        change = target - base_target
+        shares = {
+            holder: (
+                bill_shares[holder] * (base_target + change / absorber_share) / target
+                if holder in absorbers
+                else bill_shares[holder] * base_target / target
+            )
+            for holder in HOLDER_TYPES
+        }
+        if min(shares.values()) < -SHARE_TOLERANCE:
+            raise ValueError(
+                f"bill absorbers {absorbers} hold too few bills to give up {-change:.4f} of debt on {day.date()}"
+            )
+        shares = {holder: max(0.0, value) for holder, value in shares.items()}
+        if abs(sum(shares.values()) - 1.0) > 1.0e-9:
+            raise ValueError(f"bill shares do not sum to one on {day.date()}")
+        rows.append({"effective_date": day.date().isoformat(), "security_type": "bills", "shares": shares})
     return rows
 
 
@@ -221,12 +302,32 @@ def family_scenarios(
     if phase not in {"quantity", "rates"}:
         raise ValueError("phase must be quantity or rates")
     base = baseline_holder_shares(baseline)
+    base_bill_share = None
     scenarios: dict[str, dict[str, Any]] = {}
     for index, item in enumerate(family["scenarios"]):
         if bool(item.get("rate_path")) != (phase == "rates"):
             continue
         overrides: dict[str, Any] = {}
         shift = item.get("holder_shift")
+        if item.get("bill_holder_shift") and not item.get("bill_share_change"):
+            raise ValueError(f"{item['role']}: a bill holder shift needs a bill_share_change")
+        if item.get("bill_share_change"):
+            if base_bill_share is None:
+                base_bill_share = baseline_bill_share(baseline)
+            target_path = bill_share_target_path(base_bill_share, list(item["bill_share_change"]))
+            overrides["issuance_mix"] = {"mode": ISSUANCE_RULE_MODE, "bill_share_target": target_path}
+            if item.get("bill_holder_shift"):
+                if shift:
+                    raise ValueError(f"{item['role']}: declare a holder shift or a bill holder shift, not both")
+                overrides["holder_preferences"] = {
+                    "mode": "dated_static_shares",
+                    "rows": bill_holder_rows(
+                        base["bills"],
+                        base_target=base_bill_share,
+                        target_path=target_path,
+                        absorbers=[str(h) for h in item["bill_holder_shift"]["absorbers"]],
+                    ),
+                }
         if shift:
             multiplier = shift["multiplier"]
             overrides["holder_preferences"] = {
