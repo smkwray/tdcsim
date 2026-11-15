@@ -674,6 +674,19 @@ def _handoff_maturity_bucket(security_type, maturity_years=None, maturity_catego
     return 'bonds'
 
 
+# Columns _handoff_append_journal reads from a security row.
+_JOURNAL_ROW_COLUMNS = (
+    'BondID',
+    'SecurityType',
+    'HolderType',
+    'HolderSubBucket',
+    'TDCPrincipalHolderType',
+    'TDCPrincipalHolderSubBucket',
+    'OriginalMaturityYears',
+    'MaturityCategory',
+)
+
+
 def _handoff_append_journal(
     handoff_tables,
     prev_date,
@@ -1236,12 +1249,28 @@ def _handoff_append_holder_stocks(handoff_tables, active_bonds, current_date):
             )
 
 
+_STOCK_MAP_COLUMNS = (
+    'Status',
+    'SecurityType',
+    'FaceValue',
+    'AdjustedPrincipal',
+    'OriginalMaturityYears',
+    'MaturityCategory',
+    'HolderType',
+    'HolderSubBucket',
+    'TDCPrincipalHolderType',
+    'TDCPrincipalHolderSubBucket',
+)
+
+
 def _handoff_portfolio_stock_map(portfolio, *, route=False):
     if portfolio is None or portfolio.empty:
         return {}
-    frame = portfolio.copy()
-    if 'Status' in frame.columns:
-        frame = frame[frame['Status'].astype(str).eq('Active')].copy()
+    columns = [column for column in _STOCK_MAP_COLUMNS if column in portfolio.columns]
+    if 'Status' in portfolio.columns:
+        frame = portfolio.loc[portfolio['Status'].astype(str).eq('Active'), columns].copy()
+    else:
+        frame = portfolio[columns].copy()
     if frame.empty:
         return {}
     frame = _ensure_tdc_principal_route_columns(frame)
@@ -1260,32 +1289,31 @@ def _handoff_portfolio_stock_map(portfolio, *, route=False):
     frame['_adjusted_principal_stock'] = np.where(
         security_type.eq('TIPS'), adjusted, 0.0
     )
-    frame['_maturity_bucket'] = [
-        _handoff_maturity_bucket(
-            security,
-            maturity,
-            category,
-        )
-        for security, maturity, category in zip(
-            security_type,
-            frame.get(
-                'OriginalMaturityYears',
-                pd.Series(np.nan, index=frame.index),
-            ),
-            frame.get(
-                'MaturityCategory',
-                pd.Series('', index=frame.index),
-            ),
-        )
-    ]
+    bucket_cache = {}
+    buckets = []
+    for key in zip(
+        security_type,
+        frame.get(
+            'OriginalMaturityYears',
+            pd.Series(np.nan, index=frame.index),
+        ),
+        frame.get(
+            'MaturityCategory',
+            pd.Series('', index=frame.index),
+        ),
+    ):
+        bucket = bucket_cache.get(key)
+        if bucket is None:
+            bucket = _handoff_maturity_bucket(*key)
+            bucket_cache[key] = bucket
+        buckets.append(bucket)
+    frame['_maturity_bucket'] = buckets
     if route:
-        effective_routes = frame.apply(_tdc_principal_holder, axis=1)
-        frame['_route_holder'] = effective_routes.map(
-            lambda route_value: route_value['holder_sector']
-        )
-        frame['_route_subbucket'] = effective_routes.map(
-            lambda route_value: route_value['holder_subsector']
-        )
+        # Vectorized _tdc_principal_holder: the route columns were normalized by
+        # _ensure_tdc_principal_route_columns above, so only the CB override remains.
+        current_cb = frame['HolderType'].fillna('').astype(str).eq('CB')
+        frame['_route_holder'] = frame['TDCPrincipalHolderType'].where(~current_cb, 'CB')
+        frame['_route_subbucket'] = frame['TDCPrincipalHolderSubBucket'].where(~current_cb, '')
         holder_columns = ['_route_holder', '_route_subbucket']
     else:
         holder_columns = ['HolderType', 'HolderSubBucket']
@@ -1295,10 +1323,14 @@ def _handoff_portfolio_stock_map(portfolio, *, route=False):
     )[['_face_stock', '_adjusted_principal_stock']].sum()
     return {
         tuple('' if pd.isna(part) else str(part) for part in key): (
-            float(amounts['_face_stock']),
-            float(amounts['_adjusted_principal_stock']),
+            float(face_total),
+            float(adjusted_total),
         )
-        for key, amounts in grouped.iterrows()
+        for key, face_total, adjusted_total in zip(
+            grouped.index,
+            grouped['_face_stock'].to_numpy(),
+            grouped['_adjusted_principal_stock'].to_numpy(),
+        )
     }
 
 
@@ -3469,7 +3501,12 @@ def run_simulation(
             new_adjusted_principal = original_principal * index_ratio
             bond_portfolio.loc[tips_mask, 'AdjustedPrincipal'] = new_adjusted_principal
             indexation_changes = new_adjusted_principal - prev_adjusted_principal
+            tips_journal_rows = bond_portfolio.loc[
+                indexation_changes.index,
+                [column for column in _JOURNAL_ROW_COLUMNS if column in bond_portfolio.columns],
+            ].to_dict('index')
             for index, amount in indexation_changes.items():
+                tips_row = tips_journal_rows[index]
                 _handoff_append_journal(
                     handoff_tables,
                     prev_date,
@@ -3477,11 +3514,11 @@ def run_simulation(
                     event_type='indexation',
                     leg_type='tips_adjusted_principal_indexation',
                     accounting_basis='adjusted_principal_stock',
-                    row=bond_portfolio.loc[index],
+                    row=tips_row,
                     adjusted_principal_change=float(amount),
                     settlement_scope='noncash_stock_remeasurement',
                     is_intragovernmental=(
-                        str(bond_portfolio.loc[index, 'HolderType']) in INTRAGOV_HOLDERS
+                        str(tips_row['HolderType']) in INTRAGOV_HOLDERS
                     ),
                 )
             if include_tips_inflation_accretion:

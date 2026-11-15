@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import numpy as np
 import pandas as pd
 
 from tdc_shared import (
@@ -856,9 +857,20 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
                 "live portfolio snapshot is missing columns: " + ", ".join(missing)
             )
 
+        # Stream only the columns the reducer reads, and drop non-Active rows
+        # before the per-row loop. Row order is preserved, so the Kahan sums are
+        # unchanged.
+        snapshot_columns = [
+            column
+            for column in portfolio.columns
+            if str(column) in _SNAPSHOT_COLUMNS
+        ]
+        live = portfolio[snapshot_columns]
+        if "Status" in live.columns:
+            live = live.loc[_snapshot_active_mask(live["Status"])]
         column_index = {
             str(column): position
-            for position, column in enumerate(portfolio.columns)
+            for position, column in enumerate(live.columns)
         }
         holder_totals: dict[
             tuple[str, str, str, str, str], list[_Kahan]
@@ -904,7 +916,7 @@ class BoundedScenarioEvidenceSink(MutableMapping[str, _BoundedChannel]):
             sums[1].add(face)
             sums[2].add(adjusted)
 
-        for row in portfolio.itertuples(index=False, name=None):
+        for row in live.itertuples(index=False, name=None):
             if "Status" in column_index and _snapshot_text(value(row, "Status")) != "Active":
                 continue
             active_rows += 1
@@ -2642,6 +2654,35 @@ def _required_finite(values: Mapping[str, Any], column: str) -> float:
     if number is None:
         raise BoundedEvidenceError(f"missing required numeric {column}")
     return number
+
+
+_SNAPSHOT_COLUMNS = frozenset(
+    {
+        "Status",
+        "SecurityType",
+        "FaceValue",
+        "AdjustedPrincipal",
+        "HolderType",
+        "HolderSubBucket",
+        "OriginalMaturityYears",
+        "MaturityCategory",
+        "TDCPrincipalHolderType",
+        "TDCPrincipalHolderSubBucket",
+    }
+)
+
+
+def _snapshot_active_mask(status: pd.Series) -> np.ndarray:
+    """Return the rows whose _snapshot_text(Status) is "Active"."""
+
+    if pd.api.types.infer_dtype(status, skipna=True) in {"string", "empty"}:
+        # Every value is a str or missing; missing never reads as "Active".
+        return status.eq("Active").fillna(False).to_numpy(dtype=bool)
+    return np.fromiter(
+        (_snapshot_text(item) == "Active" for item in status),
+        dtype=bool,
+        count=len(status),
+    )
 
 
 def _snapshot_text(value: Any) -> str:
