@@ -6,7 +6,9 @@ Each scenario may scale one holder's auction-absorption share by a multiplier
 share to named absorbers in fixed proportions. A scenario may move the
 bill-share target by dated changes from the package's opening bill share, and
 may name the holders whose bill holdings absorb that change (the others keep
-their baseline bill holdings in dollars). A scenario may also impose a
+their baseline bill holdings in dollars). A scenario may give one buyer a dollar
+amount of added bill holdings, built evenly over a window and held after it, or
+add a dollar ramp to the Federal Reserve's holdings path. A scenario may also impose a
 nominal curve shift: either a constant key-rate shock, or a dated rate path
 derived from a completed quantity-only run of the family, in which the 10-year
 shift at each curve date is proportional to the shifted holder's shortfall as a
@@ -45,6 +47,8 @@ from write_cbo_example_scenarios import _baseline_coupling, _scenario  # noqa: E
 
 FAMILY_SPEC_SCHEMA = "tdcsim_scenario_family_spec_v1"
 HOLDER_PROFILE_FILE = "tdcsim_holder_profile_assumptions.csv"
+FED_HOLDINGS_FILE = "tdcsim_fed_holdings_path.csv"
+DEBT_STOCK_FILE = "tdcsim_debt_stock_path.csv"
 SHARE_TOLERANCE = 1.0e-12
 CURVE_SURFACE = Path("compile/compiled/forecast_inputs/tdcsim_yield_curve_surface.csv")
 RESULTS = Path("outputs/results_compact.csv.gz")
@@ -189,6 +193,122 @@ def bill_holder_rows(
     return rows
 
 
+def baseline_package_rows(baseline: CboBaselinePackage, filename: str) -> list[dict[str, str]]:
+    """Return the rows of one packaged forecast input, read from the baseline package."""
+
+    with tempfile.TemporaryDirectory(prefix="tdcsim-family-input-") as tmp:
+        root = baseline.materialize(Path(tmp) / "baseline")
+        matches = list(root.rglob(filename))
+        if len(matches) != 1:
+            raise ValueError(f"expected one baseline {filename}, found {len(matches)}")
+        with matches[0].open(newline="") as handle:
+            return list(csv.DictReader(handle))
+
+
+def build_fraction(day: pd.Timestamp, build: list[str]) -> float:
+    """Share of a dollar shift in place on ``day``: 0 before the window, linear in it, 1 after."""
+
+    if len(build) != 2:
+        raise ValueError("build must be [start date, end date]")
+    start, end = (pd.Timestamp(value).normalize() for value in build)
+    if end <= start:
+        raise ValueError("build window must end after it starts")
+    if day <= start:
+        return 0.0
+    if day >= end:
+        return 1.0
+    return (day - start).days / (end - start).days
+
+
+def bill_buyer_rows(
+    bill_shares: dict[str, float],
+    *,
+    holder: str,
+    size_bil: float,
+    build: list[str],
+    bill_stock_by_date: list[tuple[pd.Timestamp, float]],
+) -> list[dict[str, Any]]:
+    """Dated bill shares that give ``holder`` ``size_bil`` of added bill holdings.
+
+    Bills roll within a year, so a holder's share of bill auctions is close to its share
+    of the bill stock. With baseline share s and expected bill stock B on a date, the
+    holder's share rises to s + E/B, where E is the dollar shift in place on that date,
+    and every other holder's share falls in proportion to its baseline share. Rows are
+    written at the start and end of the build window and at each month end from the
+    start to the end of the horizon, so the dollar amount is held after the window.
+    """
+
+    if holder not in HOLDER_TYPES or holder in {"CB", "FedInternal", "TrustFunds"}:
+        raise ValueError(f"bill buyer must be a public auction holder, got {holder!r}")
+    if size_bil <= 0.0:
+        raise ValueError("bill buyer shift size must be positive")
+    others = 1.0 - bill_shares[holder]
+    if others <= 0.0:
+        raise ValueError(f"{holder} already takes every bill")
+    stocks = sorted(bill_stock_by_date)
+    start = pd.Timestamp(build[0]).normalize()
+    dates = sorted({start, pd.Timestamp(build[1]).normalize()} | set(pd.date_range(start, stocks[-1][0], freq="ME")))
+    rows = []
+    for day in dates:
+        stock = next((value for when, value in reversed(stocks) if when <= day), None)
+        if stock is None or stock <= 0.0:
+            raise ValueError(f"no expected bill stock on or before {day.date()}")
+        delta = size_bil * build_fraction(day, build) / stock
+        target = bill_shares[holder] + delta
+        if target > 1.0:
+            raise ValueError(f"{holder} would need more than every bill on {day.date()}")
+        shares = {
+            name: target if name == holder else value * (1.0 - target) / others
+            for name, value in bill_shares.items()
+        }
+        if abs(sum(shares.values()) - 1.0) > 1.0e-9:
+            raise ValueError(f"bill shares do not sum to one on {day.date()}")
+        rows.append({"effective_date": day.date().isoformat(), "security_type": "bills", "shares": shares})
+    return rows
+
+
+def expected_bill_stock(debt_rows: list[dict[str, str]], bill_share: float) -> list[tuple[pd.Timestamp, float]]:
+    """Expected bill stock: the bill-share target times the packaged marketable debt reference."""
+
+    return [
+        (pd.Timestamp(row["period_end"]).normalize(), bill_share * float(row["marketable_treasury_public_target_bil"]))
+        for row in debt_rows
+    ]
+
+
+def fed_holdings_rows(rows: list[dict[str, str]], *, size_bil: float, build: list[str]) -> list[dict[str, str]]:
+    """The packaged Fed holdings path plus a dollar ramp built over the window and held after it."""
+
+    out = []
+    for row in rows:
+        new = dict(row)
+        shift = size_bil * build_fraction(pd.Timestamp(row["period_end"]).normalize(), build)
+        value = float(row["cbo_fed_holdings_target_bil"]) + shift
+        if value < 0.0:
+            raise ValueError(f"Fed holdings would turn negative on {row['period_end']}")
+        new["cbo_fed_holdings_target_bil"] = repr(value)
+        out.append(new)
+    return out
+
+
+def _write_fed_holdings_path(item: dict[str, Any], baseline: CboBaselinePackage, output_dir: Path) -> dict[str, Any]:
+    spec = item["fed_holdings_change"]
+    rows = fed_holdings_rows(
+        baseline_package_rows(baseline, FED_HOLDINGS_FILE),
+        size_bil=float(spec["size_bil"]),
+        build=[str(value) for value in spec["build"]],
+    )
+    name = f"{item['role']}_fed_holdings_path.csv"
+    with (output_dir / name).open("x", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    return {
+        "mode": "absolute_path_file",
+        "file": {"relative_path": name, "sha256": sha256_file(output_dir / name), "media_type": "text/csv"},
+    }
+
+
 def nominal_curve_override(shocks: list[dict[str, float]]) -> dict[str, Any]:
     """Key-rate shock applied to the baseline curve, as in the term-premium examples."""
 
@@ -328,6 +448,28 @@ def family_scenarios(
                         absorbers=[str(h) for h in item["bill_holder_shift"]["absorbers"]],
                     ),
                 }
+        if item.get("bill_buyer_shift"):
+            if shift or "holder_preferences" in overrides:
+                raise ValueError(f"{item['role']}: declare one holder-share change per scenario")
+            if base_bill_share is None:
+                base_bill_share = baseline_bill_share(baseline)
+            buyer = item["bill_buyer_shift"]
+            overrides["holder_preferences"] = {
+                "mode": "dated_static_shares",
+                "rows": bill_buyer_rows(
+                    base["bills"],
+                    holder=str(buyer["holder"]),
+                    size_bil=float(buyer["size_bil"]),
+                    build=[str(value) for value in buyer["build"]],
+                    bill_stock_by_date=expected_bill_stock(
+                        baseline_package_rows(baseline, DEBT_STOCK_FILE), base_bill_share
+                    ),
+                ),
+            }
+        if item.get("fed_holdings_change"):
+            if output_dir is None:
+                raise ValueError(f"{item['role']}: a Fed holdings change needs an output directory")
+            overrides["fed_holdings"] = _write_fed_holdings_path(item, baseline, output_dir)
         if shift:
             multiplier = shift["multiplier"]
             overrides["holder_preferences"] = {

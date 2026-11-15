@@ -14,8 +14,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from write_scenario_family import (  # noqa: E402
     FAMILY_SPEC_SCHEMA,
+    bill_buyer_rows,
     bill_holder_rows,
     bill_share_target_path,
+    build_fraction,
+    fed_holdings_rows,
     family_scenarios,
     rate_path_surface,
     shifted_holder_rows,
@@ -354,3 +357,48 @@ def test_bill_share_changes_are_relative_to_the_package_opening_share() -> None:
     ]
     with pytest.raises(ValueError, match="exactly date and change"):
         bill_share_target_path(0.2252, [{"date": "2026-06-21", "target": 0.3}])
+
+
+def test_one_buyer_gets_the_same_dollar_holdings_while_others_keep_their_mix() -> None:
+    # Buyer comparisons need the same dollar position for every buyer; the other holders
+    # give up bills in proportion, so only the named buyer's role changes.
+    import pandas as pd
+
+    stock = [(pd.Timestamp("2026-06-21"), 7000.0), (pd.Timestamp("2028-01-01"), 8000.0), (pd.Timestamp("2029-12-31"), 9000.0)]
+    rows = bill_buyer_rows(BASE["bills"], holder="Banks", size_bil=500.0, build=["2026-10-01", "2028-09-30"], bill_stock_by_date=stock)
+    by_date = {row["effective_date"]: row["shares"] for row in rows}
+
+    assert by_date["2026-10-01"]["Banks"] == pytest.approx(0.2)
+    # Halfway through the window, half the shift is in place against the stock then expected.
+    halfway = by_date["2027-09-30"]
+    assert halfway["Banks"] * 7000.0 - 0.2 * 7000.0 == pytest.approx(500.0 * build_fraction(pd.Timestamp("2027-09-30"), ["2026-10-01", "2028-09-30"]))
+    # After the window the dollar amount is held while the bill stock grows.
+    for day, stock_level in (("2028-09-30", 8000.0), ("2029-12-31", 9000.0)):
+        shares = by_date[day]
+        assert shares["Banks"] * stock_level - 0.2 * stock_level == pytest.approx(500.0)
+        assert shares["Foreign"] / shares["Private"] == pytest.approx(0.3 / 0.5)
+        assert sum(shares.values()) == pytest.approx(1.0)
+
+
+def test_bill_buyer_rows_reject_the_fed_and_impossible_shifts() -> None:
+    import pandas as pd
+
+    stock = [(pd.Timestamp("2026-06-21"), 100.0)]
+    with pytest.raises(ValueError, match="public auction holder"):
+        bill_buyer_rows(BASE["bills"], holder="CB", size_bil=10.0, build=["2026-10-01", "2028-09-30"], bill_stock_by_date=stock)
+    with pytest.raises(ValueError, match="more than every bill"):
+        bill_buyer_rows(BASE["bills"], holder="Banks", size_bil=500.0, build=["2026-10-01", "2028-09-30"], bill_stock_by_date=stock)
+
+
+def test_fed_holdings_change_ramps_over_the_window_and_holds() -> None:
+    rows = [
+        {"period_end": day, "holder_type": "CB", "cbo_fed_holdings_target_bil": "4000.0"}
+        for day in ("2026-06-21", "2026-10-01", "2027-09-30", "2028-09-30", "2036-09-30")
+    ]
+    runoff = fed_holdings_rows(rows, size_bil=-500.0, build=["2026-10-01", "2028-09-30"])
+    values = [float(row["cbo_fed_holdings_target_bil"]) for row in runoff]
+    assert values[0] == values[1] == 4000.0
+    assert 3700.0 < values[2] < 3800.0
+    assert values[3] == values[4] == 3500.0
+    with pytest.raises(ValueError, match="turn negative"):
+        fed_holdings_rows(rows, size_bil=-5000.0, build=["2026-10-01", "2028-09-30"])

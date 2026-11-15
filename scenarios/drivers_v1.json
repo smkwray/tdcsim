@@ -1,0 +1,56 @@
+{
+  "schema_version": "tdcsim_scenario_family_spec_v1",
+  "family_id": "drivers_v1",
+  "as_of_date": "2026-11-15",
+  "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
+  "description": "Illustrative buyer shifts over the CBO baseline horizon. Each scenario gives one buyer $500 billion of added Treasury holdings, built evenly over fiscal years 2027 and 2028 and held at that dollar amount through 2036, against one common baseline. Auction buyers take the added amount in bills, with every other holder's bill share reduced in proportion; the Federal Reserve case raises, and the runoff case lowers, the Federal Reserve's holdings path by the same amount, settled in the secondary market. Issuance, rates and the fiscal path are unchanged, so the differences come from who holds the securities and how each buyer pays and is paid.",
+  "boundaries": [
+    "Illustrative scenario accounting, not a forecast or causal estimate",
+    "The shift sizes are stated assumptions, equal across buyers so their effects can be compared, not estimated demand",
+    "Every scenario puts the TGA on the operating-cash path at each fiscal-year end (within a year it sits below the path by issuance awaiting settlement), so financing-cost differences change the debt rather than the TGA",
+    "Banks pay for securities with reserves; foreign holders settle through US banks outside covered deposits; domestic private buyers pay from covered deposits, money funds through the money-fund deposit pass-through",
+    "The Federal Reserve buys from and sells to the other holders in the secondary market and takes no auction allocation"
+  ],
+  "calibration": {
+    "size": "$500 billion is about 1.6 percent of marketable debt at the opening, the same for every buyer so the deposit and reserve effects per dollar can be compared.",
+    "timing": "Built linearly from 2026-10-01 to 2028-09-30 (fiscal years 2027 and 2028) and held at $500 billion through 2036-09-30, so the cumulative result through FY2036 adds the interest and rollover flows on the position to its impact effect.",
+    "bills": "Auction buyers take the added holdings in bills because bills roll within a year, so a buyer's share of bill auctions sets its share of the bill stock; the share needed is the dollar amount divided by the expected bill stock (the package's bill-share target times its marketable debt reference)."
+  },
+  "scenarios": [
+    {
+      "role": "baseline",
+      "scenario_id": "tdcsim_drivers_v1_baseline",
+      "label": "Drivers family baseline"
+    },
+    {
+      "role": "banks",
+      "scenario_id": "tdcsim_drivers_v1_banks",
+      "label": "Banks hold $500 billion more bills, paid with reserves",
+      "bill_buyer_shift": {"holder": "Banks", "size_bil": 500.0, "build": ["2026-10-01", "2028-09-30"]}
+    },
+    {
+      "role": "foreign",
+      "scenario_id": "tdcsim_drivers_v1_foreign",
+      "label": "Foreign holders hold $500 billion more bills, paid outside covered deposits",
+      "bill_buyer_shift": {"holder": "Foreign", "size_bil": 500.0, "build": ["2026-10-01", "2028-09-30"]}
+    },
+    {
+      "role": "private_deposits",
+      "scenario_id": "tdcsim_drivers_v1_private_deposits",
+      "label": "Domestic private buyers hold $500 billion more bills, paid from deposits",
+      "bill_buyer_shift": {"holder": "Private", "size_bil": 500.0, "build": ["2026-10-01", "2028-09-30"]}
+    },
+    {
+      "role": "fed_purchases",
+      "scenario_id": "tdcsim_drivers_v1_fed_purchases",
+      "label": "The Federal Reserve holds $500 billion more Treasury securities",
+      "fed_holdings_change": {"size_bil": 500.0, "build": ["2026-10-01", "2028-09-30"]}
+    },
+    {
+      "role": "fed_runoff",
+      "scenario_id": "tdcsim_drivers_v1_fed_runoff",
+      "label": "The Federal Reserve holds $500 billion fewer Treasury securities",
+      "fed_holdings_change": {"size_bil": -500.0, "build": ["2026-10-01", "2028-09-30"]}
+    }
+  ]
+}

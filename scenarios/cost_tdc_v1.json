@@ -3,7 +3,7 @@
   "family_id": "cost_tdc_v1",
   "as_of_date": "2026-11-15",
   "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
-  "description": "Illustrative issuance-maturity scenarios over the CBO baseline horizon. Treasury moves the bill share of marketable debt up or down by 5 percentage points over the first year and the 10-year yield moves with it. Each issuance change runs twice: with the change in the bill stock spread across holders in proportion to their bill holdings, and with banks and foreign accounts taking up the whole change. Financing cost depends on the issuance mix and the yield; the deposit effect depends on who buys or gives up the bills.",
+  "description": "Illustrative issuance-maturity scenarios over the CBO baseline horizon. Treasury moves the bill share of marketable debt up or down by 5 percentage points over the first year. Each issuance change runs three times: without a yield change, to isolate the issuance mix; with the yield change and the change in the bill stock spread across holders in proportion to their bill holdings; and with the yield change and banks and foreign accounts taking up the whole change. Financing cost depends on the issuance mix and the yield; the deposit effect depends on who buys or gives up the bills.",
   "boundaries": [
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "The 10-year yield shift is a stated assumption, not an estimated response to the issuance change",
@@ -13,7 +13,7 @@
   ],
   "calibration": {
     "issuance": "Bill-share target moves linearly from the package's opening bill share (about 22.5% of marketable debt) by +5 or -5 percentage points between 2026-06-21 and 2027-06-30 and stays there. The lower case returns to the middle of the 15-20% range the Treasury Borrowing Advisory Committee has recommended; the higher case extends recent bill-heavy issuance.",
-    "rates": "Key-rate shift of the nominal curve: zero at two years and below, -25 (shorter) or +25 (longer) basis points at ten years and beyond, log-tenor linear between, from the start of the simulation.",
+    "rates": "Key-rate shift of the nominal curve: zero at two years and below, -25 (shorter) or +25 (longer) basis points at ten years and beyond, log-tenor linear between, from the start of the simulation. Mix-only cases leave the curve unchanged.",
     "holders": "Proportional cases keep the baseline auction shares, which follow opening holdings of bills and of longer securities. Bank-and-foreign cases give banks and foreign accounts the whole change in the bill stock, in proportion to their baseline bill shares; every other holder keeps its baseline bill holdings in dollars."
   },
   "scenarios": [
@@ -23,17 +23,47 @@
       "label": "Cost and TDC family baseline"
     },
     {
+      "role": "shorter_mix_only",
+      "scenario_id": "tdcsim_cost_tdc_v1_shorter_mix_only",
+      "label": "Bill share +5 points, no yield change, holders in proportion",
+      "bill_share_change": [
+        {
+          "date": "2026-06-21",
+          "change": 0.0
+        },
+        {
+          "date": "2027-06-30",
+          "change": 0.05
+        }
+      ]
+    },
+    {
       "role": "shorter_proportional",
       "scenario_id": "tdcsim_cost_tdc_v1_shorter_proportional",
       "label": "Bill share +5 points, 10-year yield -25 bp, holders in proportion",
       "bill_share_change": [
-        {"date": "2026-06-21", "change": 0.0},
-        {"date": "2027-06-30", "change": 0.05}
+        {
+          "date": "2026-06-21",
+          "change": 0.0
+        },
+        {
+          "date": "2027-06-30",
+          "change": 0.05
+        }
       ],
       "key_rate_shocks_bp": [
-        {"tenor_years": 2.0, "shock_bp": 0.0},
-        {"tenor_years": 10.0, "shock_bp": -25.0},
-        {"tenor_years": 30.0, "shock_bp": -25.0}
+        {
+          "tenor_years": 2.0,
+          "shock_bp": 0.0
+        },
+        {
+          "tenor_years": 10.0,
+          "shock_bp": -25.0
+        },
+        {
+          "tenor_years": 30.0,
+          "shock_bp": -25.0
+        }
       ]
     },
     {
@@ -41,14 +71,49 @@
       "scenario_id": "tdcsim_cost_tdc_v1_shorter_banks_foreign",
       "label": "Bill share +5 points, 10-year yield -25 bp, banks and foreign accounts buy the added bills",
       "bill_share_change": [
-        {"date": "2026-06-21", "change": 0.0},
-        {"date": "2027-06-30", "change": 0.05}
+        {
+          "date": "2026-06-21",
+          "change": 0.0
+        },
+        {
+          "date": "2027-06-30",
+          "change": 0.05
+        }
       ],
-      "bill_holder_shift": {"absorbers": ["Banks", "Foreign"]},
+      "bill_holder_shift": {
+        "absorbers": [
+          "Banks",
+          "Foreign"
+        ]
+      },
       "key_rate_shocks_bp": [
-        {"tenor_years": 2.0, "shock_bp": 0.0},
-        {"tenor_years": 10.0, "shock_bp": -25.0},
-        {"tenor_years": 30.0, "shock_bp": -25.0}
+        {
+          "tenor_years": 2.0,
+          "shock_bp": 0.0
+        },
+        {
+          "tenor_years": 10.0,
+          "shock_bp": -25.0
+        },
+        {
+          "tenor_years": 30.0,
+          "shock_bp": -25.0
+        }
+      ]
+    },
+    {
+      "role": "longer_mix_only",
+      "scenario_id": "tdcsim_cost_tdc_v1_longer_mix_only",
+      "label": "Bill share -5 points, no yield change, holders in proportion",
+      "bill_share_change": [
+        {
+          "date": "2026-06-21",
+          "change": 0.0
+        },
+        {
+          "date": "2027-06-30",
+          "change": -0.05
+        }
       ]
     },
     {
@@ -56,13 +121,28 @@
       "scenario_id": "tdcsim_cost_tdc_v1_longer_proportional",
       "label": "Bill share -5 points, 10-year yield +25 bp, holders in proportion",
       "bill_share_change": [
-        {"date": "2026-06-21", "change": 0.0},
-        {"date": "2027-06-30", "change": -0.05}
+        {
+          "date": "2026-06-21",
+          "change": 0.0
+        },
+        {
+          "date": "2027-06-30",
+          "change": -0.05
+        }
       ],
       "key_rate_shocks_bp": [
-        {"tenor_years": 2.0, "shock_bp": 0.0},
-        {"tenor_years": 10.0, "shock_bp": 25.0},
-        {"tenor_years": 30.0, "shock_bp": 25.0}
+        {
+          "tenor_years": 2.0,
+          "shock_bp": 0.0
+        },
+        {
+          "tenor_years": 10.0,
+          "shock_bp": 25.0
+        },
+        {
+          "tenor_years": 30.0,
+          "shock_bp": 25.0
+        }
       ]
     },
     {
@@ -70,14 +150,34 @@
       "scenario_id": "tdcsim_cost_tdc_v1_longer_banks_foreign",
       "label": "Bill share -5 points, 10-year yield +25 bp, banks and foreign accounts give up the bills",
       "bill_share_change": [
-        {"date": "2026-06-21", "change": 0.0},
-        {"date": "2027-06-30", "change": -0.05}
+        {
+          "date": "2026-06-21",
+          "change": 0.0
+        },
+        {
+          "date": "2027-06-30",
+          "change": -0.05
+        }
       ],
-      "bill_holder_shift": {"absorbers": ["Banks", "Foreign"]},
+      "bill_holder_shift": {
+        "absorbers": [
+          "Banks",
+          "Foreign"
+        ]
+      },
       "key_rate_shocks_bp": [
-        {"tenor_years": 2.0, "shock_bp": 0.0},
-        {"tenor_years": 10.0, "shock_bp": 25.0},
-        {"tenor_years": 30.0, "shock_bp": 25.0}
+        {
+          "tenor_years": 2.0,
+          "shock_bp": 0.0
+        },
+        {
+          "tenor_years": 10.0,
+          "shock_bp": 25.0
+        },
+        {
+          "tenor_years": 30.0,
+          "shock_bp": 25.0
+        }
       ]
     }
   ]
