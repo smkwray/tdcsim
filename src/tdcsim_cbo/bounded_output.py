@@ -724,11 +724,14 @@ def _validate_funding_mode_close(
         if float(bridge.get("debt_drift_from_reference_bil", 0.0) or 0.0) < -CASH_TOLERANCE_BIL:
             raise BoundedEvidenceError("controlled debt fell below the CBO debt reference")
     elif mode == "cbo_operating_cash_target_financing_v1":
-        excess = float(closing_result.get("TGA", 0.0) or 0.0) - float(
-            closing_result.get("CBOOperatingCashTarget", 0.0) or 0.0
+        # The TGA plus issuance decided but not yet settled holds the target.
+        excess = (
+            float(closing_result["TGA"])
+            + float(closing_result["PendingIssuanceProceeds"])
+            - float(closing_result["CBOOperatingCashTarget"])
         )
-        issued = float(bridge.get("cash_financing_proceeds_bil", 0.0) or 0.0) > CASH_TOLERANCE_BIL
-        if excess < -CASH_TOLERANCE_BIL or (issued and abs(excess) > CASH_TOLERANCE_BIL):
+        decided = float(closing_result["IssuanceNeedProceeds"]) > CASH_TOLERANCE_BIL
+        if excess < -CASH_TOLERANCE_BIL or (decided and abs(excess) > CASH_TOLERANCE_BIL):
             raise BoundedEvidenceError(f"TGA off its operating-cash target at period close: {excess}")
 
 

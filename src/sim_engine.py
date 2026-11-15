@@ -1,6 +1,7 @@
 
 """Core simulation loop for the Treasury funding-chain simulator."""
 
+import bisect
 import copy
 import time
 import traceback
@@ -38,11 +39,14 @@ from issuance_calibration import (
     bill_issuance_amount,
     bill_mask,
     bill_maturity_years,
+    bill_supply_key,
+    coupon_supply_key,
     controlled_debt_and_bills,
     controlled_marketable_mask,
     debt_base,
     is_rule_profile,
     rule_target_path,
+    settlement_rules,
     target_for_date,
 )
 from sim_helpers import OUTPUT_COLUMN_RENAMES, apply_event_actions, validate_run_params
@@ -99,6 +103,11 @@ CBO_FUNDING_MODES = frozenset(
     {CBO_FUNDING_MODE, CBO_DEBT_REFERENCE_FINANCING_MODE, CBO_OPERATING_CASH_TARGET_FINANCING_MODE}
 )
 # Issuance legs whose proceeds are sized to a cash need rather than a debt path.
+OPERATING_CASH_RESULT_COLUMNS = (
+    'IssuanceNeedProceeds',
+    'PendingIssuanceProceeds',
+    'EarlySettlementProceeds',
+)
 CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
 _US_FEDERAL_HOLIDAYS = USFederalHolidayCalendar()
@@ -2139,32 +2148,25 @@ def _issuance_pricing_context(
     }
 
 
-def _build_bill_share_supply_schedule(
-    amount,
-    *,
-    face_target_mode,
-    issuance_leg,
-    issuance_profile,
-    controlled_debt,
-    controlled_bills,
-    current_date,
-    pricing,
-):
-    """Split one issuance amount by the bill-share rule and price it.
+def _bill_share_allocations(amount, *, issuance_profile, controlled_debt, controlled_bills, current_date):
+    """Split one amount by the bill-share rule into per-security amounts.
 
     ``controlled_debt`` and ``controlled_bills`` are face (TIPS at adjusted principal)
-    after the day's maturities and any issuance already scheduled that day. When
-    ``face_target_mode`` is false, ``amount`` is cash proceeds and enters the rule as if
-    it were face: bills issue at a discount of about the bill yield times its term
-    (under 5 bp for a four-week bill, about 2% for a 52-week bill at 4%), so the bill
-    face issued exceeds the rule's bill amount by that discount and the realized share
-    lands slightly above the target. The tests bound this approximation.
+    after the day's maturities and any issuance already scheduled or pending. When the
+    amount is cash proceeds it enters the rule as if it were face: bills issue at a
+    discount of about the bill yield times its term (under 5 bp for a four-week bill,
+    about 2% for a 52-week bill at 4%), so bill face exceeds the rule's bill amount by
+    that discount and the realized share lands slightly above the target. The tests
+    bound this approximation.
+
+    Returns ``([(supply_key, security_type, maturity_years, bill_days_or_None, amount)],
+    target)``.
     """
 
     amount = float(amount or 0.0)
-    if amount <= TGA_FLOOR_TOLERANCE:
-        return [], 0.0
     target = target_for_date(rule_target_path(issuance_profile), current_date)
+    if amount <= TGA_FLOOR_TOLERANCE:
+        return [], target
     bills_amount = bill_issuance_amount(
         amount,
         target=target,
@@ -2175,18 +2177,28 @@ def _build_bill_share_supply_schedule(
     allocations = []
     for term in issuance_profile['bill_terms']:
         weeks = int(term['weeks'])
-        allocations.append(
-            ('Fixed', bill_maturity_years(weeks), bill_days(weeks), bills_amount * float(term['share']))
-        )
+        allocations.append((
+            bill_supply_key(weeks), 'Fixed', bill_maturity_years(weeks), bill_days(weeks),
+            bills_amount * float(term['share']),
+        ))
     for term in issuance_profile['coupon_terms']:
-        allocations.append(
-            (str(term['security_type']), float(term['maturity_years']), None, coupon_amount * float(term['share']))
-        )
-    residual = amount - sum(target for *_, target in allocations)
+        security_type = str(term['security_type'])
+        maturity_years = float(term['maturity_years'])
+        allocations.append((
+            coupon_supply_key(security_type, maturity_years), security_type, maturity_years, None,
+            coupon_amount * float(term['share']),
+        ))
+    residual = amount - sum(item[-1] for item in allocations)
     if abs(residual) > max(TGA_FLOOR_TOLERANCE, abs(amount) * 1.0e-12):
         raise ValueError(f'Bill-share issuance allocation does not close: residual={residual}')
+    return allocations, target
+
+
+def _quote_rule_allocations(allocations, *, face_target_mode, issuance_leg, current_date, pricing):
+    """Price rule securities issued on ``current_date`` and date their maturities."""
+
     schedule = []
-    for security_type, maturity_years, weekly_days, target_amount in allocations:
+    for _key, security_type, maturity_years, weekly_days, target_amount in allocations:
         if target_amount <= TGA_FLOOR_TOLERANCE:
             continue
         item = _quote_supply_item(
@@ -2207,7 +2219,79 @@ def _build_bill_share_supply_schedule(
             else _maturity_date_from_years(current_date, maturity_years)
         )
         schedule.append(item)
-    return schedule, target
+    return schedule
+
+
+def _build_bill_share_supply_schedule(
+    amount,
+    *,
+    face_target_mode,
+    issuance_leg,
+    issuance_profile,
+    controlled_debt,
+    controlled_bills,
+    current_date,
+    pricing,
+):
+    """Split one issuance amount by the bill-share rule and price it the same day."""
+
+    allocations, target = _bill_share_allocations(
+        amount,
+        issuance_profile=issuance_profile,
+        controlled_debt=controlled_debt,
+        controlled_bills=controlled_bills,
+        current_date=current_date,
+    )
+    return _quote_rule_allocations(
+        allocations,
+        face_target_mode=face_target_mode,
+        issuance_leg=issuance_leg,
+        current_date=current_date,
+        pricing=pricing,
+    ), target
+
+
+def _next_business_day(date_value):
+    day = pd.Timestamp(date_value).normalize()
+    while not _is_business_day(day):
+        day += pd.Timedelta(days=1)
+    return day
+
+
+def _previous_business_day(date_value):
+    day = pd.Timestamp(date_value).normalize()
+    while not _is_business_day(day):
+        day -= pd.Timedelta(days=1)
+    return day
+
+
+def _settlement_schedule(issuance_profile, start_date, end_date):
+    """Map each settlement date in ``[start_date, end_date]`` to the securities settling.
+
+    Weekday and day-of-month dates move forward to the next business day; month-end
+    issues settle on the month's last business day.
+    """
+
+    first = pd.Timestamp(start_date).normalize()
+    last = pd.Timestamp(end_date).normalize()
+    months = pd.period_range(first, last + pd.offsets.MonthEnd(0), freq='M')
+    by_date = defaultdict(list)
+    for key, (kind, value) in settlement_rules(issuance_profile).items():
+        if kind == 'weekday':
+            day = first + pd.Timedelta(days=(value - first.weekday()) % 7)
+            nominal = []
+            while day <= last:
+                nominal.append(day)
+                day += pd.Timedelta(days=7)
+            dates = [_next_business_day(day) for day in nominal]
+        elif kind == 'day_of_month':
+            dates = [_next_business_day(pd.Timestamp(month.year, month.month, value)) for month in months]
+        else:
+            dates = [_previous_business_day(month.end_time.normalize()) for month in months]
+        for settle in dates:
+            if first <= settle <= last:
+                by_date[settle].append(key)
+    return dict(sorted(by_date.items()))
 
 
 def _build_issuance_supply_schedule(
@@ -2342,6 +2426,73 @@ def _build_issuance_supply_schedule(
             'maturity_date': _maturity_date_from_years(current_date, maturity_years),
         })
     return schedule
+
+
+def _due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date):
+    """Securities whose settlement date falls in ``(prev_date, current_date]``."""
+
+    low = bisect.bisect_right(settlement_dates, pd.Timestamp(prev_date))
+    high = bisect.bisect_right(settlement_dates, pd.Timestamp(current_date))
+    due = []
+    for settle in settlement_dates[low:high]:
+        due.extend(key for key in settlement_schedule[settle] if key not in due)
+    return due
+
+
+def _decide_and_settle_pending(
+    pending,
+    *,
+    need,
+    issuance_profile,
+    pre_issuance_position,
+    due_keys,
+    projected_tga_without_settlement,
+    current_date,
+):
+    """Add the day's split to pending balances and release the ones due today.
+
+    The split counts pending face as already issued. If settling only what is due would
+    leave the TGA negative, every pending bill settles early the same day, and pending
+    coupon securities too if the bills are not enough. Mutates ``pending``; returns the
+    settling allocations and the proceeds settled early.
+    """
+
+    controlled_debt, controlled_bills = pre_issuance_position
+    for security_type, maturity_years, _weekly_days, amount in pending.values():
+        controlled_debt += amount
+        if security_type == 'Fixed' and maturity_years <= 1.0 + TGA_FLOOR_TOLERANCE:
+            controlled_bills += amount
+    allocations, _target = _bill_share_allocations(
+        need,
+        issuance_profile=issuance_profile,
+        controlled_debt=controlled_debt,
+        controlled_bills=controlled_bills,
+        current_date=current_date,
+    )
+    for key, security_type, maturity_years, weekly_days, amount in allocations:
+        if amount <= TGA_FLOOR_TOLERANCE:
+            continue
+        if key in pending:
+            pending[key][3] += amount
+        else:
+            pending[key] = [security_type, maturity_years, weekly_days, amount]
+    settling = [key for key in due_keys if key in pending]
+    settled_cash = sum(pending[key][3] for key in settling)
+    early = 0.0
+    # Bills first; coupon securities settle early only if the bills cannot keep the TGA
+    # from going negative.
+    for early_kind in ('bill', 'coupon'):
+        if projected_tga_without_settlement + settled_cash + early >= 0.0:
+            break
+        for key, item in pending.items():
+            if (key[0] == 'bill') == (early_kind == 'bill') and key not in settling:
+                settling.append(key)
+                early += item[3]
+    settled = []
+    for key in settling:
+        security_type, maturity_years, weekly_days, amount = pending.pop(key)
+        settled.append((key, security_type, maturity_years, weekly_days, amount))
+    return settled, early
 
 
 def _schedule_issuance_leg(
@@ -3162,6 +3313,11 @@ def run_simulation(
         }
     for status_col in ['FundingMode', 'FiscalIncidenceStatus', 'NetInterestDiagnosticStatus', 'CBOCashResidualStatus']:
         results[status_col] = ''
+    if cbo_operating_cash_financing_mode:
+        # Only this mode decides cash needs and settles them on a calendar; the debt-path
+        # modes keep their result columns unchanged.
+        for numeric_col in OPERATING_CASH_RESULT_COLUMNS:
+            results[numeric_col] = 0.0
     for status_col in [
         'CBOFedStockMode',
         'CBOFedSettlementScope',
@@ -3308,6 +3464,15 @@ def run_simulation(
         cb_net_expense = current_other_flows.get('cb_net_expense', 0.0)
         money_minting_transfers = current_other_flows.get('money_minting_transfers', 0.0)
         issuance_profile = copy.deepcopy(params.get('treasury_issuance_profile', {}))
+        # Under operating-cash financing the bill-share rule decides daily but settles each
+        # security on Treasury's calendar; decided amounts wait in pending balances.
+        batched_settlement = cbo_operating_cash_financing_mode and is_rule_profile(issuance_profile)
+        settlement_schedule = (
+            _settlement_schedule(issuance_profile, dates[0], dates[-1]) if batched_settlement else {}
+        )
+        settlement_dates = list(settlement_schedule)
+        settlement_calendar_data = copy.deepcopy(issuance_profile.get('settlement_calendar'))
+        pending_issuance = {}
         current_sector_prefs = copy.deepcopy(params.get('sector_preferences', {}))
         uses_legacy_sector_prefs_for_auction = 'auction_absorption_preferences' not in params
         uses_legacy_sector_prefs_for_secondary = 'secondary_target_preferences' not in params
@@ -4612,11 +4777,13 @@ def run_simulation(
                         f'covering {current_date.date()}.'
                     )
                 # The TGA lands on its target whenever it would otherwise fall short;
-                # above target nothing is issued and the surplus stays in cash.
+                # above target nothing is issued and the surplus stays in cash. Amounts
+                # already decided but not yet settled count as issued.
                 total_issuance_target_period = max(
                     0.0,
                     cbo_operating_cash_target
-                    - (projected_tga_pre_issuance + cbo_cash_residual_period),
+                    - (projected_tga_pre_issuance + cbo_cash_residual_period)
+                    - sum(item[3] for item in pending_issuance.values()),
                 )
             cbo_fed_row = _cbo_optional_exact_date_row(
                 cbo_inputs.get('fed_holdings'),
@@ -4692,16 +4859,39 @@ def run_simulation(
             primary_issuance_leg = 'cbo_reference_face_issuance'
         else:
             primary_issuance_leg = 'ordinary_issuance'
-        issuance_supply_schedule = _schedule_issuance_leg(
-            total_issuance_target_period,
-            face_target_mode=cbo_face_target_mode,
-            issuance_leg=primary_issuance_leg,
-            issuance_profile=issuance_profile,
-            current_date=current_date,
-            pricing=issuance_pricing,
-            pre_issuance_position=pre_issuance_position,
-            scheduled=(),
-        )
+        early_settlement_proceeds = 0.0
+        if batched_settlement:
+            if issuance_profile.get('settlement_calendar') != settlement_calendar_data:
+                raise ValueError('the settlement calendar cannot change during a run')
+            settlement_allocations, early_settlement_proceeds = _decide_and_settle_pending(
+                pending_issuance,
+                need=total_issuance_target_period,
+                issuance_profile=issuance_profile,
+                pre_issuance_position=pre_issuance_position,
+                due_keys=_due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date),
+                projected_tga_without_settlement=projected_tga_pre_issuance + cbo_cash_residual_period,
+                current_date=current_date,
+            )
+            operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
+            issuance_supply_schedule = _quote_rule_allocations(
+                settlement_allocations,
+                face_target_mode=False,
+                issuance_leg=primary_issuance_leg,
+                current_date=current_date,
+                pricing=issuance_pricing,
+            )
+        else:
+            operating_cash_settlement_proceeds = total_issuance_target_period
+            issuance_supply_schedule = _schedule_issuance_leg(
+                total_issuance_target_period,
+                face_target_mode=cbo_face_target_mode,
+                issuance_leg=primary_issuance_leg,
+                issuance_profile=issuance_profile,
+                current_date=current_date,
+                pricing=issuance_pricing,
+                pre_issuance_position=pre_issuance_position,
+                scheduled=(),
+            )
         if cbo_reference_financing_mode:
             reference_cash_proceeds = sum(
                 float(item['proceeds']) for item in issuance_supply_schedule
@@ -4987,10 +5177,10 @@ def run_simulation(
             results.loc[current_date, 'CashFinancingFaceIssued'] = cash_financing_face_issued
             results.loc[current_date, 'CashFinancingProceeds'] = cash_financing_proceeds
         if cbo_operating_cash_financing_mode:
-            if abs(cash_financing_proceeds - total_issuance_target_period) > target_tolerance:
+            if abs(cash_financing_proceeds - operating_cash_settlement_proceeds) > target_tolerance:
                 raise RuntimeError(
                     f"Operating-cash financing cash settlement miss at {current_date.date()}: "
-                    f"target={total_issuance_target_period:.12f}, "
+                    f"target={operating_cash_settlement_proceeds:.12f}, "
                     f"actual={cash_financing_proceeds:.12f}"
                 )
             expected_cash_financing_face = sum(
@@ -5002,6 +5192,11 @@ def run_simulation(
                 )
             results.loc[current_date, 'CashFinancingFaceIssued'] = cash_financing_face_issued
             results.loc[current_date, 'CashFinancingProceeds'] = cash_financing_proceeds
+            results.loc[current_date, 'IssuanceNeedProceeds'] = total_issuance_target_period
+            results.loc[current_date, 'PendingIssuanceProceeds'] = sum(
+                item[3] for item in pending_issuance.values()
+            )
+            results.loc[current_date, 'EarlySettlementProceeds'] = early_settlement_proceeds
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
             cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))
@@ -5568,9 +5763,13 @@ def run_simulation(
                     f"TGA={current_tga:.12f}, floor={validation_floor:.12f}"
                 )
         if cbo_operating_cash_financing_mode:
-            # Any cash flow booked after issuance would leave the TGA off its target.
-            shortfall = cbo_operating_cash_target - current_tga
-            off_target = abs(shortfall) if cash_financing_proceeds > target_tolerance else max(0.0, shortfall)
+            # The TGA plus what is decided but not yet settled sits on the target on every
+            # day with a need, and never below it; a cash flow booked after issuance would
+            # break this.
+            shortfall = cbo_operating_cash_target - (
+                current_tga + results.loc[current_date, 'PendingIssuanceProceeds']
+            )
+            off_target = abs(shortfall) if total_issuance_target_period > target_tolerance else max(0.0, shortfall)
             if off_target > target_tolerance:
                 raise RuntimeError(
                     f"Operating-cash financing left the TGA off target at {current_date.date()}: "

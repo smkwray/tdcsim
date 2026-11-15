@@ -21,6 +21,7 @@ from issuance_calibration import (
     AUCTION_REQUIRED_COLUMNS,
     CALIBRATION_FILE,
     CALIBRATION_SCHEMA_VERSION,
+    SETTLEMENT_CALENDAR,
     IssuanceCalibrationError,
     bill_issuance_amount,
     build_auction_calibration,
@@ -58,6 +59,15 @@ FIXTURE_COUPON_TERMS = [
     {"kind": "nominal", "tenor_years": 10, "share": 0.3},
     {"kind": "nominal", "tenor_years": 30, "share": 0.2},
 ]
+# The registry calendar restricted to the fixture's securities.
+FIXTURE_SETTLEMENT_CALENDAR = {
+    "bills": [entry for entry in SETTLEMENT_CALENDAR["bills"] if entry["weeks"] in {4, 13, 26}],
+    "coupons": [
+        entry
+        for entry in SETTLEMENT_CALENDAR["coupons"]
+        if entry["kind"] == "nominal" and entry["tenor_years"] in {2, 10, 30}
+    ],
+}
 
 
 def write_fixture_issuance_calibration(inputs_dir: Path, *, bill_share_target: float = 0.2) -> dict:
@@ -68,6 +78,7 @@ def write_fixture_issuance_calibration(inputs_dir: Path, *, bill_share_target: f
         "source_file": "sources/fiscaldata/auctions_query.csv",
         "bill_terms": FIXTURE_BILL_TERMS,
         "coupon_terms": FIXTURE_COUPON_TERMS,
+        "settlement_calendar": FIXTURE_SETTLEMENT_CALENDAR,
         "bill_share_target": bill_share_target,
     }
     write_json(Path(inputs_dir) / CALIBRATION_FILE, payload)
@@ -171,6 +182,7 @@ def _rule_profile(target: float) -> dict:
         target_path=[{"date": None, "bill_share_target": target}],
         bill_terms=FIXTURE_BILL_TERMS,
         coupon_terms=FIXTURE_COUPON_TERMS,
+        settlement_calendar=FIXTURE_SETTLEMENT_CALENDAR,
     )
 
 
@@ -441,16 +453,22 @@ def _bill_share_by_date(results) -> pd.Series:
 
 def test_engine_keeps_bill_share_on_target_through_rollovers(tmp_path: Path) -> None:
     """Every opening bill matures inside the window. Fixed gross shares would refinance
-    them mostly into coupons; the rule rolls them into bills and holds the share."""
+    them mostly into coupons; the rule rolls them into bills and holds the share.
+
+    Each opening bill is a tenth of the book and is replaced partly by 13- and 26-week
+    bills that settle on the next Thursday, so the share dips between a Tuesday maturity
+    and that Thursday. Once the week's bills have settled it is back on target, within
+    the bill discount and the coupons still pending until their monthly dates."""
 
     rule = _engine_params(tmp_path / "rule", profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
     results, _ = run_simulation(rule, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
     share = _bill_share_by_date(results)
-    # Proceeds-sized issuance overshoots by the bill discount only (see the schedule test),
-    # including on the days the three opening bills mature.
     assert len(share) == len(results) - 1
-    assert (share - 0.3).abs().max() < 0.002
-    assert share["2026-09-08"] == pytest.approx(0.3, abs=0.002)
+    thursdays = [day for day in share.index if pd.Timestamp(day).weekday() == 3]
+    assert len(thursdays) == 13
+    assert (share[thursdays] - 0.3).abs().max() < 0.005
+    assert share["2026-09-10"] == pytest.approx(0.3, abs=0.005)
+    assert (share - 0.3).abs().mean() < 0.01
 
     fixed = _engine_params(tmp_path / "fixed", profile=_fixed_share_profile(), mode="cbo_operating_cash_target_financing_v1")
     fixed_results, _ = run_simulation(fixed, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
@@ -482,17 +500,22 @@ def test_operating_cash_mode_holds_tga_and_puts_rate_costs_in_debt(tmp_path: Pat
     )
     for results in (base, high):
         running = results.iloc[1:]
-        issued = running["AuctionProceeds"] > 1e-9
-        assert issued.any()
-        excess = running["TGA"] - running["CBOOperatingCashTarget"]
+        decided = running["IssuanceNeedProceeds"] > 1e-9
+        assert decided.any()
+        # Cash decided but not yet settled closes the gap exactly: no day is financed twice.
+        excess = running["TGA"] + running["PendingIssuanceProceeds"] - running["CBOOperatingCashTarget"]
         assert (excess >= -1e-6).all()
-        assert excess[issued].abs().max() < 1e-6
+        assert excess[decided].abs().max() < 1e-6
+        assert (running["TGA"] >= 0.0).all()
         assert running["CashFinancingProceeds"].sum() == pytest.approx(running["AuctionProceeds"].sum())
         assert running["CBOControlledDebtTargetError"].abs().max() == 0.0
         assert running["DebtDriftFromReference"].iloc[-1] == pytest.approx(
             running["ScenarioControlledDebt"].iloc[-1] - running["CBOControlledDebtReference"].iloc[-1]
         )
-    assert high["TGA"].iloc[-1] == pytest.approx(base["TGA"].iloc[-1], abs=1e-6)
+    def cash_with_pending(results):
+        return results["TGA"].iloc[-1] + results["PendingIssuanceProceeds"].iloc[-1]
+
+    assert cash_with_pending(high) == pytest.approx(cash_with_pending(base), abs=1e-6)
     assert high["ScenarioControlledDebt"].iloc[-1] > base["ScenarioControlledDebt"].iloc[-1] + 0.1
 
 
@@ -534,3 +557,168 @@ def test_runner_row_budget_covers_every_rule_supply_item() -> None:
     days = len(pd.date_range("2026-06-21", "2027-09-30", freq="D")) - 1
     items = len(profile["bill_terms"]) + len(profile["coupon_terms"])
     assert budget >= days * items * (len(HOLDER_TYPES) + 1)
+
+
+# --- Settlement calendar ----------------------------------------------------------------
+
+
+def _new_issues(portfolio) -> pd.DataFrame:
+    issued = portfolio.loc[pd.to_datetime(portfolio["IssueDate"]) > pd.Timestamp(ENGINE_START)].copy()
+    issued["IssueDate"] = pd.to_datetime(issued["IssueDate"]).dt.normalize()
+    return issued
+
+
+def _supply_key(row) -> tuple[str, float]:
+    years = float(row["OriginalMaturityYears"])
+    if row["SecurityType"] == "Fixed" and years <= 1.0:
+        return ("bill", round(years * 365.25 / 7.0))
+    return (str(row["SecurityType"]), years)
+
+
+def test_securities_settle_only_on_their_calendar_days(tmp_path: Path) -> None:
+    """Treasury settles each security on its own calendar; issuing every security every day
+    multiplies portfolio rows and engine time without adding realism."""
+
+    from sim_engine import _settlement_schedule
+
+    params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
+    results, portfolio = run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+    schedule = _settlement_schedule(params["treasury_issuance_profile"], ENGINE_START, ENGINE_END)
+    allowed = {(day, key) for day, keys in schedule.items() for key in keys}
+    issued = _new_issues(portfolio)
+    assert not issued.empty
+    assert results["EarlySettlementProceeds"].abs().max() == 0.0
+    for _, row in issued.iterrows():
+        assert (row["IssueDate"], _supply_key(row)) in allowed
+    # 4-week bills on Tuesdays, 13- and 26-week on Thursdays, 10/30-year on the 15th
+    # (2026-08-15 is a Saturday, so the 17th), 2-year on the month's last business day.
+    days_by_key = issued.groupby(issued.apply(_supply_key, axis=1))["IssueDate"].apply(set)
+    assert {day.weekday() for day in days_by_key[("bill", 4)]} == {1}
+    assert {day.weekday() for day in days_by_key[("bill", 13)]} == {3}
+    assert pd.Timestamp("2026-08-17") in days_by_key[("Fixed", 10.0)]
+    assert days_by_key[("Fixed", 2.0)] == {pd.Timestamp("2026-07-31"), pd.Timestamp("2026-08-31"), pd.Timestamp("2026-09-30")}
+
+
+def test_row_growth_is_bounded_by_the_calendar(tmp_path: Path) -> None:
+    """Rows per year must scale with settlement events, not with days times securities."""
+
+    from sim_engine import _settlement_schedule
+    from tdc_shared import HOLDER_TYPES
+
+    params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
+    _, portfolio = run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+    schedule = _settlement_schedule(params["treasury_issuance_profile"], ENGINE_START, ENGINE_END)
+    events = sum(len(keys) for day, keys in schedule.items() if day > pd.Timestamp(ENGINE_START))
+    issued = _new_issues(portfolio)
+    assert issued.groupby(["IssueDate", "OriginalMaturityYears"]).ngroups <= events
+    assert len(issued) <= events * (len(HOLDER_TYPES) + 1)
+    days = len(pd.date_range(ENGINE_START, ENGINE_END)) - 1
+    securities = len(FIXTURE_BILL_TERMS) + len(FIXTURE_COUPON_TERMS)
+    # Daily issuance would create one item per security per day; the calendar cuts that
+    # several-fold (about thirteen-fold for the full eighteen-security mix).
+    assert events * 3 < days * securities
+
+
+def test_pending_amounts_count_as_issued_for_cash_and_bill_share() -> None:
+    """A security decided on Monday and settling Thursday must not be decided again on
+    Tuesday: pending face counts toward debt and bills, and settlement releases exactly
+    what was pending."""
+
+    from sim_engine import _decide_and_settle_pending
+
+    profile = _rule_profile(0.2)
+    pending = {("bill", 4.0): ["Fixed", 28 / 365.25, 28, 50.0]}
+    settled, early = _decide_and_settle_pending(
+        pending,
+        need=100.0,
+        issuance_profile=profile,
+        pre_issuance_position=(1000.0, 150.0),
+        due_keys=[],
+        projected_tga_without_settlement=500.0,
+        current_date=pd.Timestamp("2026-07-06"),
+    )
+    assert settled == [] and early == 0.0
+    # 0.2 x (1000 + 50 pending + 100) - (150 + 50 pending) = 30 of bills, not 70.
+    bills = sum(item[3] for key, item in pending.items() if key[0] == "bill")
+    assert bills == pytest.approx(50.0 + 30.0)
+    assert sum(item[3] for item in pending.values()) == pytest.approx(150.0)
+
+    settled, early = _decide_and_settle_pending(
+        pending,
+        need=0.0,
+        issuance_profile=profile,
+        pre_issuance_position=(1000.0, 150.0),
+        due_keys=[("bill", 4.0)],
+        projected_tga_without_settlement=500.0,
+        current_date=pd.Timestamp("2026-07-07"),
+    )
+    assert early == 0.0
+    assert [item[0] for item in settled] == [("bill", 4.0)]
+    assert settled[0][-1] == pytest.approx(50.0 + 30.0 * 0.5)
+
+
+def test_pending_bills_settle_early_rather_than_overdraw_the_tga() -> None:
+    """Between settlements the TGA runs below target by what is pending; it must never be
+    pushed negative while bills that could settle are waiting."""
+
+    from sim_engine import _decide_and_settle_pending
+
+    pending = {
+        ("bill", 13.0): ["Fixed", 91 / 365.25, 91, 40.0],
+        ("Fixed", 10.0): ["Fixed", 10.0, None, 25.0],
+    }
+    settled, early = _decide_and_settle_pending(
+        pending,
+        need=0.0,
+        issuance_profile=_rule_profile(0.2),
+        pre_issuance_position=(1000.0, 150.0),
+        due_keys=[],
+        projected_tga_without_settlement=-10.0,
+        current_date=pd.Timestamp("2026-07-06"),
+    )
+    assert early == pytest.approx(40.0)
+    assert [item[0] for item in settled] == [("bill", 13.0)]
+    assert list(pending) == [("Fixed", 10.0)]
+
+    # Only when pending bills cannot cover the shortfall do coupons settle early too.
+    pending = {
+        ("bill", 13.0): ["Fixed", 91 / 365.25, 91, 4.0],
+        ("Fixed", 10.0): ["Fixed", 10.0, None, 25.0],
+    }
+    settled, early = _decide_and_settle_pending(
+        pending,
+        need=0.0,
+        issuance_profile=_rule_profile(0.2),
+        pre_issuance_position=(1000.0, 150.0),
+        due_keys=[],
+        projected_tga_without_settlement=-10.0,
+        current_date=pd.Timestamp("2026-07-06"),
+    )
+    assert early == pytest.approx(29.0)
+    assert pending == {}
+
+
+def test_tga_returns_to_target_when_everything_pending_settles(tmp_path: Path) -> None:
+    """The TGA dips below target only by cash that is decided and waiting; once a quiet
+    spell lets every balance settle, it is back on target, and it never goes negative."""
+
+    params = _engine_params(tmp_path, profile=_rule_profile(0.3), mode="cbo_operating_cash_target_financing_v1")
+    results, _ = run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+    running = results.iloc[1:]
+    assert (running["TGA"] >= 0.0).all()
+    gap = running["CBOOperatingCashTarget"] - running["TGA"]
+    assert gap.max() > 1.0
+    assert (gap - running["PendingIssuanceProceeds"]).abs().max() < 1e-6
+    # With an all-bill target and the deficit stopped after July, the only later need is
+    # Tuesday 2026-08-04's rollover, whose bills all settle by Thursday 08-06; by Friday
+    # nothing is pending and the TGA is back on target.
+    quiet = _engine_params(tmp_path / "quiet", profile=_rule_profile(1.0), mode="cbo_operating_cash_target_financing_v1")
+    primary = Path(quiet["baseline_input_paths"]["primary_deficit_path_file"])
+    frame = pd.read_csv(primary)
+    frame.loc[pd.to_datetime(frame["period_end"]) > pd.Timestamp("2026-07-31"), "primary_deficit_bil"] = 0.0
+    frame.to_csv(primary, index=False)
+    quiet_results, _ = run_simulation(quiet, ENGINE_START, "2026-08-07", freq="D", scenario_name="baseline")
+    assert quiet_results.loc["2026-08-04", "IssuanceNeedProceeds"] > 1.0
+    last = quiet_results.iloc[-1]
+    assert last["PendingIssuanceProceeds"] == pytest.approx(0.0, abs=1e-9)
+    assert last["TGA"] == pytest.approx(last["CBOOperatingCashTarget"], abs=1e-6)

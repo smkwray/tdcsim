@@ -167,7 +167,7 @@ The CBO scenario interface supports the main downstream controls:
 ## Model Rules
 
 - By default each day issues what keeps the TGA on its operating-cash path, net of the cash residual; above the path nothing is issued. Debt absorbs cost differences, and `DebtDriftFromReference` reports the gap to CBO's debt path. CBO net interest is reported for comparison.
-- Each day's issuance first moves bills toward the bill-share target, then splits the rest across coupon securities by the auction shares.
+- Each day's decided issuance first moves bills toward the bill-share target (counting issuance decided but not yet settled), then splits the rest across coupon securities by the auction shares. Each security settles on its Treasury calendar day, listed in the package's issuance calibration; `PendingIssuanceProceeds` is what is decided but not yet settled, so `TGA + PendingIssuanceProceeds` equals the operating-cash target on every day with a need. `EarlySettlementProceeds` records pending issuance settled early to keep the TGA from going negative.
 - Under `cbo_public_debt_target` debt follows CBO's path exactly and operating-cash settings move only the TGA; under `cbo_debt_reference_plus_tga_floor_financing_v1` debt follows the path and extra borrowing starts only when the TGA would go negative.
 - The Fed meets its holdings path by buying or selling existing securities at market value and receives no allocation of new issuance.
 - Fed remittances and deferred assets are outside this runner.

@@ -1848,6 +1848,7 @@ def build_engine_params(
             ],
             bill_terms=issuance_calibration["bill_terms"],
             coupon_terms=issuance_calibration["coupon_terms"],
+            settlement_calendar=issuance_calibration["settlement_calendar"],
         ),
         "yield_curve": {
             "use_static": True,

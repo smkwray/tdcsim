@@ -1093,9 +1093,11 @@ def funding_mode_cash_checks(results: pd.DataFrame, funding_closure_mode: str) -
 def operating_cash_financing_checks(results: pd.DataFrame) -> dict[str, Any]:
     """Measure whether the TGA followed its operating-cash target.
 
-    Under ``cbo_operating_cash_target_financing_v1`` the TGA never ends a day below its
-    target, and on every day that issues it ends exactly on target: issuance tops cash
-    up to the target, and a day that opens above target issues nothing.
+    Under ``cbo_operating_cash_target_financing_v1`` the TGA plus issuance decided but
+    not yet settled never ends a day below the target, and on every day with a cash need
+    it ends exactly on it: the need tops cash up to the target, and a day that opens
+    above target decides nothing. Between settlement dates the TGA itself runs below
+    target by the pending amount, never below zero.
     """
 
     running = results.iloc[1:]
@@ -1104,14 +1106,21 @@ def operating_cash_financing_checks(results: pd.DataFrame) -> dict[str, Any]:
     statuses = running["CBOCashResidualStatus"].astype("string")
     if not statuses.eq("operating_cash_target_loaded").all():
         raise RunnerError("operating-cash financing requires a loaded operating-cash target every period")
-    excess = _numeric_column(running, "TGA") - _numeric_column(running, "CBOOperatingCashTarget")
-    issued = _numeric_column(running, "AuctionProceeds") > CASH_CLOSURE_TOLERANCE
+    tga = _numeric_column(running, "TGA")
+    target = _numeric_column(running, "CBOOperatingCashTarget")
+    pending = _numeric_column(running, "PendingIssuanceProceeds")
+    excess = tga + pending - target
+    decided = _numeric_column(running, "IssuanceNeedProceeds") > CASH_CLOSURE_TOLERANCE
     below = int((excess < -CASH_CLOSURE_TOLERANCE).sum())
-    off_on_issue = int((issued & (excess.abs() > CASH_CLOSURE_TOLERANCE)).sum())
+    off_on_issue = int((decided & (excess.abs() > CASH_CLOSURE_TOLERANCE)).sum())
+    early = _numeric_column(running, "EarlySettlementProceeds")
     return {
         "tga_below_operating_cash_target_periods": below,
         "issuance_periods_off_operating_cash_target": off_on_issue,
         "max_tga_excess_over_operating_cash_target_bil": float(excess.max()),
+        "max_pending_issuance_bil": float(pending.max()),
+        "min_tga_minus_operating_cash_target_bil": float((tga - target).min()),
+        "early_settlement_periods": int((early > CASH_CLOSURE_TOLERANCE).sum()),
         "tga_follows_operating_cash_target": below == 0 and off_on_issue == 0,
     }
 
@@ -1735,6 +1744,7 @@ def _bill_share_rule_profile(inputs: Path, payload: Mapping[str, Any]) -> dict[s
             target_path=target_path,
             bill_terms=calibration["bill_terms"],
             coupon_terms=calibration["coupon_terms"],
+            settlement_calendar=calibration["settlement_calendar"],
         )
     except IssuanceCalibrationError as exc:
         raise RunnerError(f"compiled bill-share issuance rule is malformed: {exc}") from exc

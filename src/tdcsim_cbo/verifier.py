@@ -26,6 +26,7 @@ from evaluated_nominal_curve import (
 from sim_engine import (
     CASH_FINANCING_ISSUANCE_LEGS,
     CBO_OPERATING_CASH_TARGET_FINANCING_MODE,
+    OPERATING_CASH_RESULT_COLUMNS,
     run_simulation,
 )
 
@@ -1801,6 +1802,10 @@ def _verify_operating_cash_financing_results(results: pd.DataFrame) -> None:
         raise VerificationError(
             "operating-cash financing must not report a binding CBO debt target error"
         )
+    _require_columns(results, OPERATING_CASH_RESULT_COLUMNS, label="operating-cash financing results")
+    for column in OPERATING_CASH_RESULT_COLUMNS:
+        if float(pd.to_numeric(results[column], errors="raise").min()) < -_BOUNDED_TARGET_TOLERANCE_BIL:
+            raise VerificationError(f"operating-cash financing {column} must be nonnegative")
 
 
 def _verify_bounded_result_limits(results: pd.DataFrame) -> dict[str, float]:

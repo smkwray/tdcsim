@@ -49,6 +49,35 @@ COUPON_TENORS = {
 # is not a reopening this registry knows and raises.
 REOPENING_MAX_SHORTFALL_YEARS = 1.0
 CONTROLLED_SECURITY_TYPES = ("Fixed", "TIPS", "FRN")
+# Treasury's settlement calendar for the bill-share rule's securities. Weekday and
+# day-of-month dates move to the next business day; month-end issues settle on the
+# month's last business day. Packaged in the calibration and read back through
+# settlement_rules(), the one loader.
+SETTLEMENT_CALENDAR = {
+    "bills": [
+        {"weeks": 4, "weekday": "Tuesday"},
+        {"weeks": 8, "weekday": "Tuesday"},
+        {"weeks": 17, "weekday": "Tuesday"},
+        {"weeks": 6, "weekday": "Thursday"},
+        {"weeks": 13, "weekday": "Thursday"},
+        {"weeks": 26, "weekday": "Thursday"},
+        {"weeks": 52, "weekday": "Thursday"},
+    ],
+    "coupons": [
+        {"kind": "nominal", "tenor_years": 3, "day_of_month": 15},
+        {"kind": "nominal", "tenor_years": 10, "day_of_month": 15},
+        {"kind": "nominal", "tenor_years": 30, "day_of_month": 15},
+        {"kind": "nominal", "tenor_years": 2, "day_of_month": "last_business_day"},
+        {"kind": "nominal", "tenor_years": 5, "day_of_month": "last_business_day"},
+        {"kind": "nominal", "tenor_years": 7, "day_of_month": "last_business_day"},
+        {"kind": "nominal", "tenor_years": 20, "day_of_month": "last_business_day"},
+        {"kind": "frn", "tenor_years": 2, "day_of_month": "last_business_day"},
+        {"kind": "tips", "tenor_years": 5, "day_of_month": "last_business_day"},
+        {"kind": "tips", "tenor_years": 10, "day_of_month": "last_business_day"},
+        {"kind": "tips", "tenor_years": 30, "day_of_month": "last_business_day"},
+    ],
+}
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 BILL_CUTOFF_YEARS = 1.0
 
 AUCTION_REQUIRED_COLUMNS = (
@@ -434,6 +463,7 @@ def engine_rule_profile(
     target_path: Iterable[Mapping[str, Any]],
     bill_terms: Iterable[Mapping[str, Any]],
     coupon_terms: Iterable[Mapping[str, Any]],
+    settlement_calendar: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the engine issuance profile for the bill-share rule.
 
@@ -469,6 +499,7 @@ def engine_rule_profile(
         "bill_share_target_path": path,
         "bill_terms": bills,
         "coupon_terms": coupons,
+        "settlement_calendar": json.loads(json.dumps(settlement_calendar)),
         "bills": {"category_cutoff_years": BILL_CUTOFF_YEARS},
         "notes": {"category_cutoff_years": 10.0},
         "bonds": {"category_cutoff_years": 999.0},
@@ -517,7 +548,69 @@ def validate_rule_profile(profile: Mapping[str, Any], label: str = "treasury_iss
         key = (str(term.get("security_type")), float(term.get("maturity_years", 0.0)))
         if key not in allowed_coupons:
             errors.append(f"{label}.coupon_terms[{index}] is not a registered coupon security")
+    if not errors:
+        try:
+            settlement_rules(profile)
+        except IssuanceCalibrationError as exc:
+            errors.append(f"{label}.settlement_calendar: {exc}")
     return errors
+
+
+def bill_supply_key(weeks: int) -> tuple[str, float]:
+    return ("bill", float(weeks))
+
+
+def coupon_supply_key(security_type: str, tenor_years: float) -> tuple[str, float]:
+    return (str(security_type), float(tenor_years))
+
+
+def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tuple[str, int | None]]:
+    """Return each rule security's settlement rule, keyed like the supply items.
+
+    A rule is ``("weekday", 0-4)``, ``("day_of_month", 1-28)`` or
+    ``("last_business_day", None)``. Raises unless every bill term and coupon security in
+    the profile has exactly one rule and every rule names a profile security.
+    """
+
+    calendar = profile.get("settlement_calendar")
+    if not isinstance(calendar, Mapping) or set(calendar) != {"bills", "coupons"}:
+        raise IssuanceCalibrationError("settlement_calendar must have exactly bills and coupons")
+    rules: dict[tuple[str, float], tuple[str, int | None]] = {}
+
+    def add(key: tuple[str, float], rule: tuple[str, int | None]) -> None:
+        if key in rules:
+            raise IssuanceCalibrationError(f"settlement_calendar lists {key} twice")
+        rules[key] = rule
+
+    for entry in calendar["bills"]:
+        weekday = entry.get("weekday") if isinstance(entry, Mapping) else None
+        if weekday not in _WEEKDAYS or set(entry) != {"weeks", "weekday"}:
+            raise IssuanceCalibrationError(f"settlement_calendar bill entry is malformed: {entry!r}")
+        add(bill_supply_key(int(entry["weeks"])), ("weekday", _WEEKDAYS.index(weekday)))
+    for entry in calendar["coupons"]:
+        if not isinstance(entry, Mapping) or set(entry) != {"kind", "tenor_years", "day_of_month"}:
+            raise IssuanceCalibrationError(f"settlement_calendar coupon entry is malformed: {entry!r}")
+        kind = entry["kind"]
+        if kind not in COUPON_KIND_SECURITY_TYPE:
+            raise IssuanceCalibrationError(f"settlement_calendar has unknown coupon kind {kind!r}")
+        day = entry["day_of_month"]
+        if day == "last_business_day":
+            rule: tuple[str, int | None] = ("last_business_day", None)
+        elif isinstance(day, int) and not isinstance(day, bool) and 1 <= day <= 28:
+            rule = ("day_of_month", day)
+        else:
+            raise IssuanceCalibrationError(f"settlement_calendar day_of_month is malformed: {day!r}")
+        add(coupon_supply_key(COUPON_KIND_SECURITY_TYPE[kind], entry["tenor_years"]), rule)
+    securities = {bill_supply_key(term["weeks"]) for term in profile["bill_terms"]} | {
+        coupon_supply_key(term["security_type"], term["maturity_years"]) for term in profile["coupon_terms"]
+    }
+    if set(rules) != securities:
+        missing = sorted(securities - set(rules))
+        extra = sorted(set(rules) - securities)
+        raise IssuanceCalibrationError(
+            f"settlement_calendar must cover exactly the profile's securities: missing={missing}, extra={extra}"
+        )
+    return rules
 
 
 def is_rule_profile(profile: Any) -> bool:
@@ -573,6 +666,7 @@ def build_issuance_calibration(
         "source_file": source_relative_path,
         **auctions,
         "bill_share_target": bills / controlled_debt,
+        "settlement_calendar": json.loads(json.dumps(SETTLEMENT_CALENDAR)),
         "bill_share_target_basis": {
             "as_of": simulation_start_date,
             "portfolio": "opening_portfolio_after_prestart_rollforward",
@@ -599,7 +693,7 @@ def load_calibration(path: str | Path) -> dict[str, Any]:
         raise IssuanceCalibrationError(f"issuance calibration is unreadable: {file_path.name}") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != CALIBRATION_SCHEMA_VERSION:
         raise IssuanceCalibrationError("issuance calibration has an unsupported schema_version")
-    for key in ("bill_terms", "coupon_terms", "bill_share_target"):
+    for key in ("bill_terms", "coupon_terms", "bill_share_target", "settlement_calendar"):
         if key not in payload:
             raise IssuanceCalibrationError(f"issuance calibration is missing {key}")
     _share(payload["bill_share_target"], label="calibration bill_share_target")
@@ -607,5 +701,6 @@ def load_calibration(path: str | Path) -> dict[str, Any]:
         target_path=[{"date": None, "bill_share_target": payload["bill_share_target"]}],
         bill_terms=payload["bill_terms"],
         coupon_terms=payload["coupon_terms"],
+        settlement_calendar=payload["settlement_calendar"],
     )
     return payload

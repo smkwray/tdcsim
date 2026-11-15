@@ -67,9 +67,12 @@ tdcsim-cbo verify --help
 The [downstream quick start](examples/cbo_downstream_quickstart.md) covers package
 inputs, example scenarios, output files and scenario controls. Each step:
 
-- **Issuance.** Each day the runner issues what the Treasury needs to keep its
-  cash on the operating-cash path (see **Cash**), without Treasury's auction
-  calendar. Bills fill toward a target share of outstanding marketable debt: by
+- **Issuance.** Each day the runner decides what the Treasury needs to keep its
+  cash on the operating-cash path (see **Cash**) and settles it on Treasury's
+  calendar: 4-, 8- and 17-week bills on Tuesdays; 6-, 13-, 26- and 52-week bills on
+  Thursdays; 3-, 10- and 30-year securities on the 15th; 2-, 5-, 7- and 20-year
+  notes and bonds, FRNs and TIPS on the month's last business day (dates move to a
+  business day). Bills fill toward a target share of outstanding marketable debt: by
   default the opening book's bill share, and scenarios can set a constant or a
   dated path. Because bills mature within a year, holding that share takes most
   gross issuance. The rest is split across notes, bonds, TIPS and FRNs in the
@@ -90,7 +93,9 @@ inputs, example scenarios, output files and scenario controls. Each step:
 - **Cash.** The TGA opens at its Daily Treasury Statement balance and follows the
   package's operating-cash path. When spending would take it below the path, new
   issuance tops it up; when receipts lift it above, nothing is issued until
-  spending draws it back. A scenario that costs more therefore ends with more debt
+  spending draws it back. Between settlement dates the TGA runs below the path by
+  the issuance decided but not yet settled; if it would otherwise go negative,
+  pending bills (then, if needed, pending notes and bonds) settle early that day. A scenario that costs more therefore ends with more debt
   and the same cash. CBO's debt path is reported alongside, with the scenario's
   drift from it. Every cash flow is booked on both sides, and a run fails if the
   TGA goes negative. A scenario can instead hold debt exactly on CBO's path

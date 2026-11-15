@@ -404,7 +404,9 @@ def _operating_cash_financing_invariants(boundary_checks: Mapping[str, Any]) -> 
             "observed": (
                 f"below_target_periods={boundary_checks.get('tga_below_operating_cash_target_periods', '')};"
                 f"issuance_periods_off_target={boundary_checks.get('issuance_periods_off_operating_cash_target', '')};"
-                f"max_excess_bil={boundary_checks.get('max_tga_excess_over_operating_cash_target_bil', '')}"
+                f"max_excess_bil={boundary_checks.get('max_tga_excess_over_operating_cash_target_bil', '')};"
+                f"max_pending_bil={boundary_checks.get('max_pending_issuance_bil', '')};"
+                f"early_settlement_periods={boundary_checks.get('early_settlement_periods', '')}"
             ),
         }
     ]
