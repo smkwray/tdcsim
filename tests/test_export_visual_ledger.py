@@ -28,6 +28,8 @@ def test_issue_maturity_follows_the_engine_dating_rules() -> None:
 def test_holders_map_to_the_five_export_columns_and_unknowns_raise() -> None:
     assert holder_column("CB", None) == "fed"
     assert holder_column("Private", "mmf_cash_fund_route") == "mmf"
-    assert holder_column("Private", float("nan")) == "other_domestic"
-    with pytest.raises(ValueError):
-        holder_column("TrustFunds", None)
+    assert holder_column("Private", "domestic_nonbank_deposit_funded") == "other_domestic"
+    # A Private row without a route is malformed; guessing a column would hide it.
+    for holder, route in (("Private", float("nan")), ("TrustFunds", None)):
+        with pytest.raises(ValueError):
+            holder_column(holder, route)

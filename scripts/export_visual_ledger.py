@@ -59,7 +59,7 @@ def holder_column(holder: str, subbucket: Any) -> str:
         return "foreign"
     if holder == "Private" and sub == "mmf_cash_fund_route":
         return "mmf"
-    if holder == "Private" and sub in {"", "domestic_nonbank_deposit_funded"}:
+    if holder == "Private" and sub == "domestic_nonbank_deposit_funded":
         return "other_domestic"
     raise ValueError(f"unmapped holder {holder!r}/{sub!r}")
 
@@ -171,6 +171,9 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     # it have no CUSIP; they are identified by type, term and maturity.
     book["security_id"] = book["cusip_or_synthetic_id"]
     model = ~joined
+    opening_date = pd.to_datetime(book["IssueDate"]).max()
+    if (pd.to_datetime(book.loc[model, "IssueDate"]) != opening_date).any():
+        raise SystemExit("an opening security without a CUSIP was not issued on the opening date")
     book.loc[model, "security_id"] = (
         "prestart-" + book.loc[model, "kind"] + "-" + book.loc[model, "MaturityDate"].astype(str)
     )
@@ -318,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     aggregate_gap = check_against_aggregates(run_dir, flows)
     issues = build_issues(flows, results)
     maturities_checked = check_maturities(run_dir, issues)
+    if issues["security_id"].duplicated().any():
+        raise SystemExit("issued security ids are not unique")
+    if (issues["face_fed"].abs() > TOLERANCE_BIL).any():
+        raise SystemExit("an issue allocates face to the Federal Reserve at auction")
     opening = build_opening(run_dir)
     daily = build_daily(run_dir, results, opening, issues)
     opening_gap = abs(float(opening["debt_basis_total"].sum()) - float(results["TotalDebt_Agg"].iloc[0]))
@@ -336,8 +343,11 @@ def main(argv: list[str] | None = None) -> int:
     for name, frame in outputs.items():
         frame.to_csv(args.out_dir / name, index=False, lineterminator="\n", date_format="%Y-%m-%d", float_format="%.9f")
     manifest = json.loads((run_dir / RUN_MANIFEST).read_text(encoding="utf-8"))
+    scenario_id = (manifest.get("scenario") or {}).get("scenario_id")
+    if not scenario_id:
+        raise SystemExit("run manifest records no scenario.scenario_id")
     (args.out_dir / "README.md").write_text(
-        README.format(run_label=manifest.get("scenario_id", run_dir.name), start=results.index[0].date()),
+        README.format(run_label=scenario_id, start=results.index[0].date()),
         encoding="utf-8",
     )
     from tdcsim_cbo.runtime_identity import distribution_identity, installed_archive_sha256
@@ -356,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "run": {
             "run_dir": str(run_dir.relative_to(PROJECT_ROOT)) if run_dir.is_relative_to(PROJECT_ROOT) else run_dir.name,
-            "scenario_id": manifest.get("scenario_id"),
+            "scenario_id": scenario_id,
             "baseline_package_sha256": sha256(args.baseline),
             "attestation_sha256": sha256(args.attestation),
         },

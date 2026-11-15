@@ -49,6 +49,15 @@ FAMILY_SPEC_SCHEMA = "tdcsim_scenario_family_spec_v1"
 HOLDER_PROFILE_FILE = "tdcsim_holder_profile_assumptions.csv"
 FED_HOLDINGS_FILE = "tdcsim_fed_holdings_path.csv"
 DEBT_STOCK_FILE = "tdcsim_debt_stock_path.csv"
+ITEM_KEYS = frozenset({
+    "role", "scenario_id", "label", "notes", "holder_shift", "bill_share_change", "bill_holder_shift",
+    "bill_buyer_shift", "fed_holdings_change", "key_rate_shocks_bp", "rate_path", "mmf_deposit_pass_through",
+})
+SUBKEYS = {
+    "bill_holder_shift": frozenset({"absorbers"}),
+    "bill_buyer_shift": frozenset({"holder", "size_bil", "build", "private_route"}),
+    "fed_holdings_change": frozenset({"size_bil", "build"}),
+}
 SHARE_TOLERANCE = 1.0e-12
 CURVE_SURFACE = Path("compile/compiled/forecast_inputs/tdcsim_yield_curve_surface.csv")
 RESULTS = Path("outputs/results_compact.csv.gz")
@@ -308,6 +317,8 @@ def expected_bill_stock(debt_rows: list[dict[str, str]], bill_share: float) -> l
 def fed_holdings_rows(rows: list[dict[str, str]], *, size_bil: float, build: list[str]) -> list[dict[str, str]]:
     """The packaged Fed holdings path plus a dollar ramp built over the window and held after it."""
 
+    if pd.Timestamp(build[0]).normalize() <= min(pd.Timestamp(row["period_end"]).normalize() for row in rows):
+        raise ValueError("a Fed holdings ramp must start after the opening")
     out = []
     for row in rows:
         new = dict(row)
@@ -316,6 +327,8 @@ def fed_holdings_rows(rows: list[dict[str, str]], *, size_bil: float, build: lis
         if value < 0.0:
             raise ValueError(f"Fed holdings would turn negative on {row['period_end']}")
         new["cbo_fed_holdings_target_bil"] = repr(value)
+        if shift != 0.0:
+            new["source_status"] = "family_writer_fed_holdings_ramp_over_baseline_path"
         out.append(new)
     return out
 
@@ -450,6 +463,13 @@ def family_scenarios(
         raise ValueError(f"family spec must declare {FAMILY_SPEC_SCHEMA}")
     if phase not in {"quantity", "rates"}:
         raise ValueError("phase must be quantity or rates")
+    for item in family["scenarios"]:
+        unknown = set(item) - ITEM_KEYS
+        if unknown:
+            raise ValueError(f"{item.get('role')}: unknown family scenario keys {sorted(unknown)}")
+        for key, allowed in SUBKEYS.items():
+            if key in item and set(item[key]) - allowed:
+                raise ValueError(f"{item['role']}: unknown {key} keys {sorted(set(item[key]) - allowed)}")
     base = baseline_holder_shares(baseline)
     base_bill_share = None
     scenarios: dict[str, dict[str, Any]] = {}
@@ -478,6 +498,8 @@ def family_scenarios(
                     ),
                 }
         if item.get("bill_buyer_shift"):
+            if item.get("bill_share_change"):
+                raise ValueError(f"{item['role']}: a bill-buyer shift is sized on the opening bill share and cannot be combined with a bill_share_change")
             if shift or "holder_preferences" in overrides:
                 raise ValueError(f"{item['role']}: declare one holder-share change per scenario")
             if base_bill_share is None:

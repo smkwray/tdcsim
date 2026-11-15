@@ -423,3 +423,21 @@ def test_a_money_fund_shift_leaves_domestic_nonbank_bills_at_baseline_dollars() 
     with pytest.raises(ValueError, match="holder Private"):
         bill_buyer_rows(BASE["bills"], holder="Banks", size_bil=10.0, build=["2026-10-01", "2028-09-30"],
                         bill_stock_by_date=stock, private_route="mmf_cash_fund_route", baseline_route_share=0.4)
+
+
+def test_family_items_reject_unknown_keys_and_mixed_buyer_shifts() -> None:
+    # A misspelled key would silently turn a money-fund case into a different scenario.
+    family = {"schema_version": FAMILY_SPEC_SCHEMA, "family_id": "f", "as_of_date": "2026-11-15", "scenarios": [
+        {"role": "mmf", "scenario_id": "s", "label": "l", "bill_buyer_shift": {"holder": "Private", "privte_route": "x", "size_bil": 1.0, "build": ["2026-10-01", "2028-09-30"]}},
+    ]}
+    with pytest.raises(ValueError, match="unknown bill_buyer_shift keys"):
+        family_scenarios(None, family)
+    family["scenarios"][0] = {"role": "r", "scenario_id": "s", "label": "l", "absorber": "Banks"}
+    with pytest.raises(ValueError, match="unknown family scenario keys"):
+        family_scenarios(None, family)
+
+
+def test_fed_holdings_ramp_must_start_after_the_opening() -> None:
+    rows = [{"period_end": "2026-06-21", "cbo_fed_holdings_target_bil": "4000.0"}]
+    with pytest.raises(ValueError, match="after the opening"):
+        fed_holdings_rows(rows, size_bil=500.0, build=["2026-06-21", "2028-09-30"])
