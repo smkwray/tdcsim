@@ -31,6 +31,7 @@ from forecast_input_builder import (  # noqa: E402
     parse_cbo_economic_quarterly_source_contract,
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
+from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration  # noqa: E402
 from tips_indexation import (  # noqa: E402
     build_monthly_tips_cpi_path_rows,
     build_tips_real_yield_path_rows,
@@ -499,6 +500,7 @@ def _verify_directory(root: Path, *, package_zip_sha256: str | None) -> dict[str
     _verify_artifact_hashes(root, manifest)
     _verify_manifest_package_relative_paths(root, manifest)
     _verify_source_package(root, manifest)
+    _verify_issuance_calibration(root, manifest)
     _verify_cbo_source_fixtures_against_workbooks(root)
     _verify_package_file_allowlist(root, manifest)
     _verify_claim_boundary(manifest)
@@ -512,6 +514,29 @@ def _verify_directory(root: Path, *, package_zip_sha256: str | None) -> dict[str
         "required_files": len(REQUIRED_FILES),
         "status": "pass",
     }
+
+
+def _verify_issuance_calibration(root: Path, manifest: Mapping[str, Any]) -> None:
+    """The issuance calibration must rebuild exactly from the packaged auctions and opening book."""
+
+    import pandas as pd
+
+    path = root / "forecast_inputs" / CALIBRATION_FILE
+    recorded = _read_json(path)
+    source_rel = "sources/fiscaldata/auctions_query.csv"
+    expected = build_issuance_calibration(
+        root / source_rel,
+        simulation_start_date=str(manifest.get("date_range", {}).get("simulation_start_date") or ""),
+        source_relative_path=source_rel,
+        opening_portfolio=pd.read_csv(root / "forecast_inputs" / "tdcsim_opening_portfolio.csv"),
+    )
+    if recorded != json.loads(json.dumps(expected)):
+        raise ValueError(f"forecast_inputs/{CALIBRATION_FILE} does not rebuild from the packaged sources")
+    issuance = manifest.get("issuance_mix")
+    if not isinstance(issuance, Mapping) or issuance.get("calibration_sha256") != _sha256_file(path):
+        raise ValueError("manifest issuance_mix does not bind the issuance calibration bytes")
+    if issuance.get("bill_share_target") != recorded["bill_share_target"]:
+        raise ValueError("manifest issuance_mix bill_share_target differs from the calibration")
 
 
 def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:

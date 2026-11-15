@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import sys
 
+import pandas as pd
 import pytest
 
 PROJECT_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,8 @@ from forecast_input_builder import (
     parse_cbo_economic_quarterly_source_contract,
 )
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
+from issuance_calibration import build_issuance_calibration
+from test_issuance_rule import _fixture_auctions, _write_auctions
 
 
 RUN_ROWS = 3755
@@ -580,6 +583,13 @@ def _write_valid_package(package: Path) -> Path:
     _write_cash_sensitivity(package, run_rows)
     _write_net_interest_diagnostic(package, run_rows["zero_residual"])
     source_package = _write_source_package(package)
+    calibration = build_issuance_calibration(
+        package / "sources" / "fiscaldata" / "auctions_query.csv",
+        simulation_start_date="2026-06-21",
+        source_relative_path="sources/fiscaldata/auctions_query.csv",
+        opening_portfolio=pd.read_csv(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv"),
+    )
+    _write_json(package / "forecast_inputs" / "tdcsim_issuance_calibration.json", calibration)
 
     opening_manifest = _opening_manifest(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")
     manifest = {
@@ -614,6 +624,14 @@ def _write_valid_package(package: Path) -> Path:
                 "CBOFedAuctionShare",
             ],
             "runtime_effect": "holder_allocation_only_total_issuance_unchanged",
+        },
+        "issuance_mix": {
+            "mode": "bill_share_target_v1",
+            "calibration_file": "forecast_inputs/tdcsim_issuance_calibration.json",
+            "calibration_sha256": hashlib.sha256(
+                (package / "forecast_inputs" / "tdcsim_issuance_calibration.json").read_bytes()
+            ).hexdigest(),
+            "bill_share_target": calibration["bill_share_target"],
         },
         "run_summaries": run_summaries,
         "source_package": source_package,
@@ -1129,11 +1147,13 @@ def _write_source_package(package: Path) -> dict:
         package / "sources" / "treasury" / "base_curve_2026-06-16.json",
         _base_curve_payload(),
     )
+    _write_auctions(package / "sources" / "fiscaldata" / "auctions_query.csv", _fixture_auctions())
     for rel in (
         "opening/tdcsim_initial_portfolio_cohorts.csv",
         "opening/tdcsim_ratewall_input_manifest.json",
         "fiscaldata/tips_cpi_data_detail.csv",
         "fiscaldata/frn_daily_indexes.csv",
+        "fiscaldata/auctions_query.csv",
         "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
         "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
         "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",

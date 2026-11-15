@@ -102,13 +102,18 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         "Foreign",
         "Private",
     }
-    assert manifest["issuance_mix"]["fixed_remainder_shares"] == {"bills": 0.25, "notes": 0.55, "bonds": 0.2}
-    assert manifest["issuance_mix"]["bills"] == {"0.5y": 1.0}
-    assert manifest["issuance_mix"]["notes"] == {"5.0y": 1.0}
-    assert manifest["issuance_mix"]["bonds"] == {"20.0y": 1.0}
-    assert manifest["issuance_mix"]["tips"]["target_percentage"] == 0.06
-    assert manifest["issuance_mix"]["tips"]["10.0y"] == 1.0
-    assert manifest["issuance_mix"]["frn"]["target_percentage"] == 0.04
+    # The package's issuance rule is calibrated from its own auction source and opening
+    # book, and the manifest binds the calibration bytes the runs used.
+    issuance = manifest["issuance_mix"]
+    calibration = json.loads((bundle.inputs_dir / "tdcsim_issuance_calibration.json").read_text(encoding="utf-8"))
+    assert issuance["mode"] == "bill_share_target_v1"
+    assert issuance["calibration_sha256"] == hashlib.sha256(
+        (bundle.inputs_dir / "tdcsim_issuance_calibration.json").read_bytes()
+    ).hexdigest()
+    assert issuance["bill_share_target"] == calibration["bill_share_target"]
+    assert 0.15 < calibration["bill_share_target"] < 0.30
+    assert calibration["source_sha256"] == source_files_sha(manifest, "fiscaldata/auctions_query.csv")
+    assert bundle.params["treasury_issuance_profile"]["mode"] == "bill_share_target_v1"
     assert manifest["operating_cash_construction"]["construction_mode"] == "constant_real_cbo_cpi_u"
     assert "cb_from_nyfed_soma_by_cusip" in manifest["opening_portfolio_construction"]["claim_boundary"]
     assert "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged" in (
@@ -324,3 +329,7 @@ def test_package_build_runs_the_engine_through_the_bounded_sink(monkeypatch, tmp
     assert (start, end) == (smoke.SIMULATION_START_DATE, smoke.SIMULATION_END_DATE)
     assert isinstance(kwargs["handoff_sink"], BoundedScenarioEvidenceSink)
     assert kwargs["require_bounded_handoff"] is True
+
+
+def source_files_sha(manifest: dict, rel_path: str) -> str:
+    return manifest["source_package"]["source_files"][rel_path]["sha256"]
