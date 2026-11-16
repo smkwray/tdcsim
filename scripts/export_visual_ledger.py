@@ -41,6 +41,15 @@ ISSUANCE_AGGREGATES = Path("outputs/tdcsim_period_issuance_aggregates.csv.gz")
 FINAL_PORTFOLIO = Path("outputs/final_portfolio_compact.csv.gz")
 RUN_MANIFEST = Path("tdcsim_cbo_run_manifest.json")
 FISCAL_POLICY = Path("compile/compiled/forecast_inputs/tdcsim_fiscal_incidence_policy.csv")
+ANNUAL_SUMMARY = Path("outputs/tdcsim_annual_economic_summary.csv.gz")
+# Fiscal-year cumulative financing cost in the run's annual summary -> the engine's daily flow.
+FINANCING_COST_COLUMNS = {
+    "cumulative_interest_outlay_bil": "InterestOutlay_Period",
+    "cumulative_issue_discount_cost_bil": "IssueDiscountCost_Period",
+    "cumulative_nonmarketable_interest_capitalized_bil": "NonMarketableInterestCapitalized_Period",
+    "cumulative_tips_inflation_accretion_bil": "TIPSInflationAccretion_Period",
+    "cumulative_modeled_financing_cost_bil": "FinancingCost_Period",
+}
 TOLERANCE_BIL = 1e-6
 DAYS_PER_YEAR = 365.25
 
@@ -200,7 +209,8 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     return face[columns].sort_values(["maturity_date", "security_id"]).reset_index(drop=True)
 
 
-def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, issues: pd.DataFrame) -> pd.DataFrame:
+def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, issues: pd.DataFrame,
+                financing_cost: pd.Series) -> pd.DataFrame:
     trc = pd.read_csv(run_dir / TRC, parse_dates=["Date"]).set_index("Date")
     daily = pd.DataFrame(index=results.index)
     daily["cumulative_tdc"] = results["TDC_Level"]
@@ -224,6 +234,7 @@ def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, iss
     daily["coupon_interest_paid"] = results["InterestOutlay_Period"]
     issued = issues.groupby(pd.to_datetime(issues["settlement_date"]))["face_total"].sum()
     daily["gross_face_issued"] = issued.reindex(results.index, fill_value=0.0)
+    daily["cumulative_financing_cost"] = financing_cost
     if (daily.isna().any()).any():
         raise SystemExit("daily series has gaps")
     return daily.reset_index().rename(columns={"Date": "date"})
@@ -267,6 +278,36 @@ def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[
         "net_receipt_days": int((fiscal["primary_deficit"] < 0).sum()),
     }
     return fiscal.reset_index().rename(columns={"Date": "date"}), checks
+
+
+def build_financing_cost(run_dir: Path, results: pd.DataFrame) -> tuple[pd.Series, dict[str, Any]]:
+    """Cumulative modeled financing cost since the opening, on the basis of the run's annual summary.
+
+    Sums the engine's daily cost flows and requires the running totals, and each of the four
+    components, to equal the annual summary (the source of the scenario-family export) at every
+    fiscal-year end.
+    """
+
+    cumulative = results[list(FINANCING_COST_COLUMNS.values())].cumsum()
+    annual = pd.read_csv(run_dir / ANNUAL_SUMMARY, parse_dates=["period_end"]).set_index("period_end")
+    missing = annual.index.difference(cumulative.index)
+    if len(missing):
+        raise SystemExit(f"annual summary period ends missing from the daily results: {list(missing)}")
+    expected = annual[list(FINANCING_COST_COLUMNS)].rename(columns=FINANCING_COST_COLUMNS)
+    gap = float((cumulative.loc[annual.index] - expected).abs().max().max())
+    if not gap <= TOLERANCE_BIL:
+        raise SystemExit(f"daily cumulative financing cost differs from the run's annual summary by {gap}")
+    final = annual.index.max()
+    checks = {
+        "fiscal_year_ends_checked": len(annual),
+        "max_gap_vs_run_annual_summary_bil": gap,
+        "components_through": final.date().isoformat(),
+        "components_bil": {
+            name.removeprefix("cumulative_").removesuffix("_bil"): float(cumulative.loc[final, column])
+            for name, column in FINANCING_COST_COLUMNS.items()
+        },
+    }
+    return cumulative["FinancingCost_Period"], checks
 
 
 def check_against_aggregates(run_dir: Path, flows: list[dict[str, Any]]) -> float:
@@ -329,7 +370,10 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   end-of-day levels. `securities_outstanding_count` counts securities from the two files above
   that are outstanding at the end of the day. `principal_paid`, `coupon_interest_paid` (cash
   coupons and floating-rate interest; bill interest is the discount, paid within principal at
-  maturity) and `gross_face_issued` are daily flows.
+  maturity) and `gross_face_issued` are daily flows. `cumulative_financing_cost` is the run's
+  modeled financing cost since the opening: cash interest paid, issue discount (face minus cash
+  proceeds, booked at settlement, which is how bill interest enters), capitalized nonmarketable
+  interest and TIPS inflation accretion; `receipt.json` gives the split at the last day.
 
 ## Holder split
 Holders: `fed` (Federal Reserve), `banks`, `foreign`, `mmf` (money-market funds) and
@@ -379,7 +423,8 @@ def main(argv: list[str] | None = None) -> int:
     if not scenario_id:
         raise SystemExit("run manifest records no scenario.scenario_id")
     fiscal, fiscal_checks = build_fiscal(run_dir, results, str(manifest.get("fiscal_incidence_policy_id") or ""))
-    daily = build_daily(run_dir, results, opening, issues)
+    financing_cost, financing_cost_checks = build_financing_cost(run_dir, results)
+    daily = build_daily(run_dir, results, opening, issues, financing_cost)
     opening_gap = abs(float(opening["debt_basis_total"].sum()) - float(results["TotalDebt_Agg"].iloc[0]))
     if opening_gap > 1e-6:
         raise SystemExit(f"opening book does not sum to the opening marketable debt (gap {opening_gap})")
@@ -414,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
 
     inputs = {str(path): sha256(run_dir / path) for path in (
         RUN_MANIFEST, OPENING_PORTFOLIO, OPENING_SOURCE, RESULTS, TRC, ISSUANCE_AGGREGATES, FINAL_PORTFOLIO,
-        FISCAL_POLICY)}
+        FISCAL_POLICY, ANNUAL_SUMMARY)}
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "producer": {
@@ -444,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_daily_gap_issued_face_vs_new_debt_issued_bil": issue_gap,
             "issued_tranches_matched_to_final_portfolio_maturities": maturities_checked,
             "fiscal": fiscal_checks,
+            "financing_cost": financing_cost_checks,
         },
         "outputs": {
             name: {"sha256": sha256(args.out_dir / name), "bytes": (args.out_dir / name).stat().st_size,

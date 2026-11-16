@@ -60,3 +60,33 @@ def test_fiscal_incidence_splits_the_primary_deficit_without_remainder(tmp_path)
     results.loc[dates[1], "TDC_FiscalFlow"] = 1.0
     with pytest.raises(SystemExit, match="does not add up"):
         ledger.build_fiscal(run, results, "p")
+
+
+def test_daily_financing_cost_matches_the_fiscal_year_totals_the_family_reports(tmp_path) -> None:
+    # The deck plots the daily cumulative cost next to the scenario-family totals; the two must
+    # be one basis, so the daily running sum has to land on every fiscal-year total.
+    import export_visual_ledger as ledger
+
+    dates = pd.to_datetime(["2026-06-21", "2026-09-30", "2026-10-01", "2027-09-30"])
+    flows = {"InterestOutlay_Period": [0.0, 1.0, 2.0, 3.0], "IssueDiscountCost_Period": [0.0, 0.5, 0.0, 0.5],
+             "NonMarketableInterestCapitalized_Period": [0.0] * 4, "TIPSInflationAccretion_Period": [0.0, 0.1, 0.1, 0.1]}
+    results = pd.DataFrame(flows, index=pd.Index(dates, name="Date"))
+    results["FinancingCost_Period"] = results.sum(axis=1)
+    annual = pd.DataFrame({
+        "period_end": ["2026-09-30", "2027-09-30"],
+        "cumulative_interest_outlay_bil": [1.0, 6.0], "cumulative_issue_discount_cost_bil": [0.5, 1.0],
+        "cumulative_nonmarketable_interest_capitalized_bil": [0.0, 0.0],
+        "cumulative_tips_inflation_accretion_bil": [0.1, 0.3], "cumulative_modeled_financing_cost_bil": [1.6, 7.3],
+    })
+    (tmp_path / ledger.ANNUAL_SUMMARY).parent.mkdir(parents=True)
+    annual.to_csv(tmp_path / ledger.ANNUAL_SUMMARY, index=False)
+
+    cumulative, checks = ledger.build_financing_cost(tmp_path, results)
+    assert cumulative.tolist() == pytest.approx([0.0, 1.6, 3.7, 7.3])
+    assert checks["components_bil"] == pytest.approx({
+        "interest_outlay": 6.0, "issue_discount_cost": 1.0, "nonmarketable_interest_capitalized": 0.0,
+        "tips_inflation_accretion": 0.3, "modeled_financing_cost": 7.3})
+    # A cost flow the annual summary does not carry (here on the opening day) breaks the basis.
+    results.loc[dates[0], ["InterestOutlay_Period", "FinancingCost_Period"]] = 0.2
+    with pytest.raises(SystemExit, match="differs from the run's annual summary"):
+        ledger.build_financing_cost(tmp_path, results)
