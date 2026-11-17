@@ -27,6 +27,7 @@ from forecast_input_builder import (
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
 from issuance_calibration import SETTLEMENT_CALENDAR, build_issuance_calibration
 from sim_engine import _fiscal_year_close_dates
+from issuance_calibration import AUCTION_REQUIRED_COLUMNS
 from test_issuance_rule import _fixture_auctions, _write_auctions
 
 
@@ -749,7 +750,7 @@ FIXTURE_PRESTART_ROLLFORWARD_ROWS = 35
 def _write_source_opening_book(package: Path) -> None:
     """The packaged source book behind the fixture opening portfolio: every opening row,
     with the first 35 fixed rows standing in for securities that matured before the start
-    and were rolled into pre-start bills."""
+    and were reinvested in the fixture's one bill auction settling before the start."""
 
     rows = []
     counters: dict[str, int] = {}
@@ -852,7 +853,7 @@ def _write_opening_files(package: Path) -> None:
             "replacement_face_bil": "35.0",
             "face_delta_bil": "0.0",
             "status": "balanced",
-            "derivation": "source_rows_are_replaced_by_3_month_bills",
+            "derivation": "source_rows_are_reinvested_in_the_pre_start_auction",
             "claim_boundary": "mechanical_rollforward",
             "source_bond_id": "",
             "replacement_bond_id": "",
@@ -1196,7 +1197,15 @@ def _write_source_package(package: Path) -> dict:
         package / "sources" / "treasury" / "base_curve_2026-06-16.json",
         _base_curve_payload(),
     )
-    _write_auctions(package / "sources" / "fiscaldata" / "auctions_query.csv", _fixture_auctions())
+    # The pre-start rollforward also reads each auction's CUSIP, original issue date, price
+    # and rates; the fixture's one bill settling before the start takes the matured rows.
+    rollforward_fields = {"original_issue_date": "null", "int_rate": "null", "price_per100": "99.0",
+                          "high_investment_rate": "4.0", "high_yield": "null"}
+    _write_auctions(
+        package / "sources" / "fiscaldata" / "auctions_query.csv",
+        [{"cusip": f"AUC{index:03d}", **rollforward_fields, **row} for index, row in enumerate(_fixture_auctions())],
+        columns=["record_date", *AUCTION_REQUIRED_COLUMNS, "cusip", *rollforward_fields],
+    )
     for rel in (
         "opening/tdcsim_initial_portfolio_cohorts.csv",
         "opening/tdcsim_ratewall_input_manifest.json",
@@ -1500,8 +1509,10 @@ def _opening_manifest(opening_path: Path) -> dict:
         security_totals[row["SecurityType"]] = security_totals.get(row["SecurityType"], 0.0) + debt
         holder_totals[row["HolderType"]] = holder_totals.get(row["HolderType"], 0.0) + debt
     return {
+        "record_date": "2026-05-31",
         "row_count": 2290,
         "source_rows_loaded": 2290,
+        "prestart_matured_rows": 35,
         "prestart_rollforward_rows": 35,
         "prestart_rollforward_face_bil": 35.0,
         "opening_rollforward_debt_base_delta_bil": 0.0,
@@ -1524,7 +1535,7 @@ def _opening_manifest(opening_path: Path) -> dict:
             "prebuilt_mspd_table3_market_derived_cohort_book; "
             "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
             "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
-            "securities_maturing_between_record_date_and_simulation_start_are_explicit_prestart_rollforward_bills"
+            "securities_maturing_between_record_date_and_simulation_start_are_reinvested_in_the_treasury_issues_settling_on_their_payment_dates"
         ),
     }
 

@@ -90,3 +90,41 @@ def test_daily_financing_cost_matches_the_fiscal_year_totals_the_family_reports(
     results.loc[dates[0], ["InterestOutlay_Period", "FinancingCost_Period"]] = 0.2
     with pytest.raises(SystemExit, match="differs from the run's annual summary"):
         ledger.build_financing_cost(tmp_path, results)
+
+
+def test_opening_book_lists_pre_start_replacements_under_their_own_cusips(tmp_path) -> None:
+    # Securities issued between the source book's record date and the opening must appear as
+    # the separate securities Treasury issued, merged into a CUSIP the book already holds and
+    # never pooled into one synthetic security.
+    import export_visual_ledger as ledger
+
+    def row(bond_id, issue, maturity, face, holder="Banks"):
+        return {"BondID": bond_id, "SecurityType": "Fixed", "IssueDate": issue, "MaturityDate": maturity,
+                "OriginalMaturityYears": 0.33, "CouponRate": 0.0, "FaceValue": face, "AdjustedPrincipal": 0.0,
+                "HolderType": holder, "HolderSubBucket": None}
+
+    for path in (ledger.OPENING_PORTFOLIO, ledger.OPENING_SOURCE, ledger.ROLLFORWARD):
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        row(1, "2026-03-03", "2026-06-30", 10.0),
+        row(9, "2026-03-03", "2026-06-30", 4.0, "Foreign"),  # reinvestment in the book's CUSIP
+        row(10, "2026-06-04", "2026-12-03", 6.0),  # reinvestment in a new issue
+        row(11, "2026-06-11", "2026-12-10", 5.0),  # and another
+    ]).to_csv(tmp_path / ledger.OPENING_PORTFOLIO, index=False)
+    pd.DataFrame([{"BondID": 1, "cusip_or_synthetic_id": "912797UC9", "MaturityDate": "2026-06-30"}]).to_csv(
+        tmp_path / ledger.OPENING_SOURCE, index=False)
+    pd.DataFrame([
+        {"row_type": "summary", "replacement_bond_id": None, "replacement_cusip": None},
+        {"row_type": "replacement", "replacement_bond_id": 9, "replacement_cusip": "912797UC9"},
+        {"row_type": "replacement", "replacement_bond_id": 10, "replacement_cusip": "912797VA2"},
+        {"row_type": "replacement", "replacement_bond_id": 11, "replacement_cusip": "912797VG9"},
+    ]).to_csv(tmp_path / ledger.ROLLFORWARD, index=False)
+
+    book = ledger.build_opening(tmp_path).set_index("security_id")
+    assert book["face_total"].to_dict() == pytest.approx({"912797UC9": 14.0, "912797VA2": 6.0, "912797VG9": 5.0})
+    assert book.loc["912797UC9", "face_foreign"] == pytest.approx(4.0)
+    # A row that is neither in the source book nor a named replacement fails the export.
+    pd.DataFrame([{"row_type": "summary", "replacement_bond_id": None, "replacement_cusip": None}]).to_csv(
+        tmp_path / ledger.ROLLFORWARD, index=False)
+    with pytest.raises(SystemExit, match="neither in the source book"):
+        ledger.build_opening(tmp_path)

@@ -31,7 +31,12 @@ from forecast_input_builder import (  # noqa: E402
     parse_cbo_economic_quarterly_source_contract,
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
-from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration  # noqa: E402
+from issuance_calibration import (  # noqa: E402
+    CALIBRATION_FILE,
+    build_issuance_calibration,
+    prestart_rollforward,
+    prestart_settlements,
+)
 from sim_engine import _fiscal_year_close_dates  # noqa: E402
 from tips_indexation import (  # noqa: E402
     build_monthly_tips_cpi_path_rows,
@@ -228,7 +233,7 @@ APPROVED_OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
     "prebuilt_mspd_table3_market_derived_cohort_book; "
     "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
     "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
-    "securities_maturing_between_record_date_and_simulation_start_are_explicit_prestart_rollforward_bills"
+    "securities_maturing_between_record_date_and_simulation_start_are_reinvested_in_the_treasury_issues_settling_on_their_payment_dates"
 )
 APPROVED_TOP_LEVEL_MANIFEST_KEYS = {
     "schema_version",
@@ -300,6 +305,7 @@ APPROVED_OPENING_PORTFOLIO_KEYS = {
     "opening_tips_indexation_accretion_embedded_bil",
     "opening_tips_reconstructed_original_principal_bil",
     "opening_tips_reference_cpi",
+    "prestart_matured_rows",
     "prestart_rollforward_face_bil",
     "prestart_rollforward_rows",
     "record_date",
@@ -542,24 +548,41 @@ def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:
 
 
 def _verify_opening_counts_against_source_book(root: Path, manifest: Mapping[str, Any]) -> None:
-    """Rebuild the opening book's counts from the packaged source book.
+    """Rebuild the opening book's counts from the packaged source book and auctions.
 
-    Every source row is loaded; rows maturing on or before the simulation start are
-    replaced one for one by pre-start roll-forward bills; TIPS and FRN rows (and their
-    CUSIPs) are the source's surviving TIPS and FRN rows. Comparing the manifest with
-    these catches a truncated or partially enriched book for any correctly sourced book,
-    without pinning one book's counts.
+    Every source row is loaded; rows maturing on or before the simulation start are rolled
+    forward onto the packaged auction results by the build's own rule; TIPS and FRN rows
+    (and their CUSIPs) are the source's surviving TIPS and FRN rows. Comparing the manifest
+    with these catches a truncated or partially enriched book for any correctly sourced
+    book, without pinning one book's counts.
     """
 
+    import pandas as pd
+
     opening = manifest.get("opening_portfolio_construction", {})
-    source = _read_csv_dicts(root / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv")
+    source_path = root / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv"
+    source = _read_csv_dicts(source_path)
     if not source:
         raise ValueError("packaged opening source book has no rows")
     start = str(manifest.get("date_range", {}).get("simulation_start_date") or "")
     inactive = [row for row in source if (row.get("Status") or "Active") != "Active"]
     if inactive:
         raise ValueError("packaged opening source book contains non-active rows")
-    expired = [row for row in source if row["MaturityDate"][:10] <= start]
+    book = pd.read_csv(source_path, low_memory=False)
+    for column in ("IssueDate", "MaturityDate"):
+        book[column] = pd.to_datetime(book[column], errors="coerce")
+    settlements = prestart_settlements(
+        root / "sources" / "fiscaldata" / "auctions_query.csv",
+        record_date=str(opening.get("record_date") or ""),
+        simulation_start_date=start,
+    )
+    kept_book, replacements = prestart_rollforward(
+        book,
+        settlements,
+        simulation_start_date=start,
+        next_bond_id=int(pd.to_numeric(book["BondID"]).max()) + 1,
+        cusip_column="cusip_or_synthetic_id",
+    )
     kept = [row for row in source if row["MaturityDate"][:10] > start]
 
     def cusips(security_type: str) -> set[str]:
@@ -567,8 +590,9 @@ def _verify_opening_counts_against_source_book(root: Path, manifest: Mapping[str
 
     expected = {
         "source_rows_loaded": len(source),
-        "prestart_rollforward_rows": len(expired),
-        "row_count": len(kept) + len(expired),
+        "prestart_matured_rows": len(source) - len(kept_book),
+        "prestart_rollforward_rows": len(replacements),
+        "row_count": len(kept) + len(replacements),
         "tips_rows_enriched": sum(1 for row in kept if row["SecurityType"] == "TIPS"),
         "tips_unique_cusips_enriched": len(cusips("TIPS")),
         "frn_rows_enriched": sum(1 for row in kept if row["SecurityType"] == "FRN"),
@@ -1627,15 +1651,25 @@ def _verify_rollforward(root: Path, manifest: Mapping[str, Any]) -> None:
     if len(summary_rows) != 1:
         raise ValueError("roll-forward diagnostics must contain exactly one summary row")
     summary = summary_rows[0]
-    expected_count = int(opening_manifest.get("prestart_rollforward_rows", -1))
-    if len(replacement_rows) != expected_count:
+    if len(replacement_rows) != int(opening_manifest.get("prestart_rollforward_rows", -1)):
         raise ValueError("roll-forward replacement count does not match manifest")
     if int(float(summary.get("replacement_rows", "-1"))) != len(replacement_rows):
         raise ValueError("roll-forward summary replacement_rows does not match parsed CSV")
-    if int(float(summary.get("source_rows_maturing_on_or_before_start", "-1"))) != len(replacement_rows):
-        raise ValueError("roll-forward summary source row count does not match parsed CSV")
-    source_face = sum(_csv_float(row, "source_face_bil") for row in replacement_rows)
-    replacement_face = sum(_csv_float(row, "replacement_face_bil") for row in replacement_rows)
+    source_face_by_row: dict[str, float] = {}
+    reinvested_by_row: dict[str, float] = {}
+    for row in replacement_rows:
+        source_id = row["source_bond_id"]
+        source_face = _csv_float(row, "source_face_bil")
+        if source_face_by_row.setdefault(source_id, source_face) != source_face:
+            raise ValueError(f"roll-forward rows disagree on the face of source row {source_id}")
+        reinvested_by_row[source_id] = reinvested_by_row.get(source_id, 0.0) + _csv_float(row, "replacement_face_bil")
+    matured_rows = int(opening_manifest.get("prestart_matured_rows", -1))
+    if len(source_face_by_row) != matured_rows or int(float(summary.get("source_rows_maturing_on_or_before_start", "-1"))) != matured_rows:
+        raise ValueError("roll-forward source row count does not match manifest")
+    for source_id, face in source_face_by_row.items():
+        _assert_close(f"roll-forward reinvestment of source row {source_id}", reinvested_by_row[source_id], face, NUMERIC_TOLERANCE)
+    source_face = sum(source_face_by_row.values())
+    replacement_face = sum(reinvested_by_row.values())
     _assert_close("roll-forward source face", source_face, _csv_float(summary, "source_face_bil"), NUMERIC_TOLERANCE)
     _assert_close(
         "roll-forward replacement face",

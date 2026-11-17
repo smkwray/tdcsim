@@ -52,8 +52,11 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         manifest["opening_portfolio_construction"]["mode"]
         == "prebuilt_mspd_derived_cohort_book_with_explicit_prestart_rollforward"
     )
-    assert manifest["opening_portfolio_construction"]["row_count"] == 2273
-    assert manifest["opening_portfolio_construction"]["prestart_rollforward_rows"] == 48
+    # 48 source rows mature before the start and are reinvested, holder by holder, in the 26
+    # Treasury issues settling on their payment dates: 163 replacement rows.
+    assert manifest["opening_portfolio_construction"]["row_count"] == 2388
+    assert manifest["opening_portfolio_construction"]["prestart_matured_rows"] == 48
+    assert manifest["opening_portfolio_construction"]["prestart_rollforward_rows"] == 163
     assert (
         manifest["opening_portfolio_construction"]["opening_rollforward_status"]
         == "mechanically_balanced_source_record_to_simulation_start"

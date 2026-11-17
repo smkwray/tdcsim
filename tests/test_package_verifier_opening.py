@@ -29,36 +29,62 @@ def _write_source_book(root: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({**row, "BondID": str(index)} for index, row in enumerate(rows, start=1))
 
 
 def _book_row(security_type: str, maturity: str, cusip: str) -> dict[str, str]:
-    return {"SecurityType": security_type, "MaturityDate": maturity, "Status": "Active", "cusip_or_synthetic_id": cusip}
+    return {
+        "BondID": "", "SecurityType": security_type, "IssueDate": "2026-01-02", "MaturityDate": maturity,
+        "FaceValue": "1.0", "CouponRate": "0.0", "HolderType": "Banks", "HolderSubBucket": "", "Status": "Active",
+        "cusip_or_synthetic_id": cusip,
+    }
+
+
+def _write_auctions(root: Path) -> None:
+    """Two bills settle on each pre-start payment date, so each matured row becomes two."""
+
+    path = root / "sources" / "fiscaldata" / "auctions_query.csv"
+    path.parent.mkdir(parents=True)
+    columns = ["cusip", "security_type", "issue_date", "original_issue_date", "maturity_date", "total_accepted",
+               "int_rate", "price_per100", "high_investment_rate", "high_yield", "floating_rate",
+               "inflation_index_security"]
+    issues = [("A4", "2026-06-11", "2026-07-09"), ("A13", "2026-06-11", "2026-09-10"),
+              ("B4", "2026-06-18", "2026-07-16"), ("B13", "2026-06-18", "2026-09-17")]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        for cusip, issue, maturity in issues:
+            writer.writerow([cusip, "Bill", issue, "null", maturity, "5e10", "null", "99.0", "4.0", "null", "No", "No"])
 
 
 def _manifest(**counts: int) -> dict:
-    return {"date_range": {"simulation_start_date": START}, "opening_portfolio_construction": counts}
+    return {
+        "date_range": {"simulation_start_date": START},
+        "opening_portfolio_construction": {"record_date": "2026-05-31", **counts},
+    }
 
 
 def test_opening_counts_follow_the_packaged_source_book(tmp_path: Path) -> None:
-    """Two bills mature before the start and roll forward; two TIPS rows share a CUSIP.
-    The manifest's counts must be those of this book, whatever book it is."""
+    """Two bills mature before the start and roll forward into two issues each; two TIPS
+    rows share a CUSIP. The manifest's counts must be those of this book, whatever book it is."""
 
     _write_source_book(
         tmp_path,
         [
             _book_row("Fixed", "2026-06-10", "B1"),
-            _book_row("Fixed", "2026-06-21", "B2"),
+            _book_row("Fixed", "2026-06-18", "B2"),
             _book_row("Fixed", "2027-01-01", "N1"),
             _book_row("TIPS", "2030-01-15", "T1"),
             _book_row("TIPS", "2030-01-15", "T1"),
             _book_row("FRN", "2027-10-31", "F1"),
         ],
     )
+    _write_auctions(tmp_path)
     counts = {
         "source_rows_loaded": 6,
-        "prestart_rollforward_rows": 2,
-        "row_count": 6,
+        "prestart_matured_rows": 2,
+        "prestart_rollforward_rows": 4,
+        "row_count": 8,
         "tips_rows_enriched": 2,
         "tips_unique_cusips_enriched": 1,
         "frn_rows_enriched": 1,
@@ -69,7 +95,7 @@ def test_opening_counts_follow_the_packaged_source_book(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="tips_rows_enriched"):
         _verify_opening_counts_against_source_book(tmp_path, _manifest(**{**counts, "tips_rows_enriched": 1}))
     with pytest.raises(ValueError, match="prestart_rollforward_rows"):
-        _verify_opening_counts_against_source_book(tmp_path, _manifest(**{**counts, "prestart_rollforward_rows": 1}))
+        _verify_opening_counts_against_source_book(tmp_path, _manifest(**{**counts, "prestart_rollforward_rows": 2}))
 
 
 def _fed_row(**values: object) -> dict[str, str]:

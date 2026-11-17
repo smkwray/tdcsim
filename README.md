@@ -122,7 +122,9 @@ domestic holders in proportion to each group's holdings of bills or of longer
 securities, as estimated by [WAMEST](https://github.com/smkwray/wamest) from
 Federal Reserve Financial Accounts (Z.1) and other public data. Securities that mature between the record
 date and the simulation start, including any matured on a weekend record date and
-paid the next business day, roll into 3-month bills. To rebuild the book from
+paid the next business day, are reinvested holder by holder in the Treasury issues
+that settled on their payment dates, in proportion to the amounts accepted at
+auction, so the opening book carries those issues under their own CUSIPs. To rebuild the book from
 local MSPD, SOMA and WAMEST files, run
 `python src/ratewall_input_builder.py --opening-book-only --help`.
 

@@ -66,7 +66,14 @@ from forecast_input_builder import (
     write_forecast_rows_csv,
 )
 from frn_indexation import build_forward_frn_rate_path_rows, enrich_opening_frn_from_daily_indexes
-from issuance_calibration import CALIBRATION_FILE, build_issuance_calibration, engine_rule_profile
+from issuance_calibration import (
+    CALIBRATION_FILE,
+    PRESTART_ROLLFORWARD_RULE,
+    build_issuance_calibration,
+    engine_rule_profile,
+    prestart_rollforward,
+    prestart_settlements,
+)
 from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _fiscal_year_close_dates, run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar
 from tdc_shared import (
@@ -137,7 +144,7 @@ OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
     "prebuilt_mspd_table3_market_derived_cohort_book; "
     "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
     "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
-    "securities_maturing_between_record_date_and_simulation_start_are_explicit_prestart_rollforward_bills"
+    "securities_maturing_between_record_date_and_simulation_start_are_reinvested_in_the_treasury_issues_settling_on_their_payment_dates"
 )
 
 CBO_FULL_FY2026_PRIMARY_DEFICIT_BIL = 813.727
@@ -490,6 +497,7 @@ def build_forecast_bundle(
         source_manifest=ratewall_manifest_path,
         tips_cpi_detail=tips_cpi_detail_path,
         frn_daily_indexes=frn_daily_indexes_path,
+        auctions_query=packaged_sources["auctions_query"],
     )
     holder_preferences, private_subbucket_shares = holder_profile_from_opening_weights(
         opening_portfolio_metadata["noncb_weights"]
@@ -836,6 +844,7 @@ def build_manifest(
             "simulation_start_date": SIMULATION_START_DATE,
             "row_count": opening_portfolio_metadata["row_count"],
             "source_rows_loaded": opening_portfolio_metadata["source_rows_loaded"],
+            "prestart_matured_rows": opening_portfolio_metadata["prestart_matured_rows"],
             "prestart_rollforward_rows": opening_portfolio_metadata["prestart_rollforward_rows"],
             "prestart_rollforward_face_bil": opening_portfolio_metadata["prestart_rollforward_face_bil"],
             "opening_rollforward_status": opening_portfolio_metadata["opening_rollforward_status"],
@@ -1289,8 +1298,13 @@ def load_opening_portfolio(
     source_manifest: str | Path = DEFAULT_RATEWALL_INPUT_MANIFEST,
     tips_cpi_detail: str | Path = DEFAULT_TIPS_CPI_DETAIL,
     frn_daily_indexes: str | Path = DEFAULT_FRN_DAILY_INDEXES,
+    auctions_query: str | Path = DEFAULT_AUCTIONS_QUERY,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load the tracked source-backed cohort book and align it to run start."""
+    """Load the tracked source-backed cohort book and align it to run start.
+
+    Securities maturing between the book's record date and the start are reinvested in the
+    Treasury issues settling on their payment dates (``prestart_rollforward``).
+    """
 
     portfolio_path = Path(path)
     if not portfolio_path.exists():
@@ -1351,9 +1365,17 @@ def load_opening_portfolio(
     start = pd.Timestamp(simulation_start_date)
     active = portfolio[portfolio["Status"].astype(str).eq("Active")].copy()
     expired = active[active["MaturityDate"] <= start].copy()
-    kept = active[active["MaturityDate"] > start].copy()
-    rollforward = _prestart_rollforward_rows(expired, start, next_bond_id=_next_bond_id(portfolio))
-    aligned = pd.concat([kept, rollforward], ignore_index=True)
+    settlements = prestart_settlements(
+        auctions_query, record_date=record_date, simulation_start_date=simulation_start_date
+    )
+    kept, rollforward = prestart_rollforward(
+        active,
+        settlements,
+        simulation_start_date=simulation_start_date,
+        next_bond_id=_next_bond_id(portfolio),
+        cusip_column="_SourceCUSIP",
+    )
+    aligned = pd.concat([kept, rollforward.drop(columns=["_SourceBondID", "_PaymentDate"])], ignore_index=True)
     source_active_debt_base = _portfolio_total_debt_base(active.drop(columns=["_SourceCUSIP"], errors="ignore"))
     aligned, tips_metadata, tips_diagnostics = enrich_opening_tips_from_cpi_detail(
         aligned,
@@ -1397,12 +1419,11 @@ def load_opening_portfolio(
         "simulation_start_date": simulation_start_date,
         "source_rows_loaded": source_rows_loaded,
         "row_count": int(len(aligned)),
+        "prestart_matured_rows": int(len(expired)),
         "prestart_rollforward_rows": int(len(rollforward)),
         "prestart_rollforward_face_bil": float(expired["FaceValue"].fillna(0.0).sum()),
         "opening_rollforward_status": "mechanically_balanced_source_record_to_simulation_start",
-        "opening_rollforward_policy": (
-            "active_source_positions_maturing_on_or_before_simulation_start_are_replaced_with_3_month_bills_by_holder"
-        ),
+        "opening_rollforward_policy": PRESTART_ROLLFORWARD_RULE,
         "opening_source_common_date_status": (
             "no_same_day_cusip_level_mspd_table3_book_available_locally_for_simulation_start; "
             "latest_local_mspd_table3_record_date_is_2026-05-31"
@@ -1428,48 +1449,6 @@ def load_opening_portfolio(
     return aligned, metadata
 
 
-def _prestart_rollforward_rows(expired: pd.DataFrame, start: pd.Timestamp, *, next_bond_id: int) -> pd.DataFrame:
-    if expired.empty:
-        return pd.DataFrame(columns=BOND_PORTFOLIO_COLS)
-    replacement_rows = []
-    maturity_date = start + pd.DateOffset(months=3)
-    for offset, (_, row) in enumerate(expired.iterrows()):
-        replacement = {column: pd.NA for column in BOND_PORTFOLIO_COLS}
-        face_value = float(row.get("FaceValue", 0.0) or 0.0)
-        replacement.update(
-            {
-                "BondID": next_bond_id + offset,
-                "SecurityType": "Fixed",
-                "IssueDate": start,
-                "MaturityDate": maturity_date,
-                "DatedDate": start,
-                "OriginalDatedDate": start,
-                "FirstInterestPaymentDate": pd.NaT,
-                "InterestPaymentFrequency": pd.NA,
-                "OriginalMaturityYears": 0.25,
-                "FaceValue": face_value,
-                "CouponRate": 0.0,
-                "HolderType": row.get("HolderType", "Private"),
-                "HolderSubBucket": row.get("HolderSubBucket", ""),
-                "Status": "Active",
-                "MaturityCategory": "bills",
-                "OriginalPrincipal": 0.0,
-                "AdjustedPrincipal": 0.0,
-                "ReferenceCPI_Issue": 0.0,
-                "IndexRatio": 0.0,
-                "FixedSpread": 0.0,
-                "AccruedInterest_FRN": 0.0,
-                "BenchmarkRate_FRN": 0.0,
-                "LastAccrualDate": pd.NaT,
-                "IssuePriceRatio": pd.NA,
-                "IssueProceeds": pd.NA,
-                "IssueYieldAtIssue": pd.NA,
-            }
-        )
-        replacement_rows.append(replacement)
-    return pd.DataFrame(replacement_rows, columns=BOND_PORTFOLIO_COLS)
-
-
 def _opening_rollforward_diagnostic_rows(
     expired: pd.DataFrame,
     rollforward: pd.DataFrame,
@@ -1479,6 +1458,7 @@ def _opening_rollforward_diagnostic_rows(
 ) -> list[dict[str, Any]]:
     source_total = float(expired["FaceValue"].fillna(0.0).sum()) if not expired.empty else 0.0
     replacement_total = float(rollforward["FaceValue"].fillna(0.0).sum()) if not rollforward.empty else 0.0
+    claim = "rollforward_onto_treasury_auction_results_not_a_same_day_mspd_book"
     rows: list[dict[str, Any]] = [
         {
             "row_type": "summary",
@@ -1490,40 +1470,42 @@ def _opening_rollforward_diagnostic_rows(
             "replacement_face_bil": replacement_total,
             "face_delta_bil": replacement_total - source_total,
             "status": "balanced" if abs(replacement_total - source_total) <= 1e-9 else "unbalanced",
-            "derivation": (
-                "source_MSPD_cohort_rows_maturing_on_or_before_simulation_start_are_replaced_by_3_month_bills"
-            ),
-            "claim_boundary": "mechanical_rollforward_not_same_day_cusip_level_source_reconstruction",
+            "derivation": PRESTART_ROLLFORWARD_RULE,
+            "claim_boundary": claim,
         }
     ]
     if expired.empty:
         return rows
-    replacement_by_offset = rollforward.reset_index(drop=True)
-    for offset, (_, source_row) in enumerate(expired.reset_index(drop=True).iterrows()):
-        replacement = replacement_by_offset.iloc[offset] if offset < len(replacement_by_offset.index) else {}
-        source_face = float(source_row.get("FaceValue", 0.0) or 0.0)
-        replacement_face = float(replacement.get("FaceValue", 0.0) or 0.0)
+    sources = expired.set_index("BondID")
+    reinvested = rollforward.groupby("_SourceBondID")["FaceValue"].sum()
+    for _, replacement in rollforward.iterrows():
+        source = sources.loc[replacement["_SourceBondID"]]
+        source_face = float(source["FaceValue"])
+        replacement_face = float(replacement["FaceValue"])
+        balanced = abs(float(reinvested[replacement["_SourceBondID"]]) - source_face) <= 1e-9
         rows.append(
             {
                 "row_type": "replacement",
                 "source_record_date": source_record_date,
                 "simulation_start_date": simulation_start_date,
-                "source_bond_id": source_row.get("BondID", ""),
-                "replacement_bond_id": replacement.get("BondID", ""),
-                "source_cusip": source_row.get("_SourceCUSIP", ""),
-                "source_security_type": source_row.get("SecurityType", ""),
+                "source_bond_id": replacement["_SourceBondID"],
+                "replacement_bond_id": replacement["BondID"],
+                "source_cusip": source.get("_SourceCUSIP", ""),
+                "replacement_cusip": replacement["_SourceCUSIP"],
+                "source_security_type": source.get("SecurityType", ""),
                 "replacement_security_type": replacement.get("SecurityType", ""),
-                "holder_type": source_row.get("HolderType", ""),
-                "holder_subbucket": source_row.get("HolderSubBucket", ""),
-                "source_maturity_date": _iso_date_or_empty(source_row.get("MaturityDate")),
+                "holder_type": source.get("HolderType", ""),
+                "holder_subbucket": source.get("HolderSubBucket", ""),
+                "source_maturity_date": _iso_date_or_empty(source.get("MaturityDate")),
+                "payment_date": _iso_date_or_empty(replacement["_PaymentDate"]),
                 "replacement_issue_date": _iso_date_or_empty(replacement.get("IssueDate")),
                 "replacement_maturity_date": _iso_date_or_empty(replacement.get("MaturityDate")),
                 "source_face_bil": source_face,
                 "replacement_face_bil": replacement_face,
-                "face_delta_bil": replacement_face - source_face,
-                "status": "balanced" if abs(replacement_face - source_face) <= 1e-9 else "unbalanced",
-                "derivation": "holder_preserving_3_month_bill_replacement_for_prestart_maturity",
-                "claim_boundary": "mechanical_rollforward_not_same_day_cusip_level_source_reconstruction",
+                "reinvestment_share": replacement_face / source_face if source_face else float("nan"),
+                "status": "balanced" if balanced else "unbalanced",
+                "derivation": PRESTART_ROLLFORWARD_RULE,
+                "claim_boundary": claim,
             }
         )
     return rows

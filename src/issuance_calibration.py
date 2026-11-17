@@ -744,3 +744,222 @@ def load_calibration(path: str | Path) -> dict[str, Any]:
         settlement_calendar=payload["settlement_calendar"],
     )
     return payload
+
+
+# --- Pre-start rollforward of the opening book ------------------------------------------
+
+PRESTART_ROLLFORWARD_RULE = (
+    "each_security_maturing_between_the_record_date_and_the_start_is_reinvested_holder_by_holder_"
+    "in_the_treasury_issues_settling_on_its_payment_date_pro_rata_to_their_accepted_amounts"
+)
+_AUCTION_SECURITY_CATEGORY = {"Bill": "bills", "Note": "notes", "Bond": "bonds"}
+# Row fields that describe the holder and the amount, not the security.
+_HOLDER_FIELDS = (
+    "BondID",
+    "FaceValue",
+    "HolderType",
+    "HolderSubBucket",
+    "TDCPrincipalHolderType",
+    "TDCPrincipalHolderSubBucket",
+    "IssueProceeds",
+    "Status",
+)
+
+
+def _percent(row: Mapping[str, str], column: str, *, line: int) -> float:
+    text = str(row.get(column, "")).strip()
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise IssuanceCalibrationError(
+            f"auction row {line}: {column} is not a number ({text!r})"
+        ) from exc
+    if not math.isfinite(value):
+        raise IssuanceCalibrationError(f"auction row {line}: {column} is not finite")
+    return value / 100.0
+
+
+def prestart_settlements(
+    auctions_csv: str | Path,
+    *,
+    record_date: str,
+    simulation_start_date: str,
+) -> pd.DataFrame:
+    """Treasury issues settling after the opening book's record date, up to the start.
+
+    One row per security and settlement date, with the CUSIP's original issue date (a
+    reopening carries it), maturity, coupon rate, the auction's accepted amount including
+    Fed add-ons, and its price and yield. Raises on an indexed (TIPS or FRN) issue, which
+    the rollforward does not reconstruct, on malformed rows, and on an empty window.
+    """
+
+    record = date.fromisoformat(record_date)
+    start = date.fromisoformat(simulation_start_date)
+    path = Path(auctions_csv)
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    out: list[dict[str, Any]] = []
+    for line, row in enumerate(rows, start=2):
+        issue = _date(row, "issue_date", line=line)
+        if not (record < issue <= start):
+            continue
+        security_type = str(row.get("security_type", "")).strip()
+        if security_type not in _AUCTION_SECURITY_CATEGORY:
+            raise IssuanceCalibrationError(f"auction row {line}: unknown security_type {security_type!r}")
+        if _flag(row, "floating_rate", line=line) or _flag(row, "inflation_index_security", line=line):
+            raise IssuanceCalibrationError(
+                f"auction row {line}: an indexed security settles before the start; "
+                "the pre-start rollforward reconstructs only bills, notes and bonds"
+            )
+        original_text = str(row.get("original_issue_date", "")).strip()
+        bill = security_type == "Bill"
+        out.append(
+            {
+                "cusip": str(row.get("cusip", "")).strip(),
+                "security_type": security_type,
+                "settlement_date": pd.Timestamp(issue),
+                "original_issue_date": pd.Timestamp(
+                    issue if original_text in {"", "null"} else _date(row, "original_issue_date", line=line)
+                ),
+                "maturity_date": pd.Timestamp(_date(row, "maturity_date", line=line)),
+                "accepted_bil": _dollars(row, "total_accepted", line=line) / 1.0e9,
+                "coupon_rate": 0.0 if bill else _percent(row, "int_rate", line=line),
+                "issue_price_ratio": _percent(row, "price_per100", line=line),
+                "issue_yield": _percent(row, "high_investment_rate" if bill else "high_yield", line=line),
+            }
+        )
+    if not out:
+        raise IssuanceCalibrationError(f"no Treasury issue settles in ({record}, {start}]")
+    frame = pd.DataFrame(out)
+    if frame.duplicated(["cusip", "settlement_date"]).any():
+        raise IssuanceCalibrationError("an auction file lists one CUSIP twice on one settlement date")
+    if (frame["accepted_bil"] <= TGA_FLOOR_TOLERANCE).any():
+        raise IssuanceCalibrationError("a pre-start issue has no accepted amount")
+    return frame.sort_values(["settlement_date", "maturity_date", "cusip"]).reset_index(drop=True)
+
+
+def prestart_rollforward(
+    book: pd.DataFrame,
+    settlements: pd.DataFrame,
+    *,
+    simulation_start_date: str,
+    next_bond_id: int,
+    cusip_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split an active opening book at the start and roll its matured rows forward.
+
+    A row maturing on or before the start is paid on the first settlement date on or after
+    its maturity, and its face is reinvested, for the same holder, in every Treasury issue
+    settling that day in proportion to the issue's accepted amount. A replacement in a
+    CUSIP the book already holds takes that CUSIP's terms from the book. Returns the
+    surviving rows and the replacement rows; the replacements carry ``_SourceBondID`` and
+    ``_PaymentDate`` for diagnostics. Raises unless face and holder totals are unchanged,
+    every replacement matures after the start, and no maturity date receives more
+    replacement face than the largest amount that matured on any one date before the start.
+    """
+
+    start = pd.Timestamp(simulation_start_date)
+    matured = book[book["MaturityDate"] <= start]
+    kept = book[book["MaturityDate"] > start]
+    if matured.empty:
+        return kept, pd.DataFrame(columns=[*book.columns, "_SourceBondID", "_PaymentDate"])
+    templates = kept.drop_duplicates(cusip_column).set_index(cusip_column)
+    security_fields = [c for c in book.columns if c not in _HOLDER_FIELDS and c != cusip_column]
+    terms: dict[tuple[str, pd.Timestamp], dict[str, Any]] = {}
+    for issue in settlements.itertuples(index=False):
+        if issue.cusip in templates.index:
+            template = templates.loc[issue.cusip]
+            if (
+                pd.Timestamp(template["MaturityDate"]) != issue.maturity_date
+                or pd.Timestamp(template["IssueDate"]) != issue.original_issue_date
+                or abs(float(template["CouponRate"]) - issue.coupon_rate) > 1e-9
+            ):
+                raise IssuanceCalibrationError(
+                    f"the opening book and the auction file disagree on the terms of {issue.cusip}"
+                )
+            fields = {column: template[column] for column in security_fields}
+        elif issue.original_issue_date < issue.settlement_date:
+            raise IssuanceCalibrationError(
+                f"{issue.cusip} is reopened on {issue.settlement_date.date()} but is not in the opening book"
+            )
+        else:
+            fields = {column: pd.NA for column in security_fields}
+            fields.update(
+                {
+                    "SecurityType": "Fixed",
+                    "IssueDate": issue.original_issue_date,
+                    "MaturityDate": issue.maturity_date,
+                    "OriginalMaturityYears": (issue.maturity_date - issue.original_issue_date).days
+                    / DAYS_PER_YEAR_ACTUAL,
+                    "CouponRate": issue.coupon_rate,
+                    "MaturityCategory": _AUCTION_SECURITY_CATEGORY[issue.security_type],
+                    "OriginalPrincipal": 0.0,
+                    "AdjustedPrincipal": 0.0,
+                    "ReferenceCPI_Issue": 0.0,
+                    "IndexRatio": 0.0,
+                    "FixedSpread": 0.0,
+                    "AccruedInterest_FRN": 0.0,
+                    "BenchmarkRate_FRN": 0.0,
+                    "IssuePriceRatio": issue.issue_price_ratio,
+                    "IssueYieldAtIssue": issue.issue_yield,
+                }
+            )
+        if issue.maturity_date <= start:
+            raise IssuanceCalibrationError(f"{issue.cusip} issued before the start also matures before it")
+        terms[(issue.cusip, issue.settlement_date)] = fields
+
+    dates = settlements["settlement_date"].drop_duplicates().sort_values().reset_index(drop=True)
+    rows: list[dict[str, Any]] = []
+    bond_id = int(next_bond_id)
+    for _, source in matured.iterrows():
+        later = dates[dates >= pd.Timestamp(source["MaturityDate"])]
+        if later.empty:
+            raise IssuanceCalibrationError(
+                f"no Treasury issue settles between {pd.Timestamp(source['MaturityDate']).date()} and the start"
+            )
+        payment = later.iloc[0]
+        issues = settlements[settlements["settlement_date"] == payment]
+        weights = issues["accepted_bil"] / issues["accepted_bil"].sum()
+        face = float(source["FaceValue"])
+        for issue, weight in zip(issues.itertuples(index=False), weights):
+            row = {column: pd.NA for column in book.columns}
+            row.update(terms[(issue.cusip, payment)])
+            share = face * float(weight)
+            price = row.get("IssuePriceRatio")
+            row.update(
+                {
+                    "BondID": bond_id,
+                    "FaceValue": share,
+                    "HolderType": source["HolderType"],
+                    "HolderSubBucket": source["HolderSubBucket"],
+                    "Status": "Active",
+                    "IssueProceeds": share * float(price) if pd.notna(price) else pd.NA,
+                    cusip_column: issue.cusip,
+                    "_SourceBondID": source["BondID"],
+                    "_PaymentDate": payment,
+                }
+            )
+            rows.append(row)
+            bond_id += 1
+    replacements = pd.DataFrame(rows)
+    _check_prestart_rollforward(matured, replacements, start)
+    return kept, replacements
+
+
+def _check_prestart_rollforward(matured: pd.DataFrame, replacements: pd.DataFrame, start: pd.Timestamp) -> None:
+    def holder_totals(frame: pd.DataFrame) -> pd.Series:
+        keys = [frame["HolderType"].astype(str), frame["HolderSubBucket"].fillna("").astype(str)]
+        return frame["FaceValue"].astype(float).groupby(keys).sum()
+
+    gap = holder_totals(replacements).subtract(holder_totals(matured), fill_value=0.0).abs()
+    if gap.max() > 1e-9:
+        raise IssuanceCalibrationError(f"the pre-start rollforward changes a holder's face by {gap.max()}")
+    if (pd.to_datetime(replacements["MaturityDate"]) <= start).any():
+        raise IssuanceCalibrationError("a pre-start replacement matures on or before the start")
+    largest_paid = matured["FaceValue"].astype(float).groupby(pd.to_datetime(matured["MaturityDate"])).sum().max()
+    by_maturity = replacements["FaceValue"].astype(float).groupby(pd.to_datetime(replacements["MaturityDate"])).sum()
+    if by_maturity.max() > largest_paid + 1e-9:
+        raise IssuanceCalibrationError(
+            f"the pre-start rollforward puts {by_maturity.max():.1f} billion on {by_maturity.idxmax().date()}, "
+            f"more than the {largest_paid:.1f} billion that matured on any one day before the start"
+        )

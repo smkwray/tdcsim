@@ -35,6 +35,8 @@ SCHEMA_VERSION = "tdcsim_visual_ledger_v1"
 HOLDER_COLUMNS = ("fed", "banks", "foreign", "mmf", "other_domestic")
 OPENING_PORTFOLIO = Path("compile/compiled/forecast_inputs/tdcsim_opening_portfolio.csv")
 OPENING_SOURCE = Path("compile/baseline/sources/opening/tdcsim_initial_portfolio_cohorts.csv")
+OPENING_METADATA = Path("compile/compiled/forecast_inputs/tdcsim_opening_portfolio_metadata.json")
+ROLLFORWARD = Path("compile/compiled/forecast_inputs/tdcsim_opening_rollforward_diagnostics.csv")
 RESULTS = Path("outputs/results_compact.csv.gz")
 TRC = Path("outputs/tdcsim_trc_results.csv.gz")
 ISSUANCE_AGGREGATES = Path("outputs/tdcsim_period_issuance_aggregates.csv.gz")
@@ -178,16 +180,13 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     if (book.loc[joined, "MaturityDate"] != book.loc[joined, "MaturityDate_source"]).any():
         raise SystemExit("opening book and its source disagree on maturity dates")
     book["kind"] = [security_type(t, float(y)) for t, y in zip(book["SecurityType"], book["OriginalMaturityYears"])]
-    # Securities issued by the model on the opening date to replace issues that matured before
-    # it have no CUSIP; they are identified by type, term and maturity.
-    book["security_id"] = book["cusip_or_synthetic_id"]
-    model = ~joined
-    opening_date = pd.to_datetime(book["IssueDate"]).max()
-    if (pd.to_datetime(book.loc[model, "IssueDate"]) != opening_date).any():
-        raise SystemExit("an opening security without a CUSIP was not issued on the opening date")
-    book.loc[model, "security_id"] = (
-        "prestart-" + book.loc[model, "kind"] + "-" + book.loc[model, "MaturityDate"].astype(str)
-    )
+    # Rows not in the source book are the pre-start rollforward's reinvestment in Treasury
+    # issues settling before the opening; the run's rollforward diagnostics name their CUSIPs.
+    rollforward = pd.read_csv(run_dir / ROLLFORWARD, low_memory=False)
+    added = rollforward[rollforward["row_type"] == "replacement"].set_index("replacement_bond_id")["replacement_cusip"]
+    book["security_id"] = book["cusip_or_synthetic_id"].fillna(book["BondID"].map(added))
+    if book["security_id"].isna().any():
+        raise SystemExit("an opening row is neither in the source book nor a pre-start rollforward replacement")
     book["holder"] = [holder_column(h, s) for h, s in zip(book["HolderType"], book["HolderSubBucket"])]
     book["debt_basis"] = book["AdjustedPrincipal"].where(book["SecurityType"].eq("TIPS"), book["FaceValue"])
     keys = ["security_id", "kind", "IssueDate", "MaturityDate", "CouponRate"]
@@ -349,10 +348,12 @@ Thin export of one completed TDCSim CBO scenario run, for illustration. USD bill
 Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `receipt.json`.
 
 ## Files
-- `opening_book.csv`: every security outstanding at the {start} opening, by CUSIP. Securities
-  the model issued on the opening date to replace issues that matured on the weekend before it
-  have no CUSIP and are identified as `prestart-bill-<maturity>`. Face is par; TIPS par excludes
-  inflation compensation, which `debt_basis_total` includes.
+- `opening_book.csv`: every security outstanding at the {start} opening, by CUSIP. The source
+  book is Treasury's month-end statement for {record_date}; what matured between then and the
+  opening is reinvested, holder by holder, in the Treasury issues that settled on its payment
+  date, in proportion to their accepted auction amounts, so those issues appear under their own
+  CUSIPs. Face is par; TIPS par excludes inflation compensation, which `debt_basis_total`
+  includes.
 - `issues.csv`: every security the run issued, one row per security and settlement date. The
   model issues a new security at each settlement; it never reopens an existing one
   (`is_reopening` is always false). `settlement_day_kind` marks days when pending issuance was
@@ -445,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
         README.format(
             run_label=scenario_id,
             start=results.index[0].date(),
+            record_date=json.loads((run_dir / OPENING_METADATA).read_text(encoding="utf-8"))["record_date"],
             rs_share=fiscal_checks["outside_covered_deposits_share"],
             fiscal_note=(
                 "CBO's primary deficit for each fiscal year spread evenly over its days, so it is"
@@ -458,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
     from tdcsim_cbo.runtime_identity import distribution_identity, installed_archive_sha256
 
     inputs = {str(path): sha256(run_dir / path) for path in (
-        RUN_MANIFEST, OPENING_PORTFOLIO, OPENING_SOURCE, RESULTS, TRC, ISSUANCE_AGGREGATES, FINAL_PORTFOLIO,
+        RUN_MANIFEST, OPENING_PORTFOLIO, OPENING_SOURCE, ROLLFORWARD, OPENING_METADATA, RESULTS, TRC, ISSUANCE_AGGREGATES, FINAL_PORTFOLIO,
         FISCAL_POLICY, ANNUAL_SUMMARY)}
     receipt = {
         "schema_version": SCHEMA_VERSION,
