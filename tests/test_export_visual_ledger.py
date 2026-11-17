@@ -36,7 +36,7 @@ def test_holders_map_to_the_five_export_columns_and_unknowns_raise() -> None:
 
 
 def test_fiscal_incidence_splits_the_primary_deficit_without_remainder(tmp_path) -> None:
-    # The deck shows deposit and non-deposit fiscal flows side by side; they must add to the
+    # Deposit and non-deposit fiscal flows are read side by side; they must add to the
     # deficit, and the non-deposit part must follow the run's own incidence policy.
     import export_visual_ledger as ledger
 
@@ -63,7 +63,7 @@ def test_fiscal_incidence_splits_the_primary_deficit_without_remainder(tmp_path)
 
 
 def test_daily_financing_cost_matches_the_fiscal_year_totals_the_family_reports(tmp_path) -> None:
-    # The deck plots the daily cumulative cost next to the scenario-family totals; the two must
+    # The daily cumulative cost is read next to the scenario-family totals; the two must
     # be one basis, so the daily running sum has to land on every fiscal-year total.
     import export_visual_ledger as ledger
 
