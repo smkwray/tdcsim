@@ -7,7 +7,7 @@
     "start_date": "2026-06-21",
     "end_date": "2031-09-30"
   },
-  "description": "Companion to buyer_shift_v1 in a funding state where money funds hold ON RRP balances and settle every purchase and receipt through them. Money funds acquire the same $500 billion of Treasury holdings, built over fiscal year 2027 and held through September 2031, from banks and foreign holders in fixed proportions to their bill holdings at this family baseline's 2026-09-30 close; other domestic nonbanks are unchanged.",
+  "description": "Companion to buyer_shift_v1 in a funding state where money funds hold ON RRP balances and settle every purchase and receipt through them. Money funds acquire the same $500 billion of Treasury holdings, built over fiscal year 2027 and held through September 2031, from banks, foreign holders and other domestic nonbanks in fixed proportions to their bill holdings at this family baseline's 2026-09-30 close; other domestic nonbanks are paid into covered deposits when they sell.",
   "boundaries": [
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "The $500 billion size is a stated assumption, equal across buyers so their effects can be compared, not an estimated demand response",
@@ -16,7 +16,7 @@
     "The added position is total controlled public marketable Treasury holdings at par (adjusted principal for TIPS), acquired and maintained through nominal bills; it is not exactly $500 billion more bills",
     "Every scenario puts the TGA on the operating-cash path at each fiscal-year end, so financing-cost differences change the debt rather than the TGA",
     "Counterfactual funding state: the opening money-fund ON RRP balance is set to the December 2022 peak of total ON RRP, $2,553.7 billion (an upper bound on money-fund use), although money funds held essentially no ON RRP at the 2026 opening",
-    "In this state all money-fund purchases and receipts, not only the added position, settle through ON RRP, so money-fund flows pass nothing through to covered deposits (pass-through 0.0)",
+    "In this state all money-fund purchases and receipts, not only the added position, settle through ON RRP, so money-fund flows pass nothing through to covered deposits (pass-through 0.0); other domestic nonbanks still pay from and are paid into covered deposits",
     "Compare each run with this family's baseline, not with buyer_shift_v1's"
   ],
   "calibration": {
@@ -49,14 +49,13 @@
           [
             "Foreign",
             ""
-          ]
-        ],
-        "unchanged_routes": [
+          ],
           [
             "Private",
             "domestic_nonbank_deposit_funded"
           ]
-        ]
+        ],
+        "unchanged_routes": []
       }
     }
   ]

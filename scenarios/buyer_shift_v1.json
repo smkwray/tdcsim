@@ -21,7 +21,7 @@
   "calibration": {
     "size": "$500 billion, about 1.6 percent of marketable debt at the opening, for every buyer.",
     "timing": "Zero at the 2026-09-30 close, rising linearly to $500 billion at the 2027-09-30 close, held at $500 billion through 2031-09-30.",
-    "displacement": "Donors give up the position in proportion to their realized non-Fed bill holdings in the family baseline at the 2026-09-30 close; for Private the two routes count separately, so Private's share splits between them in their own proportions. In the money-fund case the other Private route is unchanged and banks and foreign holders give up the position.",
+    "displacement": "Every other public holder route gives up the position in proportion to its realized non-Fed bill holdings in the family baseline at the 2026-09-30 close; Private's two routes count separately. In the money-fund case banks, foreign holders and other domestic nonbanks sell, and other domestic nonbanks are paid into covered deposits.",
     "trading": "After the Federal Reserve's operation each day, holders above their target sell nominal bills to holders below it at model dirty prices; each sale is spread across remaining-maturity buckets in proportion to the seller's bills."
   },
   "scenarios": [
@@ -106,14 +106,13 @@
           [
             "Foreign",
             ""
-          ]
-        ],
-        "unchanged_routes": [
+          ],
           [
             "Private",
             "domestic_nonbank_deposit_funded"
           ]
-        ]
+        ],
+        "unchanged_routes": []
       }
     }
   ]

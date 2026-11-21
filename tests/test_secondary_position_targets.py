@@ -12,6 +12,7 @@ the securities and how they pay.
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -180,6 +181,7 @@ def _realized(closure: pd.DataFrame) -> dict[tuple[str, tuple[str, str]], float]
 
 
 BANK_DONORS = [FOREIGN, PRIVATE_DNB, PRIVATE_MMF]
+MMF_DONORS = [BANKS, FOREIGN, PRIVATE_DNB]
 
 
 @pytest.fixture(scope="module")
@@ -252,11 +254,36 @@ def test_donors_give_up_the_position_in_fixed_origin_bill_proportions(bank_case,
         assert realized[(END, donor)] - base[(END, donor)] == pytest.approx(60.0 * weights[donor], abs=TOLERANCE)
 
 
-def test_money_fund_increment_is_all_money_funds_and_other_private_is_unchanged(tmp_path, baseline) -> None:
-    rows, _ = _targets(baseline[2], buyer=PRIVATE_MMF, donors=[BANKS, FOREIGN], size=40.0)
+def test_money_funds_buy_from_other_domestic_nonbanks_too_who_are_paid_into_deposits(tmp_path, baseline) -> None:
+    # The money funds' increment is theirs alone, while other domestic nonbanks sell their
+    # share like any other holder, so Private as a whole gains less than the money funds.
+    rows, weights = _targets(baseline[2], buyer=PRIVATE_MMF, donors=MMF_DONORS, size=40.0)
+    results, _, closure = _scenario(tmp_path, baseline, rows)
+    realized = _realized(closure)
+    base = {(r["date"], (r["holder_type"], r["holder_subbucket"])): r["baseline_stock_bil"] for r in rows}
+    assert weights[PRIVATE_DNB] < 0.0
+    for day in sorted({r["date"] for r in rows if r["date"] >= BUILD_END}):
+        assert realized[(day, PRIVATE_MMF)] - base[(day, PRIVATE_MMF)] == pytest.approx(40.0, abs=TOLERANCE)
+        assert realized[(day, PRIVATE_DNB)] - base[(day, PRIVATE_DNB)] == pytest.approx(
+            40.0 * weights[PRIVATE_DNB], abs=TOLERANCE)
+    # Both Private routes settle in covered deposits here (pass-through 1.0): what the funds
+    # pay the other domestic nonbanks comes back to deposits, so only their purchases from
+    # banks and foreign holders, net, leave them.
+    net = {label: results[f"HolderTargetSoldCash_{label}"] - results[f"HolderTargetBoughtCash_{label}"]
+           for label in ("PrivateDomesticNonbank", "PrivateMMF")}
+    assert net["PrivateDomesticNonbank"].sum() > 0.0
+    assert results["HolderTargetDepositEffect"].to_numpy() == pytest.approx(
+        (net["PrivateDomesticNonbank"] + net["PrivateMMF"]).to_numpy(), abs=1e-9)
+
+
+def test_a_route_declared_unchanged_stays_on_its_baseline_holdings(tmp_path, baseline) -> None:
+    # A route that is neither buyer nor donor keeps exactly its baseline holdings at every
+    # close, even while the routes around it trade.
+    rows, weights = _targets(baseline[2], buyer=PRIVATE_MMF, donors=[BANKS, FOREIGN], size=40.0)
     _, _, closure = _scenario(tmp_path, baseline, rows)
     realized = _realized(closure)
     base = {(r["date"], (r["holder_type"], r["holder_subbucket"])): r["baseline_stock_bil"] for r in rows}
+    assert weights[PRIVATE_DNB] == 0.0
     for day in sorted({r["date"] for r in rows if r["date"] >= BUILD_END}):
         assert realized[(day, PRIVATE_MMF)] - base[(day, PRIVATE_MMF)] == pytest.approx(40.0, abs=TOLERANCE)
         assert realized[(day, PRIVATE_DNB)] - base[(day, PRIVATE_DNB)] == pytest.approx(0.0, abs=TOLERANCE)
@@ -290,7 +317,7 @@ def test_a_redemption_with_no_auction_is_restored_by_a_maintenance_purchase(tmp_
 
 
 def test_federal_reserve_purchases_cannot_leave_a_target_missed(tmp_path, baseline) -> None:
-    rows, _ = _targets(baseline[2], buyer=PRIVATE_MMF, donors=[BANKS, FOREIGN], size=40.0)
+    rows, _ = _targets(baseline[2], buyer=PRIVATE_MMF, donors=MMF_DONORS, size=40.0)
     results, _, closure = _scenario(tmp_path, baseline, rows)
     assert results["CBOFedSecondaryPurchaseFace"].sum() > 0.0
     realized = _realized(closure)
@@ -354,7 +381,7 @@ def test_trc_closes_with_route_states_when_money_funds_pay_from_on_rrp(tmp_path)
     routing = _routing(on_rrp_opening=500.0, on_rrp_share=1.0)
     base_params = _params(tmp_path / "base_inputs", pass_through=0.0, routing=routing)
     base_results, _, closure = _run(base_params, tmp_path / "base")
-    rows, _ = _targets(closure, buyer=PRIVATE_MMF, donors=[BANKS, FOREIGN], size=40.0)
+    rows, _ = _targets(closure, buyer=PRIVATE_MMF, donors=MMF_DONORS, size=40.0)
     params = _params(tmp_path / "inputs", pass_through=0.0, routing=routing)
     params["holder_position_target"] = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows}
     results, _, _ = _run(params, tmp_path / "run")
@@ -375,9 +402,10 @@ def test_trc_closes_with_route_states_when_money_funds_pay_from_on_rrp(tmp_path)
     assert trc["TRC_Cumulative"].iloc[-1] - base_trc["TRC_Cumulative"].iloc[-1] == pytest.approx(
         legacy - (trc[states].iloc[-1] - base_trc[states].iloc[-1]).sum(), abs=1e-9
     )
-    # With no money-fund pass-through, only the deposit-funded route's trades (made when
-    # Federal Reserve purchases move it off its path) reach deposits.
+    # With no money-fund pass-through, only the deposit-funded route's trades reach
+    # deposits: the other domestic nonbanks are paid into deposits for the bills they sell.
     dnb_net = results["HolderTargetSoldCash_PrivateDomesticNonbank"] - results["HolderTargetBoughtCash_PrivateDomesticNonbank"]
+    assert dnb_net.sum() > 0.0
     assert results["HolderTargetDepositEffect"].to_numpy() == pytest.approx(dnb_net.to_numpy(), abs=1e-12)
 
 
@@ -385,7 +413,7 @@ def test_too_little_on_rrp_raises_with_the_route_and_date(tmp_path) -> None:
     routing = _routing(on_rrp_opening=5.0, on_rrp_share=1.0)
     base_params = _params(tmp_path / "base_inputs", pass_through=0.0, routing=routing)
     _, _, closure = _run(base_params, tmp_path / "base")
-    rows, _ = _targets(closure, buyer=PRIVATE_MMF, donors=[BANKS, FOREIGN], size=40.0)
+    rows, _ = _targets(closure, buyer=PRIVATE_MMF, donors=MMF_DONORS, size=40.0)
     params = _params(tmp_path / "inputs", pass_through=0.0, routing=routing)
     params["holder_position_target"] = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows}
     with pytest.raises(TrcRoutingError, match=r"ONRRP_MMF is negative at the 2026-09-2\d"):
@@ -521,7 +549,6 @@ def test_splitting_or_reordering_identical_lots_leaves_the_outcome_unchanged() -
 
 
 def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monkeypatch) -> None:
-    import json
     import sys
 
     import tdcsim_cbo.runner as runner_module
@@ -598,6 +625,19 @@ def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monk
     with pytest.raises(SystemExit, match="baseline reference"):
         (root / "baseline" / "run" / "tdcsim_cbo_run_manifest.json").write_text("{}")
         _case(family, root, "banks", _load(root / "baseline" / "run"), ht)
+
+
+@pytest.mark.parametrize("family", ["buyer_shift_v1", "buyer_shift_onrrp_v1"])
+def test_every_shipped_buyer_takes_its_position_from_every_other_holder(family) -> None:
+    # Each other public holder sells in proportion to its bills, so no route may sit out: a
+    # money-fund buyer buys from other domestic nonbanks as well as banks and foreign holders.
+    spec = json.loads((Path(__file__).resolve().parents[1] / "scenarios" / f"{family}.json").read_text())
+    cases = [item["holder_position_target"] for item in spec["scenarios"] if "holder_position_target" in item]
+    assert cases
+    for case in cases:
+        buyer = (case["buyer_holder"], case["buyer_private_route"])
+        assert case["unchanged_routes"] == []
+        assert sorted(tuple(donor) for donor in case["donors"]) == sorted(set(ht.PARTICIPANTS) - {buyer})
 
 
 # --- Declarations the contract and compiler refuse ---
