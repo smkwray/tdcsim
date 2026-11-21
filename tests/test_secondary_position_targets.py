@@ -82,26 +82,46 @@ def _routing(on_rrp_opening: float = 5_000.0, on_rrp_share: float = 0.0) -> dict
     }
 
 
-def _params(tmp_path: Path, *, pass_through: float = 1.0, routing: dict | None = None, fed: bool = True) -> dict:
+def _params(
+    tmp_path: Path,
+    *,
+    pass_through: float = 1.0,
+    routing: dict | None = None,
+    fed: bool = True,
+    book: list[dict] = OPENING,
+    fed_targets: dict[int, float] | None = None,
+    debt_step: tuple[str, float] | None = None,
+) -> dict:
+    """Engine params for a daily run; ``debt_step`` lowers the debt path by an amount from a date on."""
+
     periods = build_simulation_calendar(START, END, "daily")
+    debt = sum(row["FaceValue"] for row in book)
     paths = _build_temp_forecast_inputs(
         tmp_path,
         periods=periods,
         period_start=START,
-        pre_issuance_controlled_debt_bil=OPENING_DEBT,
-        cbo_public_debt_target_bil=OPENING_DEBT + 125.0,
-        later_fiscal_years={2027: (OPENING_DEBT + 125.0, 0.0)},
+        pre_issuance_controlled_debt_bil=debt,
+        cbo_public_debt_target_bil=debt + 125.0,
+        later_fiscal_years={2027: (debt + 125.0, 0.0)},
     )
+    if debt_step is not None:
+        path = paths["debt_stock_path_file"]
+        frame = pd.read_csv(path, keep_default_na=False)
+        later = frame["period_end"] >= debt_step[0]
+        for column in ("cbo_federal_debt_held_public_target_bil", "marketable_treasury_public_target_bil"):
+            frame.loc[later, column] = frame.loc[later, column].astype(float) - debt_step[1]
+        frame.to_csv(path, index=False)
     if fed:
         paths["fed_holdings_path_file"] = _write_csv(
             tmp_path / "tdcsim_fed_holdings_path.csv",
             build_fed_holdings_path_rows(
                 scenario_id="baseline", periods=periods, opening_state_date=START, opening_cb_holdings_bil=0.0,
-                cbo_fy_end_fed_holdings_bil={2026: 20.0, 2027: 300.0}, observation_date=START, available_date=START,
+                cbo_fy_end_fed_holdings_bil=fed_targets or {2026: 20.0, 2027: 300.0}, observation_date=START,
+                available_date=START,
             ),
         )
-    params = _minimal_engine_params(paths, opening_controlled_debt_bil=OPENING_DEBT)
-    params["initial_bonds_df"] = pd.DataFrame(OPENING, columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES, errors="ignore")
+    params = _minimal_engine_params(paths, opening_controlled_debt_bil=debt)
+    params["initial_bonds_df"] = pd.DataFrame(book, columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES, errors="ignore")
     params["private_mmf_split"] = {"mmf_deposit_pass_through": pass_through}
     params["trc_routing"] = copy.deepcopy(routing or _routing())
     return params
@@ -130,7 +150,7 @@ def baseline(tmp_path_factory):
     root = tmp_path_factory.mktemp("baseline")
     params = _params(root / "inputs")
     results, portfolio, closure = _run(params, root / "run")
-    return params, results, closure
+    return {**params, "_final_portfolio": portfolio}, results, closure
 
 
 def _targets(closure: pd.DataFrame, *, buyer, donors, size: float) -> tuple[list[dict], dict]:
@@ -148,7 +168,8 @@ def _targets(closure: pd.DataFrame, *, buyer, donors, size: float) -> tuple[list
 
 
 def _scenario(tmp_path: Path, baseline, rows: list[dict], **kwargs):
-    params = copy.deepcopy(baseline[0]) if not kwargs else _params(tmp_path / "inputs", **kwargs)
+    params = copy.deepcopy({k: v for k, v in baseline[0].items() if k != "_final_portfolio"}) if not kwargs \
+        else _params(tmp_path / "inputs", **kwargs)
     params["holder_position_target"] = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows}
     return _run(params, tmp_path / "run")
 
@@ -241,13 +262,31 @@ def test_money_fund_increment_is_all_money_funds_and_other_private_is_unchanged(
         assert realized[(day, PRIVATE_DNB)] - base[(day, PRIVATE_DNB)] == pytest.approx(0.0, abs=TOLERANCE)
 
 
-def test_a_redeemed_purchase_is_restored_by_a_maintenance_purchase(bank_case, baseline) -> None:
-    _, _, results, _, _ = bank_case
-    hold = results[results["HolderTargetPhase"] == "hold"]
-    # The banks' purchased bills redeem during the hold; auctions go to Private, so only
-    # secondary purchases can restore the bank target, and they do.
-    assert (hold["HolderTargetBoughtFace_Banks"] > 0.0).any()
-    assert hold["HolderTargetMaxError"].max() <= TOLERANCE
+def test_a_redemption_with_no_auction_is_restored_by_a_maintenance_purchase(tmp_path) -> None:
+    # Foreign's 80 of bills maturing 2026-10-05 are the only securities redeemed that day,
+    # and the debt path steps down by them, so Treasury issues nothing that day. Part of
+    # those bills were sold to banks during the build, so the banks' holdings fall below
+    # target and only a secondary purchase can restore them.
+    day = "2026-10-05"
+    base_params = _params(tmp_path / "base_inputs", debt_step=(day, 80.0))
+    base_results, _, closure = _run(base_params, tmp_path / "base")
+    rows, _ = _targets(closure, buyer=BANKS, donors=BANK_DONORS, size=60.0)
+    params = _params(tmp_path / "inputs", debt_step=(day, 80.0))
+    params["holder_position_target"] = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows}
+    results, portfolio, closure = _run(params, tmp_path / "run")
+    assert base_results.loc[day, "NewDebtIssued"] == 0.0 and results.loc[day, "NewDebtIssued"] == 0.0
+    redeemed_by_banks = float(portfolio.loc[
+        (portfolio["HolderType"] == "Banks") & (portfolio["MaturityDate"] == pd.Timestamp(day)), "FaceValue"
+    ].sum())
+    assert redeemed_by_banks > 1.0
+    assert results.loc[day, "HolderTargetPhase"] == "hold"
+    assert results.loc[day, "HolderTargetPreTradeMaxGap"] == pytest.approx(redeemed_by_banks, rel=1e-9)
+    assert results.loc[day, "HolderTargetBoughtFace_Banks"] == pytest.approx(redeemed_by_banks, rel=1e-9)
+    realized = _realized(closure)
+    for row in rows:
+        if row["date"] == day:
+            participant = (row["holder_type"], row["holder_subbucket"])
+            assert realized[(day, participant)] == pytest.approx(row["target_stock_bil"], abs=TOLERANCE)
 
 
 def test_federal_reserve_purchases_cannot_leave_a_target_missed(tmp_path, baseline) -> None:
@@ -260,6 +299,34 @@ def test_federal_reserve_purchases_cannot_leave_a_target_missed(tmp_path, baseli
 
 
 # --- Settlement and accounting ---
+
+
+def test_trades_settle_at_the_dated_bill_price(tmp_path) -> None:
+    # With a flat 4% curve a bill settles at face / 1.02**(days to maturity / days in the
+    # half-year ending at maturity), the semiannual convention the Fed's trades also use.
+    from dateutil.relativedelta import relativedelta
+
+    from sim_engine import _fed_secondary_dirty_value
+
+    years = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+    day = pd.Timestamp("2026-09-25")
+
+    def price(row, amount):
+        return _fed_secondary_dirty_value(row, amount, day, years, [0.04] * len(years),
+                                          interpolation_method="linear", floor_zero=False)
+
+    gaps = {BANKS: -10.0, FOREIGN: 10.0, PRIVATE_DNB: 0.0, PRIVATE_MMF: 0.0}
+    _, report = ht.rebalance_holder_positions(_book(), gaps, current_date=day, price=price)
+
+    def closed_form(maturity: str, face: float) -> float:
+        end = pd.Timestamp(maturity)
+        start = end - relativedelta(months=6)
+        return face / 1.02 ** ((end - day).days / (end - start).days)
+
+    # The banks hold 60 maturing within a month and 40 in under three months: the sale of
+    # 10 takes 6 and 4.
+    assert report.trade_face == pytest.approx(10.0)
+    assert report.trade_cash == pytest.approx(closed_form("2026-10-02", 6.0) + closed_form("2026-12-15", 4.0), rel=1e-12)
 
 
 def test_trades_settle_at_dirty_prices_while_the_stock_target_is_exact(bank_case) -> None:
@@ -355,6 +422,34 @@ def test_a_holder_above_target_sells_its_excess_rather_than_being_overwritten() 
     assert after_book["FaceValue"].sum() == pytest.approx(total_face)
     moved = after_book[after_book["BondID"] > 12]
     assert set(moved["MaturityCategory"]) == {"bills"}
+
+
+def test_a_transferred_bill_redeems_to_its_new_holder_with_its_issue_discount(bank_case, baseline) -> None:
+    # The money funds' bill maturing 2026-10-01 was partly sold to banks during the build.
+    # At redemption the banks receive that face in reserves, and the money funds' deposits
+    # receive that much less principal and original-issue discount than in the baseline.
+    day, ratio = "2026-10-01", 0.99
+    results, portfolio = bank_case[2], bank_case[3]
+    base_results, base_portfolio = baseline[1], baseline[0]["_final_portfolio"]
+
+    def matured(book, holder, route=""):
+        rows = book[(book["MaturityDate"] == pd.Timestamp(day)) & (book["HolderType"] == holder)]
+        if holder == "Private":
+            rows = rows[rows["HolderSubBucket"] == route]
+        return float(rows["FaceValue"].sum())
+
+    moved = matured(portfolio, "Banks")
+    assert moved > 1.0 and matured(base_portfolio, "Banks") == 0.0
+    assert matured(portfolio, "CB") == pytest.approx(matured(base_portfolio, "CB"), abs=1e-12)
+    assert matured(base_portfolio, "Private", MMF) - matured(portfolio, "Private", MMF) == pytest.approx(moved, rel=1e-12)
+    bought = portfolio[(portfolio["MaturityDate"] == pd.Timestamp(day)) & (portfolio["HolderType"] == "Banks")]
+    assert set(bought["TDCPrincipalHolderType"]) == {"Banks"}
+    assert (bought["IssueProceeds"] / bought["FaceValue"]).to_numpy() == pytest.approx(ratio)
+    principal = results.loc[day, "TDC_PrincipalToDU_MMF"] - base_results.loc[day, "TDC_PrincipalToDU_MMF"]
+    discount = results.loc[day, "TDC_BillDiscountInterestToDU_MMF"] - base_results.loc[day, "TDC_BillDiscountInterestToDU_MMF"]
+    assert principal == pytest.approx(-moved * ratio, rel=1e-9)
+    assert discount == pytest.approx(-moved * (1.0 - ratio), rel=1e-9)
+    assert results.loc[day, "PrincipalPaid_Bonds"] == pytest.approx(base_results.loc[day, "PrincipalPaid_Bonds"], rel=1e-12)
 
 
 def test_redemption_follows_the_new_holder_and_keeps_its_original_issue_discount() -> None:
@@ -560,3 +655,59 @@ def test_a_target_file_that_departs_from_its_declaration_is_refused(baseline) ->
     last["target_stock_bil"] += 0.5
     with pytest.raises(ht.HolderTargetError, match="increment"):
         ht.check_target_rows(tampered, path=path, weights=weights)
+
+
+# --- Representation: the Federal Reserve's purchases, then the targets ---
+
+# Both Private routes hold bills of the same two maturities, so the Fed's earliest-maturity
+# purchases from Private meet equal maturities in two routes, and the controller then
+# restores every route's holdings at maturity-dependent prices.
+TIED = [
+    _security(1, "Private", DNB, "bills", "2026-10-05", 10.0),
+    _security(2, "Private", DNB, "bills", "2027-06-01", 10.0),
+    _security(3, "Private", MMF, "bills", "2026-10-05", 10.0),
+    _security(4, "Private", MMF, "bills", "2027-06-01", 10.0),
+    _security(5, "Banks", "", "bills", "2027-06-01", 20.0),
+    _security(6, "Foreign", "", "bills", "2027-06-01", 20.0),
+]
+
+
+def _split_first_lot(book: list[dict]) -> list[dict]:
+    first, *rest = [dict(row) for row in book]
+    half = dict(first)
+    for column in ("FaceValue", "OriginalPrincipal", "AdjustedPrincipal", "IssueProceeds"):
+        first[column] = half[column] = first[column] / 2.0
+    half["BondID"] = 7
+    return [first, *rest, half]
+
+
+@pytest.mark.parametrize("representation", ["split", "reversed"])
+def test_fed_and_holder_target_are_representation_invariant(tmp_path, representation) -> None:
+    def paired(name: str, book: list[dict]):
+        root = tmp_path / name
+        options = {"book": book, "fed_targets": {2026: 7.5, 2027: 40.0}}
+        base_results, _, closure = _run(_params(root / "base_inputs", **options), root / "base")
+        rows, _ = _targets(closure, buyer=BANKS, donors=BANK_DONORS, size=5.0)
+        params = _params(root / "inputs", **options)
+        params["holder_position_target"] = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows}
+        results, portfolio, _ = _run(params, root / "run")
+        trc, base_trc = results.attrs["trc_results"], base_results.attrs["trc_results"]
+        active = portfolio[portfolio["Status"] == "Active"]
+        holdings = active.groupby(["HolderType", "HolderSubBucket", "SecurityType", "MaturityDate"], dropna=False)[
+            ["FaceValue", "IssueProceeds"]].sum()
+        return {
+            "tdc": float(results["TDC_Change"].sum() - base_results["TDC_Change"].sum()),
+            "trc": float(trc["TRC_Change"].sum() - base_trc["TRC_Change"].sum()),
+            "fed_cash": float(results["CBOFedSecondaryPurchaseCash"].sum() - base_results["CBOFedSecondaryPurchaseCash"].sum()),
+            "target_cash": float(results["HolderTargetTradeCash"].sum()),
+            "routes": results[[f"TDC_SecondaryTrades_{r}" for r in ("DomesticNonbank", "MMF")]].sum().to_numpy(),
+            "holdings": holdings,
+        }
+
+    original = paired("original", TIED)
+    other = paired(representation, _split_first_lot(TIED) if representation == "split" else list(reversed(TIED)))
+    assert original["fed_cash"] != 0.0 or original["target_cash"] > 0.0
+    for key in ("tdc", "trc", "fed_cash", "target_cash"):
+        assert other[key] == pytest.approx(original[key], abs=1e-12), key
+    assert other["routes"] == pytest.approx(original["routes"], abs=1e-12)
+    pd.testing.assert_frame_equal(other["holdings"], original["holdings"], check_exact=False, rtol=1e-12, atol=1e-12)

@@ -97,6 +97,19 @@ def _verified(root: Path, role: str) -> dict[str, Any]:
     return record
 
 
+def _check_hierarchy(role: str, day: str, rows: list[tuple[str, str, str, str, str, float]]) -> None:
+    """Fail unless each decomposition's additive rows, and each parent's "of which" rows, sum to it."""
+
+    values = {(obj, decomposition, name): value for obj, decomposition, _, _, name, value in rows}
+    sums: dict[tuple[str, str, str], float] = {}
+    for obj, decomposition, kind, parent, _, value in rows:
+        if kind != "total":
+            sums[(obj, decomposition, parent)] = sums.get((obj, decomposition, parent), 0.0) + value
+    for key, total in sums.items():
+        if abs(values[key] - total) > TOLERANCE_BIL:
+            raise SystemExit(f"{role}: {key[2]} ({key[1]}) does not equal the sum of its components on {day}")
+
+
 def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], ht: Any) -> dict[str, Any]:
     run_dir = root / role / "run"
     scenario = json.loads((run_dir / "scenario.json").read_text(encoding="utf-8"))
@@ -218,26 +231,34 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
         if abs(residual) > TOLERANCE_BIL or abs(secondary - target_trades - fed) > TOLERANCE_BIL \
                 or abs(trc_residual) > TOLERANCE_BIL:
             raise SystemExit(f"{role}: the cash components or TRC do not reconcile on {day}")
+        # (object, decomposition, row kind, parent, component, value). Additive rows sum to
+        # their decomposition's total; "of which" rows sum to their parent.
         rows_out = [
-            ("tdc", "tdc_change", tdc),
-            ("tdc", "net_other_security_settlements", net_other),
-            ("tdc", "principal_to_deposit_users", principal),
-            ("tdc", "auction_absorption", auction),
-            ("tdc", "secondary_settlements", secondary),
-            ("tdc", "secondary_settlements_target_trades", target_trades),
-            ("tdc", "secondary_settlements_federal_reserve", fed),
-            ("tdc", "treasury_interest_to_deposit_users", interest),
-            *(("tdc", f"treasury_interest_to_deposit_users_{name}", value) for name, value in parts.items()),
-            ("tdc", "fiscal_and_other", fiscal_other),
-            ("tdc", "reconciliation_residual", residual),
-            ("trc", "trc_change", trc_change),
-            *(("trc", f"trc_{name}", diff(trc, base_trc, f"TRC_{name}")) for name in TRC_FAMILIES),
-            ("trc", "holder_routed_reserve_change", legacy),
-            ("trc", "route_held_balance_change", states),
-            ("trc", "reconciliation_residual", trc_residual),
+            ("tdc", "settlement_type", "total", "", "tdc_change", tdc),
+            ("tdc", "settlement_type", "additive", "tdc_change", "net_other_security_settlements", net_other),
+            ("tdc", "settlement_type", "of_which", "net_other_security_settlements", "principal_to_deposit_users", principal),
+            ("tdc", "settlement_type", "of_which", "net_other_security_settlements", "auction_absorption", auction),
+            ("tdc", "settlement_type", "of_which", "net_other_security_settlements", "secondary_settlements", secondary),
+            ("tdc", "settlement_type", "of_which", "secondary_settlements", "secondary_settlements_target_trades", target_trades),
+            ("tdc", "settlement_type", "of_which", "secondary_settlements", "secondary_settlements_federal_reserve", fed),
+            ("tdc", "settlement_type", "additive", "tdc_change", "treasury_interest_to_deposit_users", interest),
+            *(("tdc", "settlement_type", "of_which", "treasury_interest_to_deposit_users",
+               f"treasury_interest_to_deposit_users_{name}", value) for name, value in parts.items()),
+            ("tdc", "settlement_type", "additive", "tdc_change", "fiscal_and_other", fiscal_other),
+            ("tdc", "settlement_type", "additive", "tdc_change", "reconciliation_residual", residual),
+            ("trc", "transaction_family", "total", "", "trc_change", trc_change),
+            *(("trc", "transaction_family", "additive", "trc_change", f"trc_{name}", diff(trc, base_trc, f"TRC_{name}"))
+              for name in TRC_FAMILIES),
+            ("trc", "settlement_account", "total", "", "trc_change", trc_change),
+            ("trc", "settlement_account", "additive", "trc_change", "holder_routed_reserve_change", legacy),
+            ("trc", "settlement_account", "additive", "trc_change", "minus_route_held_balance_change", -states),
+            ("trc", "settlement_account", "additive", "trc_change", "reconciliation_residual", trc_residual),
         ]
+        _check_hierarchy(role, day, rows_out)
         components.extend({"family_id": family["family_id"], "role": role, "date": day, "object": obj,
-                           "component": name, "scenario_minus_baseline_bil": value} for obj, name, value in rows_out)
+                           "decomposition": decomposition, "row_kind": kind, "parent_component": parent,
+                           "component": name, "scenario_minus_baseline_bil": value}
+                          for obj, decomposition, kind, parent, name, value in rows_out)
 
     turnover = []
     for phase in ("build", "hold"):
@@ -256,7 +277,7 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
         turnover.append({
             **common, "holder_type": "all", "holder_subbucket": "",
             "gross_face_bil": gross, "gross_cash_bil": float(rows_phase["HolderTargetTradeCash"].sum()),
-            "net_target_change_bil": net, "maintenance_face_bil": gross - net,
+            "net_target_change_bil": net, "turnover_above_net_target_change_bil": gross - net,
             "trade_days": int((rows_phase["HolderTargetTradeFace"] > 0.0).sum()),
             "lot_splits": int(rows_phase["HolderTargetLotSplits"].sum()),
             "fed_purchase_face_difference_bil": float(
@@ -337,6 +358,35 @@ def main(argv: list[str] | None = None) -> int:
         "stock_basis": "controlled public marketable Treasury holdings at par, adjusted principal for TIPS",
         "readings": "scenario less its own family baseline, cumulative since the origin close, at the end of the build and of the hold",
         "interest_note": "Treasury interest to deposit users is Treasury's payment to covered deposits, including bill discount at redemption; secondary-price effects stay in security settlements",
+        "settlement_note": (
+            "The difference between dated TDC readings is the subsequent net Treasury-attributed cash settlement effect of "
+            "maintaining the complete holdings vector under the stated controller and the synthetic Federal Reserve "
+            "allocation rule. It includes maintenance transactions, changes in Federal Reserve settlements and explicit "
+            "Treasury interest. It is not a measure of earned carry on the additional position or of its terminal market "
+            "value. Unchanged total holdings of a route do not imply unchanged security composition or cash flows."
+        ),
+        "component_equations": {
+            "tdc settlement_type": "tdc_change = net_other_security_settlements + treasury_interest_to_deposit_users + fiscal_and_other + reconciliation_residual",
+            "net_other_security_settlements": "principal_to_deposit_users + auction_absorption + secondary_settlements",
+            "secondary_settlements": "secondary_settlements_target_trades + secondary_settlements_federal_reserve",
+            "treasury_interest_to_deposit_users": "sum of treasury_interest_to_deposit_users_<type>",
+            "trc transaction_family": "trc_change = sum of trc_<family>",
+            "trc settlement_account": "trc_change = holder_routed_reserve_change + minus_route_held_balance_change + reconciliation_residual",
+            "rule": "row_kind additive rows sum to their decomposition's total; of_which rows sum to parent_component; the two TRC decompositions are alternatives and are not summed together",
+        },
+        "turnover_note": (
+            "Gross face is the controller's transfers summed once per transfer. turnover_above_net_target_change_bil is "
+            "gross face less the change in the buyer's target over the phase: during the build it is turnover above the "
+            "net build, not an identification of maintenance intent; during the hold the target is constant, so it is all "
+            "maintenance."
+        ),
+        "allocation_conventions": (
+            "Each seller's sale is spread across remaining-maturity buckets (0-30, 31-91, 92-182 and over 182 days) in "
+            "proportion to its eligible bills, whole lots first in order of maturity, holder route and terms; a seller's "
+            "selected lots are then divided among buyers in the fixed order Banks, Foreign, other domestic nonbanks, money "
+            "funds. The Federal Reserve buys Private first, then Banks, then Foreign, earliest maturity first, with equal "
+            "maturities taken in the same order of holder route and terms."
+        ),
         "families": families,
         "outputs": {name: sha256(args.out_dir / name) for name in names.values()},
     }

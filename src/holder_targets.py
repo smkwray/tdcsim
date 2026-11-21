@@ -210,6 +210,48 @@ def plan_transfers(gaps: Mapping[tuple[str, str], float]) -> list[tuple[tuple[st
     return [(seller, buyer, excess * need / total_need) for seller, excess in sellers for buyer, need in buyers]
 
 
+# Terms that make two lots economically different, in the order they rank lots. Per-face
+# ratios stand in for the quantities a split scales, so the pieces of one lot rank equal and
+# stay adjacent; BondID only breaks ties among lots whose terms all agree.
+_LOT_TERM_COLUMNS = (
+    "MaturityDate", "_route", "TDCPrincipalHolderType", "TDCPrincipalHolderSubBucket", "SecurityType",
+    "CouponRate", "FixedSpread", "IssueDate", "DatedDate", "FirstInterestPaymentDate", "InterestPaymentFrequency",
+    "OriginalMaturityYears", "MaturityCategory", "ReferenceCPI_Issue",
+)
+_LOT_RATIO_COLUMNS = ("IssueProceeds", "OriginalPrincipal", "AdjustedPrincipal", "AccruedInterest_FRN")
+
+
+def economic_lot_order(lots: pd.DataFrame) -> list[Any]:
+    """Row labels of ``lots`` ordered by maturity, holder route and contractual terms.
+
+    The order does not depend on row position or on how a holding is split into lots, so a
+    rule that takes lots in this order treats economically identical books identically.
+    """
+
+    route_rank = {"": 0, **{route: position + 1 for position, route in enumerate(PRIVATE_SUBBUCKETS)}}
+    keys = pd.DataFrame(index=lots.index)
+    keys["MaturityDate"] = pd.to_datetime(lots["MaturityDate"], errors="coerce")
+    holder = lots["HolderType"].fillna("").astype(str)
+    subbucket = lots["HolderSubBucket"].fillna("").astype(str).replace({"<NA>": "", "nan": "", "None": ""})
+    keys["_route"] = [f"{name}|{route_rank.get(route, len(route_rank))}|{route}" for name, route in zip(holder, subbucket)]
+    for column in _LOT_TERM_COLUMNS[2:]:
+        if column not in lots.columns:
+            continue
+        values = lots[column]
+        if column in {"IssueDate", "DatedDate", "FirstInterestPaymentDate"}:
+            keys[column] = pd.to_datetime(values, errors="coerce")
+        elif column in {"CouponRate", "FixedSpread", "InterestPaymentFrequency", "OriginalMaturityYears", "ReferenceCPI_Issue"}:
+            keys[column] = pd.to_numeric(values, errors="coerce")
+        else:
+            keys[column] = values.fillna("").astype(str).replace({"<NA>": "", "nan": "", "None": ""})
+    face = pd.to_numeric(lots["FaceValue"], errors="coerce")
+    for column in _LOT_RATIO_COLUMNS:
+        if column in lots.columns:
+            keys[f"_{column}_per_face"] = (pd.to_numeric(lots[column], errors="coerce") / face).round(12)
+    keys["_bond"] = pd.to_numeric(lots["BondID"], errors="coerce")
+    return list(keys.sort_values(list(keys.columns), kind="mergesort", na_position="last").index)
+
+
 def _bill_lots(portfolio: pd.DataFrame, seller: tuple[str, str], current_date: pd.Timestamp) -> pd.DataFrame:
     holder, route = seller
     security = portfolio["SecurityType"].fillna("").astype(str)
@@ -223,12 +265,12 @@ def _bill_lots(portfolio: pd.DataFrame, seller: tuple[str, str], current_date: p
     face = pd.to_numeric(portfolio["FaceValue"], errors="coerce")
     maturity = pd.to_datetime(portfolio["MaturityDate"], errors="coerce")
     eligible = fixed & category.eq("bills") & (maturity > current_date) & (face > DUST_BIL)
-    lots = portfolio.loc[eligible, ["BondID", "IssueDate", "MaturityDate", "FaceValue"]].copy()
-    lots["FaceValue"] = face[eligible]
+    # The economic order starts with maturity, so it also orders the buckets.
+    lots = portfolio.loc[economic_lot_order(portfolio.loc[eligible]), ["MaturityDate", "FaceValue"]].copy()
+    lots["FaceValue"] = face[lots.index]
     days = (pd.to_datetime(lots["MaturityDate"]) - current_date).dt.days.to_numpy()
     lots["_bucket"] = np.searchsorted(np.asarray(BUCKET_EDGES_DAYS), days, side="left")
-    lots["_bond"] = pd.to_numeric(lots["BondID"], errors="coerce")
-    return lots.sort_values(["_bucket", "MaturityDate", "IssueDate", "_bond"], kind="mergesort")
+    return lots
 
 
 def _select_lots(

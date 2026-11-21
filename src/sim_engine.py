@@ -1732,6 +1732,22 @@ def _format_fed_holder_mix(vector):
     )
 
 
+def _earliest_lot(bond_portfolio, eligible_indices):
+    """The earliest-maturing eligible lot; equal maturities go in a fixed order of route and terms.
+
+    Taking the first such row in frame order would make the Federal Reserve's purchases and
+    sales, and everything downstream, depend on how holdings happen to be split into rows.
+    """
+    maturities = pd.to_datetime(bond_portfolio.loc[eligible_indices, 'MaturityDate'], errors='coerce')
+    earliest = maturities.min()
+    if pd.isna(earliest):
+        raise ValueError('Federal Reserve secondary transfer found no eligible security with a maturity date.')
+    tied = maturities.index[maturities == earliest]
+    if len(tied) == 1:
+        return tied[0]
+    return holder_targets.economic_lot_order(bond_portfolio.loc[tied])[0]
+
+
 def _transfer_public_marketable_debt_to_cb(
     bond_portfolio,
     amount_to_purchase,
@@ -1776,7 +1792,7 @@ def _transfer_public_marketable_debt_to_cb(
             eligible_indices = holder_rows.index[pd.Series(holder_debt_base, index=holder_rows.index) > TGA_FLOOR_TOLERANCE]
             if len(eligible_indices) == 0:
                 continue
-            idx = bond_portfolio.loc[eligible_indices, 'MaturityDate'].idxmin()
+            idx = _earliest_lot(bond_portfolio, eligible_indices)
             break
         if idx is None:
             break
@@ -1888,7 +1904,7 @@ def _transfer_cb_marketable_debt_to_public(
         eligible_indices = cb_rows.index[pd.Series(cb_debt_base, index=cb_rows.index) > TGA_FLOOR_TOLERANCE]
         if len(eligible_indices) == 0:
             break
-        idx = bond_portfolio.loc[eligible_indices, 'MaturityDate'].idxmin()
+        idx = _earliest_lot(bond_portfolio, eligible_indices)
         row = bond_portfolio.loc[idx].copy()
         debt_base = _bond_debt_base(row)
         if debt_base <= TGA_FLOOR_TOLERANCE:

@@ -1691,6 +1691,8 @@ def test_cbo_fed_secondary_purchase_fails_closed_when_security_cannot_be_priced(
     paths["fed_holdings_path_file"] = _write_csv(tmp_path / "tdcsim_fed_holdings_path.csv", fed_rows)
     params = _minimal_engine_params(paths)
     params["initial_bonds_df"].loc[:, "CouponRate"] = float("nan")
+    # Mature it before the day's new bills, so it is the security the Fed must buy first.
+    params["initial_bonds_df"].loc[:, "MaturityDate"] = pd.Timestamp("2027-06-30")
 
     with pytest.raises(ValueError, match="invalid coupon rate"):
         run_simulation(
