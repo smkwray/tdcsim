@@ -1,211 +1,128 @@
 # TDCSim
 
-TDCSim simulates the U.S. Treasury's funding chain: debt issuance, interest and
-principal payments, who holds the debt, and the Treasury's cash balance. For each
-scenario it reports the Treasury Deposit Component (**TDC**), which is the
-Treasury's contribution to bank deposits. It also reports the Treasury's
-contribution to bank reserves, the Treasury General Account (**TGA**), and the
-maturity structure of the debt. Use it to compare scenarios that change issuance,
-holders, interest rates or the fiscal path.
+TDCSim simulates the US Treasury funding chain—debt issuance, interest and principal payments, holder allocations, and the Treasury General Account (TGA)—and writes paths for the Treasury Deposit Component (TDC), bank reserves, debt stocks, financing costs, and weighted-average maturity (WAM). It runs either from a YAML scenario configuration or from a Congressional Budget Office (CBO) baseline package.
 
-## Install and test
+## Data
 
-Python 3.11 or newer, from a source checkout:
+- Configuration runner (`run.py`): needs no external downloads when the opening portfolio is generated or derived from the config. Setting `initial_portfolio.mode` to `file` loads a local CSV or Excel security table.
+- CBO baseline runner (`tdcsim-cbo`): reads a local CBO baseline package and verification JSON built from CBO Budget and Economic Projection workbooks, Treasury Fiscal Data (Monthly Statement of the Public Debt (MSPD), Daily Treasury Statement (DTS), Monthly Treasury Statement (MTS), Treasury auction results, TIPS CPI detail, and FRN daily indexes), New York Fed System Open Market Account (SOMA) holdings, and opening sector shares from WAMEST (derived from the Financial Accounts of the United States (Z.1)).
+- Historical replay (`src/historical_replay.py` and `scripts/build_historical_replay_*.py`): rebuilds quarterly Treasury stocks and flows from local MSPD security detail, Treasury auction results, SOMA holdings, and Z.1 sector holdings.
+
+No API keys are required. Local source data and generated baseline packages are excluded from the repository.
+
+## Install
+
+Requires Python 3.11 or newer. From a source checkout:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt -e .
-python -m pytest -q
 ```
 
-The default suite runs on synthetic fixtures and needs no downloaded data. Two
-further lanes need local inputs or a dedicated memory budget:
-
-```bash
-python -m pytest -q -m integration     # requires local source data; fails if absent
-python -m pytest -q -m memory_stress
-```
-
-## Runners
-
-| Runner | Entry point | Time step | Opening portfolio |
-|---|---|---|---|
-| Configuration | `python run.py CONFIG.yaml` | Weekly by default | Generated, derived from the configuration, or loaded from a file |
-| CBO baseline | `tdcsim-cbo` | Daily | Security-level book built from Treasury and Federal Reserve data |
-| Historical replay | `historical_replay*` modules in `src/` | Quarterly | Treasury's published security history |
+## Usage
 
 ### Configuration runner
 
+Run a YAML scenario file (weekly steps by default):
+
 ```bash
 python run.py tdc_config.yaml
-python run.py tdc_config_optional.yaml   # adds demand elasticities and financing-cost options
+python run.py tdc_config_optional.yaml
 ```
 
-A configuration sets the fiscal path, yield curve, issuance mix, holder
-preferences and dated events, then runs groups of scenarios against each other.
-[scenario_overview.md](scenario_overview.md) describes the shipped comparisons,
-and [optional_feature_scenarios.yaml](examples/optional_feature_scenarios.yaml)
-with [calibration_notes.md](examples/calibration_notes.md) cover the optional
-features. `initial_portfolio.mode` selects the opening stock: `generated` (a
-stylized portfolio), `config_derived` (consistent with the configured curve and
-issuance mix), or `file`. A group writes results only if every scenario in it
-succeeds.
+A configuration defines the fiscal path, yield curve, issuance mix, holder preferences, and dated events across scenario groups. `tdc_config_optional.yaml` exercises TIPS, floating-rate notes (FRNs), rate-sensitive demand, and financing-cost options. A scenario group writes its outputs only when every scenario in the group succeeds. See [scenario_overview.md](scenario_overview.md), [examples/optional_feature_scenarios.yaml](examples/optional_feature_scenarios.yaml), and [examples/calibration_notes.md](examples/calibration_notes.md) for the shipped configurations.
 
 ### CBO baseline runner
 
-The CBO runner takes the Congressional Budget Office (CBO) baseline as its fiscal
-and rate path. It reads a baseline package and attestation, compiles a JSON
-scenario against them, runs it and verifies the outputs:
+Validate, run, and verify a JSON scenario against a local baseline package and verification JSON:
 
 ```bash
-tdcsim-cbo validate --help
-tdcsim-cbo run --help
-tdcsim-cbo verify --help
+tdcsim-cbo validate \
+  --baseline output/cbo_forecast_release_bound_package.zip \
+  --attestation output/cbo_forecast_release_bound_attestation.json \
+  --scenario SCENARIO.json
+
+tdcsim-cbo run \
+  --baseline output/cbo_forecast_release_bound_package.zip \
+  --attestation output/cbo_forecast_release_bound_attestation.json \
+  --scenario SCENARIO.json \
+  --output-dir OUT_DIR
+
+tdcsim-cbo verify \
+  --run-dir OUT_DIR \
+  --baseline output/cbo_forecast_release_bound_package.zip \
+  --attestation output/cbo_forecast_release_bound_attestation.json
 ```
 
-`scripts/run_cbo_forecast_smoke.py` builds the baseline package from CBO's
-workbooks and Treasury data, and runs one full-horizon baseline pass under these
-rules. The pass summary records the debt's drift from CBO's path (final, minimum,
-maximum and at each fiscal-year end); `scripts/verify_cbo_forecast_package.py`
-recomputes it from the pass's results.
+Helper scripts and subcommands:
 
-The [downstream quick start](examples/cbo_downstream_quickstart.md) covers package
-inputs, example scenarios, output files and scenario controls. Each step:
+- `python scripts/run_cbo_forecast_smoke.py`: builds a local baseline package from CBO workbooks and Treasury files and runs one full-horizon baseline pass.
+- `python scripts/verify_cbo_forecast_package.py`: checks the package inputs and recomputes debt drift against CBO's path.
+- `python scripts/write_cbo_example_scenarios.py --baseline PACKAGE.zip --attestation ATTESTATION.json --output-dir DIR`: writes 23 runnable example scenarios.
+- `python src/ratewall_input_builder.py --opening-book-only --help`: rebuilds the opening security book from local MSPD, SOMA, and WAMEST files.
+- `tdcsim-cbo --help`: lists additional subcommands for compiling inputs, exporting forecast state, and comparing policy pairs.
 
-- **Issuance.** Each day the runner decides what the Treasury needs to keep its
-  cash on the operating-cash path (see **Cash**) and settles it on Treasury's
-  calendar: 4-, 8- and 17-week bills on Tuesdays; 6-, 13-, 26- and 52-week bills on
-  Thursdays; 3-, 10- and 30-year securities on the 15th; 2-, 5-, 7- and 20-year
-  notes and bonds, FRNs and TIPS on the last day of the month. A date that is not a
-  Fedwire business day moves to the next one, as Treasury settles. Bills fill toward a target share of outstanding marketable debt: by
-  default the opening book's bill share, and scenarios can set a constant or a
-  dated path. Because bills mature within a year, holding that share takes most
-  gross issuance. The rest is split across notes, bonds, TIPS and FRNs in the
-  shares the public bought at Treasury auctions over the twelve months before the
-  start, and bills are split across 4- to 52-week terms the same way. The package
-  build measures these shares from Treasury's auction results, excluding cash
-  management bills and the Fed's allocations.
-- **Holders of new issuance.** New bills are divided among banks, foreign holders,
-  money market funds (MMFs) and other domestic holders in proportion to their bill
-  holdings in the opening book; other security types follow holdings of longer
-  securities. Scenarios can replace these shares from a chosen date.
-- **Federal Reserve.** Fed holdings follow CBO's projected path. The Fed reaches
-  it by buying or selling existing securities from other holders at market
-  value; it receives no allocation of new issuance.
-- **Payments.** Coupons, principal, floating-rate note (FRN) interest and
-  Treasury Inflation-Protected Securities (TIPS) inflation adjustments are paid
-  on each security's own dates to its current holder.
-- **Cash.** The TGA opens at its Daily Treasury Statement balance. Each day the
-  runner decides the issuance that would bring it to the package's operating-cash
-  path; when receipts lift it above the path, nothing is issued until spending
-  draws it back. Within a year the TGA sits below the path by the issuance decided
-  but still awaiting its settlement date, which can be several hundred billion
-  dollars mid-month; if it would otherwise go negative, pending bills (then, if
-  needed, pending notes and bonds) settle early that day. On September 30 the books
-  close: everything pending settles, whatever the weekday, so the TGA is on the
-  path at each fiscal-year end. A scenario that costs more therefore ends with more debt
-  and the same cash. CBO's debt path is reported alongside, with the scenario's
-  drift from it. Every cash flow is booked on both sides, and a run fails if the
-  TGA goes negative. A scenario can instead hold debt exactly on CBO's path
-  (`cbo_public_debt_target`) or follow that path and borrow only to keep the TGA
-  from going negative (`cbo_debt_reference_plus_tga_floor_financing_v1`).
+The CBO runner steps daily on Treasury's Fedwire settlement calendar: 4-, 8-, and 17-week bills settle on Tuesdays; 6-, 13-, 26-, and 52-week bills on Thursdays; 3-, 10-, and 30-year nominal securities on the 15th; and 2-, 5-, 7-, and 20-year nominal securities, FRNs, and TIPS at month-end, rolling forward to the next Fedwire business day. Pending issuance closes on September 30 each year. By default, issuance targets the package's operating-cash path and fills bills toward a target share of marketable debt while splitting coupon tenors by trailing 12-month non-Fed auction shares; scenarios can also target CBO's public-debt path or a debt-reference path with a TGA floor. Federal Reserve holdings follow CBO's path through secondary-market trades rather than primary auctions, and a run fails if the TGA goes negative. See [examples/cbo_downstream_quickstart.md](examples/cbo_downstream_quickstart.md) for scenario fields and package layout.
 
-**Opening portfolio.** `src/ratewall_input_builder.py` builds the opening book
-from Treasury's Monthly Statement of the Public Debt (MSPD). It takes every
-marketable security outstanding on the record date (about 460 in May 2026) with
-its own coupon and maturity date; the CBO package build adds each TIPS index
-ratio and FRN spread from Treasury data. Federal Reserve holdings come security
-by security from the New York Fed's System Open Market Account (SOMA) holdings.
-The rest of each security is divided among banks, foreign holders, MMFs and other
-domestic holders in proportion to each group's holdings of bills or of longer
-securities, as estimated by [WAMEST](https://github.com/smkwray/wamest) from
-Federal Reserve Financial Accounts (Z.1) and other public data. Securities that mature between the record
-date and the simulation start, including any matured on a weekend record date and
-paid the next business day, are reinvested holder by holder in the Treasury issues
-that settled on their payment dates, in proportion to the amounts accepted at
-auction, so the opening book carries those issues under their own CUSIPs. To rebuild the book from
-local MSPD, SOMA and WAMEST files, run
-`python src/ratewall_input_builder.py --opening-book-only --help`.
+### Reserve routing (TRC)
 
-### Historical replay
+To route settlement events into a daily Treasury component of reserves (TRC) table, pass `--trc-routing PATH` to `tdcsim-cbo run` or add a `trc_routing` block in a YAML config. The routing JSON sets how foreign holders settle, the share of money market fund (MMF) flows settling through the Federal Reserve's overnight reverse repo facility (ON RRP), and opening balances in other Fed accounts.
 
-The replay modules rebuild the historical Treasury stock quarter by quarter from
-MSPD security detail and auction results. They allocate each security to Z.1
-sectors with SOMA holdings fixed by security, accrue FRN and TIPS interest, and
-reconcile sector holdings to Z.1 totals. The forward runners build their own
-opening state as described above.
+## Output
 
-## Accounting
+Configuration runs write weekly CSV tables and plots under `output/`. CBO runs write a run manifest, compiled forecast inputs, and compressed daily tables under `outputs/` (dollar amounts in USD billions, maturities in years).
 
-The simulator decomposes each period's TDC as
+Main files written by a CBO run:
 
-$$TDC_{Change}=TDC_{FiscalFlow}+TDC_{DebtService}+TDC_{AuctionAbsorption}+TDC_{SecondaryTrades}+TDC_{Other}.$$
-
-| Component | Source |
+| File | Description |
 |---|---|
-| `TDC_FiscalFlow` | Spending and receipts other than debt service |
-| `TDC_DebtService` | Interest and principal paid to holders |
-| `TDC_AuctionAbsorption` | Cash paid for new issuance |
-| `TDC_SecondaryTrades` | Modeled trades between holders, including Fed purchases and sales |
-| `TDC_Other` | Other modeled Treasury and central-bank flows |
+| `outputs/results_compact.csv.gz` | Daily simulated macro series, in USD billions and years |
+| `outputs/final_portfolio_compact.csv.gz` | Closing active security book |
+| `outputs/tdcsim_period_tdc_summary.csv.gz` | Period TDC totals and component breakdown, in USD billions |
+| `outputs/tdcsim_scenario_metrics.csv.gz` | Weighted-average maturity, bill share, and short-maturity share |
+| `outputs/summary.json` | Run summary metrics |
 
-The decomposition is checked row by row. Each flow is attributed to the account
-debited or credited at settlement. **DU** is the deposit perimeter: deposit
-claims of domestic nonbank holders. **RS** is the rest of the settlement system.
-Holders are banks, the Federal Reserve (`CB`), foreign holders and private
-holders. Private holdings are split into domestic nonbanks and MMFs, and MMF
-flows reach deposits at a pass-through rate that defaults to 0.97. Bills settle
-at cash proceeds; TIPS and FRNs follow their own indexation and payment rules.
+Event-level issuance, redemption, interest, holder-stock, debt-bridge, and optional reserve-routing tables are written in the same `outputs/` directory.
 
-**Treasury component of reserves (TRC).** The same events can also be routed to
-bank reserves. Enable this with `trc_routing` in a configuration or
-`--trc-routing PATH` in the CBO runner. The routing file declares how foreign
-holders settle, the share of MMF flows that settles through the Fed's overnight
-reverse repo facility (ON RRP), and opening balances in other Fed accounts. A
-daily ledger checks that the routes close. Results are written to
-`tdcsim_trc_results` and `tdcsim_trc_metadata.json`.
+Core columns in the daily results table:
 
-## Outputs
-
-Configuration runs write CSVs and plots under `output/`. CBO runs write a
-manifest, compiled inputs, daily results, the final portfolio, issuance, principal
-and payment flow tables, and verification records to the run directory.
-
-| Column | Meaning |
+| Column | Description |
 |---|---|
-| `TDC_Change` | Period TDC |
-| `TDC_Level` | Opening level plus cumulative TDC |
-| `TGA` | Treasury General Account balance |
-| `TotalDebt_Agg` | Outstanding modeled debt |
-| `FinancingCost_Cumulative` | Cumulative financing cost |
-| `WAM` | Weighted-average maturity of the outstanding debt |
-| `DebtHeld_*` | Holdings by holder |
+| `TDC_Change` | Period TDC flow, in USD billions |
+| `TDC_Level` | Cumulative TDC, in USD billions |
+| `TGA` | Treasury General Account balance, in USD billions |
+| `TotalDebt_Agg` | Total modeled Treasury debt outstanding, in USD billions |
+| `FinancingCost_Cumulative` | Cumulative financing cost, in USD billions |
+| `WAM` | Weighted-average maturity of modeled debt, in years |
 
-`Reserves` is an older series that routes reserve effects by holder; TRC
-supersedes it. Columns containing `ru_flow` hold RS flows.
+Each period's TDC equals the sum of fiscal flows, debt service, primary auction absorption, secondary trading, and other flows, attributed by the account debited or credited at settlement (domestic nonbank deposits versus banks, the Federal Reserve, Treasury, and foreign accounts). The base reserve series routes reserve effects by holder; enabling TRC routing routes them by settlement account and checks daily closure against Fed nonreserve balances.
 
-## Model assumptions
+## Limits
 
-- Yield curves are inputs. A change in holders or issuance moves rates only when
-  the scenario also changes the curve.
-- CBO net interest and CBO's debt path are reported for comparison. By default
-  issuance follows the Treasury's cash need.
-- The configuration runner's secondary trading reallocates holdings toward
-  configured holder preferences once per step.
-- TIPS inflation accretion enters financing cost when
-  `financing_cost_options.include_tips_inflation_accretion` is on.
+- Yield curves are exogenous inputs. Changing issuance or holder mix changes rates only when the scenario also supplies a different curve.
+- Outputs are accounting-consistent scenario paths rather than causal estimates or forecasts.
+- Private holdings split into domestic nonbanks and MMFs, with MMF deposit pass-through defaulting to 0.97 unless overridden.
+- TIPS inflation accretion enters cumulative financing cost by default in the CBO runner and is turned off in `tdc_config_optional.yaml`.
+- In the configuration runner, secondary trading can reallocate holdings toward configured holder preferences once per step.
 
-## Related projects
+## Tests
 
-- [RateWall](https://github.com/smkwray/ratewall) consumes verified CBO-runner
-  exports.
-- [WAMEST](https://github.com/smkwray/wamest) estimates the maturity mix of
-  Treasury holdings by sector and supplies the opening holder split.
-- [TDCest](https://github.com/smkwray/tdcest) measures the TDC from public data.
-- [EA-TDC](https://github.com/smkwray/ea-tdc) projects deposits conditional on
-  the TDC.
+The default suite runs offline on synthetic fixtures:
+
+```bash
+python -m pytest -q
+```
+
+Two optional pytest markers cover local-data and memory checks:
+
+```bash
+python -m pytest -q -m integration
+python -m pytest -q -m memory_stress
+```
+
+`integration` requires local source or generated inputs and fails if they are absent.
 
 ## License
 
-[MIT](LICENSE)
+MIT ([LICENSE](LICENSE)).
