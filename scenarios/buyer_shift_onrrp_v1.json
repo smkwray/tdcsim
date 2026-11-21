@@ -1,0 +1,63 @@
+{
+  "schema_version": "tdcsim_scenario_family_spec_v1",
+  "family_id": "buyer_shift_onrrp_v1",
+  "as_of_date": "2026-11-21",
+  "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
+  "simulation": {
+    "start_date": "2026-06-21",
+    "end_date": "2031-09-30"
+  },
+  "description": "Companion to buyer_shift_v1 in a funding state where money funds hold ON RRP balances and settle every purchase and receipt through them. Money funds acquire the same $500 billion of Treasury holdings, built over fiscal year 2027 and held through September 2031, from banks and foreign holders in fixed proportions to their bill holdings at this family baseline's 2026-09-30 close; other domestic nonbanks are unchanged.",
+  "boundaries": [
+    "Illustrative scenario accounting, not a forecast or causal estimate",
+    "The $500 billion size is a stated assumption, equal across buyers so their effects can be compared, not an estimated demand response",
+    "Treasury issuance, yields and the fiscal path are the baseline's: every difference comes from who holds the securities and how they pay and are paid",
+    "Positions are exact at each daily period close, after the Federal Reserve's operation; this is a model clock, not literal market execution on every calendar day",
+    "The added position is total controlled public marketable Treasury holdings at par (adjusted principal for TIPS), acquired and maintained through nominal bills; it is not exactly $500 billion more bills",
+    "Every scenario puts the TGA on the operating-cash path at each fiscal-year end, so financing-cost differences change the debt rather than the TGA",
+    "Counterfactual funding state: the opening money-fund ON RRP balance is set to the December 2022 peak of total ON RRP, $2,553.7 billion (an upper bound on money-fund use), although money funds held essentially no ON RRP at the 2026 opening",
+    "In this state all money-fund purchases and receipts, not only the added position, settle through ON RRP, so money-fund flows pass nothing through to covered deposits (pass-through 0.0)",
+    "Compare each run with this family's baseline, not with buyer_shift_v1's"
+  ],
+  "calibration": {
+    "size": "Same $500 billion position, timing and displacement rule as buyer_shift_v1.",
+    "funding_state": "Money-fund deposit pass-through 0 and the trc_routing_onrrp_available_v1.json routing (money-fund ON RRP share 1, opening balance from FRED RRPONTSYD on 2022-12-30)."
+  },
+  "scenarios": [
+    {
+      "role": "baseline",
+      "scenario_id": "tdcsim_buyer_shift_onrrp_v1_baseline",
+      "label": "ON RRP-funded money-fund baseline",
+      "mmf_deposit_pass_through": 0.0
+    },
+    {
+      "role": "mmf_onrrp",
+      "scenario_id": "tdcsim_buyer_shift_onrrp_v1_mmf_onrrp",
+      "label": "Money funds hold $500 billion more Treasury securities, paid from ON RRP",
+      "mmf_deposit_pass_through": 0.0,
+      "holder_position_target": {
+        "buyer_holder": "Private",
+        "buyer_private_route": "mmf_cash_fund_route",
+        "size_bil": 500.0,
+        "origin": "2026-09-30",
+        "build_end": "2027-09-30",
+        "donors": [
+          [
+            "Banks",
+            ""
+          ],
+          [
+            "Foreign",
+            ""
+          ]
+        ],
+        "unchanged_routes": [
+          [
+            "Private",
+            "domestic_nonbank_deposit_funded"
+          ]
+        ]
+      }
+    }
+  ]
+}

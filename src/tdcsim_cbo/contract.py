@@ -8,6 +8,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Mapping
 
+import holder_targets
 from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     OPEN04_OUTPUT_CONTRACT,
@@ -170,6 +171,8 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
             _validate_by_mode(name, override, mode, {"official_cbo_baseline": (("role",), ())})
         elif name == "mmf_deposit_pass_through":
             _validate_by_mode(name, override, mode, {"fixed_fraction": (("value",), ())})
+        elif name == "holder_position_target":
+            _validate_holder_position_target(data, override)
         elif name == "issuance_mix":
             _validate_by_mode(
                 name,
@@ -184,6 +187,20 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
                 },
             )
     _validate_open04_evaluated_nominal_contract(data, overrides)
+
+
+def _validate_holder_position_target(data: Mapping[str, Any], override: Mapping[str, Any]) -> None:
+    try:
+        path = holder_targets.BuildAndHoldPath.from_points(list(override.get("target_path") or []))
+        holder_targets.declared_weights(override)
+    except (holder_targets.HolderTargetError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"scenario.overrides.holder_position_target: {exc}") from exc
+    simulation = data.get("simulation")
+    if not isinstance(simulation, Mapping) or str(simulation.get("end_date") or "") != path.hold_through.date().isoformat():
+        raise ValueError(
+            "scenario.overrides.holder_position_target: the scenario must declare a simulation "
+            "interval that ends on the last hold date"
+        )
 
 
 def _nominal_curve_fields() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:

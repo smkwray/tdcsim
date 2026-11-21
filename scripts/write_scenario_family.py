@@ -8,16 +8,21 @@ bill-share target by dated changes from the package's opening bill share, and
 may name the holders whose bill holdings absorb that change (the others keep
 their baseline bill holdings in dollars). A scenario may give one buyer a dollar
 amount of added bill holdings, built evenly over a window and held after it, or
-add a dollar ramp to the Federal Reserve's holdings path. A scenario may also impose a
+add a dollar ramp to the Federal Reserve's holdings path. A scenario may instead hold a
+buyer's realized Treasury holdings a stated dollar amount above the family baseline's,
+built evenly over a window and held after it, with named donors giving up the position in
+fixed proportions to their bill holdings at the window's start; the targets are read from
+the completed baseline run, so these scenarios are written in a later phase. A family may
+declare its simulation interval. A scenario may also impose a
 nominal curve shift: either a constant key-rate shock, or a dated rate path
 derived from a completed quantity-only run of the family, in which the 10-year
 shift at each curve date is proportional to the shifted holder's shortfall as a
 share of marketable debt at that date. Baseline shares and curves are read from
 the release-bound baseline package or the family's own runs, never restated here.
 
-``--phase quantity`` writes the scenarios without a rate path; ``--phase rates``
-writes the rate-path scenarios into the same directory once their source runs
-have completed.
+``--phase quantity`` writes the scenarios that need no completed run; ``--phase rates``
+writes the rate-path scenarios, and ``--phase positions`` the holder-target scenarios,
+into the same directory once the runs they are derived from have completed.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ for path in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import holder_targets as ht  # noqa: E402
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
 from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS  # noqa: E402
@@ -52,12 +58,20 @@ DEBT_STOCK_FILE = "tdcsim_debt_stock_path.csv"
 ITEM_KEYS = frozenset({
     "role", "scenario_id", "label", "notes", "holder_shift", "bill_share_change", "bill_holder_shift",
     "bill_buyer_shift", "fed_holdings_change", "key_rate_shocks_bp", "rate_path", "mmf_deposit_pass_through",
+    "holder_position_target",
 })
 SUBKEYS = {
     "bill_holder_shift": frozenset({"absorbers"}),
     "bill_buyer_shift": frozenset({"holder", "size_bil", "build", "private_route"}),
     "fed_holdings_change": frozenset({"size_bil", "build"}),
+    "holder_position_target": frozenset({
+        "buyer_holder", "buyer_private_route", "size_bil", "origin", "build_end", "donors", "unchanged_routes",
+    }),
 }
+PHASES = ("quantity", "rates", "positions")
+STOCK_CLOSURE = Path("outputs/tdcsim_period_stock_closure.csv.gz")
+RUN_MANIFEST = "tdcsim_cbo_run_manifest.json"
+HOLDER_TARGET_TOLERANCE_BIL = 0.000001
 SHARE_TOLERANCE = 1.0e-12
 CURVE_SURFACE = Path("compile/compiled/forecast_inputs/tdcsim_yield_curve_surface.csv")
 RESULTS = Path("outputs/results_compact.csv.gz")
@@ -451,6 +465,82 @@ def _write_rate_path(item: dict[str, Any], runs_root: Path, output_dir: Path) ->
     }
 
 
+def _route(value: Any) -> tuple[str, str]:
+    holder, route = value
+    return str(holder), str(route or "")
+
+
+def _item_phase(item: dict[str, Any]) -> str:
+    if item.get("holder_position_target"):
+        return "positions"
+    return "rates" if item.get("rate_path") else "quantity"
+
+
+def _write_holder_target(
+    item: dict[str, Any], simulation: dict[str, str], runs_root: Path, output_dir: Path
+) -> dict[str, Any]:
+    """Target file and override for a buyer held above the family baseline's realized holdings."""
+
+    spec = item["holder_position_target"]
+    run = runs_root / "baseline" / "run"
+    closure_path = run / STOCK_CLOSURE
+    closure = pd.read_csv(closure_path, keep_default_na=False, float_precision="round_trip")
+    origin = str(spec["origin"])
+    bills = ht.closing_holder_stocks(closure, bills_only=True)
+    bills = bills[bills["period_end"] == origin]
+    if bills.empty:
+        raise ValueError(f"{item['role']}: the baseline has no close on {origin}")
+    origin_bills = {(r.holder_sector, r.holder_subsector): float(r.closing_stock_bil) for r in bills.itertuples()}
+    buyer = (str(spec["buyer_holder"]), str(spec.get("buyer_private_route") or ""))
+    donors = [_route(value) for value in spec["donors"]]
+    unchanged = [_route(value) for value in spec["unchanged_routes"]]
+    weights = ht.displacement_weights(origin_bills, buyer=buyer, donors=donors)
+    target_path = [
+        {"date": origin, "increment_bil": 0.0},
+        {"date": str(spec["build_end"]), "increment_bil": float(spec["size_bil"])},
+        {"date": str(simulation["end_date"]), "increment_bil": float(spec["size_bil"])},
+    ]
+    rows = ht.target_rows(
+        ht.closing_holder_stocks(closure), path=ht.BuildAndHoldPath.from_points(target_path), weights=weights
+    )
+    name = f"{item['role']}_holder_position_target.csv"
+    with (output_dir / name).open("x", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(ht.TARGET_FILE_COLUMNS), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(
+            {key: repr(value) if isinstance(value, float) else value for key, value in row.items()} for row in rows
+        )
+    baseline_scenario = json.loads((run / "scenario.json").read_text(encoding="utf-8"))
+    return {
+        "mode": ht.HOLDER_TARGET_MODE,
+        "buyer_holder": buyer[0],
+        "buyer_private_route": buyer[1],
+        "target_path": target_path,
+        "interpolation": "linear_build_then_constant",
+        "target_scope": "controlled_public_marketable",
+        "quantity_basis": "par_or_adjusted_principal",
+        "acquisition_market": "secondary",
+        "eligible_instruments": "nominal_bills",
+        "rebalance_timing": "after_fed_target_operation_before_period_close",
+        "baseline_reference": {
+            "scenario_id": str(baseline_scenario["scenario_id"]),
+            "scenario_sha256": canonical_json_sha256(baseline_scenario),
+            "run_manifest_sha256": sha256_file(run / RUN_MANIFEST),
+            "stock_closure_sha256": sha256_file(closure_path),
+        },
+        "displacement_rule": "fixed_bill_stock_proportions_at_origin",
+        "displacement": [
+            {"holder_type": d[0], "holder_subbucket": d[1], "origin_bill_stock_bil": origin_bills[d], "weight": weights[d]}
+            for d in donors
+        ],
+        "unchanged_routes": [{"holder_type": u[0], "holder_subbucket": u[1]} for u in unchanged],
+        "allow_maintenance_sales": True,
+        "target_tolerance_bil": HOLDER_TARGET_TOLERANCE_BIL,
+        "on_infeasible": "error",
+        "file": {"relative_path": name, "sha256": sha256_file(output_dir / name), "media_type": "text/csv"},
+    }
+
+
 def family_scenarios(
     baseline: CboBaselinePackage,
     family: dict[str, Any],
@@ -461,8 +551,11 @@ def family_scenarios(
 ) -> dict[str, dict[str, Any]]:
     if family.get("schema_version") != FAMILY_SPEC_SCHEMA:
         raise ValueError(f"family spec must declare {FAMILY_SPEC_SCHEMA}")
-    if phase not in {"quantity", "rates"}:
-        raise ValueError("phase must be quantity or rates")
+    if phase not in PHASES:
+        raise ValueError(f"phase must be one of {list(PHASES)}")
+    simulation = family.get("simulation")
+    if simulation is not None and set(simulation) != {"start_date", "end_date"}:
+        raise ValueError("a family simulation interval names exactly start_date and end_date")
     for item in family["scenarios"]:
         unknown = set(item) - ITEM_KEYS
         if unknown:
@@ -474,7 +567,7 @@ def family_scenarios(
     base_bill_share = None
     scenarios: dict[str, dict[str, Any]] = {}
     for index, item in enumerate(family["scenarios"]):
-        if bool(item.get("rate_path")) != (phase == "rates"):
+        if _item_phase(item) != phase:
             continue
         overrides: dict[str, Any] = {}
         shift = item.get("holder_shift")
@@ -528,6 +621,15 @@ def family_scenarios(
                 "mode": "fixed_fraction",
                 "value": float(item["mmf_deposit_pass_through"]),
             }
+        if item.get("holder_position_target"):
+            if shift or "holder_preferences" in overrides or item.get("fed_holdings_change"):
+                raise ValueError(f"{item['role']}: a holder position target is the scenario's only holdings change")
+            if runs_root is None or output_dir is None or simulation is None:
+                raise ValueError(
+                    f"{item['role']}: a holder position target needs the baseline run, an output directory "
+                    "and the family's simulation interval"
+                )
+            overrides["holder_position_target"] = _write_holder_target(item, simulation, runs_root, output_dir)
         if item.get("fed_holdings_change"):
             if output_dir is None:
                 raise ValueError(f"{item['role']}: a Fed holdings change needs an output directory")
@@ -555,7 +657,7 @@ def family_scenarios(
             baseline,
             scenario_id=str(item["scenario_id"]),
             label=str(item["label"]),
-            simulation=None,
+            simulation={"frequency": "daily", **simulation} if simulation else None,
             coupling=_baseline_coupling(),
             overrides=overrides,
         )
@@ -581,8 +683,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--attestation", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--phase", choices=("quantity", "rates"), default="quantity")
-    parser.add_argument("--runs-root", type=Path, help="completed family runs (rates phase)")
+    parser.add_argument("--phase", choices=PHASES, default="quantity")
+    parser.add_argument("--runs-root", type=Path, help="completed family runs (rates and positions phases)")
     args = parser.parse_args(argv)
     family = json.loads(args.family_spec.read_text(encoding="utf-8"))
     baseline = CboBaselinePackage.open(args.baseline, attestation_path=args.attestation)
@@ -591,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"output directory already exists: {args.output_dir}")
         args.output_dir.mkdir(parents=True)
     elif not args.output_dir.is_dir() or args.runs_root is None:
-        raise SystemExit("the rates phase writes into the quantity directory and needs --runs-root")
+        raise SystemExit("the rates and positions phases write into the quantity directory and need --runs-root")
     written = family_scenarios(
         baseline, family, phase=args.phase, runs_root=args.runs_root, output_dir=args.output_dir
     )

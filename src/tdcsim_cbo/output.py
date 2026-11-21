@@ -12,6 +12,8 @@ from typing import Any
 
 import pandas as pd
 
+import holder_targets
+
 from ._json import sha256_file, write_json
 
 
@@ -125,6 +127,9 @@ BOUNDED_SUMMARY_COLUMNS = [
     "TDC_SecondaryTrades_MMFPlumbing",
     "CBOBuybackFaceRetired",
     "CBOBuybackCashPaid",
+    # Present only in runs that hold positions on a target.
+    holder_targets.PHASE_COLUMN,
+    *holder_targets.RESULT_COLUMNS,
 ]
 
 COMMON_METADATA_COLUMNS = [

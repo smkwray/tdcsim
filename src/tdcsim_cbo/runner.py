@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -67,6 +68,8 @@ from .compiler import (
     CboCompiledScenario,
     CboScenarioCompiler,
     HOLDER_PREFERENCE_EVENTS_FILE,
+    HOLDER_TARGET_FILE,
+    HOLDER_TARGET_SPEC_FILE,
     RUNTIME_ASSUMPTIONS_FILE,
     _open04_simulation_contract,
 )
@@ -817,6 +820,7 @@ def build_runtime_params(
     initial_values = _opening_runtime_initial_values(inputs, base_tga=base_tga)
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
     holder_events = _holder_preference_events(inputs / HOLDER_PREFERENCE_EVENTS_FILE)
+    holder_target = _holder_position_target(inputs)
     try:
         evaluated_nominal_shock, evaluated_nominal_contract = (
             load_compiled_evaluated_nominal_contract(inputs)
@@ -859,7 +863,7 @@ def build_runtime_params(
                 "evaluated_nominal_contract": evaluated_nominal_contract,
             }
         )
-    return {
+    params = {
         "initial_values": initial_values,
         "tga_params": {"target_balance": base_tga, "floor": -1e15},
         "fiscal_params": {
@@ -910,6 +914,35 @@ def build_runtime_params(
         },
         "fiscal_incidence_policy": fiscal_incidence_policy,
         "budget_interest": {"cbo_comparison_role": "nonbinding_validation_check"},
+    }
+    if holder_target is not None:
+        params["holder_position_target"] = holder_target
+    return params
+
+
+def _holder_position_target(inputs: Path) -> dict[str, Any] | None:
+    """The compiled holder position target, or None when the scenario declares none."""
+
+    spec_path = inputs / HOLDER_TARGET_SPEC_FILE
+    if not spec_path.exists():
+        if (inputs / HOLDER_TARGET_FILE).exists():
+            raise RunnerError("compiled holder position target file has no declaration")
+        return None
+    payload = read_json(spec_path)
+    if not isinstance(payload, Mapping) or payload.get("target_file") != HOLDER_TARGET_FILE:
+        raise RunnerError("compiled holder position target declaration is malformed")
+    target_path = inputs / HOLDER_TARGET_FILE
+    if sha256_file(target_path) != payload.get("target_file_sha256"):
+        raise RunnerError("compiled holder position target file does not match its declaration")
+    declaration = payload.get("declaration")
+    if not isinstance(declaration, Mapping):
+        raise RunnerError("compiled holder position target declaration is malformed")
+    with target_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    return {
+        "mode": declaration["mode"],
+        "tolerance_bil": float(declaration["target_tolerance_bil"]),
+        "rows": rows,
     }
 
 

@@ -27,6 +27,17 @@ SECURITY_TYPES = ['Fixed', 'TIPS', 'FRN', 'NonMarketable']
 # security type is one edit here rather than an edit plus a hunt for parallel copies.
 PUBLIC_MARKETABLE_SECURITY_TYPES = frozenset(SECURITY_TYPES) - {'NonMarketable'}
 MATURITY_CATEGORIES = ['bills', 'notes', 'bonds']
+# Quantities that scale with the share of a lot moved when a secondary transfer splits it.
+TRANSFER_SCALABLE_COLUMNS = (
+    'FaceValue',
+    'OriginalPrincipal',
+    'AdjustedPrincipal',
+    'AccruedInterest_FRN',
+    'IssueProceeds',
+    'CleanPrice',
+    'AccruedInterest',
+    'DirtyValue',
+)
 MARKETABLE_PREFERENCE_CATEGORIES = ('bills', 'notes', 'bonds', 'tips', 'frn')
 PREFERENCE_CATEGORIES = [*MARKETABLE_PREFERENCE_CATEGORIES, 'nonmarketable']
 PRIVATE_SUBBUCKET_DOMESTIC_NONBANK = 'domestic_nonbank_deposit_funded'

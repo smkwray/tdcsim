@@ -221,6 +221,9 @@
         },
         "mmf_deposit_pass_through": {
           "$ref": "#/$defs/mmfDepositPassThroughOverride"
+        },
+        "holder_position_target": {
+          "$ref": "#/$defs/holderPositionTargetOverride"
         }
       }
     },
@@ -1908,6 +1911,201 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1
+        }
+      }
+    },
+    "holderPositionTargetOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "buyer_holder",
+        "buyer_private_route",
+        "target_path",
+        "interpolation",
+        "target_scope",
+        "quantity_basis",
+        "acquisition_market",
+        "eligible_instruments",
+        "rebalance_timing",
+        "baseline_reference",
+        "displacement_rule",
+        "displacement",
+        "unchanged_routes",
+        "allow_maintenance_sales",
+        "target_tolerance_bil",
+        "on_infeasible",
+        "file"
+      ],
+      "properties": {
+        "mode": {
+          "const": "baseline_relative_stock_v1"
+        },
+        "buyer_holder": {
+          "enum": [
+            "Banks",
+            "Foreign",
+            "Private"
+          ]
+        },
+        "buyer_private_route": {
+          "enum": [
+            "",
+            "domestic_nonbank_deposit_funded",
+            "mmf_cash_fund_route"
+          ]
+        },
+        "target_path": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "date",
+              "increment_bil"
+            ],
+            "properties": {
+              "date": {
+                "type": "string",
+                "format": "date"
+              },
+              "increment_bil": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "interpolation": {
+          "const": "linear_build_then_constant"
+        },
+        "target_scope": {
+          "const": "controlled_public_marketable"
+        },
+        "quantity_basis": {
+          "const": "par_or_adjusted_principal"
+        },
+        "acquisition_market": {
+          "const": "secondary"
+        },
+        "eligible_instruments": {
+          "const": "nominal_bills"
+        },
+        "rebalance_timing": {
+          "const": "after_fed_target_operation_before_period_close"
+        },
+        "baseline_reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scenario_id",
+            "scenario_sha256",
+            "run_manifest_sha256",
+            "stock_closure_sha256"
+          ],
+          "properties": {
+            "scenario_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "scenario_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "run_manifest_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "stock_closure_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "displacement_rule": {
+          "const": "fixed_bill_stock_proportions_at_origin"
+        },
+        "displacement": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "holder_type",
+              "holder_subbucket",
+              "origin_bill_stock_bil",
+              "weight"
+            ],
+            "properties": {
+              "holder_type": {
+                "enum": [
+                  "Banks",
+                  "Foreign",
+                  "Private"
+                ]
+              },
+              "holder_subbucket": {
+                "enum": [
+                  "",
+                  "domestic_nonbank_deposit_funded",
+                  "mmf_cash_fund_route"
+                ]
+              },
+              "origin_bill_stock_bil": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "weight": {
+                "type": "number",
+                "minimum": -1,
+                "exclusiveMaximum": 0
+              }
+            }
+          }
+        },
+        "unchanged_routes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "holder_type",
+              "holder_subbucket"
+            ],
+            "properties": {
+              "holder_type": {
+                "enum": [
+                  "Banks",
+                  "Foreign",
+                  "Private"
+                ]
+              },
+              "holder_subbucket": {
+                "enum": [
+                  "",
+                  "domestic_nonbank_deposit_funded",
+                  "mmf_cash_fund_route"
+                ]
+              }
+            }
+          }
+        },
+        "allow_maintenance_sales": {
+          "const": true
+        },
+        "target_tolerance_bil": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 0.001
+        },
+        "on_infeasible": {
+          "const": "error"
+        },
+        "file": {
+          "$ref": "#/$defs/fileRef"
         }
       }
     }

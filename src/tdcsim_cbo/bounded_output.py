@@ -32,6 +32,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import pandas as pd
 
+import holder_targets
 from tdc_shared import (
     HOLDER_TYPES,
     INTRAGOV_HOLDERS,
@@ -170,6 +171,10 @@ _JOURNAL_CORE_ARCHETYPES = frozenset(
                 ("fed_secondary_transfer", "fed_secondary_purchase"),
                 ("fed_secondary_transfer", "fed_secondary_sale"),
                 ("preference_secondary_transfer", "generic_secondary_trading"),
+                *(
+                    (holder_targets.TRANSFER_EVENT_TYPE, scope)
+                    for scope in holder_targets.SETTLEMENT_SCOPES.values()
+                ),
             )
             for leg, basis in (
                 ("transfer_in", "beneficial_holder_stock_transfer"),
@@ -249,6 +254,15 @@ _JOURNAL_CORE_ARCHETYPES = frozenset(
             "secondary_trade_settlement",
             "treasury_cash_reserve_deposit",
             "generic_secondary_trading",
+        ),
+        *(
+            (
+                "settlement",
+                holder_targets.SETTLEMENT_LEG,
+                "reserve_and_deposit_settlement",
+                scope,
+            )
+            for scope in holder_targets.SETTLEMENT_SCOPES.values()
         ),
         (
             "transfer",

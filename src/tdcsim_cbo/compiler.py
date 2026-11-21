@@ -16,6 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+import holder_targets
 from evaluated_nominal_curve import (
     NOMINAL_EVALUATED_SHOCK_FILE,
     OPEN04_OUTPUT_CONTRACT,
@@ -69,6 +70,8 @@ FORECAST_INPUTS = "forecast_inputs"
 COMPILED_MANIFEST = "tdcsim_cbo_compiled_manifest.json"
 ISSUANCE_MIX_FILE = "tdcsim_issuance_mix_assumptions.json"
 HOLDER_PREFERENCE_EVENTS_FILE = "tdcsim_holder_preference_events.json"
+HOLDER_TARGET_FILE = "tdcsim_holder_position_target.csv"
+HOLDER_TARGET_SPEC_FILE = "tdcsim_holder_position_target.json"
 RUNTIME_ASSUMPTIONS_FILE = "tdcsim_runtime_assumptions.json"
 OPENING_RUNTIME_STATE_FILE = "tdcsim_opening_runtime_state.json"
 OPEN04_ALLOWED_MATERIALIZED_DEFAULTS = frozenset(
@@ -882,6 +885,34 @@ def _apply_overrides(
             _write_issuance_mix(forecast_inputs_dir / ISSUANCE_MIX_FILE, issuance_mix)
         changed.add(ISSUANCE_MIX_FILE)
 
+    if "holder_position_target" in overrides:
+        override = _override_mapping(overrides["holder_position_target"])
+        source = _resolve_scenario_file(spec, override.get("file"))
+        rows, header = _read_csv(source)
+        if tuple(header) != holder_targets.TARGET_FILE_COLUMNS:
+            raise CompilerError(f"holder position target file columns must be {list(holder_targets.TARGET_FILE_COLUMNS)}")
+        try:
+            holder_targets.check_target_rows(
+                rows,
+                path=holder_targets.BuildAndHoldPath.from_points(list(override["target_path"])),
+                weights=holder_targets.declared_weights(override),
+            )
+        except holder_targets.HolderTargetError as exc:
+            raise CompilerError(f"holder position target file: {exc}") from exc
+        shutil.copyfile(source, forecast_inputs_dir / HOLDER_TARGET_FILE)
+        write_json(
+            forecast_inputs_dir / HOLDER_TARGET_SPEC_FILE,
+            {
+                "schema_version": "tdcsim_holder_position_target_v1",
+                "source_role": "scenario_assumption",
+                "runtime_role": "holder_position_target",
+                "target_file": HOLDER_TARGET_FILE,
+                "target_file_sha256": sha256_file(source),
+                "declaration": {key: value for key, value in override.items() if key != "file"},
+            },
+        )
+        changed.update({HOLDER_TARGET_FILE, HOLDER_TARGET_SPEC_FILE})
+
     if "net_interest_comparator" in overrides:
         net_interest = _override_mapping(overrides["net_interest_comparator"])
         if net_interest.get("role") != "diagnostic_nonbinding":
@@ -1310,6 +1341,7 @@ def _is_file_mode(mode: str) -> bool:
         "component_path_file",
         "explicit_path_file",
         "comparison_path_file",
+        holder_targets.HOLDER_TARGET_MODE,
     }
 
 
@@ -1351,6 +1383,15 @@ def _csv_file_override_rows(
         return None
     if not _is_file_mode(str(override.get("mode") or "")):
         raise CompilerError("file references require a file-backed override mode")
+    path = _resolve_scenario_file(spec, file_ref)
+    rows, _ = _read_csv(path)
+    _assert_replacement_coverage(rows, baseline_rows, mode=str(override.get("mode") or ""))
+    return rows
+
+
+def _resolve_scenario_file(spec: CboScenarioSpec, file_ref: Any) -> Path:
+    """A scenario-relative CSV, checked against its declared SHA-256."""
+
     if not isinstance(file_ref, Mapping):
         raise CompilerError("override file reference must be a mapping")
     if spec.path is None:
@@ -1359,14 +1400,11 @@ def _csv_file_override_rows(
     path = (spec.path.parent / rel).resolve()
     if spec.path.parent.resolve() not in path.parents and path != spec.path.parent.resolve():
         raise CompilerError("scenario file reference escapes scenario directory")
-    expected_sha = str(file_ref["sha256"])
-    if sha256_file(path) != expected_sha:
+    if sha256_file(path) != str(file_ref["sha256"]):
         raise CompilerError(f"scenario file SHA-256 mismatch: {rel}")
     if file_ref.get("media_type", "text/csv") != "text/csv":
         raise CompilerError("compiler currently supports CSV file overrides only")
-    rows, _ = _read_csv(path)
-    _assert_replacement_coverage(rows, baseline_rows, mode=str(override.get("mode") or ""))
-    return rows
+    return path
 
 
 def _assert_replacement_coverage(

@@ -55,6 +55,7 @@ py-modules = [
   "historical_replay_tdc_inputs",
   "historical_replay_tdcest",
   "holder_mapping",
+  "holder_targets",
   "issuance_calibration",
   "quarterly_aggregation",
   "ratewall_assumption_mode_schema",

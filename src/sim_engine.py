@@ -33,7 +33,9 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_SHARES_KEY,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
+    TRANSFER_SCALABLE_COLUMNS,
 )
+import holder_targets
 from issuance_calibration import (
     active_special_categories,
     bill_days,
@@ -1511,16 +1513,7 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
 
 _FED_SALE_MIX_CONTEMPORANEOUS = 'contemporaneous_non_cb_public_holder_mix'
 _FED_SALE_MIX_PRIVATE = 'private_domestic_nonbank'
-_FED_TRANSFER_SCALABLE_COLUMNS = [
-    'FaceValue',
-    'OriginalPrincipal',
-    'AdjustedPrincipal',
-    'AccruedInterest_FRN',
-    'IssueProceeds',
-    'CleanPrice',
-    'AccruedInterest',
-    'DirtyValue',
-]
+_FED_TRANSFER_SCALABLE_COLUMNS = list(TRANSFER_SCALABLE_COLUMNS)
 
 
 def _fed_secondary_dirty_value(
@@ -3391,6 +3384,13 @@ def run_simulation(
     ]:
         results[numeric_col] = 0.0
     results['FundingMode'] = funding_rule_mode if cbo_funding_mode else CASH_FUNDING_MODE
+    holder_target_path = holder_targets.holder_target_path(params.get('holder_position_target'))
+    if holder_target_path is not None:
+        # Only a run that holds positions on a target carries these columns, so every
+        # other run's results keep their exact bytes.
+        results[holder_targets.PHASE_COLUMN] = ''
+        for numeric_col in holder_targets.RESULT_COLUMNS:
+            results[numeric_col] = 0.0
     raw_events = params.get('events', [])
     scheduled_events = defaultdict(list)
     processed_event_ids = set()
@@ -4663,6 +4663,8 @@ def run_simulation(
         fed_secondary_reserve_effect = 0.0
         fed_secondary_deposit_effect = 0.0
         fed_secondary_private_route_effects = _zero_private_routes()
+        holder_target_deposit_effect = 0.0
+        holder_target_private_route_effects = _zero_private_routes()
         if cbo_funding_mode:
             cbo_debt_row = _cbo_exact_date_row(
                 cbo_inputs['debt_stock'],
@@ -5527,6 +5529,113 @@ def run_simulation(
                 results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
                     'synthetic_secondary_sale_to_hit_cbo_stock_path'
                 )
+        if holder_target_path is not None:
+            if current_enable_trading:
+                raise RuntimeError(
+                    'Holder position targets close after the Federal Reserve operation and '
+                    'cannot run with preference trading, which would move positions afterward.'
+                )
+            holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date)
+            holder_target_tolerance = holder_target_path.tolerance_bil
+            holder_target_gaps = holder_targets.target_gaps(
+                holder_targets.holder_stocks(bond_portfolio),
+                holder_target_vector,
+                tolerance=holder_target_tolerance,
+                current_date=current_date,
+            )
+            holder_target_pre_gap = max(abs(value) for value in holder_target_gaps.values())
+            holder_target_report = holder_targets.RebalanceReport()
+            if holder_target_pre_gap > holder_target_tolerance:
+                if holder_target_phase == 'pre':
+                    raise holder_targets.HolderTargetError(
+                        f"holder positions differ from the matched baseline by {holder_target_pre_gap:.9f} "
+                        f"billion on {current_date.date()}, before the intervention starts"
+                    )
+                holder_target_scope = holder_targets.SETTLEMENT_SCOPES[holder_target_phase]
+                holder_target_before = {
+                    'holder': _handoff_portfolio_stock_map(bond_portfolio),
+                    'route': _handoff_portfolio_stock_map(bond_portfolio, route=True),
+                }
+                bond_portfolio, holder_target_report = holder_targets.rebalance_holder_positions(
+                    bond_portfolio,
+                    holder_target_gaps,
+                    current_date=current_date,
+                    price=lambda row, amount: _fed_secondary_dirty_value(
+                        row,
+                        amount,
+                        current_date,
+                        current_yield_curve_years,
+                        current_yield_curve_rates,
+                        interpolation_method=yield_interpolation_method,
+                        floor_zero=yield_floor_zero,
+                        nominal_shock=evaluated_nominal_shock,
+                        tips_real_curve_years=tips_real_curve_years,
+                        tips_real_curve_rates=tips_real_curve_rates,
+                    ),
+                    row_budget=handoff_tables.portfolio_row_budget if bounded_handoff else None,
+                )
+                _handoff_append_transfer_changes(
+                    handoff_tables,
+                    prev_date,
+                    current_date,
+                    holder_target_before,
+                    bond_portfolio,
+                    event_type=holder_targets.TRANSFER_EVENT_TYPE,
+                    settlement_scope=holder_target_scope,
+                )
+                for (seller, buyer), (_face, cash) in holder_target_report.pairs.items():
+                    if seller[0] == 'Private':
+                        holder_target_private_route_effects[seller[1]] += cash
+                    if buyer[0] == 'Private':
+                        holder_target_private_route_effects[buyer[1]] -= cash
+                    if trc_ledger is not None:
+                        # Holder-to-holder settlement moves reserves between banks; the
+                        # ledger books each side on its own settlement route.
+                        trc_ledger.record_trade(
+                            'SecondaryTrades',
+                            buyer=buyer[0],
+                            buyer_private_route=buyer[1] or None,
+                            seller=seller[0],
+                            seller_private_route=seller[1] or None,
+                            amount=cash,
+                        )
+                holder_target_deposit_effect = (
+                    holder_target_private_route_effects[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK]
+                    + mmf_deposit_pass_through * holder_target_private_route_effects[PRIVATE_SUBBUCKET_MMF]
+                )
+                deposit_change_period += holder_target_deposit_effect
+                _handoff_append_journal(
+                    handoff_tables,
+                    prev_date,
+                    current_date,
+                    event_type='settlement',
+                    leg_type=holder_targets.SETTLEMENT_LEG,
+                    accounting_basis='reserve_and_deposit_settlement',
+                    holder_sector='aggregate_secondary_counterparties',
+                    counterparty_sector='secondary_market',
+                    instrument_type='all_treasury',
+                    maturity_bucket='all',
+                    reserve_change=0.0,
+                    deposit_change=holder_target_deposit_effect,
+                    settlement_scope=holder_target_scope,
+                )
+            holder_target_closing = holder_targets.holder_stocks(bond_portfolio)
+            holder_target_values = holder_targets.result_values(
+                phase=holder_target_phase,
+                targets=holder_target_vector,
+                stocks=holder_target_closing,
+                pre_trade_gap=holder_target_pre_gap,
+                report=holder_target_report,
+                deposit_effect=holder_target_deposit_effect,
+            )
+            if holder_target_values['HolderTargetMaxError'] > holder_target_tolerance:
+                raise holder_targets.HolderTargetError(
+                    f"holder positions miss their target by {holder_target_values['HolderTargetMaxError']:.9f} "
+                    f"billion after trading on {current_date.date()}"
+                )
+            results.loc[current_date, holder_targets.PHASE_COLUMN] = holder_target_phase
+            for column, value in holder_target_values.items():
+                results.loc[current_date, column] = value
         if current_enable_trading and (not cbo_fed_allocation_override_active) and (not bond_portfolio.empty):
             try:
                 pref_trade_monetary_impact = {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0}
@@ -5869,6 +5978,7 @@ def run_simulation(
         results.loc[current_date, 'TDC_SecondaryTrades'] = (
             pref_trade_monetary_impact.get('deposit_change', 0.0)
             + fed_secondary_deposit_effect
+            + holder_target_deposit_effect
         )
         results.loc[current_date, 'TDC_Other'] = other_deposit_change
         private_secondary_change = results.loc[current_date, 'TDC_SecondaryTrades']
@@ -6023,8 +6133,12 @@ def run_simulation(
         results.loc[current_date, 'TDC_SecondaryTrades_DomesticNonbank'] = (
             pref_trade_monetary_impact.get('deposit_change_private_deposit_funded', 0.0)
             + fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK]
+            + holder_target_private_route_effects[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK]
         )
-        fed_secondary_mmf_gross = fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_MMF]
+        fed_secondary_mmf_gross = (
+            fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_MMF]
+            + holder_target_private_route_effects[PRIVATE_SUBBUCKET_MMF]
+        )
         results.loc[current_date, 'TDC_SecondaryTrades_MMF'] = (
             mmf_deposit_pass_through
             * (
