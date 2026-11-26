@@ -1393,3 +1393,29 @@ def test_main_format_manifest_without_a_funding_mode_reads_as_hard_target(tmp_pa
     assert "funding_closure_mode" not in manifest
     assert "funding_closure_mode" not in manifest["boundary_checks"]
     assert _manifest_funding_closure_mode(manifest) == "cbo_public_debt_target"
+
+
+def test_bounded_intragovernmental_tips_issuance_books_no_cost(tmp_path: Path) -> None:
+    # Issuance to trust funds is noncash; a cost on it would raise the modeled financing
+    # cost with no cash behind it, and TIPS rows are no exception.
+    root, manifest, results, rows = _package(tmp_path)
+    rows["issuance"].append(
+        _with_columns(
+            ISSUANCE_COLUMNS,
+            period_start=START,
+            period_end=END,
+            holder_sector="TrustFunds",
+            holder_subsector="",
+            instrument_type="TIPS",
+            maturity_bucket="notes",
+            weighted_original_term_years=10.0,
+            face_issued_bil=10.0,
+            cash_proceeds_bil=10.0,
+            discount_or_premium_bil=0.0,
+            issue_cost_bil=1.0,
+            flow_count=1,
+        )
+    )
+    _refresh_artifact(root, manifest, rows, "issuance")
+    with pytest.raises(VerificationError, match="intragovernmental issuance books a cost"):
+        _verify_bounded_outputs(root, manifest, results)

@@ -3857,9 +3857,14 @@ def _verify_bounded_issuance(
         # The booked cost is the discount, or on Treasury's calendar the debt added less
         # cash, which may be a premium and for TIPS counts adjusted principal.
         issue_cost = _bounded_float(row, "issue_cost_bil", label="bounded issuance")
-        # Intragovernmental issuance is noncash and books no cost.
-        allowed_costs = (0.0,) if holder in INTRAGOV_HOLDERS else (discount, max(0.0, discount))
-        if instrument != "TIPS" and all(abs(issue_cost - cost) > STOCK_TOLERANCE_BIL for cost in allowed_costs):
+        # Intragovernmental issuance is noncash and books no cost, TIPS included. A TIPS
+        # sold to the public books its adjusted principal, which this row does not carry.
+        if holder in INTRAGOV_HOLDERS:
+            if abs(issue_cost) > STOCK_TOLERANCE_BIL:
+                raise VerificationError("bounded intragovernmental issuance books a cost")
+        elif instrument != "TIPS" and all(
+            abs(issue_cost - cost) > STOCK_TOLERANCE_BIL for cost in (discount, max(0.0, discount))
+        ):
             raise VerificationError("bounded issuance cost is neither the signed nor the floored discount")
         period_totals[period]["face_issued_bil"] += face
         period_totals[period]["cash_proceeds_bil"] += cash
