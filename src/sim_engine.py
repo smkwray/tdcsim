@@ -2232,20 +2232,6 @@ def _quote_rule_allocations(allocations, *, face_target_mode, issuance_leg, curr
     return schedule
 
 
-def _coupon_accrued_per_face(coupon_rate, dated, maturity_date, settlement_date):
-    """Interest accrued per unit face from ``dated`` (a coupon date) to settlement,
-    actual/actual in the semiannual period."""
-
-    dated = pd.Timestamp(dated).normalize()
-    settle = pd.Timestamp(settlement_date).normalize()
-    if settle <= dated or float(coupon_rate) <= TGA_FLOOR_TOLERANCE:
-        return 0.0
-    next_coupon = _first_interest_payment_date(dated, maturity_date, 2)
-    if pd.isna(next_coupon) or next_coupon <= settle:
-        raise ValueError(f'settlement {settle.date()} is not in the first coupon period after {dated.date()}')
-    return float(coupon_rate) / 2.0 * (settle - dated).days / (next_coupon - dated).days
-
-
 def _live_frn_accrued_per_face(bond_portfolio, template):
     """Accrued FRN interest per unit face on the live rows of a template's security."""
 
@@ -2321,8 +2307,10 @@ def _quote_settlements(
     settlement off the calendar (early, or at the fiscal-year close) reopens the
     security's latest issue, or is a new issue if none is outstanding yet. A new coupon
     issue is dated on its calendar dated date and matures tenor years later; its coupon
-    and clean price come from the issue kernel at the tenor, and a buyer also pays the
-    interest accrued since the dated date (TIPS at the index ratio since then). A
+    comes from the issue kernel at the tenor's auction yield. One settling after its
+    dated date is priced at that yield from its remaining cash flows at settlement, and
+    the buyer pays the interest accrued since the dated date (31 CFR 356 Appendix B,
+    II.D; TIPS at the index ratio since then). A
     reopening keeps the reopened security's maturity, coupon, spread and reference CPI
     and is sold at its market value with accrued interest, the valuation of Fed
     secondary transfers. ``issue_price_ratio`` is that dirty value per unit face.
@@ -2398,9 +2386,33 @@ def _quote_settlements(
                 # after it pays what has accrued and the holding starts with it.
                 accrued = frn_accrual_per_face(dated, current) if dated < current else 0.0
                 extra['accrued_frn_per_face'] = accrued
+                dirty = float(item['issue_price_ratio']) + accrued
+            elif dated < current:
+                dirty = float(
+                    value_treasury_security(
+                        maturity_date=maturity,
+                        settlement_date=current,
+                        coupon_rate=float(item['coupon']),
+                        discount_yield=float(item['issue_yield']),
+                        security_type=security_type,
+                        adjusted_principal=ratio,
+                        original_principal=1.0,
+                        issue_date=dated,
+                        nominal_discount_yield=(
+                            evaluate_nominal_yield(
+                                maturity_years,
+                                pricing['current_yield_curve_years'],
+                                pricing['current_yield_curve_rates'],
+                                method=pricing['yield_interpolation_method'],
+                                floor_zero=pricing['yield_floor_zero'],
+                                shock=pricing['evaluated_nominal_shock'],
+                            )
+                            if security_type == 'TIPS' else None
+                        ),
+                    )['dirty']
+                )
             else:
-                accrued = _coupon_accrued_per_face(item.get('coupon', 0.0), dated, maturity, current) * ratio
-            dirty = float(item['issue_price_ratio']) * ratio + accrued
+                dirty = float(item['issue_price_ratio']) * ratio
             issue_registry[key] = {
                 'maturity_date': maturity,
                 'dated_date': dated,

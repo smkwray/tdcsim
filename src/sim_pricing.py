@@ -147,8 +147,9 @@ def value_treasury_security(
     path is disabled in the CBO runner. Do not describe this function as project-wide.
 
     Discounts the *dated* remaining cash flows at the semiannual bond-equivalent convention
-    of 31 CFR 356 Appendix B, including its fractional stub exponent v**(r/s) for a
-    settlement date inside a coupon period. That combination matters:
+    of 31 CFR 356 Appendix B: whole coupon periods compound, and the fraction r/s of the
+    current period to the next coupon discounts at simple interest, 1 / (1 + (r/s) y/2).
+    That combination matters:
 
     * The convention must be semiannual because the model's yields come from a Treasury par
       curve (`nominal_par_yield_coupon_setting_surface`), and par yields are semiannual
@@ -239,21 +240,25 @@ def value_treasury_security(
     coupon_payment = principal_for_coupons * coupon / freq
 
     # Appendix B indexes cash flows by WHOLE coupon periods, with a single fractional stub
-    # r/s for the part-period between settlement and the next coupon. Counting every flow in
-    # days against a nominal period length instead would drift, because real semiannual
-    # periods are 181-184 days: a par bond would not price at exactly 100.
+    # r/s for the part-period between settlement and the next coupon, discounted at simple
+    # interest. Counting every flow in days against a nominal period length instead would
+    # drift, because real semiannual periods are 181-184 days: a par bond would not price at
+    # exactly 100.
     span_days = max(1, (remaining[0] - last_coupon).days) if remaining else 1
     stub = (remaining[0] - settlement_date).days / span_days if remaining else 0.0
+    whole_periods = max(0, len(remaining) - 1)
+
+    def stub_discount(per_period):
+        return 1.0 + stub * per_period
 
     clean_pv = 0.0
     for index, _pay_date in enumerate(remaining):
         try:
-            clean_pv += coupon_payment / discount_base ** (stub + index)
+            clean_pv += coupon_payment / (stub_discount(yld_per_period) * discount_base ** index)
         except (OverflowError, ValueError, ZeroDivisionError):
             raise ValueError('Treasury valuation overflowed while discounting a coupon.')
-    terminal_exponent = stub + max(0, len(remaining) - 1)
     try:
-        clean_pv += principal_at_maturity / discount_base ** terminal_exponent
+        clean_pv += principal_at_maturity / (stub_discount(yld_per_period) * discount_base ** whole_periods)
     except (OverflowError, ValueError, ZeroDivisionError):
         raise ValueError('Treasury valuation overflowed while discounting principal.')
 
@@ -265,7 +270,7 @@ def value_treasury_security(
         nominal_yield = float(discount_yield) if nominal_discount_yield is None or pd.isna(nominal_discount_yield) else float(nominal_discount_yield)
         nominal_per_period = max(-1.0 + 1e-9, nominal_yield / freq)
         try:
-            floor_value = floor_excess / (1.0 + nominal_per_period) ** terminal_exponent
+            floor_value = floor_excess / (stub_discount(nominal_per_period) * (1.0 + nominal_per_period) ** whole_periods)
         except (OverflowError, ValueError, ZeroDivisionError):
             raise ValueError('Treasury valuation overflowed while discounting the deflation floor.')
         clean_pv += floor_value

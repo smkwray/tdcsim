@@ -378,10 +378,13 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   includes. `maturity_payment_date` is when the principal is paid: the maturity date, or the
   next day Fedwire is open when the maturity date is a weekend or holiday.
 - `issues.csv`: every security the run issued, one row per security and settlement date, on
-  Treasury's auction calendar: bills weekly (the 52-week bill every four weeks), 2-, 3-, 5- and
-  7-year notes monthly as new issues, 10-, 20- and 30-year securities new in February, May,
-  August and November and reopened in the two months after, the floating-rate note new
-  quarterly and reopened monthly, and TIPS on Treasury's schedule. A reopening
+  Treasury's auction calendar: bills weekly (the 52-week bill every four weeks), 2-, 3- and
+  5-year notes monthly as new issues, the 7-year monthly until February 2027 and then new
+  quarterly from March 2027 and reopened in the two months after, 10-, 20- and 30-year
+  securities new in February, May, August and November and reopened in the two months after
+  (20-year reopenings settle on the Friday of their auction week from June 2026), the
+  floating-rate note new quarterly and reopened monthly, and TIPS on Treasury's schedule. The
+  dates match Treasury's published auction schedules through April 2027. A reopening
   (`is_reopening`) sells more of an existing security on its terms and appears under that
   security's id; a reopening of an opening-book security uses its CUSIP. `dated_date` is
   when interest starts (buyers pay what has accrued since it or the last coupon),

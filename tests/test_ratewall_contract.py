@@ -1172,7 +1172,9 @@ def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path
     # trades below par, so measured bill holders hold more par than market value. Banks,
     # foreign holders and money funds keep exactly that; domestic nonbanks, the residual
     # sector, take the rest of the 895 bn non-Fed bills.
-    bill_factor = 1.025 ** (124.0 / 184.0)
+    # Simple interest over the part of the half-year to maturity, as Appendix B discounts a
+    # part-period (for a bill, Treasury's investment-rate convention).
+    bill_factor = 1.0 + (124.0 / 184.0) * 0.025
     allocation = metadata["opening_allocation"]
     assert allocation["curve_date"] == "2026-04-01"
     assert allocation["groups"]["bills"]["par_to_market_factor"] == pytest.approx(bill_factor)

@@ -329,8 +329,9 @@ def test_federal_reserve_purchases_cannot_leave_a_target_missed(tmp_path, baseli
 
 
 def test_trades_settle_at_the_dated_bill_price(tmp_path) -> None:
-    # With a flat 4% curve a bill settles at face / 1.02**(days to maturity / days in the
-    # half-year ending at maturity), the semiannual convention the Fed's trades also use.
+    # With a flat 4% curve a bill settles at face / (1 + 0.02 * days to maturity / days in
+    # the half-year ending at maturity): Appendix B's simple interest for a part-period, which
+    # for a bill is Treasury's investment-rate convention. The Fed's trades use it too.
     from dateutil.relativedelta import relativedelta
 
     from sim_engine import _fed_secondary_dirty_value
@@ -348,7 +349,7 @@ def test_trades_settle_at_the_dated_bill_price(tmp_path) -> None:
     def closed_form(maturity: str, face: float) -> float:
         end = pd.Timestamp(maturity)
         start = end - relativedelta(months=6)
-        return face / 1.02 ** ((end - day).days / (end - start).days)
+        return face / (1.0 + 0.02 * (end - day).days / (end - start).days)
 
     # The banks hold 60 maturing within a month and 40 in under three months: the sale of
     # 10 takes 6 and 4.

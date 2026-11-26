@@ -28,6 +28,7 @@ from issuance_calibration import (
     maturity_from_dated,
     settlement_events,
     settlement_rules,
+    two_year_auction_week_monday,
 )
 from sim_engine import run_simulation
 from simulation_calendar import is_fedwire_business_day, is_securities_business_day
@@ -75,8 +76,11 @@ def test_each_security_settles_as_often_as_treasury_auctions_it() -> None:
     for tenor in (10.0, 20.0, 30.0):
         assert months(("Fixed", tenor), "new") == [2, 5, 8, 11]
     assert months(("FRN", 2.0), "new") == [1, 4, 7, 10]
-    for tenor in (2.0, 3.0, 5.0, 7.0):
+    for tenor in (2.0, 3.0, 5.0):
         assert months(("Fixed", tenor), "reopening") == []
+    # The 7-year turns quarterly with the March 2027 new issue, reopened in April and May.
+    assert months(("Fixed", 7.0), "new") == [1, 2, 3, 6, 9, 12]
+    assert months(("Fixed", 7.0), "reopening") == [4, 5, 7, 8, 10, 11]
     assert all(is_securities_business_day(event.settle) for event in events)
 
 
@@ -102,6 +106,170 @@ def test_settlement_days_follow_treasurys_rolls() -> None:
     assert not is_securities_business_day("2026-07-03")  # Independence Day observed
 
 
+# Treasury's tentative auction schedules from the May, August and November 2026
+# refundings (home.treasury.gov/system/files/221/TentativeAuctionScheduleQ{2,3,4}2026.xml,
+# retrieved 2026-11-26, SHA-256 a9142a64..., c1f4049f..., 056d08ca...): every settlement
+# from 2026-06-22 through 2027-04-30 by security, R for a reopening, and the maturities
+# the November schedule publishes for new coupon issues. Cash management bills are left
+# out; where schedules overlap the later one is used (they agree).
+TREASURY_SCHEDULE_SETTLEMENTS = {
+    ('bill', 4.0): (
+        "2026-06-23 2026-06-30 2026-07-07 2026-07-14 2026-07-21 2026-07-28 2026-08-04 2026-08-11 "
+        "2026-08-18 2026-08-25 2026-09-01 2026-09-08 2026-09-15 2026-09-22 2026-09-29 2026-10-06 "
+        "2026-10-13 2026-10-20 2026-10-27 2026-11-03 2026-11-10 2026-11-17 2026-11-24 2026-12-01 "
+        "2026-12-08 2026-12-15 2026-12-22 2026-12-29 2027-01-05 2027-01-12 2027-01-19 2027-01-26 "
+        "2027-02-02 2027-02-09 2027-02-16 2027-02-23 2027-03-02 2027-03-09 2027-03-16 2027-03-23 "
+        "2027-03-30 2027-04-06 2027-04-13 2027-04-20 2027-04-27"
+    ),
+    ('bill', 6.0): (
+        "2026-06-25 2026-07-02 2026-07-09 2026-07-16 2026-07-23 2026-07-30 2026-08-06 2026-08-13 "
+        "2026-08-20 2026-08-27 2026-09-03 2026-09-10 2026-09-17 2026-09-24 2026-10-01 2026-10-08 "
+        "2026-10-15 2026-10-22 2026-10-29 2026-11-05 2026-11-12 2026-11-19 2026-11-27 2026-12-03 "
+        "2026-12-10 2026-12-17 2026-12-24 2026-12-31 2027-01-07 2027-01-14 2027-01-21 2027-01-28 "
+        "2027-02-04 2027-02-11 2027-02-18 2027-02-25 2027-03-04 2027-03-11 2027-03-18 2027-03-25 "
+        "2027-04-01 2027-04-08 2027-04-15 2027-04-22 2027-04-29"
+    ),
+    ('bill', 8.0): (
+        "2026-06-23 2026-06-30 2026-07-07 2026-07-14 2026-07-21 2026-07-28 2026-08-04 2026-08-11 "
+        "2026-08-18 2026-08-25 2026-09-01 2026-09-08 2026-09-15 2026-09-22 2026-09-29 2026-10-06 "
+        "2026-10-13 2026-10-20 2026-10-27 2026-11-03 2026-11-10 2026-11-17 2026-11-24 2026-12-01 "
+        "2026-12-08 2026-12-15 2026-12-22 2026-12-29 2027-01-05 2027-01-12 2027-01-19 2027-01-26 "
+        "2027-02-02 2027-02-09 2027-02-16 2027-02-23 2027-03-02 2027-03-09 2027-03-16 2027-03-23 "
+        "2027-03-30 2027-04-06 2027-04-13 2027-04-20 2027-04-27"
+    ),
+    ('bill', 13.0): (
+        "2026-06-25 2026-07-02 2026-07-09 2026-07-16 2026-07-23 2026-07-30 2026-08-06 2026-08-13 "
+        "2026-08-20 2026-08-27 2026-09-03 2026-09-10 2026-09-17 2026-09-24 2026-10-01 2026-10-08 "
+        "2026-10-15 2026-10-22 2026-10-29 2026-11-05 2026-11-12 2026-11-19 2026-11-27 2026-12-03 "
+        "2026-12-10 2026-12-17 2026-12-24 2026-12-31 2027-01-07 2027-01-14 2027-01-21 2027-01-28 "
+        "2027-02-04 2027-02-11 2027-02-18 2027-02-25 2027-03-04 2027-03-11 2027-03-18 2027-03-25 "
+        "2027-04-01 2027-04-08 2027-04-15 2027-04-22 2027-04-29"
+    ),
+    ('bill', 17.0): (
+        "2026-06-23 2026-06-30 2026-07-07 2026-07-14 2026-07-21 2026-07-28 2026-08-04 2026-08-11 "
+        "2026-08-18 2026-08-25 2026-09-01 2026-09-08 2026-09-15 2026-09-22 2026-09-29 2026-10-06 "
+        "2026-10-13 2026-10-20 2026-10-27 2026-11-03 2026-11-10 2026-11-17 2026-11-24 2026-12-01 "
+        "2026-12-08 2026-12-15 2026-12-22 2026-12-29 2027-01-05 2027-01-12 2027-01-19 2027-01-26 "
+        "2027-02-02 2027-02-09 2027-02-16 2027-02-23 2027-03-02 2027-03-09 2027-03-16 2027-03-23 "
+        "2027-03-30 2027-04-06 2027-04-13 2027-04-20 2027-04-27"
+    ),
+    ('bill', 26.0): (
+        "2026-06-25 2026-07-02 2026-07-09 2026-07-16 2026-07-23 2026-07-30 2026-08-06 2026-08-13 "
+        "2026-08-20 2026-08-27 2026-09-03 2026-09-10 2026-09-17 2026-09-24 2026-10-01 2026-10-08 "
+        "2026-10-15 2026-10-22 2026-10-29 2026-11-05 2026-11-12 2026-11-19 2026-11-27 2026-12-03 "
+        "2026-12-10 2026-12-17 2026-12-24 2026-12-31 2027-01-07 2027-01-14 2027-01-21 2027-01-28 "
+        "2027-02-04 2027-02-11 2027-02-18 2027-02-25 2027-03-04 2027-03-11 2027-03-18 2027-03-25 "
+        "2027-04-01 2027-04-08 2027-04-15 2027-04-22 2027-04-29"
+    ),
+    ('bill', 52.0): (
+        "2026-07-09 2026-08-06 2026-09-03 2026-10-01 2026-10-29 2026-11-27 2026-12-24 2027-01-21 "
+        "2027-02-18 2027-03-18 2027-04-15"
+    ),
+    ('FRN', 2.0): (
+        "2026-06-26R 2026-07-31 2026-08-28R 2026-09-25R 2026-11-02 2026-11-27R 2026-12-28R 2027-02-01 "
+        "2027-02-26R 2027-03-29R 2027-04-30"
+    ),
+    ('Fixed', 2.0): (
+        "2026-06-30 2026-07-31 2026-08-31 2026-09-30 2026-11-02 2026-11-30 2026-12-31 2027-02-01 "
+        "2027-03-01 2027-03-31 2027-04-30"
+    ),
+    ('Fixed', 3.0): (
+        "2026-07-15 2026-08-17 2026-09-15 2026-10-15 2026-11-16 2026-12-15 2027-01-15 2027-02-16 "
+        "2027-03-15 2027-04-15"
+    ),
+    ('Fixed', 5.0): (
+        "2026-06-30 2026-07-31 2026-08-31 2026-09-30 2026-11-02 2026-11-30 2026-12-31 2027-02-01 "
+        "2027-03-01 2027-03-31 2027-04-30"
+    ),
+    ('Fixed', 7.0): (
+        "2026-06-30 2026-07-31 2026-08-31 2026-09-30 2026-11-02 2026-11-30 2026-12-31 2027-02-01 "
+        "2027-03-01 2027-03-31 2027-04-30R"
+    ),
+    ('Fixed', 10.0): (
+        "2026-07-15R 2026-08-17 2026-09-15R 2026-10-15R 2026-11-16 2026-12-15R 2027-01-15R 2027-02-16 "
+        "2027-03-15R 2027-04-15R"
+    ),
+    ('Fixed', 20.0): (
+        "2026-06-22R 2026-07-24R 2026-08-31 2026-09-18R 2026-10-23R 2026-11-30 2026-12-28R 2026-12-28R "
+        "2027-01-22R 2027-03-01 2027-03-19R 2027-04-23R"
+    ),
+    ('Fixed', 30.0): (
+        "2026-07-15R 2026-08-17 2026-09-15R 2026-10-15R 2026-11-16 2026-12-15R 2027-01-15R 2027-02-16 "
+        "2027-03-15R 2027-04-15R"
+    ),
+    ('TIPS', 5.0): (
+        "2026-06-30R 2026-10-30 2026-12-31R 2026-12-31R 2027-04-30"
+    ),
+    ('TIPS', 10.0): (
+        "2026-07-31 2026-09-30R 2026-11-30R 2027-01-29 2027-03-31R"
+    ),
+    ('TIPS', 30.0): (
+        "2026-08-31R 2027-02-26"
+    ),
+}
+TREASURY_NEW_ISSUE_MATURITIES = {
+    (('FRN', 2.0), "2027-02-01"): "2029-01-31",
+    (('FRN', 2.0), "2027-04-30"): "2029-04-30",
+    (('Fixed', 2.0), "2026-11-30"): "2028-11-30",
+    (('Fixed', 2.0), "2026-12-31"): "2028-12-31",
+    (('Fixed', 2.0), "2027-02-01"): "2029-01-31",
+    (('Fixed', 2.0), "2027-03-01"): "2029-02-28",
+    (('Fixed', 2.0), "2027-03-31"): "2029-03-31",
+    (('Fixed', 2.0), "2027-04-30"): "2029-04-30",
+    (('Fixed', 3.0), "2026-11-16"): "2029-11-15",
+    (('Fixed', 3.0), "2026-12-15"): "2029-12-15",
+    (('Fixed', 3.0), "2027-01-15"): "2030-01-15",
+    (('Fixed', 3.0), "2027-02-16"): "2030-02-15",
+    (('Fixed', 3.0), "2027-03-15"): "2030-03-15",
+    (('Fixed', 3.0), "2027-04-15"): "2030-04-15",
+    (('Fixed', 5.0), "2026-11-30"): "2031-11-30",
+    (('Fixed', 5.0), "2026-12-31"): "2031-12-31",
+    (('Fixed', 5.0), "2027-02-01"): "2032-01-31",
+    (('Fixed', 5.0), "2027-03-01"): "2032-02-29",
+    (('Fixed', 5.0), "2027-03-31"): "2032-03-31",
+    (('Fixed', 5.0), "2027-04-30"): "2032-04-30",
+    (('Fixed', 7.0), "2026-11-30"): "2033-11-30",
+    (('Fixed', 7.0), "2026-12-31"): "2033-12-31",
+    (('Fixed', 7.0), "2027-02-01"): "2034-01-31",
+    (('Fixed', 7.0), "2027-03-01"): "2034-02-28",
+    (('Fixed', 7.0), "2027-03-31"): "2034-03-31",
+    (('Fixed', 10.0), "2026-11-16"): "2036-11-15",
+    (('Fixed', 10.0), "2027-02-16"): "2037-02-15",
+    (('Fixed', 20.0), "2026-11-30"): "2046-11-15",
+    (('Fixed', 20.0), "2027-03-01"): "2047-02-15",
+    (('Fixed', 30.0), "2026-11-16"): "2056-11-15",
+    (('Fixed', 30.0), "2027-02-16"): "2057-02-15",
+    (('TIPS', 5.0), "2027-04-30"): "2032-04-15",
+    (('TIPS', 10.0), "2027-01-29"): "2037-01-15",
+    (('TIPS', 30.0), "2027-02-26"): "2057-02-15",
+}
+
+
+def test_the_calendar_matches_treasurys_published_auction_schedules() -> None:
+    """Treasury publishes its auctions about six months ahead. Over the first ten months
+    of the scenario the calendar must settle every security on exactly Treasury's dates,
+    as a new issue or a reopening as Treasury sells it, and date and mature new issues
+    as Treasury does. The window spans two changes Treasury announced: 20-year reopenings
+    settle on the Friday of the auction week from June 2026 (2026-06-22 for the Juneteenth
+    week, 2026-12-28 for Christmas), and the 7-year is reopened from April 2027."""
+
+    events = settlement_events(_profile(), date(2026, 6, 22), date(2027, 4, 30))
+    calendar = {(event.key, event.settle.isoformat()): event for event in events}
+    published = {
+        (key, text.rstrip("R")): "reopening" if text.endswith("R") else "new"
+        for key, dates in TREASURY_SCHEDULE_SETTLEMENTS.items()
+        for text in dates.split()
+    }
+    assert sorted(calendar) == sorted(published)
+    coupons = {item: issue for item, issue in published.items() if item[0][0] != "bill"}
+    assert {item: calendar[item].issue for item in coupons} == coupons
+    rules = settlement_rules(_profile())
+    for (key, settle), maturity in TREASURY_NEW_ISSUE_MATURITIES.items():
+        event = calendar[(key, settle)]
+        assert event.issue == "new"
+        assert maturity_from_dated(rules[key], dated_date(rules[key], event.nominal)).isoformat() == maturity
+
+
 def test_new_issues_are_dated_and_mature_on_treasurys_dates() -> None:
     """A 20-year bond or a TIPS is dated on the 15th of its month and settles at month end;
     a month-end note matures on a month end even when it settled on the 1st or 2nd."""
@@ -124,7 +292,12 @@ def _auction_rows_from_calendar(start: date, end: date) -> list[dict[str, str]]:
     bills_maturing: set[date] = set()
     for event in settlement_events(profile, start - timedelta(days=400), end):
         key = event.key
+        auction = event.settle - timedelta(days=3)
+        if key == ("Fixed", 20.0):
+            # The Wednesday of the 20-year's auction week, the week before the 2-year's.
+            auction = two_year_auction_week_monday(event.nominal.year, event.nominal.month) - timedelta(days=5)
         row = {
+            "auction_date": auction.isoformat(),
             "issue_date": event.settle.isoformat(),
             "cash_management_bill_cmb": "No",
             "floating_rate": "Yes" if key[0] == "FRN" else "No",
@@ -183,6 +356,15 @@ def test_calendar_check_rejects_a_year_that_departs_from_treasurys_calendar(tmp_
     reopening["original_issue_date"] = "null"
     with pytest.raises(IssuanceCalibrationError, match="auction is new, calendar says reopening"):
         check_settlement_calendar(_write(tmp_path / "relabeled.csv", relabeled), simulation_start_date="2026-06-21")
+
+    # The scenario years extrapolate the 20-year's auction week, so the check holds the
+    # auction file to it even while reopenings still settled at month end.
+    assert report["auction_weeks"] == 12
+    rescheduled = [dict(row) for row in rows]
+    bond = next(row for row in rescheduled if row["security_term"] == "20-Year" and row["issue_date"] >= "2025-07-01")
+    bond["auction_date"] = (date.fromisoformat(bond["auction_date"]) + timedelta(days=7)).isoformat()
+    with pytest.raises(IssuanceCalibrationError, match="not in the week"):
+        check_settlement_calendar(_write(tmp_path / "rescheduled.csv", rescheduled), simulation_start_date="2026-06-21")
 
 
 # --- The engine on Treasury's calendar -----------------------------------------------------
@@ -330,6 +512,29 @@ def test_the_pricer_counts_each_contractual_coupon_once() -> None:
     )
     assert value["clean"] == pytest.approx(1.0, abs=1e-5)
     assert value["accrued"] == pytest.approx(0.02 * 182 / 183)
+
+
+def test_the_pricer_reproduces_treasurys_appendix_b_examples() -> None:
+    """31 CFR 356 Appendix B prices whole coupon periods at compound interest and the
+    fraction of a period before the next coupon at simple interest. Its example A is an
+    8 3/4% bond issued on its dated date at 8.84% (99.057893); example D is a new 9 1/2%
+    note dated 1985-11-15 and issued 1985-11-29 at 9.54%, whose buyer pays 100.098321
+    including 0.367403 of accrued interest. A compound stub misprices D by 0.77bp of face."""
+
+    from sim_pricing import value_treasury_security
+
+    a = value_treasury_security(
+        maturity_date=pd.Timestamp("2020-05-15"), settlement_date=pd.Timestamp("1990-05-15"),
+        coupon_rate=0.0875, discount_yield=0.0884, issue_date=pd.Timestamp("1990-05-15"),
+    )
+    assert round(a["clean"] * 100.0, 6) == 99.057893
+    d = value_treasury_security(
+        maturity_date=pd.Timestamp("1995-11-15"), settlement_date=pd.Timestamp("1985-11-29"),
+        coupon_rate=0.095, discount_yield=0.0954, issue_date=pd.Timestamp("1985-11-15"),
+    )
+    assert (round(d["dirty"] * 100.0, 6), round(d["accrued"] * 100.0, 6), round(d["clean"] * 100.0, 6)) == (
+        100.098321, 0.367403, 99.730918,
+    )
 
 
 def test_bills_mature_on_their_weekly_cycle_moved_off_holidays() -> None:
@@ -516,6 +721,40 @@ def test_the_fed_rolls_bills_into_bills_and_coupons_into_coupons(tmp_path: Path)
     assert not add_ons.empty and (add_ons["OriginalMaturityYears"] <= 1.0).all()
     coupons = portfolio[(pd.to_datetime(portfolio["IssueDate"]) == pd.Timestamp("2026-09-15")) & (portfolio["OriginalMaturityYears"] > 1.0)]
     assert not coupons.empty and (coupons["HolderType"] != "CB").all()
+
+
+def test_a_september_30_maturity_does_not_roll_into_the_20_year_reopening(tmp_path: Path) -> None:
+    """The September 2026 20-year reopening settles on Friday 2026-09-18, the auction
+    week's Friday. A Fed note maturing Wednesday 2026-09-30 rolls into the 2-, 5- and
+    7-year notes issued that day. The 20-year that the fiscal-year close settles the
+    same day is not an auction, so the Fed takes none of it."""
+
+    from forecast_bundle_builders import build_fed_holdings_path_rows
+    from simulation_calendar import build_simulation_calendar
+    from test_cbo_engine_integration import _write_csv
+
+    params = _params(
+        tmp_path,
+        [_portfolio_row(914, security_type="Fixed", years=2.0, maturity="2026-09-30", face=20.0, holder="CB")],
+    )
+    rows = build_fed_holdings_path_rows(
+        scenario_id="baseline",
+        periods=build_simulation_calendar(ENGINE_START, ENGINE_END, "daily"),
+        opening_state_date=ENGINE_START,
+        opening_cb_holdings_bil=20.0,
+        cbo_fy_end_fed_holdings_bil={2026: 20.0},
+        observation_date=ENGINE_START,
+        available_date=ENGINE_START,
+    )
+    params["baseline_input_paths"]["fed_holdings_path_file"] = str(_write_csv(tmp_path / "fed.csv", rows))
+    results, portfolio = run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+    assert results.loc["2026-09-30", "FedRolloverFace"] == pytest.approx(20.0)
+    issued = pd.to_datetime(portfolio["IssueDate"])
+    twenty = pd.to_datetime(portfolio["MaturityDate"]).dt.year == 2046  # May 2026 and August 2026 bonds
+    assert (twenty & (issued == pd.Timestamp("2026-09-18"))).any()
+    assert not (twenty & (issued > pd.Timestamp("2026-09-18")) & (portfolio["HolderType"] == "CB")).any()
+    add_ons = portfolio[(portfolio["HolderType"] == "CB") & (issued == pd.Timestamp("2026-09-30"))]
+    assert {pd.Timestamp(day).year for day in add_ons["MaturityDate"]} == {2028, 2031, 2033}
 
 
 def test_a_tips_add_on_is_sized_in_adjusted_principal() -> None:
