@@ -73,7 +73,18 @@ NONCB_OPENING_ROUTES = (
 # they take whatever non-Fed par the measured routes do not hold.
 NONCB_RESIDUAL_ROUTE = ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK)
 OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
-# WAMEST holdings are market values; the book is at par. Each group's par-to-market
+# WAMEST records each sector's Financial Accounts level basis. A market value (an LM series,
+# as for foreign holders) converts to par with its group's factor. Any other level (the FL
+# series of depositories and money funds: book value or amortized cost) is a book value:
+# bills at book still carry their discount and convert with the bill factor, while coupon
+# securities at book are read as par. That is a declared approximation: book value mixes
+# amortized cost, near par, with fair value for banks' securities available for sale.
+WAMEST_LEVEL_BASES = {
+    "z1_market_value_level": "market_value",
+    "z1_level_basis_not_confirmed_market_value": "book_value",
+    "computed_or_unknown": "book_value",
+}
+# The book is at par. Each group's par-to-market
 # factor prices its non-Fed securities on the governed baseline curve, evaluated as the
 # CBO runtime evaluates it.
 OPENING_PRICE_CURVE = {
@@ -439,13 +450,17 @@ def load_soma_auction_add_ons(path: Path, *, after: str, through: str) -> tuple[
 def load_wamest_noncb_weights(path: Path, *, record_date: str) -> dict:
     """Return WAMEST non-Fed holdings and shares by opening route for bills and nonbills.
 
-    Uses the latest WAMEST quarter on or before ``record_date``. Only ``level``
-    and ``bill_share`` are read; the Fed row is excluded because CB comes from SOMA.
-    The shares are the measured (market-value) shares; the opening book converts the
-    holdings to par itself.
+    Uses the latest WAMEST quarter on or before ``record_date``. Only ``level``,
+    ``bill_share`` and the level's valuation basis are read; the Fed row is excluded
+    because CB comes from SOMA. The shares are the measured shares; the opening book
+    converts the holdings to par itself, by basis (``WAMEST_LEVEL_BASES``).
     """
 
-    frame = pd.read_csv(path, usecols=["date", "sector_key", "level", "bill_share", "publication_status"], dtype=str)
+    frame = pd.read_csv(
+        path,
+        usecols=["date", "sector_key", "level", "bill_share", "publication_status", "revaluation_valuation_basis"],
+        dtype=str,
+    )
     dates = sorted(value for value in frame["date"].dropna().unique() if value <= record_date)
     if not dates:
         raise ValueError(f"WAMEST panel {path.name} has no quarter on or before {record_date}")
@@ -456,6 +471,10 @@ def load_wamest_noncb_weights(path: Path, *, record_date: str) -> dict:
     if unknown or absent or sectors.duplicated().any():
         raise ValueError(f"WAMEST sectors at {dates[-1]} do not match the route registry: unknown={unknown} absent={absent}")
     holdings = {route: {"bills": 0.0, "nonbills": 0.0} for route in NONCB_OPENING_ROUTES}
+    by_basis = {
+        route: {group: {basis: 0.0 for basis in sorted(set(WAMEST_LEVEL_BASES.values()))} for group in ("bills", "nonbills")}
+        for route in NONCB_OPENING_ROUTES
+    }
     for row in rows.itertuples(index=False):
         route = WAMEST_SECTOR_ROUTES[row.sector_key]
         if route is None:
@@ -464,15 +483,21 @@ def load_wamest_noncb_weights(path: Path, *, record_date: str) -> dict:
         bill_share = pd.to_numeric(row.bill_share, errors="coerce")
         if row.publication_status != "published_estimate" or pd.isna(level) or level < 0 or not 0.0 <= bill_share <= 1.0:
             raise ValueError(f"WAMEST row {row.sector_key} at {dates[-1]} is not a usable published estimate")
-        holdings[route]["bills"] += float(level) * float(bill_share)
-        holdings[route]["nonbills"] += float(level) * (1.0 - float(bill_share))
+        basis = WAMEST_LEVEL_BASES.get(row.revaluation_valuation_basis)
+        if basis is None:
+            raise ValueError(
+                f"WAMEST row {row.sector_key} at {dates[-1]} has unknown level basis {row.revaluation_valuation_basis!r}"
+            )
+        for group, amount in (("bills", float(level) * float(bill_share)), ("nonbills", float(level) * (1.0 - float(bill_share)))):
+            holdings[route][group] += amount
+            by_basis[route][group][basis] += amount
     weights = {}
     for group in ("bills", "nonbills"):
         total = sum(holdings[route][group] for route in NONCB_OPENING_ROUTES)
         if total <= 0:
             raise ValueError(f"WAMEST non-Fed {group} holdings are not positive at {dates[-1]}")
         weights[group] = {route: holdings[route][group] / total for route in NONCB_OPENING_ROUTES}
-    return {"wamest_date": dates[-1], "weights": weights, "holdings_usd_mil": holdings}
+    return {"wamest_date": dates[-1], "weights": weights, "holdings_usd_mil": holdings, "holdings_by_basis_usd_mil": by_basis}
 
 
 def _normalize_holder_shares(raw: dict[str, float]) -> dict[str, float]:
@@ -935,13 +960,21 @@ def _route_key(route: tuple[str, str]) -> str:
     return "/".join(route).rstrip("/")
 
 
+def _measured_par_bil(by_basis_mil: dict, *, factor: float, group: str) -> float:
+    """Measured holdings at par: market values convert with the group factor; book values
+    of bills too, while coupon securities at book are read as par."""
+
+    book_factor = factor if group == "bills" else 1.0
+    return (by_basis_mil["market_value"] * factor + by_basis_mil["book_value"] * book_factor) / 1000.0
+
+
 def _opening_route_par(measured_mil: dict, *, noncb_par_bil: float, factor: float, group: str) -> dict:
     """Convert measured route holdings to par; the residual route takes the rest of the group's par."""
 
     if noncb_par_bil <= 0.0:
         raise ValueError(f"opening book has no non-Fed {group} par to allocate")
     par = {
-        route: measured_mil[route] / 1000.0 * factor
+        route: _measured_par_bil(measured_mil[route], factor=factor, group=group)
         for route in NONCB_OPENING_ROUTES
         if route != NONCB_RESIDUAL_ROUTE
     }
@@ -974,8 +1007,9 @@ def build_initial_portfolio(
     (and SOMA's matured-unpaid amounts in the matured cohorts), plus the SOMA add-ons of
     auctions settling after the SOMA as-of date and by the record date. The rest is
     split among non-Fed holders by bills and nonbills: banks, foreign holders and money
-    funds keep their WAMEST holdings, which are market values, converted to par with
-    the group's par-to-market factor on the governed baseline curve; domestic nonbanks,
+    funds keep their WAMEST holdings converted to par by level basis
+    (``WAMEST_LEVEL_BASES``) with the group's par-to-market factor on the governed
+    baseline curve; domestic nonbanks,
     the Financial Accounts' residual sector, take the remaining non-Fed par. The split
     is uniform within bills and within nonbills; no public source gives other holders
     by CUSIP.
@@ -1139,7 +1173,7 @@ def build_initial_portfolio(
             raise ValueError(f"opening book has no priced non-Fed {group} to convert WAMEST holdings to par")
         factors[group] = priced[group]["par"] / priced[group]["market"]
         route_par[group] = _opening_route_par(
-            {route: noncb["holdings_usd_mil"][route][group] for route in NONCB_OPENING_ROUTES},
+            {route: noncb["holdings_by_basis_usd_mil"][route][group] for route in NONCB_OPENING_ROUTES},
             noncb_par_bil=noncb_par[group],
             factor=factors[group],
             group=group,
@@ -1300,7 +1334,11 @@ def build_initial_portfolio(
         "noncb_weights_basis": "wamest_measured_market_value_shares_for_new_issuance_not_opening_split",
         "opening_allocation": {
             "rule": OPENING_ALLOCATION_RULE,
-            "measured_holdings_basis": "wamest_level_times_bill_share_read_as_market_value",
+            "measured_holdings_basis": "wamest_level_times_bill_share_by_level_basis",
+            "level_basis_field": "revaluation_valuation_basis",
+            "level_bases": dict(sorted(WAMEST_LEVEL_BASES.items())),
+            "market_value_treatment": "converted_with_group_factor",
+            "book_value_treatment": "bills_converted_with_bill_factor_coupon_securities_read_as_par",
             "residual_route": _route_key(NONCB_RESIDUAL_ROUTE),
             "price_basis": "clean_market_value_per_unit_of_book_par",
             "pricing_date": record_date,
@@ -1319,15 +1357,22 @@ def build_initial_portfolio(
                     "priced_par_bil": priced[group]["par"],
                     "priced_market_value_bil": priced[group]["market"],
                     "unpriced_tips_par_bil": unpriced_par[group],
-                    "measured_market_value_bil": {
-                        _route_key(route): noncb["holdings_usd_mil"][route][group] / 1000.0 for route in NONCB_OPENING_ROUTES
+                    "measured_bil_by_basis": {
+                        _route_key(route): {
+                            basis: amount / 1000.0
+                            for basis, amount in noncb["holdings_by_basis_usd_mil"][route][group].items()
+                        }
+                        for route in NONCB_OPENING_ROUTES
                     },
                     "par_bil": {_route_key(route): route_par[group][route] for route in NONCB_OPENING_ROUTES},
                     "domestic_nonbank_residual_bil": route_par[group][NONCB_RESIDUAL_ROUTE],
                     # Non-Fed par that no measured holding at par accounts for; the residual
                     # route absorbs it on top of its own measured holdings at par.
                     "residual_gap_bil": noncb_par[group]
-                    - factors[group] * sum(noncb["holdings_usd_mil"][route][group] for route in NONCB_OPENING_ROUTES) / 1000.0,
+                    - sum(
+                        _measured_par_bil(noncb["holdings_by_basis_usd_mil"][route][group], factor=factors[group], group=group)
+                        for route in NONCB_OPENING_ROUTES
+                    ),
                     "route_weights": {_route_key(route): route_weights[group][route] for route in NONCB_OPENING_ROUTES},
                 }
                 for group in groups

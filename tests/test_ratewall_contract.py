@@ -991,7 +991,9 @@ def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tm
 
 # WAMEST holdings in USD millions: (level, bill share). Measured bills are banks 100,
 # foreign 200, money funds 400 and households 150 bn; measured nonbills are 100, 800,
-# 100 and 450 bn.
+# 100 and 450 bn. Foreign holders and households report market values (Financial
+# Accounts LM series); banks and money funds report book values (FL series).
+_OPENING_MARKET_VALUE_SECTORS = {"foreigners_total", "households_nonprofits"}
 _OPENING_WAMEST_LEVELS = {
     "bank_us_chartered": (200_000.0, 0.5),
     "foreigners_total": (1_000_000.0, 0.2),
@@ -1098,6 +1100,10 @@ def _opening_book_inputs(
                 "level": level,
                 "bill_share": bill_share,
                 "publication_status": "published_estimate",
+                "revaluation_valuation_basis": (
+                    "z1_market_value_level" if sector in _OPENING_MARKET_VALUE_SECTORS
+                    else "z1_level_basis_not_confirmed_market_value"
+                ),
             }
         )
     wamest_path = tmp_path / "wamest.csv"
@@ -1168,10 +1174,10 @@ def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path
     assert add_ons["amount_bil_by_cusip"] == {"FAKEBILL1": pytest.approx(5.0), "FAKETIPS1": pytest.approx(12.0)}
     assert "auction_soma_add_ons" in book.loc[book["HolderType"].eq("CB") & is_bill, "source_status"].iloc[0]
 
-    # WAMEST holdings are market values; the bill (124 days to maturity, flat 5% curve)
-    # trades below par, so measured bill holders hold more par than market value. Banks,
-    # foreign holders and money funds keep exactly that; domestic nonbanks, the residual
-    # sector, take the rest of the 895 bn non-Fed bills.
+    # The bill (124 days to maturity, flat 5% curve) trades below par, and a bill carries
+    # that discount at market value or at book, so measured bill holders hold more par
+    # than they report. Banks, foreign holders and money funds keep exactly that; domestic
+    # nonbanks, the residual sector, take the rest of the 895 bn non-Fed bills.
     # Simple interest over the part of the half-year to maturity, as Appendix B discounts a
     # part-period (for a bill, Treasury's investment-rate convention).
     bill_factor = 1.0 + (124.0 / 184.0) * 0.025
@@ -1198,10 +1204,14 @@ def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path
     factor = group["par_to_market_factor"]
     assert factor == pytest.approx(group["priced_par_bil"] / group["priced_market_value_bil"])
     assert factor > 1.02
+    # Foreign holders report market value, converted to par. Banks and money funds report
+    # book value, which for coupon securities is read as par: converting it with the
+    # discount-bond factor would hand them par no source says they hold.
     assert nonbills["Foreign"] == pytest.approx(800.0 * factor)
-    assert nonbills["Banks"] == pytest.approx(100.0 * factor)
-    assert nonbills[mmf] == pytest.approx(100.0 * factor)
-    assert nonbills[dn] == pytest.approx(note_noncb + matured_noncb + 228.0 - 1000.0 * factor)
+    assert nonbills["Banks"] == pytest.approx(100.0)
+    assert nonbills[mmf] == pytest.approx(100.0)
+    assert nonbills[dn] == pytest.approx(note_noncb + matured_noncb + 228.0 - 800.0 * factor - 200.0)
+    assert group["measured_bil_by_basis"]["Banks"] == {"book_value": pytest.approx(100.0), "market_value": 0.0}
     # The split stays uniform within a group, so each TIPS holder takes the group weight.
     tips_noncb = 300.0 - 72.0
     assert face[("FAKETIPS1", "Foreign", "")] / tips_noncb == pytest.approx(group["route_weights"]["Foreign"])
@@ -1289,6 +1299,16 @@ def test_opening_book_fails_when_measured_holdings_exceed_non_fed_par(tmp_path):
 def test_opening_book_fails_loudly_on_inconsistent_sources(tmp_path, overrides, message):
     inputs = _opening_book_inputs(tmp_path, **overrides)
     with pytest.raises(ValueError, match=message):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+def test_opening_book_fails_on_an_unknown_wamest_level_basis(tmp_path):
+    # A level whose valuation basis is not declared cannot be converted to par safely.
+    inputs = _opening_book_inputs(tmp_path)
+    frame = pd.read_csv(inputs["wamest_path"])
+    frame.loc[frame["sector_key"].eq("bank_us_chartered"), "revaluation_valuation_basis"] = "amortized_cost_v2"
+    frame.to_csv(inputs["wamest_path"], index=False)
+    with pytest.raises(ValueError, match="unknown level basis"):
         rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
 
 
