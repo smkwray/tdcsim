@@ -50,7 +50,7 @@ tdcsim-cbo verify --run-dir OUT_DIR --baseline "$PKG" --attestation "$ATT"
 | `scripts/run_cbo_forecast_smoke.py` | Builds a local baseline from CBO and Treasury files in `output/cbo_forecast_smoke/` and runs it over the full horizon |
 | `scripts/verify_cbo_forecast_package.py PACKAGE` | Checks a baseline package and its reported debt drift from CBO's path; `--write-zip` also zips it |
 | `scripts/write_cbo_example_scenarios.py` | Writes 23 example scenarios for a package (`--baseline`, `--attestation`, `--output-dir`) |
-| `src/ratewall_input_builder.py --opening-book-only` | Rebuilds the opening security book from local MSPD, SOMA and WAMEST files named on the command line |
+| `src/ratewall_input_builder.py --opening-book-only` | Rebuilds the opening security book from local MSPD, SOMA, WAMEST and Treasury auction files named on the command line, pricing it on the input directory's yield curve |
 
 Run the helpers with `python`; `tdcsim-cbo --help` lists the other subcommands. The CBO runner steps through Fedwire (Federal Reserve settlement system) business days, settling each security on its Treasury settlement day and everything pending at the September 30 fiscal-year close. By default, issuance keeps the TGA on the package's operating-cash path, and a run fails if the TGA goes negative; the [CBO quickstart](examples/cbo_downstream_quickstart.md) covers other funding rules, scenario fields and package layout.
 

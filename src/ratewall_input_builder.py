@@ -4,7 +4,8 @@ The builder deliberately separates exact public source objects from constrained
 allocations. MSPD supplies security-level marketable Treasury cohorts and NY Fed
 SOMA supplies Federal Reserve holdings by CUSIP. No public source gives other
 holders by CUSIP, so the non-Fed remainder of each security is split by WAMEST
-sector bill and nonbill holdings.
+sector bill and nonbill holdings: banks, foreign holders and money funds keep their
+measured holdings converted to par, and domestic nonbanks take the rest.
 """
 
 from __future__ import annotations
@@ -26,7 +27,10 @@ import pandas as pd
 import yaml
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
+from cbo_yield_curve_surface import INTERPOLATION_METHOD
+from sim_pricing import evaluate_nominal_yield, value_treasury_security
 from tdc_shared import (
+    DAYS_PER_YEAR_ACTUAL,
     MARKETABLE_PREFERENCE_CATEGORIES,
     MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
     MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
@@ -34,12 +38,14 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
 )
+from yield_curve_path import curve_for_date, load_yield_curve_surface
 
 
 FISCALDATA_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
 SOMA_ASOF_DATES_URL = "https://markets.newyorkfed.org/api/soma/asofdates/list.json"
 SOMA_TREASURY_ASOF_URL = "https://markets.newyorkfed.org/api/soma/tsy/get/asof/{as_of}.csv"
 SOMA_HOLDINGS_FILENAME = "nyfed_soma_treasury_holdings.csv"
+YIELD_CURVE_SURFACE_FILENAME = "tdcsim_yield_curve_surface.csv"
 SOMA_TYPE_CLASSES = {
     "Bills": ("Bills",),
     "NotesBonds": ("Notes", "Bonds"),
@@ -50,7 +56,9 @@ MATURED_CLASS_CATEGORIES = {"Bills": "bills", "Notes": "notes", "Bonds": "bonds"
 MSPD_TOTAL_TOLERANCE_MIL = 1.0
 BOND_HISTORY_SOURCE = (
     "FiscalData MSPD security cohorts scaled to MSPD Table 1 class totals; "
-    "CB from NY Fed SOMA by CUSIP; non-Fed remainder split by WAMEST sector bill and nonbill holdings"
+    "CB from NY Fed SOMA by CUSIP plus SOMA auction add-ons settling by the record date; "
+    "banks, foreign and money funds at WAMEST bill and nonbill holdings converted to par, "
+    "domestic nonbanks take the rest of the non-Fed remainder"
 )
 WAMEST_CANONICAL_RELATIVE_PATH = "wamest/outputs/full_coverage_release/canonical_sector_maturity.csv"
 # Opening-book holder routes for non-Fed holders: (HolderType, HolderSubBucket).
@@ -60,6 +68,18 @@ NONCB_OPENING_ROUTES = (
     ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK),
     ("Private", PRIVATE_SUBBUCKET_MMF),
 )
+# Domestic nonbanks are the Financial Accounts' residual sector, so in the opening book
+# they take whatever non-Fed par the measured routes do not hold.
+NONCB_RESIDUAL_ROUTE = ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK)
+OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
+# WAMEST holdings are market values; the book is at par. Each group's par-to-market
+# factor prices its non-Fed securities on the governed baseline curve, evaluated as the
+# CBO runtime evaluates it.
+OPENING_PRICE_CURVE = {
+    "scenario_id": "cbo_shape_preserving_baseline",
+    "interpolation_method": INTERPOLATION_METHOD,
+    "floor_zero": False,
+}
 # Every WAMEST canonical sector maps to one opening route. The Fed maps to None
 # because CB holdings come from SOMA by CUSIP. Depository institutions, including
 # credit unions, settle through reserve or correspondent balances and route to Banks.
@@ -378,11 +398,43 @@ def load_soma_cusip_holdings(path: Path) -> tuple[str, pd.DataFrame]:
     )
 
 
+def load_soma_auction_add_ons(path: Path, *, after: str, through: str) -> tuple[int, dict[str, float]]:
+    """Return the auction count and SOMA add-ons by CUSIP (USD millions) settling in (after, through].
+
+    The add-ons are on the MSPD outstanding basis, so a TIPS add-on carries its index
+    ratio on the issue date. The file must reach past ``through`` so a stale file
+    cannot drop add-ons silently.
+    """
+
+    frame = pd.read_csv(path, dtype=str)
+    required = ["issue_date", "cusip", "soma_accepted", "inflation_index_security", "index_ratio_on_issue_date"]
+    missing = [column for column in required if column not in frame.columns]
+    if missing or frame.empty:
+        raise ValueError(f"auction file {path.name} is empty or lacks columns: {missing}")
+    issue = pd.to_datetime(frame["issue_date"], errors="coerce")
+    if issue.isna().any():
+        raise ValueError(f"auction file {path.name} has {int(issue.isna().sum())} rows without a valid issue date")
+    if issue.max() <= pd.Timestamp(through):
+        raise ValueError(f"auction file {path.name} ends on {issue.max().date()}, so it may miss settlements through {through}")
+    rows = frame[(issue > pd.Timestamp(after)) & (issue <= pd.Timestamp(through))]
+    cusips = rows["cusip"].fillna("").astype(str).str.strip()
+    amount = pd.to_numeric(rows["soma_accepted"], errors="coerce")
+    tips_flag = rows["inflation_index_security"].fillna("").astype(str).str.strip()
+    ratio = pd.to_numeric(rows["index_ratio_on_issue_date"], errors="coerce").where(tips_flag.eq("Yes"), 1.0)
+    bad = amount.isna() | (amount < 0) | ratio.isna() | (ratio <= 0) | cusips.eq("") | ~tips_flag.isin(["Yes", "No"])
+    if bad.any():
+        raise ValueError(f"auction file {path.name} has {int(bad.sum())} unusable SOMA rows settling in ({after}, {through}]")
+    add_ons = (amount * ratio / 1.0e6).groupby(cusips).sum()
+    return len(rows), {cusip: float(value) for cusip, value in sorted(add_ons.items())}
+
+
 def load_wamest_noncb_weights(path: Path, *, record_date: str) -> dict:
-    """Split each class group among non-Fed holders by WAMEST sector bill and nonbill holdings.
+    """Return WAMEST non-Fed holdings and shares by opening route for bills and nonbills.
 
     Uses the latest WAMEST quarter on or before ``record_date``. Only ``level``
     and ``bill_share`` are read; the Fed row is excluded because CB comes from SOMA.
+    The shares are the measured (market-value) shares; the opening book converts the
+    holdings to par itself.
     """
 
     frame = pd.read_csv(path, usecols=["date", "sector_key", "level", "bill_share", "publication_status"], dtype=str)
@@ -817,6 +869,84 @@ def _load_absorption_scenarios(
     return scenarios, metadata, private_subbucket_scenarios
 
 
+def _opening_price_curve(path: Path, *, record_date: str) -> tuple[list[float], list[float], str]:
+    """Return the governed baseline curve on or before ``record_date`` and its curve date."""
+
+    years, rates, label = curve_for_date(
+        load_yield_curve_surface(path), record_date, scenario_id=OPENING_PRICE_CURVE["scenario_id"]
+    )
+    prefix = "dynamic_curve_surface:"
+    if not years or not label.startswith(prefix):
+        raise ValueError(f"{path.name} has no {OPENING_PRICE_CURVE['scenario_id']} curve on or before {record_date}: {label}")
+    return years, rates, label[len(prefix):]
+
+
+def _clean_price_ratio(item: dict, *, settlement: pd.Timestamp, curve_years: list[float], curve_rates: list[float]) -> float | None:
+    """Clean market value per unit of book par at ``settlement``; None for a TIPS.
+
+    Matured-unpaid debt is paid at par on the next business day. FRNs price at par. A
+    TIPS needs a real curve, and the input directory governs none, so it is left out of
+    the factor sample rather than priced on the nominal curve.
+    """
+
+    if item["maturity_date"] <= settlement:
+        return 1.0
+    if item["security_type"] == "TIPS":
+        return None
+    coupon_rate = item["coupon_rate"]
+    if coupon_rate > 0.0 and item["issue_date"] > settlement:
+        raise ValueError(f"{item['cusip']} pays a coupon but is issued after {settlement.date()}")
+    years_to_maturity = (item["maturity_date"] - settlement).total_seconds() / (DAYS_PER_YEAR_ACTUAL * 24 * 60 * 60)
+    market_yield = evaluate_nominal_yield(
+        years_to_maturity,
+        curve_years,
+        curve_rates,
+        method=OPENING_PRICE_CURVE["interpolation_method"],
+        floor_zero=OPENING_PRICE_CURVE["floor_zero"],
+        shock=None,
+    )
+    if not math.isfinite(float(market_yield)):
+        raise ValueError(f"{item['cusip']} has no finite market yield on the opening curve")
+    clean = float(
+        value_treasury_security(
+            settlement_date=settlement,
+            maturity_date=item["maturity_date"],
+            coupon_rate=coupon_rate,
+            discount_yield=float(market_yield),
+            security_type=item["security_type"],
+            face_value=1.0,
+            issue_date=item["issue_date"],
+        )["clean"]
+    )
+    if not math.isfinite(clean) or clean <= 0.0:
+        raise ValueError(f"{item['cusip']} produced an invalid clean price {clean}")
+    return clean
+
+
+def _route_key(route: tuple[str, str]) -> str:
+    return "/".join(route).rstrip("/")
+
+
+def _opening_route_par(measured_mil: dict, *, noncb_par_bil: float, factor: float, group: str) -> dict:
+    """Convert measured route holdings to par; the residual route takes the rest of the group's par."""
+
+    if noncb_par_bil <= 0.0:
+        raise ValueError(f"opening book has no non-Fed {group} par to allocate")
+    par = {
+        route: measured_mil[route] / 1000.0 * factor
+        for route in NONCB_OPENING_ROUTES
+        if route != NONCB_RESIDUAL_ROUTE
+    }
+    par[NONCB_RESIDUAL_ROUTE] = noncb_par_bil - sum(par.values())
+    negative = {_route_key(route): value for route, value in par.items() if value < 0.0}
+    if negative:
+        raise ValueError(
+            f"opening {group} par holdings would be negative: {negative}; measured holdings at par "
+            f"exceed the non-Fed {group} par of {noncb_par_bil:.3f} bn"
+        )
+    return {route: par[route] for route in NONCB_OPENING_ROUTES}
+
+
 def build_initial_portfolio(
     output_path: Path,
     *,
@@ -825,15 +955,21 @@ def build_initial_portfolio(
     table3_rows: list[dict],
     soma_path: Path,
     wamest_path: Path,
+    yield_curve_path: Path,
+    auctions_path: Path,
 ) -> tuple[pd.DataFrame, dict]:
     """Write the MSPD security-level opening book with CUSIP-level CB and WAMEST-split remainders.
 
     MSPD Table 3 securities, plus one cohort per class for debt that matured on a
     non-business record date and is paid on the next business day, are scaled to the
     Table 1 debt-held-by-public class total. CB holds the SOMA amount of each CUSIP
-    (and SOMA's matured-unpaid amounts in the matured cohorts). The rest is split
-    among non-Fed holders by their WAMEST bill or nonbill holdings, so the split is
-    uniform within bills and within nonbills; no public source gives other holders
+    (and SOMA's matured-unpaid amounts in the matured cohorts), plus the SOMA add-ons of
+    auctions settling after the SOMA as-of date and by the record date. The rest is
+    split among non-Fed holders by bills and nonbills: banks, foreign holders and money
+    funds keep their WAMEST holdings, which are market values, converted to par with
+    the group's par-to-market factor on the governed baseline curve; domestic nonbanks,
+    the Financial Accounts' residual sector, take the remaining non-Fed par. The split
+    is uniform within bills and within nonbills; no public source gives other holders
     by CUSIP.
     """
 
@@ -841,6 +977,8 @@ def build_initial_portfolio(
     if soma_as_of > record_date:
         raise ValueError(f"SOMA as-of date {soma_as_of} is after MSPD record date {record_date}")
     noncb = load_wamest_noncb_weights(wamest_path, record_date=record_date)
+    add_on_auctions, soma_add_ons = load_soma_auction_add_ons(auctions_path, after=soma_as_of, through=record_date)
+    curve_years, curve_rates, curve_date = _opening_price_curve(yield_curve_path, record_date=record_date)
     targets = {
         row["security_class_desc"]: _safe_float(row.get("debt_held_public_mil_amt"))
         for row in table1_rows
@@ -906,6 +1044,13 @@ def build_initial_portfolio(
         matured_mil[class_key] = max(0.0, class_total - unmatured)
 
     soma_amount = dict(zip(soma["cusip"], soma["amount_mil"]))
+    # SOMA is weekly; the Fed's add-ons at auctions settling after its as-of date and by
+    # the record date are Fed holdings at the record date.
+    absent_add_ons = sorted(set(soma_add_ons) - set(cusip_outstanding))
+    if absent_add_ons:
+        raise ValueError(f"auctions settling in ({soma_as_of}, {record_date}] are absent from MSPD: {absent_add_ons}")
+    for cusip, amount in soma_add_ons.items():
+        soma_amount[cusip] = soma_amount.get(cusip, 0.0) + amount
     unmatched = soma[~soma["cusip"].isin(cusip_outstanding)]
     unmatched_live = unmatched[unmatched["maturity_date"] > record_date]
     if not unmatched_live.empty:
@@ -941,19 +1086,64 @@ def build_initial_portfolio(
             }
         )
 
-    output_rows: list[dict] = []
-    bond_id = 1
+    groups = ("bills", "nonbills")
+    noncb_par = {group: 0.0 for group in groups}
+    priced = {group: {"par": 0.0, "market": 0.0} for group in groups}
+    unpriced_par = {group: 0.0 for group in groups}
     for item in candidate_rows:
         target_total = targets.get(item["class_key"], 0.0)
         if target_total <= 0:
             raise ValueError(f"MSPD Table 1 has no debt-held-by-public total for {item['class_key']}")
         # Table 1 excludes intragovernmental holdings; scale each class's Table 3 total to it.
         class_scale = target_total / class_totals[item["class_key"]]
+        cusip = item["cusip"]
+        item["coupon_rate"] = _safe_float(item["source_row"].get("interest_rate_pct")) / 100.0
+        # MSPD and SOMA amounts are in millions of dollars; contract columns use billions.
+        item["public_face"] = item["outstanding"] * class_scale / 1000.0
+        if "matured_cb_mil" in item:
+            item["cb_face"] = item["matured_cb_mil"] / 1000.0
+        else:
+            item["cb_face"] = soma_amount.get(cusip, 0.0) * item["outstanding"] / cusip_outstanding[cusip] / 1000.0
+        if item["cb_face"] > item["public_face"] * (1.0 + 1e-9) + 1e-9:
+            raise ValueError(
+                f"SOMA (with auction add-ons) holds more of {cusip} than MSPD debt held by the public: "
+                f"{item['cb_face']} > {item['public_face']}"
+            )
+        item["remainder"] = max(0.0, item["public_face"] - item["cb_face"])
+        group = item["group"] = "bills" if item["class_key"] == "Bills" else "nonbills"
+        noncb_par[group] += item["remainder"]
+        if item["remainder"] <= 0.0:
+            continue
+        ratio = _clean_price_ratio(item, settlement=record_ts, curve_years=curve_years, curve_rates=curve_rates)
+        if ratio is None:
+            unpriced_par[group] += item["remainder"]
+        else:
+            priced[group]["par"] += item["remainder"]
+            priced[group]["market"] += item["remainder"] * ratio
+    factors = {}
+    route_par = {}
+    for group in groups:
+        if priced[group]["market"] <= 0.0:
+            raise ValueError(f"opening book has no priced non-Fed {group} to convert WAMEST holdings to par")
+        factors[group] = priced[group]["par"] / priced[group]["market"]
+        route_par[group] = _opening_route_par(
+            {route: noncb["holdings_usd_mil"][route][group] for route in NONCB_OPENING_ROUTES},
+            noncb_par_bil=noncb_par[group],
+            factor=factors[group],
+            group=group,
+        )
+    route_weights = {
+        group: {route: route_par[group][route] / noncb_par[group] for route in NONCB_OPENING_ROUTES} for group in groups
+    }
+
+    output_rows: list[dict] = []
+    bond_id = 1
+    for item in candidate_rows:
         is_matured = "matured_cb_mil" in item
         source_row = item["source_row"]
         class_desc = str(source_row.get("security_class1_desc", ""))
         cusip = item["cusip"]
-        coupon_rate = _safe_float(source_row.get("interest_rate_pct")) / 100.0
+        coupon_rate = item["coupon_rate"]
         issue_yield = _safe_float(source_row.get("yield_pct"), coupon_rate * 100.0) / 100.0
         maturity_years = item["original_maturity_years"]
         maturity_category = item.get("maturity_category") or _maturity_category(class_desc, maturity_years)
@@ -962,21 +1152,13 @@ def build_initial_portfolio(
         if is_bill:
             day_count = max(1.0, (item["maturity_date"] - item["issue_date"]).days)
             price_ratio = max(0.75, min(1.0, 1.0 - issue_yield * day_count / 360.0))
-        # MSPD and SOMA amounts are in millions of dollars; contract columns use billions.
-        public_face = item["outstanding"] * class_scale / 1000.0
-        if is_matured:
-            cb_face = item["matured_cb_mil"] / 1000.0
-        else:
-            cb_face = soma_amount.get(cusip, 0.0) * item["outstanding"] / cusip_outstanding[cusip] / 1000.0
-        if cb_face > public_face * (1.0 + 1e-9) + 1e-9:
-            raise ValueError(f"SOMA holds more of {cusip} than MSPD debt held by the public: {cb_face} > {public_face}")
-        remainder = max(0.0, public_face - cb_face)
-        group = "bills" if item["class_key"] == "Bills" else "nonbills"
+        group = item["group"]
+        has_add_on = soma_add_ons.get(cusip, 0.0) > 0.0
         routes = [
-            (holder, subbucket, remainder * noncb["weights"][group][(holder, subbucket)])
+            (holder, subbucket, item["remainder"] * route_weights[group][(holder, subbucket)])
             for holder, subbucket in NONCB_OPENING_ROUTES
         ]
-        routes.insert(1, ("CB", "", cb_face))
+        routes.insert(1, ("CB", "", item["cb_face"]))
         for holder, holder_subbucket, face_value in routes:
             if face_value <= 1e-9:
                 continue
@@ -1029,6 +1211,7 @@ def build_initial_portfolio(
                     "ratewall_perimeter": "DU" if holder == "Private" else "RU",
                     "source_family": (
                         "fiscaldata_mspd_table_3_market;nyfed_soma_cusip_holdings"
+                        + (";fiscaldata_auctions_soma_accepted" if has_add_on else "")
                         if is_cb
                         else "fiscaldata_mspd_table_3_market;wamest_sector_bill_share"
                     ),
@@ -1047,8 +1230,10 @@ def build_initial_portfolio(
                         + "mspd_million_amounts_scaled_to_table1_class_total_and_converted_to_bil;"
                         + (
                             f"cb_from_nyfed_soma_asof_{soma_as_of}"
+                            + (f"_plus_auction_soma_add_ons_through_{record_date}" if has_add_on else "")
                             if is_cb
-                            else f"noncb_remainder_split_by_wamest_{noncb['wamest_date']}_{group}_holdings_not_cusip_holder_evidence"
+                            else f"noncb_remainder_split_by_wamest_{noncb['wamest_date']}_{group}_holdings_at_par_"
+                            "domestic_nonbank_residual_not_cusip_holder_evidence"
                         )
                     ),
                     "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
@@ -1075,19 +1260,66 @@ def build_initial_portfolio(
             "cusips": int(len(matured_unpaid)),
             "amount_bil": float(matured_unpaid["amount_mil"].sum() / 1000.0),
         },
-        # The Fed reinvested these at auctions MSPD records under new CUSIPs; their
-        # amounts sit with non-Fed holders in this book.
+        # The Fed reinvests these at auctions MSPD records under new CUSIPs; the add-ons
+        # below put those new holdings with CB.
         "soma_paid_before_record_date": {
             "cusips": int(len(paid_before_record)),
             "amount_bil": float(paid_before_record["amount_mil"].sum() / 1000.0),
+        },
+        "soma_auction_add_ons": {
+            "settlement_window": f"({soma_as_of}, {record_date}]",
+            "auctions": add_on_auctions,
+            "cusips_with_add_on": sum(1 for value in soma_add_ons.values() if value > 0.0),
+            "amount_bil": sum(soma_add_ons.values()) / 1000.0,
+            "amount_bil_by_cusip": {cusip: value / 1000.0 for cusip, value in soma_add_ons.items()},
+            "source": auctions_path.name,
+            "source_sha256": _sha256(auctions_path),
         },
         "matured_unpaid_bil": {key: value / 1000.0 for key, value in sorted(matured_mil.items()) if value > 0.0},
         "noncb_source": WAMEST_CANONICAL_RELATIVE_PATH,
         "noncb_source_sha256": _sha256(wamest_path),
         "wamest_date": noncb["wamest_date"],
+        # New-issuance holder shares read these measured shares; the opening book's own
+        # split is opening_allocation.groups.*.route_weights.
         "noncb_weights": {
-            group: {"/".join(route).rstrip("/"): share for route, share in shares.items()}
+            group: {_route_key(route): share for route, share in shares.items()}
             for group, shares in noncb["weights"].items()
+        },
+        "noncb_weights_basis": "wamest_measured_market_value_shares_for_new_issuance_not_opening_split",
+        "opening_allocation": {
+            "rule": OPENING_ALLOCATION_RULE,
+            "measured_holdings_basis": "wamest_level_times_bill_share_read_as_market_value",
+            "residual_route": _route_key(NONCB_RESIDUAL_ROUTE),
+            "price_basis": "clean_market_value_per_unit_of_book_par",
+            "pricing_date": record_date,
+            "curve_file": yield_curve_path.name,
+            "curve_sha256": _sha256(yield_curve_path),
+            **{f"curve_{key}": value for key, value in OPENING_PRICE_CURVE.items()},
+            "curve_date": curve_date,
+            "frn_treatment": "priced_at_par",
+            "matured_unpaid_treatment": "valued_at_par",
+            "tips_treatment": "excluded_from_factor_sample_no_governed_real_curve_take_group_factor",
+            "tips_par_basis": "mspd_outstanding_including_inflation_adjustment",
+            "groups": {
+                group: {
+                    "par_to_market_factor": factors[group],
+                    "noncb_par_bil": noncb_par[group],
+                    "priced_par_bil": priced[group]["par"],
+                    "priced_market_value_bil": priced[group]["market"],
+                    "unpriced_tips_par_bil": unpriced_par[group],
+                    "measured_market_value_bil": {
+                        _route_key(route): noncb["holdings_usd_mil"][route][group] / 1000.0 for route in NONCB_OPENING_ROUTES
+                    },
+                    "par_bil": {_route_key(route): route_par[group][route] for route in NONCB_OPENING_ROUTES},
+                    "domestic_nonbank_residual_bil": route_par[group][NONCB_RESIDUAL_ROUTE],
+                    # Non-Fed par that no measured holding at par accounts for; the residual
+                    # route absorbs it on top of its own measured holdings at par.
+                    "residual_gap_bil": noncb_par[group]
+                    - factors[group] * sum(noncb["holdings_usd_mil"][route][group] for route in NONCB_OPENING_ROUTES) / 1000.0,
+                    "route_weights": {_route_key(route): route_weights[group][route] for route in NONCB_OPENING_ROUTES},
+                }
+                for group in groups
+            },
         },
         "holder_totals_bil": dict(sorted(holder_totals.items())),
     }
@@ -1692,6 +1924,7 @@ def build_all(
     config_path: Path,
     ratewall_root: Path,
     project_root: Path,
+    auctions_query: Path,
 ) -> dict:
     _ensure_dir(output_dir)
     contract_output_dir = project_root / "output" / "ratewall_contract_source_backed"
@@ -1707,6 +1940,11 @@ def build_all(
     record_date = _latest_record_date("v1/debt/mspd/mspd_table_1")
     soma_path = output_dir / SOMA_HOLDINGS_FILENAME
     soma_url = fetch_soma_treasury_holdings(record_date, soma_path)
+    # The opening book prices its non-Fed securities on this surface.
+    _, artifacts["yield_curve"] = build_yield_curve_surface(
+        output_dir / YIELD_CURVE_SURFACE_FILENAME,
+        cbo_economic_path=cbo_economic_path,
+    )
     _, artifacts["initial_portfolio"] = build_initial_portfolio(
         output_dir / "tdcsim_initial_portfolio_cohorts.csv",
         record_date=record_date,
@@ -1714,15 +1952,13 @@ def build_all(
         table3_rows=_fetch_fiscaldata_rows("v1/debt/mspd/mspd_table_3_market", record_date=record_date),
         soma_path=soma_path,
         wamest_path=ratewall_root.parent / WAMEST_CANONICAL_RELATIVE_PATH,
+        yield_curve_path=output_dir / YIELD_CURVE_SURFACE_FILENAME,
+        auctions_path=auctions_query,
     )
     artifacts["initial_portfolio"]["soma_source_url"] = soma_url
     _, artifacts["primary_flow"] = build_primary_flow_path(
         output_dir / "tdcsim_primary_flow_to_du_path.csv",
         cbo_budget_path=cbo_budget_path,
-    )
-    _, artifacts["yield_curve"] = build_yield_curve_surface(
-        output_dir / "tdcsim_yield_curve_surface.csv",
-        cbo_economic_path=cbo_economic_path,
     )
     _, artifacts["holder_absorption"] = build_holder_absorption_path(
         output_dir / "tdcsim_holder_absorption_path.csv",
@@ -1773,15 +2009,22 @@ def rebuild_opening_book(
     mspd_table_3_market: Path,
     soma_holdings: Path,
     wamest_canonical: Path,
+    auctions_query: Path,
 ) -> dict:
     """Rebuild only the opening book in an existing input directory from local source files.
 
     The SOMA file is copied beside the book, and the manifest's opening-book entry and
     file hashes are replaced; the other artifacts in the directory are left as they are.
+    The book is priced on the directory's yield curve surface, which must be the one the
+    manifest records.
     """
 
     manifest_path = output_dir / "tdcsim_ratewall_input_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    curve_path = output_dir / YIELD_CURVE_SURFACE_FILENAME
+    recorded_curve = manifest.get("files", {}).get(YIELD_CURVE_SURFACE_FILENAME, {}).get("sha256")
+    if not curve_path.exists() or recorded_curve != _sha256(curve_path):
+        raise ValueError(f"{curve_path.name} is missing or does not match the manifest's recorded hash")
     tables = {}
     for name, path in (("table1", mspd_table_1), ("table3", mspd_table_3_market)):
         frame = pd.read_csv(path, dtype=str)
@@ -1800,6 +2043,8 @@ def rebuild_opening_book(
         table3_rows=tables["table3"],
         soma_path=soma_path,
         wamest_path=wamest_canonical,
+        yield_curve_path=curve_path,
+        auctions_path=auctions_query,
     )
     metadata["mspd_source_sha256"] = {path.name: _sha256(path) for path in (mspd_table_1, mspd_table_3_market)}
     manifest["artifacts"]["initial_portfolio"] = metadata
@@ -1815,6 +2060,12 @@ def main() -> None:
     parser.add_argument("--output-dir", default="data/ratewall_inputs")
     parser.add_argument("--config-path", default="tdc_config_ratewall_source_backed.yaml")
     parser.add_argument("--ratewall-root", default="../ratewall")
+    parser.add_argument(
+        "--auctions-query",
+        type=Path,
+        required=True,
+        help="FiscalData auctions file; the Fed's add-ons settling by the record date go to CB",
+    )
     opening = parser.add_argument_group("rebuild only the opening book from local files")
     opening.add_argument("--opening-book-only", action="store_true")
     opening.add_argument("--record-date")
@@ -1837,6 +2088,7 @@ def main() -> None:
             soma_holdings=args.soma_holdings,
             wamest_canonical=args.wamest_canonical
             or (project_root / args.ratewall_root).resolve().parent / WAMEST_CANONICAL_RELATIVE_PATH,
+            auctions_query=args.auctions_query,
         )
         print(json.dumps({"status": "ok", "initial_portfolio": manifest["artifacts"]["initial_portfolio"]}, indent=2, sort_keys=True))
         return
@@ -1845,6 +2097,7 @@ def main() -> None:
         config_path=(project_root / args.config_path).resolve(),
         ratewall_root=(project_root / args.ratewall_root).resolve(),
         project_root=project_root,
+        auctions_query=args.auctions_query,
     )
     print(json.dumps({"status": "ok", "files": manifest["files"]}, indent=2, sort_keys=True))
 

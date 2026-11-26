@@ -989,12 +989,42 @@ def test_ratewall_source_backed_combined_scenarios_reuse_holder_shift_targets(tm
         )
 
 
-def _opening_book_inputs(tmp_path, *, soma_rows=None, drop_sector=None, extra_table3=None, soma_as_of="2026-04-29"):
-    """Synthetic MSPD, SOMA and WAMEST inputs shaped like the real files.
+# WAMEST holdings in USD millions: (level, bill share). Measured bills are banks 100,
+# foreign 200, money funds 400 and households 150 bn; measured nonbills are 100, 800,
+# 100 and 450 bn.
+_OPENING_WAMEST_LEVELS = {
+    "bank_us_chartered": (200_000.0, 0.5),
+    "foreigners_total": (1_000_000.0, 0.2),
+    "money_market_funds": (500_000.0, 0.8),
+    "households_nonprofits": (600_000.0, 0.25),
+}
+# Auctions as (issue date, CUSIP, SOMA accepted in dollars, TIPS flag, index ratio). Only
+# settlements after the SOMA as-of date (2026-04-29) and by the record date (2026-04-30)
+# are Fed holdings SOMA does not yet show.
+_OPENING_AUCTIONS = [
+    ("2026-04-28", "FAKEBILL1", "9000000000", "No", ""),
+    ("2026-04-30", "FAKEBILL1", "5000000000", "No", ""),
+    ("2026-04-30", "FAKETIPS1", "10000000000", "Yes", "1.2"),
+    ("2026-05-05", "FAKEBILL1", "3000000000", "No", ""),
+]
+
+
+def _opening_book_inputs(
+    tmp_path,
+    *,
+    soma_rows=None,
+    drop_sector=None,
+    extra_table3=None,
+    soma_as_of="2026-04-29",
+    wamest_levels=None,
+    auction_rows=None,
+):
+    """Synthetic MSPD, SOMA, WAMEST, curve and auction inputs shaped like the real files.
 
     One bill, one note and one TIPS security; 100,000 of notes matured on the record
     date and are unpaid; 1% of notes are held intragovernmentally, so Table 1 is below
-    the Table 3 class total.
+    the Table 3 class total. The baseline curve is a flat 5% on and before the record
+    date, so the bill and the 4% note trade below par.
     """
 
     table1 = [
@@ -1055,14 +1085,12 @@ def _opening_book_inputs(tmp_path, *, soma_rows=None, drop_sector=None, extra_ta
         ]
     ).to_csv(soma_path, index=False)
 
-    levels = {"bank_us_chartered": (100.0, 0.5), "foreigners_total": (300.0, 0.2), "money_market_funds": (200.0, 0.8)}
+    levels = wamest_levels or _OPENING_WAMEST_LEVELS
     wamest_rows = []
     for sector in rib.WAMEST_SECTOR_ROUTES:
         if sector == drop_sector:
             continue
         level, bill_share = levels.get(sector, (0.0, 0.0))
-        if sector == "households_nonprofits":
-            level, bill_share = 400.0, 0.25
         wamest_rows.append(
             {
                 "date": "2026-03-31",
@@ -1074,38 +1102,116 @@ def _opening_book_inputs(tmp_path, *, soma_rows=None, drop_sector=None, extra_ta
         )
     wamest_path = tmp_path / "wamest.csv"
     pd.DataFrame(wamest_rows).to_csv(wamest_path, index=False)
+
+    # A later baseline curve and another scenario carry other rates, so pricing on any
+    # curve but the baseline on or before the record date changes the factors.
+    curve_path = tmp_path / "curve.csv"
+    pd.DataFrame(
+        [
+            {"scenario_id": scenario, "curve_date": curve_date, "tenor_years": tenor, "nominal_rate": rate, "rate_unit": "decimal"}
+            for scenario, curve_date, rate in (
+                ("cbo_shape_preserving_baseline", "2026-04-01", 0.05),
+                ("cbo_shape_preserving_baseline", "2026-07-01", 0.09),
+                ("higher_for_longer_sensitivity", "2026-04-01", 0.09),
+            )
+            for tenor in (0.25, 1.0, 10.0, 30.0)
+        ]
+    ).to_csv(curve_path, index=False)
+
+    auctions_path = tmp_path / "auctions.csv"
+    pd.DataFrame(
+        [
+            {
+                "issue_date": issue,
+                "cusip": cusip,
+                "soma_accepted": amount,
+                "inflation_index_security": tips,
+                "index_ratio_on_issue_date": ratio,
+            }
+            for issue, cusip, amount, tips, ratio in (_OPENING_AUCTIONS if auction_rows is None else auction_rows)
+        ]
+    ).to_csv(auctions_path, index=False)
     return {
         "record_date": "2026-04-30",
         "table1_rows": table1,
         "table3_rows": table3,
         "soma_path": soma_path,
         "wamest_path": wamest_path,
+        "yield_curve_path": curve_path,
+        "auctions_path": auctions_path,
     }
 
 
-def test_opening_book_pins_cb_to_soma_and_splits_remainder_by_wamest_bill_holdings(tmp_path):
+def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path):
     frame, metadata = rib.build_initial_portfolio(tmp_path / "cohorts.csv", **_opening_book_inputs(tmp_path))
-    face = frame.assign(FaceValue=frame["FaceValue"].astype(float)).set_index(
-        ["cusip_or_synthetic_id", "HolderType", "HolderSubBucket"]
-    )["FaceValue"]
+    book = frame.assign(FaceValue=frame["FaceValue"].astype(float))
+    face = book.set_index(["cusip_or_synthetic_id", "HolderType", "HolderSubBucket"])["FaceValue"]
+    is_bill = book["cusip_or_synthetic_id"].isin(["FAKEBILL1"])
+    route = book["HolderType"] + "/" + book["HolderSubBucket"].fillna("")
+    route = route.str.rstrip("/")
+    bills = book[is_bill].groupby(route[is_bill])["FaceValue"].sum()
+    nonbills = book[~is_bill].groupby(route[~is_bill])["FaceValue"].sum()
+    dn, mmf = "Private/domestic_nonbank_deposit_funded", "Private/mmf_cash_fund_route"
 
     # MSPD and SOMA are in millions; the book is in billions. CB holds exactly the
     # SOMA amount of each CUSIP, so Fed maturities land on the actual dates and sizes.
     # The 1% intragovernmental scaling applies to the public total, never to SOMA.
-    assert face[("FAKEBILL1", "CB", "")] == pytest.approx(100.0)
+    # The Fed's 5 bn add-on settling after the SOMA as-of date is a Fed holding on the
+    # record date; add-ons SOMA already shows, or settling later, are not.
+    assert face[("FAKEBILL1", "CB", "")] == pytest.approx(105.0)
     assert face[("FAKENOTE1", "CB", "")] == pytest.approx(500.0)
-    # TIPS outstanding in MSPD includes the inflation adjustment, so CB does too.
-    assert face[("FAKETIPS1", "CB", "")] == pytest.approx(60.0)
+    # TIPS outstanding in MSPD includes the inflation adjustment, so CB does too, and a
+    # TIPS add-on carries its index ratio (10 bn par at 1.2).
+    assert face[("FAKETIPS1", "CB", "")] == pytest.approx(60.0 + 12.0)
+    add_ons = metadata["soma_auction_add_ons"]
+    assert add_ons["auctions"] == 2 and add_ons["amount_bil"] == pytest.approx(17.0)
+    assert add_ons["amount_bil_by_cusip"] == {"FAKEBILL1": pytest.approx(5.0), "FAKETIPS1": pytest.approx(12.0)}
+    assert "auction_soma_add_ons" in book.loc[book["HolderType"].eq("CB") & is_bill, "source_status"].iloc[0]
 
-    # Non-Fed bill remainder (900) follows WAMEST bill holdings: banks 50, foreign 60,
-    # MMF 160, domestic nonbank 100 of 370. Nonbills follow nonbill holdings instead,
-    # so money funds take far more of a bill than of a note.
-    bill_total = 50.0 + 60.0 + 160.0 + 100.0
-    assert face[("FAKEBILL1", "Private", "mmf_cash_fund_route")] == pytest.approx(900.0 * 160.0 / bill_total)
-    note_total = 50.0 + 240.0 + 40.0 + 300.0
-    note_public = 2000.0 * 0.99
-    assert face[("FAKENOTE1", "Private", "mmf_cash_fund_route")] == pytest.approx((note_public - 500.0) * 40.0 / note_total)
-    assert face[("FAKENOTE1", "Foreign", "")] == pytest.approx((note_public - 500.0) * 240.0 / note_total)
+    # WAMEST holdings are market values; the bill (124 days to maturity, flat 5% curve)
+    # trades below par, so measured bill holders hold more par than market value. Banks,
+    # foreign holders and money funds keep exactly that; domestic nonbanks, the residual
+    # sector, take the rest of the 895 bn non-Fed bills.
+    bill_factor = 1.025 ** (124.0 / 184.0)
+    allocation = metadata["opening_allocation"]
+    assert allocation["curve_date"] == "2026-04-01"
+    assert allocation["groups"]["bills"]["par_to_market_factor"] == pytest.approx(bill_factor)
+    assert bills["Banks"] == pytest.approx(100.0 * bill_factor)
+    assert bills["Foreign"] == pytest.approx(200.0 * bill_factor)
+    assert bills[mmf] == pytest.approx(400.0 * bill_factor)
+    assert bills[dn] == pytest.approx(895.0 - 700.0 * bill_factor)
+    assert allocation["groups"]["bills"]["domestic_nonbank_residual_bil"] == pytest.approx(bills[dn])
+    # Spreading the unmeasured remainder in proportion to measured holdings, the old
+    # rule, would hand foreign holders par that no source says they hold.
+    assert abs(bills["Foreign"] - 895.0 * 200.0 / 850.0) > 5.0
+
+    # Nonbills: the 4% note is below par on the 5% curve, matured-unpaid notes are paid at
+    # par, and TIPS, which need a real curve, stay out of the factor sample but take the
+    # group's factor through their holders.
+    group = allocation["groups"]["nonbills"]
+    note_noncb = 2000.0 * 0.99 - 500.0
+    matured_noncb = 100.0 * 0.99 - 20.0
+    assert group["priced_par_bil"] == pytest.approx(note_noncb + matured_noncb)
+    assert group["unpriced_tips_par_bil"] == pytest.approx(300.0 - 72.0)
+    factor = group["par_to_market_factor"]
+    assert factor == pytest.approx(group["priced_par_bil"] / group["priced_market_value_bil"])
+    assert factor > 1.02
+    assert nonbills["Foreign"] == pytest.approx(800.0 * factor)
+    assert nonbills["Banks"] == pytest.approx(100.0 * factor)
+    assert nonbills[mmf] == pytest.approx(100.0 * factor)
+    assert nonbills[dn] == pytest.approx(note_noncb + matured_noncb + 228.0 - 1000.0 * factor)
+    # The split stays uniform within a group, so each TIPS holder takes the group weight.
+    tips_noncb = 300.0 - 72.0
+    assert face[("FAKETIPS1", "Foreign", "")] / tips_noncb == pytest.approx(group["route_weights"]["Foreign"])
+
+    # New issuance keeps the measured WAMEST shares; the opening residual is a stock gap,
+    # not evidence of who buys at auction.
+    assert metadata["noncb_weights"]["bills"] == {
+        "Banks": pytest.approx(100.0 / 850.0),
+        "Foreign": pytest.approx(200.0 / 850.0),
+        dn: pytest.approx(150.0 / 850.0),
+        mmf: pytest.approx(400.0 / 850.0),
+    }
 
     # Notes that matured on the record date and are paid the next business day stay in
     # the book as one cohort maturing on the record date, including the Fed's share, so
@@ -1117,8 +1223,7 @@ def test_opening_book_pins_cb_to_soma_and_splits_remainder_by_wamest_bill_holdin
     assert face[("matured_unpaid_notes", "CB", "")] == pytest.approx(20.0)
 
     # Splitting holders never changes the public totals in Table 1.
-    totals = frame.assign(FaceValue=frame["FaceValue"].astype(float)).groupby("cusip_or_synthetic_id")["FaceValue"].sum()
-    assert totals.sum() == pytest.approx(1000.0 + 2079.0 + 300.0)
+    assert book["FaceValue"].sum() == pytest.approx(1000.0 + 2079.0 + 300.0)
 
     assert metadata["soma_matured_unpaid_at_record_date"] == {"cusips": 1, "amount_bil": pytest.approx(20.0)}
     # A SOMA security paid before the record date is reported, not silently dropped.
@@ -1131,11 +1236,29 @@ def test_opening_book_pins_cb_to_soma_and_splits_remainder_by_wamest_bill_holdin
     }
 
 
+def test_opening_book_fails_when_measured_holdings_exceed_non_fed_par(tmp_path):
+    # Foreign bills measured at 1,000 bn exceed the 895 bn of non-Fed bills; a negative
+    # domestic nonbank holding must stop the build rather than be clipped to zero.
+    levels = {**_OPENING_WAMEST_LEVELS, "foreigners_total": (5_000_000.0, 0.2)}
+    inputs = _opening_book_inputs(tmp_path, wamest_levels=levels)
+    with pytest.raises(ValueError, match="bills par holdings would be negative"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"soma_rows": [("FAKENEW01", "NotesBonds", "2030-01-01", "1000000000", "")]}, "absent from MSPD"),
-        ({"soma_rows": [("FAKEBILL1", "Bills", "2026-09-01", "1500000000000", "")]}, "SOMA holds more"),
+        ({"soma_rows": [("FAKEBILL1", "Bills", "2026-09-01", "1500000000000", "")]}, "holds more of FAKEBILL1"),
+        # An add-on can push CB past the public amount, or name a security MSPD lacks.
+        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "950000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "holds more of FAKEBILL1"),
+        ({"auction_rows": [("2026-04-30", "FAKENEW02", "1000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "auctions settling in"),
+        # A file that ends by the record date may miss add-ons, and a missing SOMA amount
+        # in the window is not a zero.
+        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "5000000000", "No", "")]}, "may miss settlements"),
+        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
+        ({"auction_rows": [("2026-04-30", "FAKETIPS1", "1000000000", "Yes", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
+        ({"auction_rows": [("2026-04-30", "FAKETIPS1", "1000000000", "", "1.2"), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
         ({"soma_rows": [("FAKEBMAT1", "Bills", "2026-04-30", "1000000000", "")]}, "no matured amount"),
         ({"soma_as_of": "2026-05-06"}, "after MSPD record date"),
         # A dated security row without dates would otherwise vanish into the class scaling.
@@ -1187,19 +1310,31 @@ def test_opening_book_rebuild_keeps_manifest_bound_to_the_files(tmp_path):
     out.mkdir()
     (out / "other.csv").write_text("x\n1\n", encoding="utf-8")
     other = {"sha256": "unchanged", "bytes": 4}
-    (out / "tdcsim_ratewall_input_manifest.json").write_text(
-        json.dumps({"artifacts": {"initial_portfolio": {}, "other": {"rows": 1}}, "files": {"other.csv": other}, "source_hierarchy": {}}),
-        encoding="utf-8",
-    )
+    curve = out / rib.YIELD_CURVE_SURFACE_FILENAME
+    curve.write_bytes(inputs["yield_curve_path"].read_bytes())
+    rebuild = {
+        "record_date": "2026-04-30",
+        "mspd_table_1": t1,
+        "mspd_table_3_market": t3,
+        "soma_holdings": inputs["soma_path"],
+        "wamest_canonical": inputs["wamest_path"],
+        "auctions_query": inputs["auctions_path"],
+    }
 
-    manifest = rib.rebuild_opening_book(
-        out,
-        record_date="2026-04-30",
-        mspd_table_1=t1,
-        mspd_table_3_market=t3,
-        soma_holdings=inputs["soma_path"],
-        wamest_canonical=inputs["wamest_path"],
-    )
+    def write_manifest(curve_sha256):
+        files = {"other.csv": other, curve.name: {"sha256": curve_sha256, "bytes": curve.stat().st_size}}
+        (out / "tdcsim_ratewall_input_manifest.json").write_text(
+            json.dumps({"artifacts": {"initial_portfolio": {}, "other": {"rows": 1}}, "files": files, "source_hierarchy": {}}),
+            encoding="utf-8",
+        )
+
+    # The book is priced on the directory's curve, so a curve the manifest does not
+    # describe would bind the book to an ungoverned surface.
+    write_manifest("0" * 64)
+    with pytest.raises(ValueError, match="does not match the manifest"):
+        rib.rebuild_opening_book(out, **rebuild)
+    write_manifest(rib._sha256(curve))
+    manifest = rib.rebuild_opening_book(out, **rebuild)
 
     on_disk = json.loads((out / "tdcsim_ratewall_input_manifest.json").read_text(encoding="utf-8"))
     assert on_disk == manifest
@@ -1208,6 +1343,7 @@ def test_opening_book_rebuild_keeps_manifest_bound_to_the_files(tmp_path):
     assert manifest["files"]["other.csv"] == other
     assert manifest["artifacts"]["other"] == {"rows": 1}
     assert manifest["artifacts"]["initial_portfolio"]["cb_source"] == "nyfed_soma_treasury_holdings_by_cusip"
+    assert manifest["artifacts"]["initial_portfolio"]["opening_allocation"]["curve_sha256"] == rib._sha256(curve)
     assert set(manifest["artifacts"]["initial_portfolio"]["mspd_source_sha256"]) == {t1.name, t3.name}
 
 
