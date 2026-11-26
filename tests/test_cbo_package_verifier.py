@@ -626,6 +626,7 @@ def _write_valid_package(package: Path) -> Path:
         simulation_start_date="2026-06-21",
         source_relative_path="sources/fiscaldata/auctions_query.csv",
         opening_portfolio=pd.read_csv(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv"),
+        check_calendar=False,
     )
     _write_json(package / "forecast_inputs" / "tdcsim_issuance_calibration.json", calibration)
 

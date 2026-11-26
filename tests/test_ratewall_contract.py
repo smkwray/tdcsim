@@ -1251,14 +1251,17 @@ def test_opening_book_fails_when_measured_holdings_exceed_non_fed_par(tmp_path):
         ({"soma_rows": [("FAKENEW01", "NotesBonds", "2030-01-01", "1000000000", "")]}, "absent from MSPD"),
         ({"soma_rows": [("FAKEBILL1", "Bills", "2026-09-01", "1500000000000", "")]}, "holds more of FAKEBILL1"),
         # An add-on can push CB past the public amount, or name a security MSPD lacks.
-        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "950000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "holds more of FAKEBILL1"),
-        ({"auction_rows": [("2026-04-30", "FAKENEW02", "1000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "auctions settling in"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKEBILL1", "950000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "holds more of FAKEBILL1"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKENEW02", "1000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "auctions settling in"),
         # A file that ends by the record date may miss add-ons, and a missing SOMA amount
         # in the window is not a zero.
-        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "5000000000", "No", "")]}, "may miss settlements"),
-        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
-        ({"auction_rows": [("2026-04-30", "FAKETIPS1", "1000000000", "Yes", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
-        ({"auction_rows": [("2026-04-30", "FAKETIPS1", "1000000000", "", "1.2"), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKEBILL1", "5000000000", "No", "")]}, "may miss settlements"),
+        # So may one that starts after the SOMA date, and a CUSIP listed twice on one day.
+        ({"auction_rows": [("2026-04-30", "FAKEBILL1", "5000000000", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "may miss settlements after"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKEBILL1", "1", "No", ""), ("2026-04-30", "FAKEBILL1", "1", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "twice on one settlement date"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKEBILL1", "", "No", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKETIPS1", "1000000000", "Yes", ""), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
+        ({"auction_rows": [("2026-04-01", "FAKEOLD01", "0", "No", ""), ("2026-04-30", "FAKETIPS1", "1000000000", "", "1.2"), ("2026-05-05", "FAKEBILL1", "0", "No", "")]}, "unusable SOMA rows"),
         ({"soma_rows": [("FAKEBMAT1", "Bills", "2026-04-30", "1000000000", "")]}, "no matured amount"),
         ({"soma_as_of": "2026-05-06"}, "after MSPD record date"),
         # A dated security row without dates would otherwise vanish into the class scaling.

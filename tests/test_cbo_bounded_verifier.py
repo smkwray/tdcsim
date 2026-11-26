@@ -1041,6 +1041,7 @@ def test_bounded_coherent_issuance_thin_path_tamper_fails_stock_bridge(
             face_issued_bil=10.0,
             cash_proceeds_bil=9.0,
             discount_or_premium_bil=1.0,
+            issue_cost_bil=1.0,
             flow_count=1,
         )
     )

@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -416,12 +417,19 @@ def load_soma_auction_add_ons(path: Path, *, after: str, through: str) -> tuple[
         raise ValueError(f"auction file {path.name} has {int(issue.isna().sum())} rows without a valid issue date")
     if issue.max() <= pd.Timestamp(through):
         raise ValueError(f"auction file {path.name} ends on {issue.max().date()}, so it may miss settlements through {through}")
+    if issue.min() > pd.Timestamp(after):
+        raise ValueError(f"auction file {path.name} starts on {issue.min().date()}, so it may miss settlements after {after}")
     rows = frame[(issue > pd.Timestamp(after)) & (issue <= pd.Timestamp(through))]
+    if rows.duplicated(["issue_date", "cusip"]).any():
+        raise ValueError(f"auction file {path.name} lists one CUSIP twice on one settlement date in ({after}, {through}]")
     cusips = rows["cusip"].fillna("").astype(str).str.strip()
     amount = pd.to_numeric(rows["soma_accepted"], errors="coerce")
     tips_flag = rows["inflation_index_security"].fillna("").astype(str).str.strip()
     ratio = pd.to_numeric(rows["index_ratio_on_issue_date"], errors="coerce").where(tips_flag.eq("Yes"), 1.0)
-    bad = amount.isna() | (amount < 0) | ratio.isna() | (ratio <= 0) | cusips.eq("") | ~tips_flag.isin(["Yes", "No"])
+    bad = (
+        ~np.isfinite(amount) | (amount < 0) | ~np.isfinite(ratio) | (ratio <= 0)
+        | cusips.eq("") | ~tips_flag.isin(["Yes", "No"])
+    )
     if bad.any():
         raise ValueError(f"auction file {path.name} has {int(bad.sum())} unusable SOMA rows settling in ({after}, {through}]")
     add_ons = (amount * ratio / 1.0e6).groupby(cusips).sum()
@@ -1098,6 +1106,10 @@ def build_initial_portfolio(
         class_scale = target_total / class_totals[item["class_key"]]
         cusip = item["cusip"]
         item["coupon_rate"] = _safe_float(item["source_row"].get("interest_rate_pct")) / 100.0
+        if "matured_cb_mil" not in item and item["security_type"] in {"Fixed", "TIPS"} and item["class_key"] != "Bills":
+            raw_rate = _safe_float(item["source_row"].get("interest_rate_pct"), math.nan)
+            if not math.isfinite(raw_rate) or raw_rate <= 0.0:
+                raise ValueError(f"MSPD Table 3 coupon security {cusip} has no valid interest rate")
         # MSPD and SOMA amounts are in millions of dollars; contract columns use billions.
         item["public_face"] = item["outstanding"] * class_scale / 1000.0
         if "matured_cb_mil" in item:

@@ -410,6 +410,7 @@ _ISSUANCE_SUMS = (
     "face_issued_bil",
     "cash_proceeds_bil",
     "discount_or_premium_bil",
+    "issue_cost_bil",
 )
 _ISSUANCE_WEIGHTED = (
     "weighted_original_term_years",

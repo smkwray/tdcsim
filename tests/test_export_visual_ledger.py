@@ -10,19 +10,46 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from export_visual_ledger import holder_column, issue_maturity, security_type, term_label  # noqa: E402
+from export_visual_ledger import build_issues, holder_column, payment_date, security_type  # noqa: E402
 
 
-def test_issue_maturity_follows_the_engine_dating_rules() -> None:
-    # The export derives maturity dates from settlement and term; they must match how the
-    # engine dated the securities, or the book would show bills outliving their term.
-    settled = pd.Timestamp("2026-07-07")
-    four_week = 28 / 365.25
-    assert security_type("Fixed", four_week) == "bill"
-    assert term_label("bill", four_week) == "4w"
-    assert issue_maturity(settled, "bill", four_week) == pd.Timestamp("2026-08-04")
-    assert issue_maturity(pd.Timestamp("2026-08-31"), "note", 2.0) == pd.Timestamp("2028-08-31")
+def _event(day: str, holder: str, sub: str, face: float, *, reopening: bool, kind: str = "calendar") -> dict:
+    return {
+        "period_end": day, "weighted_original_term_years": 10.0, "instrument_type": "Fixed",
+        "holder_sector": holder, "holder_subsector": sub, "face_issued_bil": face,
+        "cash_proceeds_bil": face * 0.99, "coupon_rate_decimal": 0.04, "security_id_tranche": str(len(day) + int(face)),
+        "security_label": "fixed-10y-2036-08-15", "maturity_date": "2036-08-15", "dated_date": "2026-08-15",
+        "is_reopening": reopening, "settlement_kind": kind,
+    }
+
+
+def test_issues_keep_the_engines_terms_and_a_reopening_stays_one_security() -> None:
+    # The deck's inspector shows each security's dates: a reopening must appear under the
+    # security it reopens, with that security's maturity, not as a new note dated from
+    # its own settlement day.
+    flows = [
+        _event("2026-08-17", "Banks", "", 10.0, reopening=False),
+        _event("2026-08-17", "CB", "", 2.0, reopening=False),
+        _event("2026-09-15", "Private", "mmf_cash_fund_route", 5.0, reopening=True),
+        _event("2026-09-30", "Foreign", "", 3.0, reopening=True, kind="fiscal_year_close"),
+    ]
+    issues = build_issues(flows)
+    assert issues["security_id"].tolist() == ["fixed-10y-2036-08-15"] * 3
+    assert issues["is_reopening"].tolist() == [False, True, True]
+    assert issues["settlement_day_kind"].tolist() == ["calendar", "calendar", "fiscal_year_close"]
+    assert issues.loc[0, "face_fed"] == 2.0 and issues.loc[0, "face_total"] == 12.0
+    assert set(issues["maturity_date"]) == {pd.Timestamp("2036-08-15")}
     assert security_type("Fixed", 7.0) == "note" and security_type("Fixed", 20.0) == "bond"
+    del flows[0]["security_label"]
+    with pytest.raises(SystemExit, match="issue terms"):
+        build_issues(flows)
+
+
+def test_payment_dates_move_off_weekends_and_holidays_but_not_contract_dates() -> None:
+    assert payment_date("2027-05-15") == pd.Timestamp("2027-05-17")  # Saturday
+    assert payment_date("2026-11-26") == pd.Timestamp("2026-11-27")  # Thanksgiving
+    assert payment_date("2027-12-24") == pd.Timestamp("2027-12-24")  # Fedwire open before a Saturday holiday
+    assert payment_date("2033-04-15") == pd.Timestamp("2033-04-15")  # Good Friday: Fedwire pays
 
 
 def test_holders_map_to_the_five_export_columns_and_unknowns_raise() -> None:

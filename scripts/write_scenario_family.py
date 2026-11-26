@@ -45,6 +45,7 @@ for path in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 import holder_targets as ht  # noqa: E402
+from simulation_calendar import previous_securities_business_day  # noqa: E402
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
 from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS  # noqa: E402
@@ -236,6 +237,11 @@ def build_fraction(day: pd.Timestamp, build: list[str]) -> float:
     start, end = (pd.Timestamp(value).normalize() for value in build)
     if end <= start:
         raise ValueError("build window must end after it starts")
+    # Shifts build on securities business days only: a closed day keeps the last business
+    # day's share, and a window ending on a closed day is complete on the business day before.
+    day, start, end = (pd.Timestamp(previous_securities_business_day(value)) for value in (day, start, end))
+    if end <= start:
+        raise ValueError("build window must span a securities business day")
     if day <= start:
         return 0.0
     if day >= end:

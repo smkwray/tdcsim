@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import pandas as pd
 
+from simulation_calendar import previous_securities_business_day
 from tdc_shared import (
     INTRAGOV_HOLDERS,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
@@ -440,11 +441,18 @@ class BuildAndHoldPath:
         day = pd.Timestamp(day).normalize()
         if day > self.hold_through:
             raise HolderTargetError(f"no holder target is declared after {self.hold_through.date()}")
-        if day <= self.origin:
+        # The position builds on securities business days only: a close when the market is
+        # shut keeps the last business day's increment, when the baseline does not move
+        # either, and a build ending on a closed day is complete the business day before.
+        day, origin, build_end = (
+            pd.Timestamp(previous_securities_business_day(value))
+            for value in (day, self.origin, self.build_end)
+        )
+        if day <= origin:
             return 0.0
-        if day >= self.build_end:
+        if day >= build_end:
             return self.size_bil
-        return self.size_bil * (day - self.origin).days / (self.build_end - self.origin).days
+        return self.size_bil * (day - origin).days / (build_end - origin).days
 
     def phase(self, day: Any) -> str:
         day = pd.Timestamp(day).normalize()

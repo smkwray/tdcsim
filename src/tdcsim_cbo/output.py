@@ -221,6 +221,7 @@ HANDOFF_TABLE_COLUMNS = {
         "face_issued_bil",
         "cash_proceeds_bil",
         "discount_or_premium_bil",
+        "issue_cost_bil",
         "coupon_rate_decimal",
         "reference_rate_decimal",
         "spread_bps",
@@ -1147,7 +1148,19 @@ def _accounting_closure_handoff_tables(
 ) -> dict[str, list[dict[str, Any]]]:
     journal = pd.DataFrame(raw.get("tdcsim_accounting_journal", []))
     if journal.empty:
-        return {"tdcsim_accounting_closure": []}
+        # A period without accounting events (a day Fedwire is closed) still closes: its
+        # stocks, cash, reserves and deposits must not have moved.
+        journal = pd.DataFrame(
+            columns=[
+                "period_start",
+                "period_end",
+                "face_stock_change_bil",
+                "adjusted_principal_change_bil",
+                "treasury_cash_change_bil",
+                "reserve_change_bil",
+                "deposit_change_bil",
+            ]
+        )
     result_rows = _ensure_date_column(results).copy()
     result_rows["Date"] = pd.to_datetime(result_rows["Date"], errors="coerce")
     result_rows = (

@@ -977,7 +977,7 @@ def test_cbo_frn_coarse_frequency_same_day_coupon_maturity_pays_final_interest_o
     assert redeemed_frn["AccruedInterest_FRN"] == pytest.approx(0.0)
 
 
-def test_cbo_frn_daily_lockout_uses_two_business_days_with_holiday_weekend(tmp_path: Path) -> None:
+def test_cbo_frn_lockout_counts_federal_reserve_business_days_over_a_holiday_weekend(tmp_path: Path) -> None:
     periods = build_simulation_calendar("2026-07-01", "2026-07-07", "daily")
     paths = _build_temp_forecast_inputs(tmp_path, periods=periods, period_start="2026-07-01", period_end="2026-07-07")
     rows = []
@@ -1014,11 +1014,15 @@ def test_cbo_frn_daily_lockout_uses_two_business_days_with_holiday_weekend(tmp_p
         scenario_name="baseline",
     )
 
-    expected_payment = 1_000.0 * ((0.020 + 0.001) * 6.0 / 360.0)
+    # The lockout counts days the Federal Reserve Banks are open (31 CFR 356.2). They are
+    # open on Friday 2026-07-03 although Independence Day (a Saturday) is observed then,
+    # so the two business days before the July 7 payment are July 6 and July 3: July 2
+    # accrues at its own rate and July 3 through 7 at July 3's.
+    expected_payment = 1_000.0 * ((0.020 + 0.001) + (0.030 + 0.001) * 5.0) / 360.0
     paid = float(results["InterestPaid_Bonds"].sum())
     assert paid == pytest.approx(expected_payment)
     final_frn = final_portfolio[final_portfolio["BondID"] == 1].iloc[0]
-    assert final_frn["BenchmarkRate_FRN"] == pytest.approx(0.020)
+    assert final_frn["BenchmarkRate_FRN"] == pytest.approx(0.030)
     assert final_frn["AccruedInterest_FRN"] == pytest.approx(0.0)
 
 

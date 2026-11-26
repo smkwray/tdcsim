@@ -3,6 +3,7 @@
 
 import bisect
 import copy
+import functools
 import time
 import traceback
 from collections import defaultdict
@@ -10,7 +11,6 @@ from datetime import timedelta
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
 from dateutil.relativedelta import relativedelta
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_price_ratio
@@ -40,6 +40,7 @@ from issuance_calibration import (
     active_special_categories,
     bill_days,
     bill_issuance_amount,
+    bill_maturity,
     bill_mask,
     bill_maturity_years,
     bill_supply_key,
@@ -49,7 +50,10 @@ from issuance_calibration import (
     debt_base,
     is_rule_profile,
     rule_target_path,
-    fiscal_year_close_rules,
+    dated_date,
+    fiscal_year_close_dates,
+    maturity_from_dated,
+    settlement_events,
     settlement_rules,
     target_for_date,
 )
@@ -97,6 +101,7 @@ from ratewall_paths import (
     primary_flow_for_period,
     resolve_holder_absorption_scenario,
 )
+from simulation_calendar import add_fedwire_business_days, is_fedwire_business_day, is_securities_business_day
 from yield_curve_path import curve_for_date, load_yield_curve_surface
 
 
@@ -115,9 +120,6 @@ OPERATING_CASH_RESULT_COLUMNS = (
 )
 CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
-_US_FEDERAL_HOLIDAYS = USFederalHolidayCalendar()
-_BUSINESS_DAY_CACHE = {}
-_US_FEDERAL_HOLIDAY_DATES = None
 
 
 def _is_cbo_funding_mode(params):
@@ -504,43 +506,15 @@ def _lookup_cbo_period_row(lookup, frame, scenario_id, period_start, period_end,
     return _cbo_period_row(frame, scenario_id, period_start, period_end, dataset_name)
 
 
-def _is_business_day(date_value):
-    global _US_FEDERAL_HOLIDAY_DATES
-    day = pd.Timestamp(date_value).normalize()
-    cache_key = day.date()
-    if cache_key in _BUSINESS_DAY_CACHE:
-        return _BUSINESS_DAY_CACHE[cache_key]
-    if day.weekday() >= 5:
-        _BUSINESS_DAY_CACHE[cache_key] = False
-        return False
-    if _US_FEDERAL_HOLIDAY_DATES is None:
-        _US_FEDERAL_HOLIDAY_DATES = {
-            pd.Timestamp(value).date()
-            for value in _US_FEDERAL_HOLIDAYS.holidays(start="1900-01-01", end="2100-12-31")
-        }
-    is_business_day = cache_key not in _US_FEDERAL_HOLIDAY_DATES
-    _BUSINESS_DAY_CACHE[cache_key] = is_business_day
-    return is_business_day
-
-
 def _subtract_business_days(date_value, business_days):
-    day = pd.Timestamp(date_value).normalize()
-    remaining = max(0, int(round(float(business_days or 0))))
-    while remaining > 0:
-        day -= pd.Timedelta(days=1)
-        if _is_business_day(day):
-            remaining -= 1
-    return day
+    """Business days back for an FRN's rate lockout: days the Federal Reserve Banks are
+    open, the definition in 31 CFR 356.2 (Fedwire's calendar)."""
+
+    return pd.Timestamp(add_fedwire_business_days(date_value, -max(0, int(round(float(business_days or 0))))))
 
 
 def _add_business_days(date_value, business_days):
-    day = pd.Timestamp(date_value).normalize()
-    remaining = max(0, int(round(float(business_days or 0))))
-    while remaining > 0:
-        day += pd.Timedelta(days=1)
-        if _is_business_day(day):
-            remaining -= 1
-    return day
+    return pd.Timestamp(add_fedwire_business_days(date_value, max(0, int(round(float(business_days or 0))))))
 
 
 def _lookup_cbo_period_row_ending_on_or_before(frame, scenario_id, period_end, dataset_name):
@@ -1031,6 +1005,9 @@ def _handoff_append_issuance(
     holder_sector='',
     holder_subsector='',
     issuance_leg='ordinary_issuance',
+    issue_terms=None,
+    adjusted_principal_issued=None,
+    issue_cost=None,
 ):
     face_issued = float(face_issued or 0.0)
     cash_proceeds = float(cash_proceeds or 0.0)
@@ -1038,6 +1015,7 @@ def _handoff_append_issuance(
         return
     handoff_tables['tdcsim_period_issuance_flows'].append(
         {
+            **(issue_terms or {}),
             **_handoff_period(prev_date, current_date),
             'flow_id': _handoff_flow_id('issuance', pd.Timestamp(current_date).date(), security_id),
             'security_id': _handoff_security_id({'BondID': security_id}),
@@ -1050,6 +1028,11 @@ def _handoff_append_issuance(
             'face_issued_bil': face_issued,
             'cash_proceeds_bil': cash_proceeds,
             'discount_or_premium_bil': face_issued - cash_proceeds,
+            # What the run books as issue cost: debt added less cash for a calendar issue,
+            # the discount (never a premium) otherwise.
+            'issue_cost_bil': (
+                max(0.0, face_issued - cash_proceeds) if issue_cost is None else float(issue_cost)
+            ),
             'coupon_rate_decimal': float(coupon_rate) if not pd.isna(coupon_rate) else np.nan,
             'reference_rate_decimal': float(reference_rate) if not pd.isna(reference_rate) else np.nan,
             'spread_bps': float(spread_bps) if not pd.isna(spread_bps) else np.nan,
@@ -1081,7 +1064,9 @@ def _handoff_append_issuance(
         maturity_bucket=_handoff_maturity_bucket(security_type, maturity_years),
         face_stock_change=face_issued,
         adjusted_principal_change=(
-            face_issued if str(security_type) == 'TIPS' else 0.0
+            (face_issued if adjusted_principal_issued is None else float(adjusted_principal_issued))
+            if str(security_type) == 'TIPS'
+            else 0.0
         ),
         treasury_cash_change=cash_proceeds,
         settlement_scope=(
@@ -2045,8 +2030,13 @@ def _quote_supply_item(
     current_date,
     bill_term_days,
     pricing,
+    bill_days_to_maturity=None,
 ):
     """Price one issuance item; the caller dates it.
+
+    ``bill_term_days`` is a bill's nominal term, which selects the CBO 3-month quote for
+    the 13-week bill; ``bill_days_to_maturity`` is the days it is actually outstanding
+    (fewer when a holiday moved its settlement), which that quote is priced over.
 
     A bill with ``bill_term_days`` equal to the 91-day CBO bill is quoted on the CBO
     3-month discount rate in CBO mode; other bills price off the nominal curve.
@@ -2118,6 +2108,9 @@ def _quote_supply_item(
         face, proceeds, price = _quote_issuance(
             'Fixed', maturity_years, coupon, issue_yield, target, face_target_mode,
             bill_discount_rate=bill_discount_rate,
+            bill_days_to_maturity=(
+                CBO_3M_BILL_DAYS if bill_days_to_maturity is None else bill_days_to_maturity
+            ),
         )
         item = {
             'type': 'Fixed', 'maturity': maturity_years, 'face_amount': face,
@@ -2234,6 +2227,241 @@ def _quote_rule_allocations(allocations, *, face_target_mode, issuance_leg, curr
     return schedule
 
 
+def _coupon_accrued_per_face(coupon_rate, dated, maturity_date, settlement_date):
+    """Interest accrued per unit face from ``dated`` (a coupon date) to settlement,
+    actual/actual in the semiannual period."""
+
+    dated = pd.Timestamp(dated).normalize()
+    settle = pd.Timestamp(settlement_date).normalize()
+    if settle <= dated or float(coupon_rate) <= TGA_FLOOR_TOLERANCE:
+        return 0.0
+    next_coupon = _first_interest_payment_date(dated, maturity_date, 2)
+    if pd.isna(next_coupon) or next_coupon <= settle:
+        raise ValueError(f'settlement {settle.date()} is not in the first coupon period after {dated.date()}')
+    return float(coupon_rate) / 2.0 * (settle - dated).days / (next_coupon - dated).days
+
+
+def _live_frn_accrued_per_face(bond_portfolio, template):
+    """Accrued FRN interest per unit face on the live rows of a template's security."""
+
+    rows = bond_portfolio[
+        (bond_portfolio['Status'] == 'Active')
+        & (bond_portfolio['SecurityType'] == 'FRN')
+        & (pd.to_datetime(bond_portfolio['MaturityDate']).dt.normalize() == template['maturity_date'])
+        & ((pd.to_numeric(bond_portfolio['FixedSpread'], errors='coerce') - template['spread']).abs() <= 1e-12)
+    ]
+    face = float(pd.to_numeric(rows['FaceValue'], errors='coerce').sum())
+    if face <= TGA_FLOOR_TOLERANCE:
+        raise ValueError(f"no outstanding FRN maturing {template['maturity_date'].date()} to reopen")
+    return float(pd.to_numeric(rows['AccruedInterest_FRN'], errors='coerce').fillna(0.0).sum()) / face
+
+
+def _opening_issue_registry(bond_portfolio, calendar_rules, opening_date):
+    """The latest issue of each coupon security in the opening book: what a reopening
+    before the run's first new issue of that security reopens.
+
+    A security is the book's latest issue date among rows of its type whose original
+    term is within half a year of the tenor. A security the book does not hold has no
+    entry; reopening it before its first new issue then raises.
+    """
+
+    registry = {}
+    active = bond_portfolio[bond_portfolio['Status'] == 'Active']
+    issue_dates = pd.to_datetime(active['IssueDate']).dt.normalize()
+    years = pd.to_numeric(active['OriginalMaturityYears'], errors='coerce')
+    for key, rule in calendar_rules.items():
+        if rule.is_bill:
+            continue
+        security_type, tenor = key
+        rows = active[
+            (active['SecurityType'] == security_type)
+            & ((years - tenor).abs() < 0.5)
+            & (issue_dates <= pd.Timestamp(opening_date))
+        ]
+        if rows.empty:
+            continue
+        latest = rows.loc[pd.to_datetime(rows['IssueDate']).idxmax()]
+        maturity = pd.Timestamp(latest['MaturityDate']).normalize()
+        dated = maturity - relativedelta(years=int(round(tenor)))
+        if rule.dated == 'month_end':
+            dated = dated + pd.offsets.MonthEnd(0)
+        registry[key] = {
+            'maturity_date': maturity,
+            'dated_date': dated,
+            'coupon': float(latest['CouponRate'] or 0.0),
+            'spread': float(latest['FixedSpread'] or 0.0) if security_type == 'FRN' else 0.0,
+            'reference_cpi_issue': float(latest['ReferenceCPI_Issue']) if security_type == 'TIPS' else np.nan,
+            'security_label': f"{security_type.lower()}-{tenor:g}y-{maturity.date()}",
+        }
+    return registry
+
+
+def _quote_settlements(
+    settled,
+    *,
+    due_events,
+    off_calendar_kind,
+    issuance_leg,
+    current_date,
+    pricing,
+    calendar_rules,
+    issue_registry,
+    bond_portfolio,
+    reference_cpi_on,
+    frn_accrual_per_face,
+):
+    """Price the securities settling today on Treasury's terms.
+
+    A calendar settlement is a new issue or a reopening as the calendar says; a
+    settlement off the calendar (early, or at the fiscal-year close) reopens the
+    security's latest issue, or is a new issue if none is outstanding yet. A new coupon
+    issue is dated on its calendar dated date and matures tenor years later; its coupon
+    and clean price come from the issue kernel at the tenor, and a buyer also pays the
+    interest accrued since the dated date (TIPS at the index ratio since then). A
+    reopening keeps the reopened security's maturity, coupon, spread and reference CPI
+    and is sold at its market value with accrued interest, the valuation of Fed
+    secondary transfers. ``issue_price_ratio`` is that dirty value per unit face.
+    Updates ``issue_registry`` with each new issue.
+    """
+
+    current = pd.Timestamp(current_date).normalize()
+    schedule = []
+    for key, security_type, maturity_years, weekly_days, amount in settled:
+        if amount <= TGA_FLOOR_TOLERANCE:
+            continue
+        event = due_events.get(key)
+        settlement_kind = 'calendar' if event is not None else off_calendar_kind[key]
+        issue_kind = event.issue if event is not None else 'reopening'
+        template = issue_registry.get(key)
+        if issue_kind == 'reopening' and (template is None or template['maturity_date'] <= current + pd.Timedelta(days=1)):
+            if event is not None:
+                raise ValueError(f'{key} reopens on {current.date()} but no issue of it is outstanding')
+            issue_kind = 'new'
+        quote = functools.partial(
+            _quote_supply_item,
+            face_target_mode=False,
+            issuance_leg=issuance_leg,
+            current_date=current,
+            pricing=pricing,
+        )
+        extra = {
+            'supply_key': key,
+            'is_reopening': issue_kind == 'reopening',
+            'settlement_kind': settlement_kind,
+            'reference_cpi_issue': np.nan,
+            'index_ratio': np.nan,
+            'accrued_frn_per_face': 0.0,
+        }
+        if weekly_days is not None:
+            # A bill matures on its weekly cycle (issuance_calibration.bill_maturity),
+            # whatever day a holiday moved its settlement to, and is the same
+            # security as any bill already maturing that day (Treasury reopens it).
+            if issue_kind == 'new':
+                nominal = pd.Timestamp(event.nominal if event is not None else current.date())
+                maturity = pd.Timestamp(bill_maturity(nominal.date(), int(key[1])))
+                issue_registry[key] = {'maturity_date': maturity, 'security_label': f'bill-{maturity.date()}'}
+            else:
+                maturity = template['maturity_date']
+            days = int((maturity - current).days)
+            item = quote(
+                'Fixed', days / DAYS_PER_YEAR_ACTUAL, amount, bill_term_days=weekly_days, bill_days_to_maturity=days
+            )
+            item['maturity'] = maturity_years
+            outstanding = bond_portfolio[
+                (bond_portfolio['Status'] == 'Active')
+                & (bond_portfolio['SecurityType'] == 'Fixed')
+                & (pd.to_numeric(bond_portfolio['CouponRate'], errors='coerce').fillna(0.0) <= TGA_FLOOR_TOLERANCE)
+                & (pd.to_datetime(bond_portfolio['MaturityDate']).dt.normalize() == maturity)
+            ]
+            extra['is_reopening'] = issue_kind == 'reopening' or not outstanding.empty
+            item.update(extra, maturity_date=maturity, dated_date=current, security_label=f'bill-{maturity.date()}')
+            schedule.append(item)
+            continue
+        if issue_kind == 'new':
+            rule = calendar_rules[key]
+            nominal = event.nominal if event is not None else current.date()
+            dated = pd.Timestamp(dated_date(rule, nominal))
+            maturity = pd.Timestamp(maturity_from_dated(rule, dated.date()))
+            item = quote(security_type, maturity_years, amount, bill_term_days=None)
+            ratio = 1.0
+            reference_cpi = np.nan
+            if security_type == 'TIPS':
+                reference_cpi = float(reference_cpi_on(dated))
+                ratio = float(reference_cpi_on(current)) / reference_cpi
+            if security_type == 'FRN':
+                # Interest accrues from the dated date (a month end); a buyer settling
+                # after it pays what has accrued and the holding starts with it.
+                accrued = frn_accrual_per_face(dated, current) if dated < current else 0.0
+                extra['accrued_frn_per_face'] = accrued
+            else:
+                accrued = _coupon_accrued_per_face(item.get('coupon', 0.0), dated, maturity, current) * ratio
+            dirty = float(item['issue_price_ratio']) * ratio + accrued
+            issue_registry[key] = {
+                'maturity_date': maturity,
+                'dated_date': dated,
+                'coupon': float(item.get('coupon', 0.0) or 0.0),
+                'spread': float(item.get('spread', 0.0) or 0.0),
+                'reference_cpi_issue': reference_cpi,
+                'security_label': f"{security_type.lower()}-{key[1]:g}y-{maturity.date()}",
+            }
+            template = issue_registry[key]
+            extra.update(reference_cpi_issue=reference_cpi, index_ratio=ratio)
+        else:
+            maturity = template['maturity_date']
+            dated = template['dated_date']
+            ratio = 1.0
+            unit = {
+                'SecurityType': security_type,
+                'MaturityDate': maturity,
+                'CouponRate': template['coupon'],
+                'IssueDate': dated,
+                'FirstInterestPaymentDate': pd.NaT,
+                'FaceValue': 1.0,
+                'OriginalPrincipal': 1.0,
+                'AccruedInterest_FRN': 0.0,
+            }
+            if security_type == 'TIPS':
+                ratio = float(reference_cpi_on(current)) / float(template['reference_cpi_issue'])
+                unit['AdjustedPrincipal'] = ratio
+                extra.update(reference_cpi_issue=float(template['reference_cpi_issue']), index_ratio=ratio)
+            elif security_type == 'FRN':
+                unit['AccruedInterest_FRN'] = _live_frn_accrued_per_face(bond_portfolio, template)
+                extra['accrued_frn_per_face'] = unit['AccruedInterest_FRN']
+            valuation = _fed_secondary_dirty_value(
+                pd.Series(unit),
+                ratio,
+                current,
+                pricing['current_yield_curve_years'],
+                pricing['current_yield_curve_rates'],
+                interpolation_method=pricing['yield_interpolation_method'],
+                floor_zero=pricing['yield_floor_zero'],
+                nominal_shock=pricing['evaluated_nominal_shock'],
+                tips_real_curve_years=pricing['tips_real_curve_years'],
+                tips_real_curve_rates=pricing['tips_real_curve_rates'],
+            )
+            dirty = float(valuation['dirty_value'])
+            item = {
+                'type': security_type,
+                'maturity': maturity_years,
+                'coupon': template['coupon'],
+                'spread': template['spread'],
+                'issue_yield': float(valuation['discount_yield']),
+                'issuance_leg': issuance_leg,
+            }
+        face = float(amount) / dirty
+        item.update(
+            extra,
+            face_amount=face,
+            proceeds=float(amount),
+            issue_price_ratio=dirty,
+            maturity_date=maturity,
+            dated_date=dated,
+            security_label=template['security_label'],
+        )
+        schedule.append(item)
+    return schedule
+
+
 def _build_bill_share_supply_schedule(
     amount,
     *,
@@ -2263,71 +2491,17 @@ def _build_bill_share_supply_schedule(
     ), target
 
 
-_FEDWIRE_CLOSED_DATES = None
-
-
-def _is_fedwire_business_day(date_value):
-    """Fedwire's calendar: closed weekends and federal holidays, but a holiday that falls
-    on a Saturday leaves the Friday open, and one on a Sunday closes the Monday."""
-
-    global _FEDWIRE_CLOSED_DATES
-    day = pd.Timestamp(date_value).normalize()
-    if day.weekday() >= 5:
-        return False
-    if _FEDWIRE_CLOSED_DATES is None:
-        closed = set()
-        for rule in _US_FEDERAL_HOLIDAYS.rules:
-            if rule.offset is None and rule.day is not None:
-                # Fixed-date holidays: shift Sunday to Monday only.
-                for year in range(1900, 2101):
-                    if rule.start_date is not None and pd.Timestamp(year, rule.month, rule.day) < rule.start_date:
-                        continue
-                    actual = pd.Timestamp(year, rule.month, rule.day)
-                    if actual.weekday() == 6:
-                        closed.add((actual + pd.Timedelta(days=1)).date())
-                    elif actual.weekday() < 5:
-                        closed.add(actual.date())
-            else:
-                closed.update(
-                    pd.Timestamp(value).date()
-                    for value in rule.dates('1900-01-01', '2100-12-31')
-                )
-        _FEDWIRE_CLOSED_DATES = closed
-    return day.date() not in _FEDWIRE_CLOSED_DATES
-
-
-def _next_fedwire_business_day(date_value):
-    day = pd.Timestamp(date_value).normalize()
-    while not _is_fedwire_business_day(day):
-        day += pd.Timedelta(days=1)
-    return day
-
-
 def _settlement_schedule(issuance_profile, start_date, end_date):
-    """Map each settlement date in ``[start_date, end_date]`` to the securities settling.
+    """Map each settlement business day in ``[start_date, end_date]`` to the securities
+    settling then, each with its calendar event (new issue or reopening, nominal date)."""
 
-    Weekday, day-of-month and month-end dates that are not Fedwire business days roll
-    forward to the next business day, as Treasury settles them.
-    """
-
-    first = pd.Timestamp(start_date).normalize()
-    last = pd.Timestamp(end_date).normalize()
-    months = pd.period_range(first, last + pd.offsets.MonthEnd(0), freq='M')
-    by_date = defaultdict(list)
-    for key, (kind, value) in settlement_rules(issuance_profile).items():
-        if kind == 'weekday':
-            day = first + pd.Timedelta(days=(value - first.weekday()) % 7)
-            nominal = []
-            while day <= last:
-                nominal.append(day)
-                day += pd.Timedelta(days=7)
-        elif kind == 'day_of_month':
-            nominal = [pd.Timestamp(month.year, month.month, value) for month in months]
-        else:
-            nominal = [month.end_time.normalize() for month in months]
-        for settle in (_next_fedwire_business_day(day) for day in nominal):
-            if first <= settle <= last:
-                by_date[settle].append(key)
+    by_date = defaultdict(dict)
+    for event in settlement_events(
+        issuance_profile,
+        pd.Timestamp(start_date).date(),
+        pd.Timestamp(end_date).date(),
+    ):
+        by_date[pd.Timestamp(event.settle)][event.key] = event
     return dict(sorted(by_date.items()))
 
 
@@ -2466,27 +2640,28 @@ def _build_issuance_supply_schedule(
 
 
 def _fiscal_year_close_dates(issuance_profile, start_date, end_date):
-    """Last calendar days of the close months in ``[start_date, end_date]``, whatever the
-    weekday: the books close and everything pending settles there."""
+    """Last business days of the close months in ``[start_date, end_date]``: the books
+    close and everything pending settles there."""
 
-    first = pd.Timestamp(start_date).normalize()
-    last = pd.Timestamp(end_date).normalize()
-    close_months = set(fiscal_year_close_rules(issuance_profile))
     return [
-        month.end_time.normalize()
-        for month in pd.period_range(first, last + pd.offsets.MonthEnd(0), freq='M')
-        if month.month in close_months and first <= month.end_time.normalize() <= last
+        pd.Timestamp(value)
+        for value in fiscal_year_close_dates(
+            issuance_profile,
+            pd.Timestamp(start_date).date(),
+            pd.Timestamp(end_date).date(),
+        )
     ]
 
 
-def _due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date):
-    """Securities whose settlement date falls in ``(prev_date, current_date]``."""
+def _due_settlement_events(settlement_schedule, settlement_dates, prev_date, current_date):
+    """Calendar events of the securities whose settlement date falls in ``(prev_date,
+    current_date]``, keyed by security; a security due twice keeps its later event."""
 
     low = bisect.bisect_right(settlement_dates, pd.Timestamp(prev_date))
     high = bisect.bisect_right(settlement_dates, pd.Timestamp(current_date))
-    due = []
+    due = {}
     for settle in settlement_dates[low:high]:
-        due.extend(key for key in settlement_schedule[settle] if key not in due)
+        due.update(settlement_schedule[settle])
     return due
 
 
@@ -2500,6 +2675,7 @@ def _decide_and_settle_pending(
     projected_tga_without_settlement,
     current_date,
     settle_all=False,
+    can_settle=True,
 ):
     """Add the day's split to pending balances and release the ones due today.
 
@@ -2529,6 +2705,14 @@ def _decide_and_settle_pending(
             pending[key][3] += amount
         else:
             pending[key] = [security_type, maturity_years, weekly_days, amount]
+    if not can_settle:
+        # The securities market is closed: nothing settles, so the TGA must not need it.
+        if due_keys or settle_all or projected_tga_without_settlement < 0.0:
+            raise RuntimeError(
+                f'issuance would have to settle on {pd.Timestamp(current_date).date()}, '
+                'a day the securities market is closed'
+            )
+        return [], 0.0, 0.0
     settling = [key for key in due_keys if key in pending]
     sweep = 0.0
     if settle_all:
@@ -3817,10 +4001,50 @@ def run_simulation(
             opening_date=t0,
             opening_result=results.loc[t0].to_dict(),
         )
+    if batched_settlement:
+        calendar_rules = settlement_rules(issuance_profile)
+        issue_registry = _opening_issue_registry(bond_portfolio, calendar_rules, dates[0])
+
+    def frn_accrual_per_face(dated, settle):
+        """Interest per unit face on a new FRN over (dated, settle], at the FRN rate path's
+        benchmark plus the new-issue spread, on the engine's daily accrual convention."""
+
+        frame = cbo_inputs.get('frn_rate_path') if isinstance(cbo_inputs, dict) else None
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            raise ValueError('a new FRN settling after its dated date needs the FRN rate path')
+        total = 0.0
+        for day in pd.date_range(pd.Timestamp(dated) + pd.Timedelta(days=1), pd.Timestamp(settle), freq='D'):
+            row = _frn_rate_path_row_for_date(
+                frame, cbo_scenario_id, day, lookup=cbo_inputs.get('frn_rate_path_date_lookup', {})
+            )
+            if row is None:
+                raise ValueError(f'the FRN rate path has no rate for {day.date()}')
+            basis = float(row.get('day_count_basis', FRN_DAY_COUNT_BASIS) or FRN_DAY_COUNT_BASIS)
+            total += (float(row['benchmark_rate_decimal']) + float(frn_spread)) / basis
+        return total
+    last_payment_date = dates[0]
+    last_market_date = dates[0]
     for i in range(1, num_periods):
         prev_date = dates[i - 1]
         current_date = dates[i]
         delta_t_days = (current_date - prev_date).days
+        # On Treasury's calendar cash moves only when Fedwire is open: payments due on a
+        # closed day are made on the next business day, whose window reaches back to the
+        # last one. Securities settle and trade only on securities business days, which
+        # also exclude Good Friday and the Friday before a Saturday holiday.
+        payments_open = (not batched_settlement) or is_fedwire_business_day(current_date)
+        market_open = (not batched_settlement) or is_securities_business_day(current_date)
+        window_start = last_payment_date if batched_settlement else prev_date
+        settle_window_start = last_market_date if batched_settlement else prev_date
+        if payments_open:
+            last_payment_date = current_date
+        if market_open:
+            last_market_date = current_date
+        due_events = (
+            _due_settlement_events(settlement_schedule, settlement_dates, settle_window_start, current_date)
+            if batched_settlement and market_open
+            else {}
+        )
         delta_t_years = delta_t_days / DAYS_PER_YEAR_ACTUAL
         triggered_events_in_period = False
         for event_date in sorted(scheduled_events.keys()):
@@ -3962,7 +4186,7 @@ def run_simulation(
         frn_mask = (bond_portfolio['Status'] == 'Active') & (bond_portfolio['SecurityType'] == 'FRN')
         frn_coupon_payment_amounts = {}
         frn_maturity_payment_amounts = {}
-        if frn_mask.any():
+        if frn_mask.any() and payments_open:
             frn_path_frame = (
                 cbo_inputs.get('frn_rate_path')
                 if cbo_funding_mode and isinstance(cbo_inputs, dict)
@@ -3987,7 +4211,7 @@ def run_simulation(
                         cbo_inputs.get('frn_rate_path_lookup', {}),
                         frn_path_frame,
                         cbo_scenario_id,
-                        prev_date,
+                        window_start,
                         current_date,
                         'CBO FRN rate path',
                     )
@@ -4008,7 +4232,7 @@ def run_simulation(
                 frn_yield = 0.0 if pd.isna(frn_yield) else frn_yield
             lockout_business_days = _frn_lockout_business_days(frn_path_row)
             accrual_dates = pd.date_range(
-                pd.Timestamp(prev_date).normalize() + pd.Timedelta(days=1),
+                pd.Timestamp(window_start).normalize() + pd.Timedelta(days=1),
                 pd.Timestamp(current_date).normalize(),
                 freq='D',
             )
@@ -4068,7 +4292,7 @@ def run_simulation(
                     accrued_balance = 0.0 if pd.isna(accrued_balance) else float(accrued_balance)
                     coupon_dates = {
                         pd.Timestamp(value).normalize()
-                        for value in _frn_coupon_dates_for_period(bond, prev_date, current_date)
+                        for value in _frn_coupon_dates_for_period(bond, window_start, current_date)
                     }
                     maturity_date = pd.Timestamp(bond.get('MaturityDate')).normalize()
                     last_benchmark_rate = float(frn_yield)
@@ -4144,6 +4368,11 @@ def run_simulation(
                 'CBO primary deficit path',
             )
             cbo_period_primary_deficit = float(cbo_primary_row['primary_deficit_bil'])
+            if not payments_open and abs(cbo_period_primary_deficit) > TGA_FLOOR_TOLERANCE:
+                raise ValueError(
+                    f'the primary deficit path books {cbo_period_primary_deficit} billion on '
+                    f'{current_date.date()}, a day Fedwire is closed; fiscal flows must fall on business days'
+                )
             cbo_incidence = _cbo_incidence_from_config(params)
             if cbo_incidence is None:
                 cbo_incidence = _cbo_incidence_row(cbo_inputs['fiscal_incidence'], cbo_scenario_id)
@@ -4227,9 +4456,12 @@ def run_simulation(
         tips_coupon_interest_paid_by_private_route = _zero_private_routes()
         tips_inflation_compensation_paid_by_private_route = _zero_private_routes()
         cb_private_maturity_tdc_period = 0.0
+        # The Fed's stock removed at maturity (adjusted principal for TIPS; a deflation
+        # floor's top-up is cash, not stock).
+        cb_stock_matured = 0.0
         total_principal_paid_period = 0.0
         total_interest_paid_period = 0.0
-        maturing_mask = bond_portfolio['MaturityDate'].notna() & (bond_portfolio['MaturityDate'] > prev_date) & (bond_portfolio['MaturityDate'] <= current_date) & (bond_portfolio['Status'] == 'Active')
+        maturing_mask = bond_portfolio['MaturityDate'].notna() & (bond_portfolio['MaturityDate'] > window_start) & (bond_portfolio['MaturityDate'] <= current_date) & (bond_portfolio['Status'] == 'Active') & payments_open
         maturing_indices = bond_portfolio[maturing_mask].index
         if not maturing_indices.empty:
             maturing_tranches = bond_portfolio.loc[maturing_indices].copy()
@@ -4392,6 +4624,10 @@ def run_simulation(
                         is_additive_to_cash_total=True,
                     )
                 principal_paid_by_holder[holder] += principal_payment
+                if holder == 'CB':
+                    cb_stock_matured += (
+                        adjusted_principal_stock_removed if security_type == 'TIPS' else principal_payment
+                    )
                 interest_paid_by_holder[holder] += interest_payment
                 principal_component_paid_by_holder[holder] += max(
                     0.0, principal_payment - bill_discount_interest_payment
@@ -4425,11 +4661,11 @@ def run_simulation(
                 total_interest_paid_period += interest_payment
         active_mask = bond_portfolio['Status'] == 'Active'
         frn_active_mask = active_mask & (bond_portfolio['SecurityType'] == 'FRN')
-        if frn_active_mask.any():
+        if frn_active_mask.any() and payments_open:
             frn_tranches = bond_portfolio.loc[frn_active_mask]
             frn_paying_indices = _coupon_due_indices_for_period(
                 frn_tranches,
-                prev_date,
+                window_start,
                 current_date,
                 frequency=4,
             )
@@ -4476,9 +4712,10 @@ def run_simulation(
                     bond_portfolio.loc[fallback_reset_indices, 'AccruedInterest_FRN'] = 0.0
                 total_interest_paid_period += payment_amount.sum()
         fixed_tips_mask = active_mask & bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS']) & (bond_portfolio['CouponRate'] > TGA_FLOOR_TOLERANCE)
-        if fixed_tips_mask.any():
+        if fixed_tips_mask.any() and payments_open:
             fixed_tips_tranches = bond_portfolio.loc[fixed_tips_mask]
-            if (current_date - prev_date).days <= 1:
+            coupon_due_dates = {}
+            if (current_date - window_start).days <= 1:
                 fixed_tips_paying_indices = _daily_coupon_due_indices(fixed_tips_tranches, current_date, frequency=2)
             else:
                 fixed_tips_paying_indices = []
@@ -4488,7 +4725,7 @@ def run_simulation(
                     coupon_dates = get_coupon_dates_in_period(
                         issue_dt,
                         maturity_dt,
-                        prev_date,
+                        window_start,
                         current_date,
                         frequency=2,
                         first_interest_payment_date=bond.get('FirstInterestPaymentDate'),
@@ -4496,10 +4733,26 @@ def run_simulation(
                     )
                     if coupon_dates:
                         fixed_tips_paying_indices.append(idx)
+                        coupon_due_dates[idx] = pd.Timestamp(max(coupon_dates)).normalize()
             if fixed_tips_paying_indices:
                 fixed_tips_paying_indices = list(set(fixed_tips_paying_indices))
                 paying_tranches = bond_portfolio.loc[fixed_tips_paying_indices]
                 principal_base = np.where(paying_tranches['SecurityType'] == 'TIPS', paying_tranches['AdjustedPrincipal'].fillna(paying_tranches['FaceValue']), paying_tranches['FaceValue'])
+                # A TIPS coupon paid after a closed due date uses the due date's index
+                # ratio: the payment moves, the amount does not.
+                for position, idx in enumerate(paying_tranches.index):
+                    due = coupon_due_dates.get(idx)
+                    if due is None or due >= pd.Timestamp(current_date).normalize():
+                        continue
+                    if paying_tranches.at[idx, 'SecurityType'] == 'TIPS':
+                        principal_base[position] = float(paying_tranches.at[idx, 'OriginalPrincipal']) * _reference_cpi_at_event(
+                            due,
+                            opening_date=t0,
+                            reference_lag_months=ref_cpi_lag,
+                            annual_inflation=cpi_inflation,
+                            results=results,
+                            cbo_reference_lookup=cbo_reference_cpi_lookup,
+                        ) / float(paying_tranches.at[idx, 'ReferenceCPI_Issue'])
                 payment_amount = (principal_base * paying_tranches['CouponRate'] / 2.0).clip(lower=0)
                 for idx, amount in payment_amount.items():
                     row = paying_tranches.loc[idx]
@@ -4827,7 +5080,11 @@ def run_simulation(
                     'period_end',
                     'CBO operating cash path',
                 )
-                cbo_operating_cash_target = float(cbo_operating_cash_row['operating_cash_target_bil'])
+                cbo_operating_cash_target = (
+                    float(cbo_operating_cash_row['operating_cash_target_bil'])
+                    if payments_open
+                    else float(results.loc[prev_date, 'CBOOperatingCashTarget'])
+                )
                 cbo_cash_residual_status = 'operating_cash_target_loaded'
             else:
                 cbo_operating_cash_target = projected_tga_pre_issuance
@@ -4842,6 +5099,11 @@ def run_simulation(
                 )
                 cbo_cash_reconciliation_residual_input = float(cbo_cash_residual_row['cash_reconciliation_residual_bil'])
                 cbo_cash_residual_period = cbo_cash_reconciliation_residual_input
+                if not payments_open and abs(cbo_cash_residual_period) > TGA_FLOOR_TOLERANCE:
+                    raise ValueError(
+                        f'the cash reconciliation residual moves cash on {current_date.date()}, '
+                        'a day Fedwire is closed'
+                    )
             if cbo_operating_cash_financing_mode:
                 if cbo_cash_residual_status != 'operating_cash_target_loaded':
                     raise ValueError(
@@ -4866,7 +5128,20 @@ def run_simulation(
             )
             if cbo_fed_row is not None:
                 cbo_fed_allocation_override_active = True
-                cbo_fed_holdings_target = float(cbo_fed_row['cbo_fed_holdings_target_bil'])
+                # The Fed does not operate while the securities market is closed: its
+                # target is then what it holds (TIPS accretion and maturities paid on
+                # Fedwire days move that), and it returns to its path on the next
+                # market day. Securities that matured on a closed day are not yet paid,
+                # so no trade may touch them.
+                cbo_fed_holdings_target = (
+                    float(cbo_fed_row['cbo_fed_holdings_target_bil'])
+                    if market_open
+                    else float(
+                        bond_portfolio.loc[
+                            (bond_portfolio['Status'] == 'Active') & (bond_portfolio['HolderType'] == 'CB')
+                        ].apply(_bond_debt_base, axis=1).sum()
+                    )
+                )
                 results.loc[current_date, 'CBOFedHoldingsTargetApplicable'] = 1.0
             # The operating-cash mode sizes proceeds, not face; its need is CashFinancingProceeds.
             results.loc[current_date, 'CBORequiredFaceIssuance'] = (
@@ -4887,6 +5162,7 @@ def run_simulation(
             results.loc[current_date, 'CBOCashResidualStatus'] = cbo_cash_residual_status
         new_bonds_added_list = []
         total_issued_face_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+        total_issued_stock_by_holder = {h: 0.0 for h in HOLDER_TYPES}
         total_issued_proceeds_by_holder = {h: 0.0 for h in HOLDER_TYPES}
         total_issued_proceeds_by_private_route = _zero_private_routes()
         actual_issued_amount = 0.0
@@ -4945,25 +5221,40 @@ def run_simulation(
                 raise ValueError('the settlement calendar cannot change during a run')
             close_books_today = (
                 bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(current_date))
-                > bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(prev_date))
+                > bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(settle_window_start))
             )
+            if not payments_open:
+                if total_issuance_target_period > TGA_FLOOR_TOLERANCE:
+                    raise RuntimeError(
+                        f'operating cash needs {total_issuance_target_period} billion on {current_date.date()}, '
+                        'a day Fedwire is closed'
+                    )
+                total_issuance_target_period = 0.0
             settlement_allocations, early_settlement_proceeds, fiscal_year_close_settlement_proceeds = _decide_and_settle_pending(
                 pending_issuance,
                 need=total_issuance_target_period,
                 issuance_profile=issuance_profile,
                 pre_issuance_position=pre_issuance_position,
-                due_keys=_due_settlement_keys(settlement_schedule, settlement_dates, prev_date, current_date),
+                due_keys=list(due_events),
                 projected_tga_without_settlement=projected_tga_pre_issuance + cbo_cash_residual_period,
                 current_date=current_date,
                 settle_all=close_books_today,
+                can_settle=market_open,
             )
             operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
-            issuance_supply_schedule = _quote_rule_allocations(
+            off_calendar_kind = 'fiscal_year_close' if close_books_today else 'early_settlement'
+            issuance_supply_schedule = _quote_settlements(
                 settlement_allocations,
-                face_target_mode=False,
+                due_events=due_events,
+                off_calendar_kind={item[0]: off_calendar_kind for item in settlement_allocations},
                 issuance_leg=primary_issuance_leg,
                 current_date=current_date,
                 pricing=issuance_pricing,
+                calendar_rules=calendar_rules,
+                issue_registry=issue_registry,
+                bond_portfolio=bond_portfolio,
+                reference_cpi_on=lambda day: float(results.loc[pd.Timestamp(day).normalize(), 'Reference_CPI']),
+                frn_accrual_per_face=frn_accrual_per_face,
             )
         else:
             operating_cash_settlement_proceeds = total_issuance_target_period
@@ -5176,22 +5467,46 @@ def run_simulation(
                             maturity_date,
                             interest_payment_frequency_val,
                         )
+                        # Treasury terms from the settlement calendar: a tranche is issued
+                        # on its settlement day; its dated date is the security's (a
+                        # reopening's is the reopened security's), the buyer paid what had
+                        # accrued since the last coupon, and the next coupon is paid whole.
+                        dated_date_val = pd.Timestamp(details.get('dated_date', current_date))
                         original_principal_val = 0.0
+                        adjusted_principal_val = 0.0
                         reference_cpi_issue_val = 0.0
                         index_ratio_init_val = 0.0
+                        accrued_frn_val = 0.0
                         last_accrual_date_val = pd.NaT
                         if sec_type == 'TIPS':
                             original_principal_val = route_face_value
-                            reference_cpi_issue_val = results.loc[current_date, 'Reference_CPI']
-                            index_ratio_init_val = 1.0
+                            reference_cpi_issue_val = details.get('reference_cpi_issue', np.nan)
+                            index_ratio_init_val = details.get('index_ratio', np.nan)
+                            if pd.isna(reference_cpi_issue_val):
+                                reference_cpi_issue_val = results.loc[current_date, 'Reference_CPI']
+                                index_ratio_init_val = 1.0
+                            adjusted_principal_val = route_face_value * float(index_ratio_init_val)
                         elif sec_type == 'FRN':
                             last_accrual_date_val = current_date
+                            accrued_frn_val = route_face_value * float(details.get('accrued_frn_per_face', 0.0))
                         maturity_category_val = None
                         if sec_type == 'Fixed':
                             maturity_category_val = get_maturity_category(mat_yrs, issuance_profile)
-                        new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'TDCPrincipalHolderType': holder, 'TDCPrincipalHolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': current_date, 'OriginalDatedDate': current_date, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': original_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': 0.0, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
+                        new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'TDCPrincipalHolderType': holder, 'TDCPrincipalHolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': dated_date_val, 'OriginalDatedDate': dated_date_val, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': adjusted_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': accrued_frn_val, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
                         new_bonds_added_list.append(new_tranche)
+                        tranche_stock = adjusted_principal_val if sec_type == 'TIPS' else route_face_value
+                        if is_noncash_intragovernmental_issuance:
+                            tranche_issue_cost = 0.0
+                        elif 'settlement_kind' in details:
+                            # Debt added less cash received, signed: a reopening can sell
+                            # at a premium, and accrued interest received offsets the
+                            # full first coupon the holder will be paid.
+                            tranche_issue_cost = tranche_stock - issue_proceeds_val
+                        else:
+                            tranche_issue_cost = max(0.0, route_face_value - issue_proceeds_val)
+                        issue_discount_cost_period += tranche_issue_cost
                         total_issued_face_by_holder[holder] += route_face_value
+                        total_issued_stock_by_holder[holder] += tranche_stock
                         total_issued_proceeds_by_holder[holder] += issue_proceeds_val
                         if holder == 'Private':
                             total_issued_proceeds_by_private_route[holder_subbucket] += issue_proceeds_val
@@ -5201,11 +5516,6 @@ def run_simulation(
                         if issuance_leg_val in CASH_FINANCING_ISSUANCE_LEGS:
                             cash_financing_face_issued += route_face_value
                             cash_financing_proceeds += issue_proceeds_val
-                        if not is_noncash_intragovernmental_issuance:
-                            issue_discount_cost_period += max(
-                                0.0,
-                                route_face_value - issue_proceeds_val,
-                            )
                         _handoff_append_issuance(
                             handoff_tables,
                             prev_date,
@@ -5222,6 +5532,19 @@ def run_simulation(
                             holder_sector=holder,
                             holder_subsector=holder_subbucket if holder == 'Private' else '',
                             issuance_leg=issuance_leg_val,
+                            issue_cost=tranche_issue_cost,
+                            adjusted_principal_issued=adjusted_principal_val if sec_type == 'TIPS' else None,
+                            issue_terms=(
+                                {
+                                    'security_label': details['security_label'],
+                                    'maturity_date': str(pd.Timestamp(maturity_date).date()),
+                                    'dated_date': str(dated_date_val.date()),
+                                    'is_reopening': bool(details['is_reopening']),
+                                    'settlement_kind': details['settlement_kind'],
+                                }
+                                if 'settlement_kind' in details
+                                else None
+                            ),
                         )
                         next_bond_id_to_assign += 1
             bond_id_counter = next_bond_id_to_assign
@@ -5562,6 +5885,11 @@ def run_simulation(
             holder_target_pre_gap = max(abs(value) for value in holder_target_gaps.values())
             holder_target_report = holder_targets.RebalanceReport()
             if holder_target_pre_gap > holder_target_tolerance:
+                if not market_open:
+                    raise holder_targets.HolderTargetError(
+                        f"holder position targets move by {holder_target_pre_gap:.9f} billion on "
+                        f"{current_date.date()}, a day the securities market is closed"
+                    )
                 if holder_target_phase == 'pre':
                     raise holder_targets.HolderTargetError(
                         f"holder positions differ from the matched baseline by {holder_target_pre_gap:.9f} "
@@ -5652,7 +5980,7 @@ def run_simulation(
             results.loc[current_date, holder_targets.PHASE_COLUMN] = holder_target_phase
             for column, value in holder_target_values.items():
                 results.loc[current_date, column] = value
-        if current_enable_trading and (not cbo_fed_allocation_override_active) and (not bond_portfolio.empty):
+        if current_enable_trading and market_open and (not cbo_fed_allocation_override_active) and (not bond_portfolio.empty):
             try:
                 pref_trade_monetary_impact = {'reserve_change': 0.0, 'deposit_change': 0.0, 'tga_change': 0.0, 'tga_drain': 0.0}
                 bond_portfolio_temp = bond_portfolio.reset_index(drop=True)
@@ -5852,8 +6180,9 @@ def run_simulation(
                     f"error={results.loc[current_date, 'CBOFedHoldingsTargetError']:.12f}"
                 )
             cbo_fed_end_stock = float(results.loc[current_date, 'DebtHeld_CB'])
-            cbo_fed_maturities = float(principal_paid_by_holder.get('CB', 0.0))
-            cbo_fed_auction_addons = float(total_issued_face_by_holder.get('CB', 0.0))
+            cbo_fed_maturities = cb_stock_matured
+            # Stock added at auction: adjusted principal for TIPS, as in the Fed bridge.
+            cbo_fed_auction_addons = float(total_issued_stock_by_holder.get('CB', 0.0))
             results.loc[current_date, 'CBOFedBeginStock'] = cbo_fed_begin_stock
             results.loc[current_date, 'CBOFedMaturitiesAndRedemptions'] = cbo_fed_maturities
             results.loc[current_date, 'CBOFedTipsPrincipalIndexation'] = cb_tips_indexation_period

@@ -17,23 +17,26 @@ shares.
 from __future__ import annotations
 
 import bisect
+import calendar as calendar_module
 import csv
 import hashlib
 import json
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from simulation_calendar import next_securities_business_day, previous_securities_business_day
 from tdc_shared import DAYS_PER_YEAR_ACTUAL, INTRAGOV_HOLDERS, TGA_FLOOR_TOLERANCE
 
 ISSUANCE_RULE_MODE = "bill_share_target_v1"
-CALIBRATION_SCHEMA_VERSION = "tdcsim_issuance_calibration_v1"
+CALIBRATION_SCHEMA_VERSION = "tdcsim_issuance_calibration_v2"
 CALIBRATION_FILE = "tdcsim_issuance_calibration.json"
 
 BILL_TERM_WEEKS = (4, 6, 8, 13, 17, 26, 52)
@@ -50,15 +53,28 @@ COUPON_TENORS = {
 REOPENING_MAX_SHORTFALL_YEARS = 1.0
 CONTROLLED_SECURITY_TYPES = ("Fixed", "TIPS", "FRN")
 # Treasury's settlement calendar for the bill-share rule's securities, on the Fedwire
-# business-day calendar. Weekday, day-of-month and month-end dates that are not business
-# days roll forward to the next business day (a month-end issue for a Saturday month end
-# settles the following Monday). Separately, the books close on the last calendar day of
-# each federal fiscal year: everything pending settles that day whatever the weekday, an
-# accounting close rather than a market settlement, so fiscal-year-end stocks carry no
-# pending cash. Packaged in the calibration and read back through settlement_rules() and
-# fiscal_year_close_rules().
+# securities business-day calendar (simulation_calendar.is_securities_business_day).
+# Checked against
+# the auction file's twelve months before the start by check_settlement_calendar().
+#
+# Bills settle on a weekday every ``every_weeks`` weeks counted from ``anchor_date``
+# (every week when absent), on the next business day when that weekday is closed.
+# A coupon security settles in the listed months, each settlement either a new issue
+# or a reopening of the latest new issue. Its day rule is a day of the month or
+# ``month_end`` (the next business day when closed), ``last_business_day`` (the business
+# day on or before the month's last day) or ``last_friday`` (the next business day when
+# closed). A new issue is dated on ``dated`` of the month it belongs to (the 15th or the
+# month end, whatever day it settles) and matures that many years later, on the month
+# end for month-end dates; a buyer pays the interest accrued since the dated date or the
+# last coupon. The books close on the last business day of each federal fiscal year:
+# everything pending settles then, as reopenings, so fiscal-year-end stocks carry no
+# pending cash. Packaged in the calibration and read back through settlement_rules()
+# and fiscal_year_close_rules().
+_ALL_MONTHS = list(range(1, 13))
+_QUARTERLY_REFUNDING_MONTHS = [2, 5, 8, 11]
+_REFUNDING_REOPENING_MONTHS = [1, 3, 4, 6, 7, 9, 10, 12]
 SETTLEMENT_CALENDAR = {
-    "fiscal_year_close": [{"month": 9, "day_of_month": "last_calendar_day"}],
+    "fiscal_year_close": [{"month": 9, "day_of_month": "last_business_day"}],
     "bills": [
         {"weeks": 4, "weekday": "Tuesday"},
         {"weeks": 8, "weekday": "Tuesday"},
@@ -66,20 +82,74 @@ SETTLEMENT_CALENDAR = {
         {"weeks": 6, "weekday": "Thursday"},
         {"weeks": 13, "weekday": "Thursday"},
         {"weeks": 26, "weekday": "Thursday"},
-        {"weeks": 52, "weekday": "Thursday"},
+        {"weeks": 52, "weekday": "Thursday", "every_weeks": 4, "anchor_date": "2026-06-11"},
     ],
     "coupons": [
-        {"kind": "nominal", "tenor_years": 3, "day_of_month": 15},
-        {"kind": "nominal", "tenor_years": 10, "day_of_month": 15},
-        {"kind": "nominal", "tenor_years": 30, "day_of_month": 15},
-        {"kind": "nominal", "tenor_years": 2, "day_of_month": "month_end"},
-        {"kind": "nominal", "tenor_years": 5, "day_of_month": "month_end"},
-        {"kind": "nominal", "tenor_years": 7, "day_of_month": "month_end"},
-        {"kind": "nominal", "tenor_years": 20, "day_of_month": "month_end"},
-        {"kind": "frn", "tenor_years": 2, "day_of_month": "month_end"},
-        {"kind": "tips", "tenor_years": 5, "day_of_month": "month_end"},
-        {"kind": "tips", "tenor_years": 10, "day_of_month": "month_end"},
-        {"kind": "tips", "tenor_years": 30, "day_of_month": "month_end"},
+        {
+            "kind": "nominal", "tenor_years": 2, "dated": "month_end",
+            "schedule": [{"issue": "new", "months": _ALL_MONTHS, "day": "month_end"}],
+        },
+        {
+            "kind": "nominal", "tenor_years": 3, "dated": 15,
+            "schedule": [{"issue": "new", "months": _ALL_MONTHS, "day": 15}],
+        },
+        {
+            "kind": "nominal", "tenor_years": 5, "dated": "month_end",
+            "schedule": [{"issue": "new", "months": _ALL_MONTHS, "day": "month_end"}],
+        },
+        {
+            "kind": "nominal", "tenor_years": 7, "dated": "month_end",
+            "schedule": [{"issue": "new", "months": _ALL_MONTHS, "day": "month_end"}],
+        },
+        {
+            "kind": "nominal", "tenor_years": 10, "dated": 15,
+            "schedule": [
+                {"issue": "new", "months": _QUARTERLY_REFUNDING_MONTHS, "day": 15},
+                {"issue": "reopening", "months": _REFUNDING_REOPENING_MONTHS, "day": 15},
+            ],
+        },
+        {
+            "kind": "nominal", "tenor_years": 20, "dated": 15,
+            "schedule": [
+                {"issue": "new", "months": _QUARTERLY_REFUNDING_MONTHS, "day": "month_end"},
+                {"issue": "reopening", "months": _REFUNDING_REOPENING_MONTHS, "day": "month_end"},
+            ],
+        },
+        {
+            "kind": "nominal", "tenor_years": 30, "dated": 15,
+            "schedule": [
+                {"issue": "new", "months": _QUARTERLY_REFUNDING_MONTHS, "day": 15},
+                {"issue": "reopening", "months": _REFUNDING_REOPENING_MONTHS, "day": 15},
+            ],
+        },
+        {
+            "kind": "frn", "tenor_years": 2, "dated": "month_end",
+            "schedule": [
+                {"issue": "new", "months": [1, 4, 7, 10], "day": "month_end"},
+                {"issue": "reopening", "months": [2, 3, 5, 6, 8, 9, 11, 12], "day": "last_friday"},
+            ],
+        },
+        {
+            "kind": "tips", "tenor_years": 5, "dated": 15,
+            "schedule": [
+                {"issue": "new", "months": [4, 10], "day": "last_business_day"},
+                {"issue": "reopening", "months": [6, 12], "day": "last_business_day"},
+            ],
+        },
+        {
+            "kind": "tips", "tenor_years": 10, "dated": 15,
+            "schedule": [
+                {"issue": "new", "months": [1, 7], "day": "last_business_day"},
+                {"issue": "reopening", "months": [3, 5, 9, 11], "day": "last_business_day"},
+            ],
+        },
+        {
+            "kind": "tips", "tenor_years": 30, "dated": 15,
+            "schedule": [
+                {"issue": "new", "months": [2], "day": "last_business_day"},
+                {"issue": "reopening", "months": [8], "day": "last_business_day"},
+            ],
+        },
     ],
 }
 _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
@@ -110,6 +180,13 @@ class IssuanceCalibrationError(ValueError):
 
 def bill_days(weeks: int) -> int:
     return 7 * int(weeks)
+
+
+def bill_maturity(nominal: date, weeks: int) -> date:
+    """A bill's maturity: its weekly cycle date (the nominal settlement day plus its term),
+    or the next securities business day when that is a holiday, as Treasury dates them."""
+
+    return next_securities_business_day(nominal + timedelta(days=bill_days(weeks)))
 
 
 def bill_maturity_years(weeks: int) -> float:
@@ -334,6 +411,130 @@ def build_auction_calibration(
         ],
         "source_sha256": hashlib.sha256(raw).hexdigest(),
         "source_bytes": len(raw),
+    }
+
+
+def _full_calendar_profile(settlement_calendar: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "settlement_calendar": settlement_calendar,
+        "bill_terms": [{"weeks": weeks} for weeks in BILL_TERM_WEEKS],
+        "coupon_terms": [
+            {"security_type": COUPON_KIND_SECURITY_TYPE[kind], "maturity_years": float(tenor)}
+            for kind, tenors in COUPON_TENORS.items()
+            for tenor in tenors
+        ],
+    }
+
+
+def _cross_tenor_reopening(row: Mapping[str, str], *, line: int) -> bool:
+    original = str(row.get("original_security_term", "")).strip()
+    term = str(row.get("security_term", "")).strip()
+    if original in {"", "null"}:
+        raise IssuanceCalibrationError(f"auction row {line}: a reopening has no original_security_term")
+    return _term_years(original, line=line) > _term_years(term, line=line) + REOPENING_MAX_SHORTFALL_YEARS
+
+
+def check_settlement_calendar(
+    auctions_csv: str | Path,
+    *,
+    simulation_start_date: str,
+    settlement_calendar: Mapping[str, Any] = SETTLEMENT_CALENDAR,
+) -> dict[str, Any]:
+    """Check the calendar against Treasury's auctions in the twelve months before the start.
+
+    Every non-cash-management auction issued in the window must fall on a calendar
+    settlement of its security, as a new issue exactly when the calendar says new (a
+    reopening carries an earlier original issue date), and every new coupon issue must
+    mature on the calendar's dated date plus its tenor. A bill must mature on its weekly
+    cycle (``bill_maturity``) and is a reopening exactly when an
+    earlier bill matures the same day. Every calendar settlement in the window must have
+    its auction. Raises with the mismatches; returns the counts.
+    """
+
+    start = date.fromisoformat(simulation_start_date)
+    window_start = (pd.Timestamp(start) - pd.DateOffset(years=1)).date()
+    window_end = start - timedelta(days=1)
+    profile = _full_calendar_profile(settlement_calendar)
+    rules = settlement_rules(profile)
+    expected = {(event.settle, event.key): event for event in settlement_events(profile, window_start, window_end)}
+    with Path(auctions_csv).open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    # A bill reopens any earlier bill maturing the same day; the file's whole history
+    # tells which bills were already outstanding.
+    first_bill_issue: dict[date, date] = {}
+    for line, row in enumerate(rows, start=2):
+        if str(row.get("security_type", "")).strip() == "Bill" and not _flag(row, "cash_management_bill_cmb", line=line):
+            maturity = _date(row, "maturity_date", line=line)
+            issue = _date(row, "issue_date", line=line)
+            first_bill_issue[maturity] = min(issue, first_bill_issue.get(maturity, issue))
+    seen: set[tuple[date, tuple[str, float]]] = set()
+    problems: list[str] = []
+    counts = {"auctions": 0, "new_issues": 0, "reopenings": 0, "cross_tenor_reopenings": 0}
+    for line, row in enumerate(rows, start=2):
+        issue = _date(row, "issue_date", line=line)
+        if not (window_start <= issue < start) or _flag(row, "cash_management_bill_cmb", line=line):
+            continue
+        security_type = str(row.get("security_type", "")).strip()
+        term = str(row.get("security_term", "")).strip()
+        if security_type == "Bill":
+            key = bill_supply_key(_bill_weeks(term, line=line))
+        else:
+            kind = (
+                "frn" if _flag(row, "floating_rate", line=line)
+                else "tips" if _flag(row, "inflation_index_security", line=line)
+                else "nominal"
+            )
+            key = coupon_supply_key(COUPON_KIND_SECURITY_TYPE[kind], coupon_tenor(kind, term, line=line))
+        event = expected.get((issue, key))
+        if event is None:
+            problems.append(f"{key} settled {issue} off the calendar")
+            continue
+        if (issue, key) in seen:
+            problems.append(f"{key} settled twice on {issue}")
+            continue
+        seen.add((issue, key))
+        counts["auctions"] += 1
+        original_text = str(row.get("original_issue_date", "")).strip()
+        reopened = original_text not in {"", "null"} and _date(row, "original_issue_date", line=line) < issue
+        if key[0] == "bill":
+            maturity = _date(row, "maturity_date", line=line)
+            calendar_maturity = bill_maturity(event.nominal, int(key[1]))
+            if maturity != calendar_maturity:
+                problems.append(f"{key} issued {issue} matures {maturity}, calendar says {calendar_maturity}")
+                continue
+            if reopened != (first_bill_issue[maturity] < issue):
+                problems.append(f"{key} on {issue}: auction is {'a reopening' if reopened else 'new'}, the bills outstanding say otherwise")
+                continue
+            counts["reopenings" if reopened else "new_issues"] += 1
+            continue
+        if reopened and event.issue == "new" and _cross_tenor_reopening(row, line=line):
+            # Treasury occasionally sells a new issue's slot as a reopening of an older,
+            # longer note with the same maturity date (the January 2026 two-year reopened
+            # a January 2023 five-year); the security sold has the calendar's terms.
+            counts["cross_tenor_reopenings"] += 1
+            continue
+        if reopened != (event.issue == "reopening"):
+            problems.append(f"{key} on {issue}: auction is {'a reopening' if reopened else 'new'}, calendar says {event.issue}")
+            continue
+        counts["reopenings" if reopened else "new_issues"] += 1
+        if not reopened:
+            maturity = _date(row, "maturity_date", line=line)
+            calendar_maturity = maturity_from_dated(rules[key], dated_date(rules[key], event.nominal))
+            if maturity != calendar_maturity:
+                problems.append(f"{key} issued {issue} matures {maturity}, calendar says {calendar_maturity}")
+    missing = sorted(set(expected) - seen)
+    problems.extend(f"{key} has no auction settling {settle}" for settle, key in missing)
+    if problems:
+        raise IssuanceCalibrationError(
+            f"settlement calendar disagrees with Treasury's auctions in [{window_start}, {start}): "
+            + "; ".join(problems[:20])
+            + (f"; and {len(problems) - 20} more" if len(problems) > 20 else "")
+        )
+    return {
+        "window": {"issue_date_start_inclusive": window_start.isoformat(), "issue_date_end_exclusive": start.isoformat()},
+        **counts,
+        "calendar_settlements": len(expected),
+        "status": "pass",
     }
 
 
@@ -571,16 +772,47 @@ def validate_rule_profile(profile: Mapping[str, Any], label: str = "treasury_iss
     return errors
 
 
-def _day_rule(day: Any) -> tuple[str, int | None]:
-    if day == "month_end":
-        return ("month_end", None)
-    if isinstance(day, int) and not isinstance(day, bool) and 1 <= day <= 28:
-        return ("day_of_month", day)
-    raise IssuanceCalibrationError(f"settlement_calendar day_of_month is malformed: {day!r}")
+COUPON_DAY_RULES = ("month_end", "last_business_day", "last_friday")
+ISSUE_KINDS = ("new", "reopening")
+
+
+@dataclass(frozen=True)
+class SettlementEntry:
+    """Months in which a coupon security settles, the day rule, and new or reopening."""
+
+    months: frozenset[int]
+    day: int | str
+    issue: str
+
+
+@dataclass(frozen=True)
+class SecurityCalendar:
+    """One security's settlement calendar: a bill's weekday cycle or a coupon's months."""
+
+    key: tuple[str, float]
+    weekday: int | None = None
+    every_weeks: int = 1
+    anchor: date | None = None
+    dated: int | str | None = None
+    entries: tuple[SettlementEntry, ...] = ()
+
+    @property
+    def is_bill(self) -> bool:
+        return self.weekday is not None
+
+
+@dataclass(frozen=True)
+class SettlementEvent:
+    """A calendar settlement: ``nominal`` is the unadjusted date, ``settle`` the business day."""
+
+    settle: date
+    key: tuple[str, float]
+    issue: str
+    nominal: date
 
 
 def fiscal_year_close_rules(profile: Mapping[str, Any]) -> list[int]:
-    """Months whose last calendar day closes the books: everything pending settles."""
+    """Months whose last business day closes the books: everything pending settles."""
 
     entries = profile["settlement_calendar"].get("fiscal_year_close")
     if not isinstance(entries, list) or not entries:
@@ -590,7 +822,7 @@ def fiscal_year_close_rules(profile: Mapping[str, Any]) -> list[int]:
         if (
             not isinstance(entry, Mapping)
             or set(entry) != {"month", "day_of_month"}
-            or entry["day_of_month"] != "last_calendar_day"
+            or entry["day_of_month"] != "last_business_day"
         ):
             raise IssuanceCalibrationError(f"fiscal_year_close entry is malformed: {entry!r}")
         month = entry["month"]
@@ -608,12 +840,31 @@ def coupon_supply_key(security_type: str, tenor_years: float) -> tuple[str, floa
     return (str(security_type), float(tenor_years))
 
 
-def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tuple[str, int | None]]:
-    """Return each rule security's settlement rule, keyed like the supply items.
+def _months(value: Any, *, label: str) -> frozenset[int]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(m, int) or isinstance(m, bool) or not 1 <= m <= 12 for m in value)
+        or len(set(value)) != len(value)
+    ):
+        raise IssuanceCalibrationError(f"{label} months are malformed: {value!r}")
+    return frozenset(value)
 
-    A rule is ``("weekday", 0-4)``, ``("day_of_month", 1-28)`` or ``("month_end", None)``;
-    each date rolls forward to the next business day. Raises unless every bill term and coupon security in
-    the profile has exactly one rule and every rule names a profile security.
+
+def _coupon_day(value: Any, *, label: str) -> int | str:
+    if value in COUPON_DAY_RULES:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 28:
+        return value
+    raise IssuanceCalibrationError(f"{label} day is malformed: {value!r}")
+
+
+def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], SecurityCalendar]:
+    """Return each rule security's settlement calendar, keyed like the supply items.
+
+    Raises unless every bill term and coupon security in the profile has exactly one
+    calendar, every calendar names a profile security, and each coupon security's
+    months are covered at most once and include at least one new-issue month.
     """
 
     calendar = profile.get("settlement_calendar")
@@ -622,25 +873,77 @@ def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tupl
             "settlement_calendar must have exactly bills, coupons and fiscal_year_close"
         )
     fiscal_year_close_rules(profile)
-    rules: dict[tuple[str, float], tuple[str, int | None]] = {}
+    rules: dict[tuple[str, float], SecurityCalendar] = {}
 
-    def add(key: tuple[str, float], rule: tuple[str, int | None]) -> None:
-        if key in rules:
-            raise IssuanceCalibrationError(f"settlement_calendar lists {key} twice")
-        rules[key] = rule
+    def add(rule: SecurityCalendar) -> None:
+        if rule.key in rules:
+            raise IssuanceCalibrationError(f"settlement_calendar lists {rule.key} twice")
+        rules[rule.key] = rule
 
     for entry in calendar["bills"]:
-        weekday = entry.get("weekday") if isinstance(entry, Mapping) else None
-        if weekday not in _WEEKDAYS or set(entry) != {"weeks", "weekday"}:
+        if not isinstance(entry, Mapping) or not {"weeks", "weekday"} <= set(entry) <= {
+            "weeks", "weekday", "every_weeks", "anchor_date",
+        }:
             raise IssuanceCalibrationError(f"settlement_calendar bill entry is malformed: {entry!r}")
-        add(bill_supply_key(int(entry["weeks"])), ("weekday", _WEEKDAYS.index(weekday)))
+        weekday = entry["weekday"]
+        if weekday not in _WEEKDAYS:
+            raise IssuanceCalibrationError(f"settlement_calendar bill weekday is malformed: {entry!r}")
+        every = entry.get("every_weeks", 1)
+        if not isinstance(every, int) or isinstance(every, bool) or every < 1:
+            raise IssuanceCalibrationError(f"settlement_calendar bill every_weeks is malformed: {entry!r}")
+        anchor = None
+        if every > 1:
+            try:
+                anchor = date.fromisoformat(str(entry.get("anchor_date")))
+            except ValueError as exc:
+                raise IssuanceCalibrationError(
+                    f"settlement_calendar bill cycle needs an ISO anchor_date: {entry!r}"
+                ) from exc
+            if anchor.weekday() != _WEEKDAYS.index(weekday):
+                raise IssuanceCalibrationError(f"settlement_calendar bill anchor is not a {weekday}: {entry!r}")
+        elif "anchor_date" in entry:
+            raise IssuanceCalibrationError(f"settlement_calendar weekly bill has an anchor_date: {entry!r}")
+        add(
+            SecurityCalendar(
+                key=bill_supply_key(int(entry["weeks"])),
+                weekday=_WEEKDAYS.index(weekday),
+                every_weeks=every,
+                anchor=anchor,
+            )
+        )
     for entry in calendar["coupons"]:
-        if not isinstance(entry, Mapping) or set(entry) != {"kind", "tenor_years", "day_of_month"}:
+        if not isinstance(entry, Mapping) or set(entry) != {"kind", "tenor_years", "dated", "schedule"}:
             raise IssuanceCalibrationError(f"settlement_calendar coupon entry is malformed: {entry!r}")
         kind = entry["kind"]
         if kind not in COUPON_KIND_SECURITY_TYPE:
             raise IssuanceCalibrationError(f"settlement_calendar has unknown coupon kind {kind!r}")
-        add(coupon_supply_key(COUPON_KIND_SECURITY_TYPE[kind], entry["tenor_years"]), _day_rule(entry["day_of_month"]))
+        label = f"settlement_calendar {kind} {entry['tenor_years']}-year"
+        if entry["dated"] not in (15, "month_end"):
+            raise IssuanceCalibrationError(f"{label} dated must be 15 or month_end")
+        schedule = entry["schedule"]
+        if not isinstance(schedule, list) or not schedule:
+            raise IssuanceCalibrationError(f"{label} schedule must be a nonempty list")
+        entries = []
+        seen: set[int] = set()
+        for item in schedule:
+            if not isinstance(item, Mapping) or set(item) != {"issue", "months", "day"}:
+                raise IssuanceCalibrationError(f"{label} schedule entry is malformed: {item!r}")
+            if item["issue"] not in ISSUE_KINDS:
+                raise IssuanceCalibrationError(f"{label} issue must be new or reopening: {item!r}")
+            months = _months(item["months"], label=label)
+            if months & seen:
+                raise IssuanceCalibrationError(f"{label} lists a month twice")
+            seen |= months
+            entries.append(SettlementEntry(months, _coupon_day(item["day"], label=label), item["issue"]))
+        if not any(item.issue == "new" for item in entries):
+            raise IssuanceCalibrationError(f"{label} has no new-issue month")
+        add(
+            SecurityCalendar(
+                key=coupon_supply_key(COUPON_KIND_SECURITY_TYPE[kind], entry["tenor_years"]),
+                dated=entry["dated"],
+                entries=tuple(entries),
+            )
+        )
     securities = {bill_supply_key(term["weeks"]) for term in profile["bill_terms"]} | {
         coupon_supply_key(term["security_type"], term["maturity_years"]) for term in profile["coupon_terms"]
     }
@@ -651,6 +954,90 @@ def settlement_rules(profile: Mapping[str, Any]) -> dict[tuple[str, float], tupl
             f"settlement_calendar must cover exactly the profile's securities: missing={missing}, extra={extra}"
         )
     return rules
+
+
+def _month_end(year: int, month: int) -> date:
+    return date(year, month, calendar_module.monthrange(year, month)[1])
+
+
+def _coupon_settlement(rule: SettlementEntry, year: int, month: int) -> tuple[date, date]:
+    """Return (nominal, settle) for a coupon settlement in ``year``-``month``."""
+
+    if rule.day == "month_end":
+        nominal = _month_end(year, month)
+        return nominal, next_securities_business_day(nominal)
+    if rule.day == "last_business_day":
+        nominal = _month_end(year, month)
+        return nominal, previous_securities_business_day(nominal)
+    if rule.day == "last_friday":
+        nominal = _month_end(year, month)
+        nominal -= timedelta(days=(nominal.weekday() - 4) % 7)
+        return nominal, next_securities_business_day(nominal)
+    nominal = date(year, month, int(rule.day))
+    return nominal, next_securities_business_day(nominal)
+
+
+def settlement_events(profile: Mapping[str, Any], start: date, end: date) -> list[SettlementEvent]:
+    """Calendar settlements whose business day falls in ``[start, end]``, in date order."""
+
+    first = start - timedelta(days=40)
+    events: list[SettlementEvent] = []
+    for key, rule in settlement_rules(profile).items():
+        if rule.is_bill:
+            if rule.anchor is None:
+                day = first + timedelta(days=(rule.weekday - first.weekday()) % 7)
+            else:
+                cycle = 7 * rule.every_weeks
+                day = rule.anchor + timedelta(days=((first - rule.anchor).days // cycle) * cycle)
+            while day <= end:
+                settle = next_securities_business_day(day)
+                if start <= settle <= end:
+                    events.append(SettlementEvent(settle, key, "new", day))
+                day += timedelta(days=7 * rule.every_weeks)
+            continue
+        year, month = first.year, first.month
+        while date(year, month, 1) <= end:
+            for entry in rule.entries:
+                if month in entry.months:
+                    nominal, settle = _coupon_settlement(entry, year, month)
+                    if start <= settle <= end:
+                        events.append(SettlementEvent(settle, key, entry.issue, nominal))
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return sorted(events, key=lambda event: (event.settle, event.key))
+
+
+def fiscal_year_close_dates(profile: Mapping[str, Any], start: date, end: date) -> list[date]:
+    """Last business days of the close months whose business day falls in ``[start, end]``."""
+
+    close_months = set(fiscal_year_close_rules(profile))
+    out = []
+    for year in range(start.year, end.year + 1):
+        for month in sorted(close_months):
+            close = previous_securities_business_day(_month_end(year, month))
+            if start <= close <= end:
+                out.append(close)
+    return out
+
+
+def dated_date(rule: SecurityCalendar, nominal: date) -> date:
+    """A new coupon issue's dated date: the 15th or the end of its nominal month."""
+
+    if rule.dated == "month_end":
+        return _month_end(nominal.year, nominal.month)
+    if rule.dated == 15:
+        return date(nominal.year, nominal.month, 15)
+    raise IssuanceCalibrationError(f"{rule.key} has no dated-date rule")
+
+
+def maturity_from_dated(rule: SecurityCalendar, dated: date) -> date:
+    """Tenor years after the dated date; month-end dated issues mature on a month end."""
+
+    tenor = int(round(rule.key[1]))
+    if abs(rule.key[1] - tenor) > 1e-9:
+        raise IssuanceCalibrationError(f"{rule.key} tenor is not a whole number of years")
+    if rule.dated == "month_end":
+        return _month_end(dated.year + tenor, dated.month)
+    return date(dated.year + tenor, dated.month, dated.day)
 
 
 def is_rule_profile(profile: Any) -> bool:
@@ -694,8 +1081,14 @@ def build_issuance_calibration(
     simulation_start_date: str,
     source_relative_path: str,
     opening_portfolio: pd.DataFrame,
+    check_calendar: bool = True,
 ) -> dict[str, Any]:
-    """Auction shares plus the opening bill share of controlled marketable debt."""
+    """Auction shares, the opening bill share of controlled marketable debt, and the
+    settlement calendar with its check against the auction source.
+
+    ``check_calendar=False`` is for synthetic auction fixtures that do not carry a full
+    year of Treasury's calendar; the calibration then records that it was not checked.
+    """
 
     auctions = build_auction_calibration(auctions_csv, simulation_start_date=simulation_start_date)
     controlled_debt, bills = controlled_debt_and_bills(opening_portfolio)
@@ -707,6 +1100,11 @@ def build_issuance_calibration(
         **auctions,
         "bill_share_target": bills / controlled_debt,
         "settlement_calendar": json.loads(json.dumps(SETTLEMENT_CALENDAR)),
+        "settlement_calendar_check": (
+            check_settlement_calendar(auctions_csv, simulation_start_date=simulation_start_date)
+            if check_calendar
+            else {"status": "not_checked_synthetic_auction_source"}
+        ),
         "bill_share_target_basis": {
             "as_of": simulation_start_date,
             "portfolio": "opening_portfolio_after_prestart_rollforward",

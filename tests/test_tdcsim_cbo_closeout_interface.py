@@ -19,7 +19,7 @@ from tdcsim_cbo.output import hash_output_tree, write_scenario_outputs
 from tdcsim_cbo.runner import RunnerError, build_runtime_params
 from tdcsim_cbo.verifier import VerificationError, verify_compiled_scenario, verify_scenario_run
 from tdc_shared import PORTFOLIO_DTYPES
-from simulation_calendar import build_simulation_calendar
+from simulation_calendar import build_simulation_calendar, is_fedwire_business_day
 from test_cbo_engine_integration import (
     _build_temp_forecast_inputs,
     _dynamic_surface_path,
@@ -1279,7 +1279,8 @@ def _write_cash_residual_override(path: Path) -> Path:
                 "scenario_id": "baseline",
                 "period_start": period.period_start.isoformat(),
                 "period_end": period.period_end.isoformat(),
-                "cash_reconciliation_residual_bil": 7.5,
+                # Cash moves only on Fedwire business days.
+                "cash_reconciliation_residual_bil": 7.5 if is_fedwire_business_day(period.period_end) else 0.0,
                 "component_type": "explicit_test_residual",
                 "affects_operating_cash": True,
                 "affects_primary_deficit": False,

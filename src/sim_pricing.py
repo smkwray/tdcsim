@@ -230,10 +230,9 @@ def value_treasury_security(
         yld_per_period = -1.0 + 1e-9
     discount_base = 1.0 + yld_per_period
 
-    remaining = _remaining_coupon_dates(
+    remaining, last_coupon = _coupon_dates_around_settlement(
         settlement_date=settlement_date,
         maturity_date=maturity_date,
-        issue_date=issue_date,
         first_interest_payment_date=first_interest_payment_date,
         frequency=freq,
     )
@@ -243,8 +242,7 @@ def value_treasury_security(
     # r/s for the part-period between settlement and the next coupon. Counting every flow in
     # days against a nominal period length instead would drift, because real semiannual
     # periods are 181-184 days: a par bond would not price at exactly 100.
-    prior_coupon = remaining[0] - relativedelta(months=12 // freq) if remaining else settlement_date
-    span_days = max(1, (remaining[0] - prior_coupon).days) if remaining else 1
+    span_days = max(1, (remaining[0] - last_coupon).days) if remaining else 1
     stub = (remaining[0] - settlement_date).days / span_days if remaining else 0.0
 
     clean_pv = 0.0
@@ -275,10 +273,9 @@ def value_treasury_security(
     accrued = 0.0
     if coupon > TGA_FLOOR_TOLERANCE and remaining:
         next_coupon = remaining[0]
-        prior_coupon = next_coupon - relativedelta(months=12 // freq)
-        span = (next_coupon - prior_coupon).days
+        span = (next_coupon - last_coupon).days
         if span > 0:
-            elapsed = max(0, (settlement_date - prior_coupon).days)
+            elapsed = max(0, (settlement_date - last_coupon).days)
             accrued = coupon_payment * min(1.0, elapsed / span)
 
     clean = clean_pv - accrued
@@ -293,26 +290,35 @@ def value_treasury_security(
     }
 
 
-def _remaining_coupon_dates(*, settlement_date, maturity_date, issue_date, first_interest_payment_date, frequency):
-    """Coupon dates strictly after settlement, through maturity, newest schedule info first."""
+def _coupon_dates_around_settlement(*, settlement_date, maturity_date, first_interest_payment_date, frequency):
+    """Contractual coupon dates strictly after settlement through maturity, and the last
+    coupon date on or before settlement.
+
+    Dates walk back from maturity on the payment engine's rule (``coupon_payment_date``:
+    the maturity day of month, or the month end for a month-end maturity), so every
+    scheduled coupon is counted once and none is skipped. Coupons before an explicit
+    first interest payment date are not owed.
+    """
 
     months = 12 // max(1, int(frequency))
-    anchor = first_interest_payment_date if first_interest_payment_date is not None and not pd.isna(first_interest_payment_date) else None
-    if anchor is None:
-        # Treasury coupons fall on the maturity day-of-month, so walk back from maturity.
-        anchor = maturity_date
+    maturity = pd.Timestamp(maturity_date).normalize()
+    settlement = pd.Timestamp(settlement_date).normalize()
+    first = (
+        pd.Timestamp(first_interest_payment_date).normalize()
+        if first_interest_payment_date is not None and not pd.isna(first_interest_payment_date)
+        else None
+    )
     dates = []
-    cursor = pd.Timestamp(anchor)
-    while cursor > settlement_date + pd.Timedelta(days=1):
-        cursor = cursor - relativedelta(months=months)
-    cursor = cursor + relativedelta(months=months)
-    while cursor <= maturity_date + pd.Timedelta(days=1):
-        if cursor > settlement_date:
-            dates.append(min(pd.Timestamp(cursor), pd.Timestamp(maturity_date)))
-        cursor = cursor + relativedelta(months=months)
-    if not dates or dates[-1] < maturity_date:
-        dates.append(pd.Timestamp(maturity_date))
-    return sorted(set(dates))
+    step = 0
+    while True:
+        year, month_index = divmod(maturity.year * 12 + maturity.month - 1 - step * months, 12)
+        day = pd.Timestamp(coupon_payment_date(maturity, year, month_index + 1)).normalize()
+        if day <= settlement:
+            return sorted(dates), day
+        if first is None or day >= first:
+            dates.append(day)
+        step += 1
+
 
 def calculate_face_from_proceeds_target(security_type, maturity_years, coupon_rate, yield_at_issuance, proceeds_target):
     """Convert a proceeds target into face issued, accounting for bill discounts."""

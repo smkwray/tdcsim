@@ -25,9 +25,12 @@ settings chosen to produce moderate comparative statics.
 
 Choices made in `src/ratewall_input_builder.py`:
 
-- Opening book: Federal Reserve holdings come from SOMA by CUSIP. The non-Fed
-  remainder of each security is split by WAMEST sector holdings of bills or of
-  longer securities. Depository institutions, including credit unions, route to
+- Opening book: Federal Reserve holdings come from SOMA by CUSIP, plus its add-ons
+  at auctions settling between the SOMA date and the book's record date. The
+  non-Fed remainder of each security is split uniformly within bills and within
+  longer securities: banks, foreign holders and money funds keep their WAMEST
+  holdings, read as market values and converted to par, and domestic nonbanks
+  take the rest. Depository institutions, including credit unions, route to
   `Banks`; money market funds route to the MMF subbucket of `Private`; all other
   domestic sectors route to the domestic nonbank subbucket.
 - New-issuance holder shares blend tdcmix holder priors with recent Z.1 absorption.

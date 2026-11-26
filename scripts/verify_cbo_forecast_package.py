@@ -503,6 +503,8 @@ def _verify_issuance_calibration(root: Path, manifest: Mapping[str, Any]) -> Non
         simulation_start_date=str(manifest.get("date_range", {}).get("simulation_start_date") or ""),
         source_relative_path=source_rel,
         opening_portfolio=pd.read_csv(root / "forecast_inputs" / "tdcsim_opening_portfolio.csv"),
+        check_calendar=(recorded.get("settlement_calendar_check") or {}).get("status")
+        != "not_checked_synthetic_auction_source",
     )
     if recorded != json.loads(json.dumps(expected)):
         raise ValueError(f"forecast_inputs/{CALIBRATION_FILE} does not rebuild from the packaged sources")

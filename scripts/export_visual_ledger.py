@@ -30,8 +30,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import pandas as pd  # noqa: E402
 
 from run_open04_reproduction import _assert_installed_distribution_import  # noqa: E402
+from simulation_calendar import is_fedwire_business_day, next_fedwire_business_day  # noqa: E402
 
-SCHEMA_VERSION = "tdcsim_visual_ledger_v1"
+SCHEMA_VERSION = "tdcsim_visual_ledger_v2"
 HOLDER_COLUMNS = ("fed", "banks", "foreign", "mmf", "other_domestic")
 OPENING_PORTFOLIO = Path("compile/compiled/forecast_inputs/tdcsim_opening_portfolio.csv")
 OPENING_SOURCE = Path("compile/baseline/sources/opening/tdcsim_initial_portfolio_cohorts.csv")
@@ -89,19 +90,10 @@ def security_type(model_type: str, original_years: float) -> str:
     return "note" if original_years <= 10.0 + 1e-9 else "bond"
 
 
-def term_label(kind: str, original_years: float) -> str:
-    if kind == "bill":
-        return f"{round(original_years * DAYS_PER_YEAR / 7)}w"
-    return f"{round(original_years)}y"
+def payment_date(due: Any) -> pd.Timestamp:
+    """When a payment due on ``due`` is made: that day if Fedwire is open, else the next day it is."""
 
-
-def issue_maturity(settlement: pd.Timestamp, kind: str, original_years: float) -> pd.Timestamp:
-    """Maturity as the engine dates it: bills a whole number of weeks, others whole months."""
-
-    if kind == "bill":
-        return settlement + pd.Timedelta(days=7 * round(original_years * DAYS_PER_YEAR / 7))
-    months = int(round(original_years * 12.0))
-    return settlement + pd.DateOffset(years=months // 12, months=months % 12)
+    return pd.Timestamp(next_fedwire_business_day(pd.Timestamp(due)))
 
 
 def replay_issuance(run_dir: Path, baseline: Path, attestation: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -128,22 +120,34 @@ def replay_issuance(run_dir: Path, baseline: Path, attestation: Path) -> tuple[d
     return result, rows
 
 
-def build_issues(flows: list[dict[str, Any]], results: pd.DataFrame) -> pd.DataFrame:
+ISSUE_TERM_FIELDS = ("security_label", "maturity_date", "dated_date", "is_reopening", "settlement_kind")
+
+
+def build_issues(flows: list[dict[str, Any]]) -> pd.DataFrame:
+    """One row per security and settlement date, on the terms the engine issued it.
+
+    The engine names each security (a reopening carries the reopened security's name),
+    dates it and says whether the settlement was on Treasury's calendar, early, or at the
+    fiscal-year close; a reopening therefore appears on several settlement dates under one
+    security id.
+    """
+
     frame = pd.DataFrame(flows)
+    missing = [field for field in ISSUE_TERM_FIELDS if field not in frame.columns or frame[field].isna().any()]
+    if missing:
+        raise SystemExit(f"issuance events lack the engine's issue terms: {missing}")
     frame["settlement_date"] = pd.to_datetime(frame["period_end"]).dt.normalize()
     frame["term"] = frame["weighted_original_term_years"].astype(float)
     frame["kind"] = [security_type(t, y) for t, y in zip(frame["instrument_type"], frame["term"])]
     frame["holder"] = [holder_column(h, s) for h, s in zip(frame["holder_sector"], frame["holder_subsector"])]
-    frame["label"] = [term_label(k, y) for k, y in zip(frame["kind"], frame["term"])]
-    frame["security_id"] = (
-        frame["kind"] + "-" + frame["label"] + "-" + frame["settlement_date"].dt.strftime("%Y-%m-%d")
-    )
-    keys = ["security_id", "settlement_date", "kind", "term", "label", "coupon_rate_decimal"]
+    frame["security_id"] = frame["security_label"].astype(str)
+    keys = ["security_id", "settlement_date", "kind", "term", "coupon_rate_decimal", "maturity_date", "dated_date",
+            "is_reopening", "settlement_kind"]
     if frame[keys].isna().any().any():
         raise SystemExit("an issuance event lacks a date, term or coupon")
-    coupon_groups = frame.groupby("security_id")["coupon_rate_decimal"].nunique()
-    if (coupon_groups > 1).any():
-        raise SystemExit("a security id carries more than one coupon")
+    terms = frame.groupby("security_id")[["maturity_date", "coupon_rate_decimal"]].nunique()
+    if (terms > 1).any().any():
+        raise SystemExit("a security id carries more than one maturity or coupon")
     grouped = frame.groupby(keys)
     out = frame.pivot_table(index=keys, columns="holder", values="face_issued_bil", aggfunc="sum", fill_value=0.0)
     for column in HOLDER_COLUMNS:
@@ -153,23 +157,35 @@ def build_issues(flows: list[dict[str, Any]], results: pd.DataFrame) -> pd.DataF
     out = out.join(grouped["cash_proceeds_bil"].sum().rename("cash_proceeds_total"))
     out = out.join(grouped["security_id_tranche"].agg(lambda s: ";".join(sorted(s, key=int))).rename("model_tranche_ids"))
     out = out.reset_index()
-    out["maturity_date"] = [issue_maturity(d, k, y) for d, k, y in zip(out["settlement_date"], out["kind"], out["term"])]
-    day_kind = {}
-    for day, row in results.iterrows():
-        if float(row.get("FiscalYearCloseSettlementProceeds", 0.0) or 0.0) > TOLERANCE_BIL:
-            day_kind[day] = "fiscal_year_close"
-        elif float(row.get("EarlySettlementProceeds", 0.0) or 0.0) > TOLERANCE_BIL:
-            day_kind[day] = "early_settlement"
-    out["settlement_day_kind"] = [day_kind.get(day, "calendar") for day in out["settlement_date"]]
-    out["is_reopening"] = False
-    out = out.rename(columns={"kind": "security_type", "term": "original_term_years", "coupon_rate_decimal": "coupon_rate"})
+    out["maturity_date"] = pd.to_datetime(out["maturity_date"])
+    out["maturity_payment_date"] = [payment_date(day) for day in out["maturity_date"]]
+    out = out.rename(columns={
+        "kind": "security_type", "term": "original_term_years", "coupon_rate_decimal": "coupon_rate",
+        "settlement_kind": "settlement_day_kind", **{c: f"face_{c}" for c in HOLDER_COLUMNS},
+    })
     columns = [
-        "security_id", "settlement_date", "security_type", "original_term_years", "maturity_date", "coupon_rate",
-        "face_total", *(f"face_{c}" for c in HOLDER_COLUMNS), "cash_proceeds_total", "is_reopening",
-        "settlement_day_kind", "model_tranche_ids",
+        "security_id", "settlement_date", "security_type", "original_term_years", "dated_date", "maturity_date",
+        "maturity_payment_date", "coupon_rate", "face_total", *(f"face_{c}" for c in HOLDER_COLUMNS),
+        "cash_proceeds_total", "is_reopening", "settlement_day_kind", "model_tranche_ids",
     ]
-    out = out.rename(columns={c: f"face_{c}" for c in HOLDER_COLUMNS})
     return out[columns].sort_values(["settlement_date", "security_type", "original_term_years"]).reset_index(drop=True)
+
+
+def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame) -> pd.DataFrame:
+    """Give a reopening of an opening-book security that security's CUSIP."""
+
+    lookup = {
+        (kind, pd.Timestamp(maturity), round(float(coupon), 9)): security_id
+        for security_id, kind, maturity, coupon in zip(
+            opening["security_id"], opening["security_type"], opening["maturity_date"], opening["coupon_rate"]
+        )
+    }
+    out = issues.copy()
+    for index, row in out.iterrows():
+        key = (row["security_type"], pd.Timestamp(row["maturity_date"]), round(float(row["coupon_rate"]), 9))
+        if row["is_reopening"] and key in lookup:
+            out.loc[index, "security_id"] = lookup[key]
+    return out
 
 
 def build_opening(run_dir: Path) -> pd.DataFrame:
@@ -203,8 +219,9 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
         "kind": "security_type", "IssueDate": "issue_date", "MaturityDate": "maturity_date", "CouponRate": "coupon_rate",
         **{c: f"face_{c}" for c in HOLDER_COLUMNS},
     })
-    columns = ["security_id", "security_type", "issue_date", "maturity_date", "coupon_rate", "face_total",
-               *(f"face_{c}" for c in HOLDER_COLUMNS), "debt_basis_total"]
+    face["maturity_payment_date"] = [payment_date(day) for day in pd.to_datetime(face["maturity_date"])]
+    columns = ["security_id", "security_type", "issue_date", "maturity_date", "maturity_payment_date", "coupon_rate",
+               "face_total", *(f"face_{c}" for c in HOLDER_COLUMNS), "debt_basis_total"]
     return face[columns].sort_values(["maturity_date", "security_id"]).reset_index(drop=True)
 
 
@@ -212,18 +229,23 @@ def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, iss
                 financing_cost: pd.Series) -> pd.DataFrame:
     trc = pd.read_csv(run_dir / TRC, parse_dates=["Date"]).set_index("Date")
     daily = pd.DataFrame(index=results.index)
+    daily["fedwire_open"] = [is_fedwire_business_day(day) for day in results.index]
     daily["cumulative_tdc"] = results["TDC_Level"]
     daily["cumulative_trc"] = trc["TRC_Cumulative"].reindex(results.index)
     daily["tga"] = results["TGA"]
     daily["marketable_debt"] = results["TotalDebt_Agg"]
     daily["pending_issuance"] = results["PendingIssuanceProceeds"]
+    # A security counts once, from its first settlement (the opening for the opening
+    # book, which the run may reopen) until its principal is paid.
+    new = issues[~issues["security_id"].isin(opening["security_id"])]
+    first = new.groupby("security_id").agg(start=("settlement_date", "min"), end=("maturity_payment_date", "first"))
     maturities = pd.concat([
-        pd.to_datetime(opening["maturity_date"]),
-        pd.to_datetime(issues["maturity_date"]),
+        pd.to_datetime(opening["maturity_payment_date"]),
+        pd.to_datetime(first["end"]),
     ])
     starts = pd.concat([
         pd.Series(results.index[0], index=range(len(opening))),
-        pd.to_datetime(issues["settlement_date"]).reset_index(drop=True),
+        pd.to_datetime(first["start"]).reset_index(drop=True),
     ])
     counts = []
     for day in results.index:
@@ -353,19 +375,32 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   opening is reinvested, holder by holder, in the Treasury issues that settled on its payment
   date, in proportion to their accepted auction amounts, so those issues appear under their own
   CUSIPs. Face is par; TIPS par excludes inflation compensation, which `debt_basis_total`
-  includes.
-- `issues.csv`: every security the run issued, one row per security and settlement date. The
-  model issues a new security at each settlement; it never reopens an existing one
-  (`is_reopening` is always false). `settlement_day_kind` marks days when pending issuance was
-  settled early to keep the TGA from going negative, or at the fiscal-year close.
-  `model_tranche_ids` lists the model's per-holder rows.
+  includes. `maturity_payment_date` is when the principal is paid: the maturity date, or the
+  next day Fedwire is open when the maturity date is a weekend or holiday.
+- `issues.csv`: every security the run issued, one row per security and settlement date, on
+  Treasury's auction calendar: bills weekly (the 52-week bill every four weeks), 2-, 3-, 5- and
+  7-year notes monthly as new issues, 10-, 20- and 30-year securities new in February, May,
+  August and November and reopened in the two months after, the floating-rate note new
+  quarterly and reopened monthly, and TIPS on Treasury's schedule. A reopening
+  (`is_reopening`) sells more of an existing security on its terms and appears under that
+  security's id; a reopening of an opening-book security uses its CUSIP. `dated_date` is
+  when interest starts (buyers pay what has accrued since it or the last coupon),
+  `maturity_date` the contractual maturity and `maturity_payment_date` the day principal is
+  paid. `settlement_day_kind` is `calendar`, `early_settlement` (pending issuance settled
+  early to keep the TGA from going negative) or `fiscal_year_close` (everything pending
+  settles on the fiscal year's last business day); off-calendar settlements reopen each
+  security's latest issue. `model_tranche_ids` lists the model's per-holder rows.
 - `fiscal.csv`: one row per day. `primary_deficit` is the net fiscal flow out of the TGA
   ({fiscal_note}). `fiscal_to_du` is the part landing in covered deposits (TDC_FiscalFlow);
   `fiscal_to_rs` is the part settling outside covered deposits, here the reserve-settled share
   of the run's fiscal incidence policy ({rs_share:.0%}; foreign and other shares are zero), so
   the two sum to `primary_deficit` every day. `trc_fiscal_flow` is the reserve effect
   (TRC_FiscalFlow). Gross outlays and receipts are not modeled separately.
-- `daily.csv`: one row per day. `cumulative_tdc` and `cumulative_trc` are net totals since the
+- `daily.csv`: one row per calendar day. `fedwire_open` marks the days cash can move: on the
+  others nothing is paid, issued or settled, and fiscal flows are zero; a payment due then is
+  made on the next open day at its contractual amount. Securities do not settle on Good
+  Friday or the Friday before a Saturday holiday either, although Fedwire is open.
+  `cumulative_tdc` and `cumulative_trc` are net totals since the
   opening (no component legs). `tga`, `marketable_debt` (TIPS at par plus inflation
   compensation) and `pending_issuance` (issuance decided but awaiting its settlement date) are
   end-of-day levels. `securities_outstanding_count` counts securities from the two files above
@@ -380,7 +415,9 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
 Holders: `fed` (Federal Reserve), `banks`, `foreign`, `mmf` (money-market funds) and
 `other_domestic` (all other domestic holders, which pay from bank deposits).
 - Opening book: holders as of the opening. The Federal Reserve's holdings are its SOMA holdings
-  by CUSIP; the remainder is split by measured sector shares of bills and of longer securities.
+  by CUSIP. The remainder is split uniformly within bills and within longer securities: banks,
+  foreign holders and money funds keep their measured sector holdings converted to par, and
+  other domestic holders take the rest.
 - Issues: holders at issuance. The Federal Reserve takes no auction allocation in this model,
   so `face_fed` is zero for every issue. After issuance the Federal Reserve keeps its holdings
   on its path by buying securities from other holders in the secondary market (domestic private
@@ -412,13 +449,18 @@ def main(argv: list[str] | None = None) -> int:
     for row in flows:
         row["security_id_tranche"] = str(row["security_id"])
     aggregate_gap = check_against_aggregates(run_dir, flows)
-    issues = build_issues(flows, results)
+    issues = build_issues(flows)
     maturities_checked = check_maturities(run_dir, issues)
-    if issues["security_id"].duplicated().any():
-        raise SystemExit("issued security ids are not unique")
+    if issues.duplicated(["security_id", "settlement_date"]).any():
+        raise SystemExit("a security settles twice on one day")
+    for column in ("settlement_date", "maturity_payment_date"):
+        closed = [day for day in pd.to_datetime(issues[column]) if not is_fedwire_business_day(day)]
+        if closed:
+            raise SystemExit(f"{column} falls on a day Fedwire is closed: {closed[:3]}")
     if (issues["face_fed"].abs() > TOLERANCE_BIL).any():
         raise SystemExit("an issue allocates face to the Federal Reserve at auction")
     opening = build_opening(run_dir)
+    issues = name_reopened_opening_securities(issues, opening)
     manifest = json.loads((run_dir / RUN_MANIFEST).read_text(encoding="utf-8"))
     scenario_id = (manifest.get("scenario") or {}).get("scenario_id")
     if not scenario_id:

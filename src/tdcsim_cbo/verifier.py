@@ -94,6 +94,7 @@ from .output import (
     write_scenario_outputs,
 )
 from .process_watchdog import THREAD_LIMIT_ENVIRONMENT_VARIABLES
+from tdc_shared import INTRAGOV_HOLDERS
 from .runtime_identity import (
     assert_loaded_distribution_modules,
     distribution_identity,
@@ -3841,10 +3842,17 @@ def _verify_bounded_issuance(
             face - cash,
             label="bounded issuance discount/proceeds identity",
         )
+        # The booked cost is the discount, or on Treasury's calendar the debt added less
+        # cash, which may be a premium and for TIPS counts adjusted principal.
+        issue_cost = _bounded_float(row, "issue_cost_bil", label="bounded issuance")
+        # Intragovernmental issuance is noncash and books no cost.
+        allowed_costs = (0.0,) if holder in INTRAGOV_HOLDERS else (discount, max(0.0, discount))
+        if instrument != "TIPS" and all(abs(issue_cost - cost) > STOCK_TOLERANCE_BIL for cost in allowed_costs):
+            raise VerificationError("bounded issuance cost is neither the signed nor the floored discount")
         period_totals[period]["face_issued_bil"] += face
         period_totals[period]["cash_proceeds_bil"] += cash
         period_totals[period]["discount_or_premium_bil"] += discount
-        period_totals[period]["issue_discount_cost_bil"] += max(0.0, discount)
+        period_totals[period]["issue_discount_cost_bil"] += issue_cost
         if issuance_leg in CASH_FINANCING_ISSUANCE_LEGS:
             period_totals[period]["cash_financing_face_issued_bil"] += face
             period_totals[period]["cash_financing_proceeds_bil"] += cash
@@ -3895,15 +3903,11 @@ def _verify_bounded_issuance(
                 float(result_evidence[period]["CashFinancingProceeds"]),
                 label="bounded cash-financing/results proceeds bridge",
             )
-        if (
-            float(result_evidence[period]["IssueDiscountCost_Period"])
-            + STOCK_TOLERANCE_BIL
-            < period_totals[period]["issue_discount_cost_bil"]
-        ):
-            raise VerificationError(
-                "bounded issuance/results discount cost is below the "
-                "recoverable aggregate lower bound"
-            )
+        _bounded_close(
+            period_totals[period]["issue_discount_cost_bil"],
+            float(result_evidence[period]["IssueDiscountCost_Period"]),
+            label="bounded issuance/results issue cost bridge",
+        )
     return {"annual": annual, "period": period_totals}
 
 

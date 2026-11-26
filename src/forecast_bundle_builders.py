@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from forecast_paths import operating_cash_runtime_role
-from simulation_calendar import SimulationPeriod
+from simulation_calendar import SimulationPeriod, is_fedwire_business_day
 
 
 DATE_TOLERANCE_BIL = 0.000001
@@ -245,12 +245,17 @@ def build_primary_deficit_path_rows(
     scenario_id: str,
     periods: Sequence[SimulationPeriod],
     primary_deficit_by_fiscal_year_bil: Mapping[int, float],
-    allocation_method: str = "actual_day_weighted_equal_by_day",
-    source_status: str = "annual_or_remaining_primary_deficit_allocated_by_actual_days",
+    allocation_method: str = "equal_by_fedwire_business_day",
+    source_status: str = "annual_or_remaining_primary_deficit_allocated_by_fedwire_business_days",
     claim_boundary: str = "period_rows_sum_to_annual_or_remaining_primary_deficit",
     tolerance_bil: float = DATE_TOLERANCE_BIL,
 ) -> list[dict[str, Any]]:
-    """Allocate annual or remaining primary deficits across period rows."""
+    """Allocate annual or remaining primary deficits across period rows.
+
+    Each fiscal year's amount is spread equally over its Fedwire business days, and a
+    period takes the share of the business days it contains: Treasury cash moves only
+    when Fedwire is open, so a weekend or holiday period books nothing.
+    """
 
     if not periods:
         raise ValueError("periods must not be empty")
@@ -263,13 +268,21 @@ def build_primary_deficit_path_rows(
         if fiscal_year not in primary_deficit_by_fiscal_year_bil:
             raise ValueError(f"missing primary deficit amount for FY{fiscal_year}")
         amount = float(primary_deficit_by_fiscal_year_bil[fiscal_year])
-        total_days = sum(period.day_count for period in fy_periods)
+        business_days = {
+            id(period): sum(
+                1
+                for offset in range(1, period.day_count + 1)
+                if is_fedwire_business_day(period.period_start + timedelta(days=offset))
+            )
+            for period in fy_periods
+        }
+        total_days = sum(business_days.values())
         if total_days <= 0:
-            raise ValueError(f"FY{fiscal_year} has no positive day-count periods")
+            raise ValueError(f"FY{fiscal_year} has no Fedwire business days")
         fy_rows: list[dict[str, Any]] = []
         allocated = 0.0
         for period in fy_periods:
-            weight = period.day_count / total_days
+            weight = business_days[id(period)] / total_days
             value = amount * weight
             allocated += value
             fy_rows.append(

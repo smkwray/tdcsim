@@ -37,7 +37,7 @@ from sim_engine import (
     run_simulation,
 )
 from sim_pricing import get_security_category_for_prefs
-from simulation_calendar import build_simulation_calendar
+from simulation_calendar import build_simulation_calendar, is_fedwire_business_day
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
 from tdcsim_cbo._json import write_json
 from test_cbo_engine_integration import _build_temp_forecast_inputs, _minimal_engine_params
@@ -59,12 +59,16 @@ FIXTURE_COUPON_TERMS = [
     {"kind": "nominal", "tenor_years": 10, "share": 0.3},
     {"kind": "nominal", "tenor_years": 30, "share": 0.2},
 ]
-# The registry calendar restricted to the fixture's securities.
+# The registry calendar restricted to the fixture's securities, with every coupon a new
+# issue each month on its registry day, so a fixture book needs nothing to reopen.
 FIXTURE_SETTLEMENT_CALENDAR = {
     "fiscal_year_close": SETTLEMENT_CALENDAR["fiscal_year_close"],
     "bills": [entry for entry in SETTLEMENT_CALENDAR["bills"] if entry["weeks"] in {4, 13, 26}],
     "coupons": [
-        entry
+        {
+            **entry,
+            "schedule": [{"issue": "new", "months": list(range(1, 13)), "day": entry["schedule"][0]["day"]}],
+        }
         for entry in SETTLEMENT_CALENDAR["coupons"]
         if entry["kind"] == "nominal" and entry["tenor_years"] in {2, 10, 30}
     ],
@@ -307,6 +311,7 @@ def test_package_calibration_records_opening_bill_share(tmp_path: Path) -> None:
         simulation_start_date=START,
         source_relative_path="sources/fiscaldata/auctions_query.csv",
         opening_portfolio=portfolio,
+        check_calendar=False,
     )
     assert controlled_debt_and_bills(portfolio) == pytest.approx((1000.0, 200.0))
     assert calibration["bill_share_target"] == pytest.approx(0.2)
@@ -793,12 +798,12 @@ def test_month_ends_and_holidays_roll_forward_on_the_fedwire_calendar() -> None:
     2026-03-02 and 2026-06-01. Business days are Fedwire's: open on the Friday before a
     Saturday holiday, closed on the Monday after a Sunday holiday."""
 
-    from sim_engine import _is_fedwire_business_day, _settlement_schedule
+    from sim_engine import _settlement_schedule
 
-    assert _is_fedwire_business_day("2026-07-03")  # July 4 is a Saturday
-    assert _is_fedwire_business_day("2027-12-31")  # New Year's Day 2028 is a Saturday
-    assert not _is_fedwire_business_day("2027-07-05")  # July 4 is a Sunday
-    assert not _is_fedwire_business_day("2026-11-26")  # Thanksgiving
+    assert is_fedwire_business_day("2026-07-03")  # July 4 is a Saturday
+    assert is_fedwire_business_day("2027-12-31")  # New Year's Day 2028 is a Saturday
+    assert not is_fedwire_business_day("2027-07-05")  # July 4 is a Sunday
+    assert not is_fedwire_business_day("2026-11-26")  # Thanksgiving
 
     schedule = _settlement_schedule(_full_registry_profile(), "2025-08-01", "2027-12-31")
     two_year = sorted(day for day, keys in schedule.items() if ("Fixed", 2.0) in keys)
@@ -813,23 +818,24 @@ def test_month_ends_and_holidays_roll_forward_on_the_fedwire_calendar() -> None:
     assert pd.Timestamp("2026-11-26") not in thursday_bills
 
 
-def test_fiscal_year_close_settles_everything_on_a_weekend_september_30(tmp_path: Path) -> None:
-    """Needs and maturities still land on a Saturday September 30 (2028, 2029, 2034,
-    2035). The close is an accounting close on the last simulated day of the year, not a
-    market settlement, so it must clear what is pending whatever the weekday."""
+def test_fiscal_year_close_settles_on_the_last_business_day_and_the_weekend_is_still(tmp_path: Path) -> None:
+    """When September 30 is a Saturday or Sunday (2028, 2029, 2034, 2035) the books close
+    on the Friday: what is pending settles then, as reopenings of each security's latest
+    issue, the TGA closes the year on its target, and nothing settles, pays or moves cash
+    over the weekend, so the September 30 stocks are the Friday's."""
 
     from sim_engine import _fiscal_year_close_dates
 
     profile = _full_registry_profile()
     closes = _fiscal_year_close_dates(profile, "2028-06-01", "2035-12-31")
-    assert [day.date().isoformat() for day in closes][:2] == ["2028-09-30", "2029-09-30"]
-    assert closes[0].weekday() == 5 and closes[1].weekday() == 6
+    assert [day.date().isoformat() for day in closes][:2] == ["2028-09-29", "2029-09-28"]
+    assert all(is_fedwire_business_day(day) for day in closes)
 
-    # Run the mechanics on a Saturday close inside a fixture window: move the close month
-    # to October, whose last day in 2026 is a Saturday.
+    # Run the mechanics on a Saturday month end inside a fixture window: move the close
+    # month to October, whose last day in 2026 is a Saturday.
     rule = _rule_profile(0.3)
     rule["settlement_calendar"] = {**rule["settlement_calendar"], "fiscal_year_close": [
-        {"month": 10, "day_of_month": "last_calendar_day"}
+        {"month": 10, "day_of_month": "last_business_day"}
     ]}
     params = _engine_params(
         tmp_path,
@@ -839,14 +845,26 @@ def test_fiscal_year_close_settles_everything_on_a_weekend_september_30(tmp_path
         later_fiscal_years={2027: (1_200.0, 70.0)},
     )
     results, portfolio = run_simulation(params, ENGINE_START, "2026-11-04", freq="D", scenario_name="baseline")
-    close = results.loc["2026-10-31"]
-    assert pd.Timestamp("2026-10-31").weekday() == 5
-    assert results.loc["2026-10-30", "PendingIssuanceProceeds"] > 1.0
-    assert close["IssuanceNeedProceeds"] > 0.0
+    close = results.loc["2026-10-30"]
+    assert pd.Timestamp("2026-10-30").weekday() == 4
     assert close["PendingIssuanceProceeds"] == pytest.approx(0.0, abs=1e-9)
     assert close["FiscalYearCloseSettlementProceeds"] > 1.0
     assert close["TGA"] == pytest.approx(close["CBOOperatingCashTarget"], abs=1e-6)
-    assert (pd.to_datetime(portfolio["IssueDate"]) == pd.Timestamp("2026-10-31")).any()
+    for weekend in ("2026-10-31", "2026-11-01"):
+        day = results.loc[weekend]
+        assert day["NewDebtIssued"] == 0.0 and day["IssuanceNeedProceeds"] == 0.0
+        assert day["PrincipalPaid_Bonds"] == 0.0 and day["InterestPaid_Bonds"] == 0.0
+        assert day["TGA"] == close["TGA"] and day["PendingIssuanceProceeds"] == 0.0
+    issued = pd.to_datetime(portfolio["IssueDate"])
+    assert all(is_fedwire_business_day(day) for day in issued[issued > pd.Timestamp(ENGINE_START)])
+    # The 10-year was last issued on 2026-10-15; the close reopens it rather than dating a
+    # 10-year note from a Friday the 30th.
+    ten_year = portfolio[
+        (issued == pd.Timestamp("2026-10-30"))
+        & (portfolio["OriginalMaturityYears"] == 10.0)
+    ]
+    assert not ten_year.empty
+    assert set(pd.to_datetime(ten_year["MaturityDate"])) == {pd.Timestamp("2036-10-15")}
 
 
 def test_an_event_may_not_switch_the_issuance_rule_mid_run(tmp_path: Path) -> None:
@@ -918,12 +936,20 @@ def test_reference_mode_row_budget_covers_both_daily_legs(tmp_path: Path) -> Non
         category: dict(split) for category in ("bills", "notes", "bonds")
     }
     results, portfolio = run_simulation(params, ENGINE_START, end, freq="D", scenario_name="baseline")
-    running = results.iloc[1:]
+    # Fiscal flows fall on business days, so the surplus that keeps both legs going does
+    # too; the TGA starts at zero and the floor leg starts in the second week.
+    running = results.loc["2026-07-06":]
+    running = running[[is_fedwire_business_day(day) for day in running.index]]
     assert (running["CashFinancingProceeds"] > 0.0).mean() > 0.9
     assert (running["NewDebtIssued"] > running["CashFinancingFaceIssued"] + 1.0).mean() > 0.9
     one_leg = dict(params, funding_rule={**params["funding_rule"], "mode": "cbo_operating_cash_target_financing_v1"})
     rows = len(portfolio)
-    assert rows > _portfolio_row_budget(one_leg, start=ENGINE_START, end=end)
+    # A day with both legs adds more rows than a one-leg cap allows any single period.
+    periods = len(pd.date_range(ENGINE_START, end, freq="D")) - 1
+    opening_rows = len(params["initial_bonds_df"])
+    one_leg_per_period = (_portfolio_row_budget(one_leg, start=ENGINE_START, end=end) - opening_rows - 64) / periods
+    new_rows_by_day = pd.to_datetime(portfolio["IssueDate"]).value_counts()
+    assert new_rows_by_day.loc[running.index[running["CashFinancingProceeds"] > 0.0]].max() > one_leg_per_period
     assert rows <= _portfolio_row_budget(params, start=ENGINE_START, end=end)
 
 

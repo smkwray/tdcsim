@@ -105,6 +105,157 @@ def _is_regular_interval(period_start: date, period_end: date, frequency: Calend
     raise ValueError(f"unsupported calendar frequency: {frequency!r}")
 
 
+_FEDWIRE_CLOSED_DATES: frozenset[date] | None = None
+
+
+def _fedwire_closed_dates() -> frozenset[date]:
+    """Weekday federal holidays on which Fedwire is closed, 1900-2100.
+
+    The Federal Reserve observes a fixed-date holiday that falls on a Sunday on the
+    Monday, but stays open on the Friday before a Saturday holiday (it settled Treasury
+    issues on 2021-12-31, the Friday before New Year's Day 2022).
+    """
+
+    global _FEDWIRE_CLOSED_DATES
+    if _FEDWIRE_CLOSED_DATES is None:
+        from pandas import Timestamp
+        from pandas.tseries.holiday import USFederalHolidayCalendar
+
+        closed: set[date] = set()
+        for rule in USFederalHolidayCalendar().rules:
+            if rule.offset is None and rule.day is not None:
+                for year in range(1900, 2101):
+                    actual = date(year, rule.month, rule.day)
+                    if rule.start_date is not None and Timestamp(actual) < rule.start_date:
+                        continue
+                    if actual.weekday() == 6:
+                        closed.add(actual + timedelta(days=1))
+                    elif actual.weekday() < 5:
+                        closed.add(actual)
+            else:
+                closed.update(value.date() for value in rule.dates("1900-01-01", "2100-12-31"))
+        _FEDWIRE_CLOSED_DATES = frozenset(closed)
+    return _FEDWIRE_CLOSED_DATES
+
+
+def is_fedwire_business_day(value: date | datetime | str) -> bool:
+    """True on days Fedwire settles: weekdays that are not federal holidays it observes."""
+
+    day = _as_date(value)
+    return day.weekday() < 5 and day not in _fedwire_closed_dates()
+
+
+def next_fedwire_business_day(value: date | datetime | str) -> date:
+    """The day itself if Fedwire settles on it, else the next day it does."""
+
+    day = _as_date(value)
+    while not is_fedwire_business_day(day):
+        day += timedelta(days=1)
+    return day
+
+
+def previous_fedwire_business_day(value: date | datetime | str) -> date:
+    """The day itself if Fedwire settles on it, else the last day before it that does."""
+
+    day = _as_date(value)
+    while not is_fedwire_business_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
+def _easter_sunday(year: int) -> date:
+    """Gregorian Easter (anonymous Gregorian algorithm)."""
+
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    weekday_offset = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * weekday_offset) // 451
+    month, day = divmod(h + weekday_offset - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+def is_securities_business_day(value: date | datetime | str) -> bool:
+    """True on days Treasury securities trade and new issues settle.
+
+    The securities market closes on every day Fedwire does, and also on Good Friday
+    (except when it is the first Friday of its month, the employment report's day, when
+    the market only closes early) and on the Friday before a Saturday federal holiday
+    other than New Year's Day. Treasury settled the March 2018 and March 2024 TIPS on
+    the Thursday before Good Friday and the March 2018 FRN on the Monday after it, while
+    it settled on Friday 2021-12-31, the day before New Year's Day 2022.
+    """
+
+    day = _as_date(value)
+    if not is_fedwire_business_day(day):
+        return False
+    if day == _easter_sunday(day.year) - timedelta(days=2) and day.day > 7:
+        return False
+    saturday = day + timedelta(days=1)
+    return not (
+        day.weekday() == 4
+        and saturday in _saturday_federal_holidays()
+        and (saturday.month, saturday.day) != (1, 1)
+    )
+
+
+_SATURDAY_FEDERAL_HOLIDAYS: frozenset[date] | None = None
+
+
+def _saturday_federal_holidays() -> frozenset[date]:
+    global _SATURDAY_FEDERAL_HOLIDAYS
+    if _SATURDAY_FEDERAL_HOLIDAYS is None:
+        from pandas import Timestamp
+        from pandas.tseries.holiday import USFederalHolidayCalendar
+
+        days: set[date] = set()
+        for rule in USFederalHolidayCalendar().rules:
+            if rule.offset is None and rule.day is not None:
+                for year in range(1900, 2101):
+                    actual = date(year, rule.month, rule.day)
+                    if rule.start_date is not None and Timestamp(actual) < rule.start_date:
+                        continue
+                    if actual.weekday() == 5:
+                        days.add(actual)
+        _SATURDAY_FEDERAL_HOLIDAYS = frozenset(days)
+    return _SATURDAY_FEDERAL_HOLIDAYS
+
+
+def next_securities_business_day(value: date | datetime | str) -> date:
+    """The day itself if Treasury securities settle on it, else the next day they do."""
+
+    day = _as_date(value)
+    while not is_securities_business_day(day):
+        day += timedelta(days=1)
+    return day
+
+
+def previous_securities_business_day(value: date | datetime | str) -> date:
+    """The day itself if Treasury securities settle on it, else the last day before that does."""
+
+    day = _as_date(value)
+    while not is_securities_business_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
+def add_fedwire_business_days(value: date | datetime | str, count: int) -> date:
+    """Move ``count`` Fedwire business days forward (negative: backward) from ``value``."""
+
+    day = _as_date(value)
+    step = timedelta(days=1 if count >= 0 else -1)
+    remaining = abs(int(count))
+    while remaining > 0:
+        day += step
+        if is_fedwire_business_day(day):
+            remaining -= 1
+    return day
+
+
 def september_30_control_dates(start_date: date | datetime | str, end_date: date | datetime | str) -> list[date]:
     """Return September 30 control boundaries inside the configured date span."""
 
