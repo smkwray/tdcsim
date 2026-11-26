@@ -1,6 +1,6 @@
 """Treasury's calendar in the CBO lane: business days, auction cadence and reopenings.
 
-The thesis deck shows a month of settlements and every security's dates, so calendar
+The visual ledger lists every settlement and every security's dates, so calendar
 artifacts are visible: a payment or settlement on a weekend, a 52-week bill every week,
 TIPS every month, or a 10-year note maturing on a date Treasury never uses. These tests
 pin the calendar to Treasury's practice and the engine to it.

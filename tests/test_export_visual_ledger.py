@@ -24,7 +24,7 @@ def _event(day: str, holder: str, sub: str, face: float, *, reopening: bool, kin
 
 
 def test_issues_keep_the_engines_terms_and_a_reopening_stays_one_security() -> None:
-    # The deck's inspector shows each security's dates: a reopening must appear under the
+    # The ledger shows each security's dates: a reopening must appear under the
     # security it reopens, with that security's maturity, not as a new note dated from
     # its own settlement day.
     flows = [
