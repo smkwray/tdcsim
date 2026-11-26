@@ -291,6 +291,7 @@ BOUNDED_HANDOFF_TAXONOMY = {
                 "cbo_reference_face_issuance",
                 "tga_floor_cash_financing",
                 "operating_cash_target_financing",
+                "fed_rollover_add_on",
             }
         ),
     },
@@ -755,6 +756,7 @@ def _validate_funding_mode_close(
             float(opening_result.get("PendingIssuanceProceeds", 0.0) or 0.0)
             + float(closing_result["IssuanceNeedProceeds"])
             - float(closing_result["AuctionProceeds"])
+            + float(closing_result["FedRolloverProceeds"])
         )
         if abs(pending_error) > CASH_TOLERANCE_BIL:
             raise BoundedEvidenceError(f"pending issuance identity failed at period close: {pending_error}")

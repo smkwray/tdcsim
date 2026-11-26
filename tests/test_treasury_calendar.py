@@ -393,3 +393,150 @@ def test_a_holiday_shortened_13_week_bill_keeps_the_cbo_bill_quote(monkeypatch) 
         current_date=pd.Timestamp("2026-11-27"), bill_term_days=91, pricing=pricing, bill_days_to_maturity=90,
     )
     assert item["issue_price_ratio"] == pytest.approx(discount_price_ratio(0.03, 90))
+
+
+# --- The Fed rolls its maturing holdings at auction ----------------------------------------
+
+
+def _fed_run(tmp_path: Path, fy_end_target: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The Fed holds a 4-week bill maturing Tuesday 2026-07-07 (20) and a 13-week bill
+    maturing Thursday 2026-07-09 (30), and follows a path from 50 to ``fy_end_target``
+    by 2026-09-30."""
+
+    from forecast_bundle_builders import build_fed_holdings_path_rows
+    from simulation_calendar import build_simulation_calendar
+    from test_cbo_engine_integration import _write_csv
+
+    params = _params(
+        tmp_path,
+        [
+            _portfolio_row(910, security_type="Fixed", years=28 / 365.25, maturity="2026-07-07", face=20.0, holder="CB"),
+            _portfolio_row(911, security_type="Fixed", years=91 / 365.25, maturity="2026-07-09", face=30.0, holder="CB"),
+        ],
+    )
+    rows = build_fed_holdings_path_rows(
+        scenario_id="baseline",
+        periods=build_simulation_calendar(ENGINE_START, ENGINE_END, "daily"),
+        opening_state_date=ENGINE_START,
+        opening_cb_holdings_bil=50.0,
+        cbo_fy_end_fed_holdings_bil={2026: fy_end_target},
+        observation_date=ENGINE_START,
+        available_date=ENGINE_START,
+    )
+    params["baseline_input_paths"]["fed_holdings_path_file"] = str(_write_csv(tmp_path / "fed.csv", rows))
+    return run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+
+
+def _assert_cash_rule_closes(results: pd.DataFrame) -> None:
+    running = results.iloc[1:]
+    excess = running["TGA"] + running["PendingIssuanceProceeds"] - running["CBOOperatingCashTarget"]
+    decided = running["IssuanceNeedProceeds"] > 1e-9
+    assert excess.min() > -1e-6 and excess[decided].abs().max() < 1e-6
+
+
+def test_the_fed_rolls_maturing_holdings_into_the_days_auctions_not_the_secondary_market(tmp_path: Path) -> None:
+    """On a flat path the Fed replaces each maturing bill with add-ons at the auctions
+    settling that day, pro rata across them, paying for them itself: no secondary
+    purchase pulls securities, reserves or deposits from private holders, and the
+    Treasury's cash rule still closes because the add-on cash is counted the same day."""
+
+    results, portfolio = _fed_run(tmp_path, 50.0)
+    assert results.loc["2026-07-07", "FedRolloverFace"] == pytest.approx(20.0)
+    assert results.loc["2026-07-09", "FedRolloverFace"] == pytest.approx(30.0)
+    # The add-on bills mature inside the window and roll again: every maturity is rolled.
+    assert (results["FedRolloverFace"] - results["CBOFedMaturitiesAndRedemptions"]).abs().max() < 1e-9
+    assert results["FedRolloverFace"].sum() > 50.0
+    assert results["FedRedeemedFace"].abs().max() < 1e-9
+    assert results["CBOFedSecondaryPurchaseFace"].abs().max() < 1e-9
+    assert results["TDC_SecondaryTrades"].abs().max() < 1e-9
+    assert (results["DebtHeld_CentralBank"].iloc[1:] - 50.0).abs().max() < 1e-6
+    add_ons = portfolio[(portfolio["HolderType"] == "CB") & (pd.to_datetime(portfolio["IssueDate"]) > pd.Timestamp(ENGINE_START))]
+    tuesday = add_ons[pd.to_datetime(add_ons["IssueDate"]) == pd.Timestamp("2026-07-07")]
+    weeks = sorted({round(float(years) * 365.25 / 7) for years in tuesday["OriginalMaturityYears"]})
+    assert weeks == [4, 8, 17]  # the bills that settle on Tuesdays
+    assert (results["CBOFedAuctionRolloverAddons"] <= results["CBOFedMaturitiesAndRedemptions"] + 1e-9).all()
+    _assert_cash_rule_closes(results)
+
+
+def test_the_fed_buys_in_the_secondary_market_only_for_growth(tmp_path: Path) -> None:
+    """On a rising path the Fed rolls all of its maturing holdings and buys only the
+    path's growth in the secondary market: 30 over the window, not 30 plus the 50 that
+    matured, which is what replacing maturities by purchases would churn."""
+
+    results, _ = _fed_run(tmp_path, 80.0)
+    assert (results["FedRolloverFace"] - results["CBOFedMaturitiesAndRedemptions"]).abs().max() < 1e-9
+    assert results["CBOFedSecondaryPurchaseFace"].sum() == pytest.approx(30.0, abs=1e-6)
+    assert results.loc["2026-09-30", "DebtHeld_CentralBank"] == pytest.approx(80.0, abs=1e-6)
+    _assert_cash_rule_closes(results)
+
+
+def test_on_a_falling_path_maturities_run_off_before_the_fed_sells(tmp_path: Path) -> None:
+    """When the path falls the Fed rolls only what keeps it on the path and lets the rest
+    of a maturity run off; it sells in the secondary market only on days when nothing it
+    holds matures."""
+
+    results, _ = _fed_run(tmp_path, 30.0)
+    maturity_days = results.index[results["CBOFedMaturitiesAndRedemptions"] > 1e-9]
+    assert pd.Timestamp("2026-07-07") in maturity_days and pd.Timestamp("2026-07-09") in maturity_days
+    for day in maturity_days:
+        row = results.loc[day]
+        assert row["FedRedeemedFace"] > 0.0 and row["CBOFedSecondarySaleCash"] == 0.0
+        assert row["DebtHeld_CentralBank"] == pytest.approx(row["CBOFedHoldingsTarget"], abs=1e-6)
+    assert results["FedRedeemedFace"].sum() > 0.0
+    assert results.loc["2026-09-30", "DebtHeld_CentralBank"] == pytest.approx(30.0, abs=1e-6)
+    _assert_cash_rule_closes(results)
+
+
+def test_the_fed_rolls_bills_into_bills_and_coupons_into_coupons(tmp_path: Path) -> None:
+    """2026-09-15 is a Tuesday: the 3-, 10- and 30-year notes settle with the Tuesday
+    bills. A maturing Fed bill rolls only into the bills, as the Desk does, however much
+    coupon issuance is pending."""
+
+    from forecast_bundle_builders import build_fed_holdings_path_rows
+    from simulation_calendar import build_simulation_calendar
+    from test_cbo_engine_integration import _write_csv
+
+    params = _params(
+        tmp_path,
+        [_portfolio_row(913, security_type="Fixed", years=91 / 365.25, maturity="2026-09-15", face=20.0, holder="CB")],
+    )
+    rows = build_fed_holdings_path_rows(
+        scenario_id="baseline",
+        periods=build_simulation_calendar(ENGINE_START, ENGINE_END, "daily"),
+        opening_state_date=ENGINE_START,
+        opening_cb_holdings_bil=20.0,
+        cbo_fy_end_fed_holdings_bil={2026: 20.0},
+        observation_date=ENGINE_START,
+        available_date=ENGINE_START,
+    )
+    params["baseline_input_paths"]["fed_holdings_path_file"] = str(_write_csv(tmp_path / "fed.csv", rows))
+    results, portfolio = run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+    assert results.loc["2026-09-15", "FedRolloverFace"] == pytest.approx(20.0)
+    add_ons = portfolio[(portfolio["HolderType"] == "CB") & (pd.to_datetime(portfolio["IssueDate"]) == pd.Timestamp("2026-09-15"))]
+    assert not add_ons.empty and (add_ons["OriginalMaturityYears"] <= 1.0).all()
+    coupons = portfolio[(pd.to_datetime(portfolio["IssueDate"]) == pd.Timestamp("2026-09-15")) & (portfolio["OriginalMaturityYears"] > 1.0)]
+    assert not coupons.empty and (coupons["HolderType"] != "CB").all()
+
+
+def test_a_tips_add_on_is_sized_in_adjusted_principal() -> None:
+    """A TIPS reopened at an index ratio of 1.1 adds 1.1 of stock per unit face. The Fed's
+    face across securities stays proportional to what is offered, scaled so the stock it
+    adds is the stock it rolls, and it lands on its path instead of overshooting it."""
+
+    from sim_engine import _fed_rollover_allocation
+
+    profile = _profile()
+    due = {("TIPS", 10.0): object(), ("Fixed", 2.0): object()}
+    # Pending cash 55 at 1.1 per face and 50 at par: 50 face pending in each.
+    pending = {("TIPS", 10.0): ["TIPS", 10.0, None, 55.0], ("Fixed", 2.0): ["Fixed", 2.0, None, 50.0]}
+    allocation = _fed_rollover_allocation(
+        {"bills": 0.0, "coupons": 22.0},
+        due_events=due,
+        pending=pending,
+        issuance_profile=profile,
+        unit_prices=lambda keys: {("TIPS", 10.0): (1.1, 1.1), ("Fixed", 2.0): (1.0, 1.0)},
+    )
+    stock = sum(face * per_face for face, _price, per_face in allocation.values())
+    assert stock == pytest.approx(22.0)
+    # Equal face offered, so equal face taken, as the Desk's tenders are in face.
+    assert allocation[("TIPS", 10.0)][0] == pytest.approx(allocation[("Fixed", 2.0)][0])

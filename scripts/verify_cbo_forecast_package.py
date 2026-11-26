@@ -786,8 +786,8 @@ def _compute_run_metrics(
         if _float(row, "IssuanceNeedProceeds") > NUMERIC_TOLERANCE and abs(excess) > NUMERIC_TOLERANCE:
             raise ValueError(f"{run_id} row {row_index} TGA plus pending issuance is off target on a need day")
         _assert_close(
-            f"{run_id} row {row_index} all issuance is operating-cash financing",
-            _float(row, "CashFinancingProceeds"),
+            f"{run_id} row {row_index} all issuance is operating-cash financing or the Fed's rollover",
+            _float(row, "CashFinancingProceeds") + _float(row, "FedRolloverProceeds"),
             _float(row, "AuctionProceeds"),
             NUMERIC_TOLERANCE,
         )
@@ -800,7 +800,7 @@ def _compute_run_metrics(
             _float(row, "PendingIssuanceProceeds"),
             _float(previous, "PendingIssuanceProceeds")
             + _float(row, "IssuanceNeedProceeds")
-            - _float(row, "AuctionProceeds"),
+            - (_float(row, "AuctionProceeds") - _float(row, "FedRolloverProceeds")),
             NUMERIC_TOLERANCE,
         )
     by_date = {row["Date"]: row for row in rows}
@@ -1016,12 +1016,15 @@ def _verify_fed_stock_bridge(
             purchases,
             NUMERIC_TOLERANCE,
         )
+        issued = _float(row, "NewDebtIssued")
         _assert_close(
             f"{run_id} row {row_index} Fed auction share",
             _float(row, "CBOFedAuctionShare"),
-            0.0,
+            _float(row, "FedRolloverFace") / issued if issued > NUMERIC_TOLERANCE else 0.0,
             NUMERIC_TOLERANCE,
         )
+        if auction_addons > maturities + NUMERIC_TOLERANCE:
+            raise ValueError(f"{run_id} row {row_index} Fed auction add-ons exceed its maturing holdings")
         expected_gross = sum(abs(value) for value in (maturities, tips_indexation, auction_addons, purchases, sales))
         _assert_close(
             f"{run_id} row {row_index} Fed gross stock flow",

@@ -101,7 +101,7 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     assert run.manifest_path.exists()
     assert run.results_path.exists()
     assert run.run_manifest["boundary_checks"]["net_interest_role"] == "diagnostic_nonbinding"
-    assert run.run_manifest["boundary_checks"]["fed_target_holder_allocation_only"] is True
+    assert run.run_manifest["boundary_checks"]["fed_auction_add_ons_roll_over_maturities"] is True
     assert verify_compiled_scenario(run.compiled.compiled_dir)["status"] == "pass"
     for verification in (
         verify_scenario_run(run.output_dir),

@@ -309,9 +309,9 @@ def validation_from_boundary_checks(boundary_checks: Mapping[str, Any]) -> dict[
     )
     gates = [
         {
-            "id": "fed_target_holder_allocation_only",
-            "status": "pass" if boundary_checks.get("fed_target_holder_allocation_only") is True else "fail",
-            "observed": str(boundary_checks.get("max_abs_fed_auction_face", "")),
+            "id": "fed_auction_add_ons_roll_over_maturities",
+            "status": "pass" if boundary_checks.get("fed_auction_add_ons_roll_over_maturities") is True else "fail",
+            "observed": str(boundary_checks.get("max_fed_add_on_excess_over_maturities", "")),
         },
         {
             "id": "net_interest_diagnostic_nonbinding",

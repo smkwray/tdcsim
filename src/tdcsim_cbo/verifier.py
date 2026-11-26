@@ -121,6 +121,7 @@ REQUIRED_RESULT_COLUMNS = (
     "CBOControlledDebtTargetError",
     "CBOFedAuctionShare",
     "CBOFedAuctionRolloverAddons",
+    "CBOFedMaturitiesAndRedemptions",
     "CBORemittanceCashEffect",
     "NetInterestDiagnosticStatus",
 )
@@ -336,8 +337,8 @@ def verify_scenario_run(
         raise VerificationError("net interest role must remain diagnostic_nonbinding")
     if boundaries.get("remittance_deferred_asset_status") != "unsupported_in_cbo_scenario_lane":
         raise VerificationError("remittance/deferred-asset status must remain unsupported")
-    if boundaries.get("fed_target_holder_allocation_only") is not True:
-        raise VerificationError("Fed target holder-allocation boundary failed")
+    if boundaries.get("fed_auction_add_ons_roll_over_maturities") is not True:
+        raise VerificationError("the Fed's auction add-ons exceed its maturing holdings")
     recomputed = _verify_output_invariants(root, manifest)
     return {
         "status": "pass",
@@ -1649,8 +1650,14 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         )
     elif funding_closure_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
         _verify_operating_cash_financing_results(results)
-    if fed_share > 1e-12 or fed_face > 1e-12:
-        raise VerificationError(f"Fed auction boundary failed: share={fed_share}, face={fed_face}")
+    fed_excess = float(
+        (
+            pd.to_numeric(results["CBOFedAuctionRolloverAddons"], errors="raise")
+            - pd.to_numeric(results["CBOFedMaturitiesAndRedemptions"], errors="raise")
+        ).max()
+    )
+    if fed_excess > 1e-9:
+        raise VerificationError(f"the Fed's auction add-ons exceed its maturing holdings by {fed_excess}")
     if remittance_cash > 1e-12:
         raise VerificationError(f"remittance cash effect must remain zero: {remittance_cash}")
     statuses = set(str(value) for value in results["NetInterestDiagnosticStatus"].dropna().unique())
@@ -1806,8 +1813,10 @@ def _verify_operating_cash_financing_results(results: pd.DataFrame) -> None:
             "signed issue-price cash-gap identity",
         ),
         (
-            numeric["CashFinancingProceeds"] - numeric["AuctionProceeds"],
-            "all issuance is operating-cash financing",
+            numeric["CashFinancingProceeds"]
+            + pd.to_numeric(results["FedRolloverProceeds"], errors="raise")
+            - numeric["AuctionProceeds"],
+            "all issuance is operating-cash financing or the Fed's rollover",
         ),
     )
     for error, label in identities:
@@ -1824,7 +1833,10 @@ def _verify_operating_cash_financing_results(results: pd.DataFrame) -> None:
     # pending(t) = pending(t-1) + need(t) - settled proceeds(t), from zero at the opening.
     pending = pd.to_numeric(results["PendingIssuanceProceeds"], errors="raise").reset_index(drop=True)
     need = pd.to_numeric(results["IssuanceNeedProceeds"], errors="raise").reset_index(drop=True)
-    settled = numeric["AuctionProceeds"].reset_index(drop=True)
+    # The Fed's add-ons settle the day its holdings mature; they are never pending.
+    settled = (
+        numeric["AuctionProceeds"] - pd.to_numeric(results["FedRolloverProceeds"], errors="raise")
+    ).reset_index(drop=True)
     previous = pending.shift(1, fill_value=0.0)
     if float((pending - (previous + need - settled)).abs().max()) > _BOUNDED_TARGET_TOLERANCE_BIL:
         raise VerificationError("operating-cash financing pending issuance identity failed")

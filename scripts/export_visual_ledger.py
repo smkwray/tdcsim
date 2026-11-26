@@ -418,10 +418,11 @@ Holders: `fed` (Federal Reserve), `banks`, `foreign`, `mmf` (money-market funds)
   by CUSIP. The remainder is split uniformly within bills and within longer securities: banks,
   foreign holders and money funds keep their measured sector holdings converted to par, and
   other domestic holders take the rest.
-- Issues: holders at issuance. The Federal Reserve takes no auction allocation in this model,
-  so `face_fed` is zero for every issue. After issuance the Federal Reserve keeps its holdings
-  on its path by buying securities from other holders in the secondary market (domestic private
-  holders first, shortest maturity first), so holdings change after issuance. Label this split
+- Issues: holders at issuance. The Federal Reserve rolls its maturing holdings over at auction
+  as add-ons (`face_fed`), in the securities settling the day its holdings are paid, in
+  proportion to the amounts sold to the public. Beyond that it follows its holdings path by
+  buying from or selling to other holders in the secondary market (domestic private holders
+  first, shortest maturity first), so holdings change after issuance. Label this split
   "at issuance".
 """
 
@@ -457,8 +458,6 @@ def main(argv: list[str] | None = None) -> int:
         closed = [day for day in pd.to_datetime(issues[column]) if not is_fedwire_business_day(day)]
         if closed:
             raise SystemExit(f"{column} falls on a day Fedwire is closed: {closed[:3]}")
-    if (issues["face_fed"].abs() > TOLERANCE_BIL).any():
-        raise SystemExit("an issue allocates face to the Federal Reserve at auction")
     opening = build_opening(run_dir)
     issues = name_reopened_opening_securities(issues, opening)
     manifest = json.loads((run_dir / RUN_MANIFEST).read_text(encoding="utf-8"))

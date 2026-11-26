@@ -63,6 +63,9 @@ RESULT_COLUMNS = [
     "PendingIssuanceProceeds",
     "EarlySettlementProceeds",
     "FiscalYearCloseSettlementProceeds",
+    "FedRolloverFace",
+    "FedRolloverProceeds",
+    "FedRedeemedFace",
     "CashFinancingProceeds",
     "NewDebtIssued",
     "AuctionProceeds",
@@ -223,6 +226,50 @@ def test_cbo_package_verifier_rejects_fed_bridge_tampering_with_refreshed_hashes
 
     with pytest.raises(ValueError, match="Fed secondary purchase face"):
         verify_package(package)
+
+
+def _add_fed_rollover(package: Path, *, add_on: float) -> None:
+    """Roll 2 of the Fed's maturing holdings on the second day into ``add_on`` of auction
+    face at 0.99, booked consistently in issuance, cash, the auction share and the bridge."""
+
+    results_path = package / "exports_baseline" / "results_compact.csv"
+    rows = _read_csv(results_path)
+    row = rows[1]
+    issued = float(row["NewDebtIssued"]) + add_on
+    row["FedRolloverFace"] = str(add_on)
+    row["FedRolloverProceeds"] = str(add_on * 0.99)
+    row["NewDebtIssued"] = str(issued)
+    row["AuctionProceeds"] = str(float(row["AuctionProceeds"]) + add_on * 0.99)
+    row["CBOFedAuctionShare"] = str(add_on / issued)
+    row["CBOFedMaturitiesAndRedemptions"] = "2.0"
+    row["CBOFedAuctionRolloverAddons"] = str(add_on)
+    row["CBOFedEndStock"] = str(float(row["CBOFedEndStock"]) - 2.0 + add_on)
+    row["DebtHeld_CentralBank"] = row["CBOFedEndStock"]
+    row["CBOFedNetStockChange"] = str(float(row["CBOFedEndStock"]) - float(row["CBOFedBeginStock"]))
+    row["CBOFedHoldingsTargetError"] = str(float(row["CBOFedEndStock"]) - float(row["CBOFedHoldingsTarget"]))
+    row["CBOFedGrossStockFlow"] = str(float(row["CBOFedGrossStockFlow"]) + 2.0 + add_on)
+    _write_csv(results_path, list(rows[0]), rows)
+    _rewrite_summary(results_path, package / "exports_baseline" / "summary.json")
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_summaries"]["baseline"] = _summary(_read_csv(results_path))
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _refresh_manifest_hashes(package)
+
+
+def test_cbo_package_verifier_accepts_a_fed_rollover_and_rejects_one_above_its_maturities(tmp_path: Path) -> None:
+    """The Fed's add-ons are auction cash the Treasury receives without a public need, so
+    they enter auction proceeds and the auction share but not the public pending balance;
+    they may not exceed what the Fed had maturing."""
+
+    package = _write_valid_package(tmp_path / "pkg")
+    _add_fed_rollover(package, add_on=2.0)
+    assert verify_package(package)["status"] == "pass"
+
+    over = _write_valid_package(tmp_path / "over")
+    _add_fed_rollover(over, add_on=3.0)
+    with pytest.raises(ValueError, match="exceed its maturing holdings"):
+        verify_package(over)
 
 
 def test_cbo_package_verifier_rejects_remittance_overclaim_with_refreshed_hashes(tmp_path: Path) -> None:
@@ -1340,6 +1387,9 @@ def _result_rows(debt_rows: list[dict[str, str]], *, opening_cb_holdings: float)
             "PendingIssuanceProceeds": pending,
             "EarlySettlementProceeds": 0.0,
             "FiscalYearCloseSettlementProceeds": 0.0,
+            "FedRolloverFace": 0.0,
+            "FedRolloverProceeds": 0.0,
+            "FedRedeemedFace": 0.0,
             "CashFinancingProceeds": settled,
             "NewDebtIssued": 0.0 if index == 0 else 1.0,
             "AuctionProceeds": settled,

@@ -131,6 +131,7 @@ _PORTFOLIO_NUMERIC_COLUMNS = tuple(
 _BOUNDARY_NUMERIC_COLUMNS = (
     "CBOFedAuctionShare",
     "CBOFedAuctionRolloverAddons",
+    "CBOFedMaturitiesAndRedemptions",
     "TGA",
     "CBOOperatingCashTarget",
     "CBOCashReconciliationResidual",
@@ -1106,7 +1107,14 @@ def validate_run_boundaries(
     fed_auction_share_max = _max_abs(results, "CBOFedAuctionShare")
     fed_auction_face_max = _max_abs(results, "CBOFedAuctionRolloverAddons")
     fed_auction_face_sum = _sum_abs(results, "CBOFedAuctionRolloverAddons")
-    fed_boundary_pass = fed_auction_share_max <= 1e-12 and fed_auction_face_max <= 1e-12
+    # The Fed takes auction add-ons only to roll over what matured that day.
+    fed_add_on_excess = float(
+        (
+            _numeric_column(results, "CBOFedAuctionRolloverAddons")
+            - _numeric_column(results, "CBOFedMaturitiesAndRedemptions")
+        ).max()
+    )
+    fed_boundary_pass = fed_add_on_excess <= 1e-9
     cash_closure = _cash_closure_checks(results)
     omf = omf_reconciliation(results, inputs)
     return {
@@ -1115,7 +1123,8 @@ def validate_run_boundaries(
         "max_abs_fed_auction_share": fed_auction_share_max,
         "max_abs_fed_auction_face": fed_auction_face_max,
         "sum_abs_fed_auction_face": fed_auction_face_sum,
-        "fed_target_holder_allocation_only": fed_boundary_pass,
+        "max_fed_add_on_excess_over_maturities": fed_add_on_excess,
+        "fed_auction_add_ons_roll_over_maturities": fed_boundary_pass,
         "net_interest_role": "diagnostic_nonbinding",
         "remittance_deferred_asset_status": "unsupported_in_cbo_scenario_lane",
         **cash_closure,

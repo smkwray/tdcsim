@@ -267,8 +267,9 @@ def build_auction_calibration(
 ) -> dict[str, Any]:
     """Measure public gross auction shares over the twelve months before the start.
 
-    Public amount is ``total_accepted - soma_accepted``: the Fed takes no auction
-    allocation in the CBO lane, so its add-ons are not part of the modeled supply.
+    Public amount is ``total_accepted - soma_accepted``: the CBO lane models the Fed's
+    add-ons separately, as rollovers of its own maturing holdings, so they are not part of
+    the public supply these shares split.
     Cash management bills are excluded. Raises on missing columns, malformed values,
     unmapped terms, an empty window, or a source that does not cover the window.
     """
