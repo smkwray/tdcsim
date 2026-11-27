@@ -734,16 +734,22 @@ def _write_mmf_acquisitions(
 FED_LOT_JOURNAL_OUTPUT = "tdcsim_fed_lot_journal"
 
 
+FED_YEAR_END_LOTS_OUTPUT = "tdcsim_fed_year_end_lots"
+
+
 def _write_fed_lot_journal(
     results: pd.DataFrame, out: Path, outputs: dict[str, Any], *, suffix: str, compression: str,
 ) -> None:
-    """The Fed's lot journal: the evidence that rebuilds its acquisition-basis income."""
+    """The Fed's lot journal, the evidence that rebuilds its acquisition-basis income, and its lots
+    with their terms at each September 30 close, which rebuild its receivable there."""
 
-    if "fed_lot_journal" not in results.attrs:
-        return
-    path = out / f"{FED_LOT_JOURNAL_OUTPUT}{suffix}"
-    _write_frame(results.attrs["fed_lot_journal"], path, compression=compression)
-    outputs[FED_LOT_JOURNAL_OUTPUT] = _artifact_record(out, path)
+    for attribute, logical_name in (("fed_lot_journal", FED_LOT_JOURNAL_OUTPUT),
+                                    ("fed_year_end_lots", FED_YEAR_END_LOTS_OUTPUT)):
+        if attribute not in results.attrs:
+            continue
+        path = out / f"{logical_name}{suffix}"
+        _write_frame(results.attrs[attribute], path, compression=compression)
+        outputs[logical_name] = _artifact_record(out, path)
 
 
 def _write_trc_outputs(

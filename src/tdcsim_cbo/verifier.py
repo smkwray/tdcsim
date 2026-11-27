@@ -86,6 +86,7 @@ from .open04_campaign import (
 from .output import (
     HANDOFF_TABLE_COLUMNS,
     FED_LOT_JOURNAL_OUTPUT,
+    FED_YEAR_END_LOTS_OUTPUT,
     MMF_ACQUISITIONS_COLUMNS,
     MMF_ACQUISITIONS_OUTPUT,
     TDC_AMOUNT_BASIS,
@@ -1637,7 +1638,8 @@ def _verify_bounded_engine_replay(
             metadata=row_metadata,
         )
         for logical_name in (
-            "results", "final_portfolio", MMF_ACQUISITIONS_OUTPUT, FED_LOT_JOURNAL_OUTPUT, "tdcsim_trc_results",
+            "results", "final_portfolio", MMF_ACQUISITIONS_OUTPUT, FED_LOT_JOURNAL_OUTPUT, FED_YEAR_END_LOTS_OUTPUT,
+            "tdcsim_trc_results",
             "tdcsim_trc_metadata",
         ):
             expected = output_manifest.get(logical_name)
@@ -1771,14 +1773,15 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         return _read_results(root / "outputs" / str(entry["path"])) if entry else None
 
     try:
-        if FED_LOT_JOURNAL_OUTPUT not in output_manifest:
-            raise ValueError("the run does not deliver the Fed lot journal")
+        if FED_LOT_JOURNAL_OUTPUT not in output_manifest or FED_YEAR_END_LOTS_OUTPUT not in output_manifest:
+            raise ValueError("the run does not deliver the Fed lot journal and its year-end lots")
         fed_checks = verify_fed_remittances(
             results,
             inputs_dir,
             lots=evidence(FED_LOT_JOURNAL_OUTPUT),
             opening_portfolio=_engine_opening_portfolio(inputs_dir, str(manifest["simulation"]["start_date"])),
             final_portfolio=evidence("final_portfolio"),
+            year_end_lots=evidence(FED_YEAR_END_LOTS_OUTPUT),
             carried_lots=runner_module.opening_fed_lots(inputs_dir),
             trc_results=evidence("tdcsim_trc_results"),
             ledger=evidence("ledger"),

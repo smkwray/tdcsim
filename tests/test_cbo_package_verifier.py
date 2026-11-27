@@ -1103,9 +1103,6 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
     legacy = 3_000.0
     # The lots left at the close: the surviving opening lots, caught up through the close, and
     # the fixture's purchases (zero-coupon), whose terms set the closing receivable.
-    survivors = valued.loc[valued["HolderType"].eq("CB") & valued["Status"].eq("Active")
-                           & pd.to_datetime(valued["MaturityDate"]).gt(last_day)].copy()
-    survivors["LastAccrualDate"], survivors["AccruedInterest_FRN"] = last_day.date().isoformat(), 0.0
     purchases = pd.DataFrame([
         {"BondID": 10**6 + index, "HolderType": "CB", "Status": "Active", "SecurityType": "Fixed", "CouponRate": 0.0,
          "IssueDate": rows[index]["Date"], "DatedDate": rows[index]["Date"], "MaturityDate": "2040-01-02",
@@ -1113,9 +1110,30 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
          "AdjustedPrincipal": float(rows[index]["CBOFedSecondaryPurchaseFace"]), "AccruedInterest_FRN": 0.0}
         for index in range(1, len(rows)) if float(rows[index]["CBOFedSecondaryPurchaseFace"]) > 0.0
     ])
-    final = pd.concat([survivors, purchases], ignore_index=True)
+
+    def held_at(day: pd.Timestamp) -> pd.DataFrame:
+        """The lots alive at ``day``: surviving opening lots caught up through it, and purchases."""
+
+        survivors = valued.loc[valued["HolderType"].eq("CB") & valued["Status"].eq("Active")
+                               & pd.to_datetime(valued["MaturityDate"]).gt(day)].copy()
+        survivors["LastAccrualDate"], survivors["AccruedInterest_FRN"] = day.date().isoformat(), 0.0
+        bought = purchases.loc[pd.to_datetime(purchases["IssueDate"]).le(day)] if not purchases.empty else purchases
+        return pd.concat([survivors, bought], ignore_index=True)
+
+    final = held_at(last_day)
     closing = {**dict.fromkeys(ACCRUAL_TYPES, 0.0),
                "coupon": _rebuild_fed_receivable(final, last_day, opening_day=first_day, inputs=inputs)}
+    # At each September 30 the receivable is what the lots held then imply.
+    year_end_lots, year_end_receivable = [], {}
+    for row in rows[1:]:
+        day = pd.Timestamp(row["Date"])
+        if day.month == 9 and day.day == 30:
+            held = held_at(day)
+            year_end_lots.append(held.assign(date=day.date().isoformat()))
+            year_end_receivable[row["Date"]] = {
+                **dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                "coupon": _rebuild_fed_receivable(held, day, opening_day=first_day, inputs=inputs),
+            }
     for index in range(1, len(rows)):
         row, prev = rows[index], rows[index - 1]
         paid = book.remittance(row["Date"])
@@ -1128,7 +1146,8 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
             prev["Date"], row["Date"], tga=float(row["TGA"]), remitted=paid, treasury_reserve_effect=effect,
             treasury={
                 "cash": dict.fromkeys(ACCRUAL_TYPES, 0.0),
-                "accrued_end": dict(closing if index == len(rows) - 1 else receivable),
+                "accrued_end": dict(closing if index == len(rows) - 1
+                                    else year_end_receivable.get(row["Date"], receivable)),
                 "accrued_purchased": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_sold": dict.fromkeys(ACCRUAL_TYPES, 0.0),
                 "tips_indexation": 0.0, "floor_topup": 0.0, "realized_gains": 0.0,
                 "premium_acquired": bought, "premium_sold": 0.0, "stock": float(row["DebtHeld_CentralBank"]),
@@ -1143,6 +1162,7 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
     pd.DataFrame(book.lots.journal, columns=FED_LOT_JOURNAL_COLUMNS).to_csv(exports / "fed_lot_journal.csv", index=False)
     assert set(final["BondID"].astype(int)) == set(book.lots.lots)
     final.to_csv(exports / "final_portfolio_active.csv", index=False)
+    pd.concat(year_end_lots, ignore_index=True).to_csv(exports / "fed_year_end_lots.csv", index=False)
 
 
 def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:

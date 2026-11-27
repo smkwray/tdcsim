@@ -131,6 +131,7 @@ REQUIRED_FILES = {
     "exports_baseline/final_portfolio_active.csv",
     "exports_baseline/maturity_ledger.csv",
     "exports_baseline/fed_lot_journal.csv",
+    "exports_baseline/fed_year_end_lots.csv",
     "tdcsim_partial_interest_financing_diagnostic.csv",
     "sources/source_manifest.json",
     "sources/cbo/51118-2026-02-Budget-Projections.xlsx",
@@ -722,6 +723,7 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
                 simulation_start_date=str(compact["Date"].iloc[0]),
             ),
             final_portfolio=pd.read_csv(root / run_dir / "final_portfolio_active.csv"),
+            year_end_lots=pd.read_csv(root / run_dir / "fed_year_end_lots.csv"),
         )
         run_metrics[run_id] = metrics
 

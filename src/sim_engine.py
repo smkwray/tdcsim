@@ -4583,6 +4583,7 @@ def run_simulation(
         results.loc[t0, 'CBORemittanceCashEffect'] = 0.0
         fed_first_row = _fed_income_row(cbo_inputs, cbo_scenario_id, t0, dates[1])
         fed_policy_path = cbo_inputs['policy_rate_path']
+        fed_year_end_lots = []  # the Fed's lots and their terms at each September 30 close
         fed_opening = FedOpening.from_row(fed_first_row)
         fed_cb_rows = bond_portfolio[
             bond_portfolio['HolderType'].eq('CB') & bond_portfolio['Status'].eq('Active')
@@ -7322,6 +7323,8 @@ def run_simulation(
             for column, value in fed_values.items():
                 results.loc[current_date, column] = value
             fed_basis = _new_fed_basis(fed_book.lots)
+            if current_date.month == 9 and current_date.day == 30:
+                fed_year_end_lots.append(fed_cb_rows[BOND_PORTFOLIO_COLS].assign(date=current_date.date().isoformat()))
         results.loc[current_date, 'TDC_Change'] = adjusted_deposit_change_period
         results.loc[current_date, 'TGAChange'] = current_tga - prev_tga
         results.loc[current_date, 'TDC_FiscalFlow'] = fiscal_deposit_change
@@ -7558,6 +7561,10 @@ def run_simulation(
     results.attrs['mmf_acquisition_maturities'] = mmf_acquisition_maturities
     if cbo_funding_mode:
         results.attrs['fed_lot_journal'] = pd.DataFrame(fed_book.lots.journal, columns=FED_LOT_JOURNAL_COLUMNS)
+        results.attrs['fed_year_end_lots'] = (
+            pd.concat(fed_year_end_lots, ignore_index=True) if fed_year_end_lots
+            else pd.DataFrame(columns=[*BOND_PORTFOLIO_COLS, 'date'])
+        )
     results.attrs['run_metadata'] = {
         'scenario_name': scenario_name,
         'start_date': str(start_date),

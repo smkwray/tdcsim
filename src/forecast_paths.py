@@ -1047,7 +1047,7 @@ def _per_period(evidence: pd.DataFrame, dates: pd.Series, value: str, mask) -> n
     return totals.reindex(dates.iloc[1:]).fillna(0.0).to_numpy()
 
 
-def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series) -> dict:
+def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series, checkpoints=()) -> dict:
     """Rebuild the Fed's acquisition-basis income from its lot journal, vintage by vintage.
 
     Every opening lot and every acquisition is its own vintage, amortized straight line to
@@ -1094,6 +1094,8 @@ def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series) -> dict:
     closing = np.zeros(len(dates))
     order = np.argsort(event_days, kind="stable")
     cursor, count = 0, 0
+    checks = {int(np.datetime64(pd.Timestamp(day).date(), "D").astype(np.int64)) for day in checkpoints}
+    live_at = {}
     for i, day in enumerate(day_numbers):
         if i:
             held = np.flatnonzero(live)
@@ -1146,6 +1148,10 @@ def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series) -> dict:
             _close(premium[matured], np.zeros(matured.size), "premium left on a matured Fed lot")
             live[matured] = False
         closing[i] = premium[live].sum()
+        if int(day) in checks:
+            live_at[str(np.datetime64(int(day), "D"))] = {
+                key for key, held in vintages.items() if any(live[index] for index in held)
+            }
     lots = {}
     for key, held in vintages.items():
         held = [index for index in held if live[index]]
@@ -1158,7 +1164,7 @@ def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series) -> dict:
             "bill": bool(bill[held[0]]),
             "premium_bil": float(premium[held].sum()),
         }
-    return {**flows, "closing_premium": closing, "lots": lots}
+    return {**flows, "closing_premium": closing, "lots": lots, "live_at": live_at}
 
 
 def check_earnings_due_closes(results: pd.DataFrame, opening_due: float) -> None:
@@ -1289,6 +1295,7 @@ def verify_fed_remittances(
     lots: pd.DataFrame,
     opening_portfolio: pd.DataFrame,
     final_portfolio: pd.DataFrame | None,
+    year_end_lots: pd.DataFrame,
     carried_lots: Mapping[int, float] | None = None,
     trc_results: pd.DataFrame | None = None,
     ledger: pd.DataFrame | None = None,
@@ -1373,7 +1380,8 @@ def verify_fed_remittances(
            flows["CB_PremiumAcquired"] - flows["CB_PremiumSold"] + flows["CB_BillDiscountAccretion"]
            + flows["CB_CouponPremiumAmortization"], "Fed unamortized premium")
     # The acquisition basis rebuilt lot by lot from the opening and each trade's evidence.
-    rebuilt = rebuild_fed_lot_income(lots, dates)
+    year_ends = [day for day in dates.iloc[1:] if day.month == 9 and day.day == 30]
+    rebuilt = rebuild_fed_lot_income(lots, dates, checkpoints=year_ends)
     for name, output in (
         ("bill_accretion", "CB_BillDiscountAccretion"), ("coupon_amortization", "CB_CouponPremiumAmortization"),
         ("premium_acquired", "CB_PremiumAcquired"), ("premium_sold", "CB_PremiumSold"),
@@ -1388,6 +1396,20 @@ def verify_fed_remittances(
     _close([out["CB_TreasuryAccruedInterest"][0]],
            [_rebuild_fed_receivable(opening_portfolio, dates.iloc[0], opening_day=dates.iloc[0], inputs=inputs)],
            "opening Fed accrued-interest receivable against its lots' terms")
+    # And at every fiscal-year end, from the Fed's lots there: exactly the lots the journal leaves
+    # open, so income cannot move across a fiscal-year boundary.
+    recorded = pd.to_datetime(year_end_lots["date"]).dt.normalize()
+    if not set(recorded) <= set(year_ends):
+        raise ValueError("the Fed's year-end lots name a day that is not one of the run's fiscal-year ends")
+    position = {day: i for i, day in enumerate(dates)}
+    for day in year_ends:
+        held = year_end_lots.loc[recorded.eq(day)]
+        alive = held.loc[pd.to_datetime(held["MaturityDate"]).dt.normalize() > day, "BondID"]
+        if set(pd.to_numeric(alive, errors="raise").astype(int)) != rebuilt["live_at"][str(day.date())]:
+            raise ValueError(f"the Fed's lots at {day.date()} are not the lots its journal leaves open")
+        _close([out["CB_TreasuryAccruedInterest"][position[day]]],
+               [_rebuild_fed_receivable(held, day, opening_day=dates.iloc[0], inputs=inputs)],
+               f"Fed accrued-interest receivable at {day.date()} against its lots' terms")
     if final_portfolio is not None:
         _close([out["CB_TreasuryAccruedInterest"][-1]],
                [_rebuild_fed_receivable(final_portfolio, dates.iloc[-1], opening_day=dates.iloc[0], inputs=inputs)],

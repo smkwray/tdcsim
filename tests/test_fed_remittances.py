@@ -85,6 +85,7 @@ def _verify(results, paths) -> dict:
     return verify_fed_remittances(
         _frame(results), paths["fed_income_path_file"].parent, lots=results.attrs["fed_lot_journal"],
         opening_portfolio=results.attrs["opening_portfolio"], final_portfolio=results.attrs["final_portfolio"],
+        year_end_lots=results.attrs["fed_year_end_lots"],
     )
 
 
@@ -572,8 +573,28 @@ def test_verifier_rebuilds_the_fed_receivable_from_its_lots_terms(tmp_path):
         results.loc[last, "CB_DeferredAsset"] = max(0.0, -results.loc[last, "CB_EarningsRemittancesDue"])
 
     output_dir, verify, _ = _tampered_runner_run(tmp_path, fabricate)
-    with pytest.raises(ValueError, match="closing Fed accrued-interest receivable against its lots' terms"):
+    # The run closes on a fiscal-year end, where the year-end rebuild catches it first.
+    with pytest.raises(ValueError, match="receivable (at 2026-09-30 )?against its lots' terms"):
         verify(output_dir)
+
+
+def test_verifier_rebuilds_the_fed_receivable_at_every_fiscal_year_end(tmp_path):
+    """The audit's boundary probe: 0.1 of coupon income earned on 2026-10-01 booked a day early,
+    with that day's receivable, income, earnings due and deferred asset moved to match. Annual
+    income moves across the fiscal-year boundary; only the receivable the Fed's lots imply at
+    September 30 exposes it."""
+
+    results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=-100.0)
+    _verify(results, paths)
+    moved = results.copy()
+    for column in ("CB_CouponAccrual", "CB_TreasuryInterestIncome", "CB_NetIncome"):
+        moved.loc["2026-09-30", column] += 0.1
+        moved.loc["2026-10-01", column] -= 0.1
+    for column in ("CB_TreasuryAccruedInterest", "CB_EarningsRemittancesDue"):
+        moved.loc["2026-09-30", column] += 0.1
+    moved.loc["2026-09-30", "CB_DeferredAsset"] = max(0.0, -moved.loc["2026-09-30", "CB_EarningsRemittancesDue"])
+    with pytest.raises(ValueError, match="receivable at 2026-09-30 against its lots' terms"):
+        _verify(moved, paths)
 
 
 def test_replay_is_bound_to_the_results_file_delivered(tmp_path):
@@ -670,7 +691,8 @@ def test_the_fed_earns_a_tips_deflation_floor_and_the_exports_show_it(tmp_path):
     def verify(frame):
         return verify_fed_remittances(
             _frame(frame), paths["fed_income_path_file"].parent, lots=results.attrs["fed_lot_journal"],
-            opening_portfolio=opening, final_portfolio=None, payments=payments,
+            opening_portfolio=opening, final_portfolio=None, year_end_lots=results.attrs["fed_year_end_lots"],
+            payments=payments,
         )
 
     verify(results)
