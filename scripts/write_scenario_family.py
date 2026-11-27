@@ -64,7 +64,7 @@ ITEM_KEYS = frozenset({
     "holder_position_target", "mmf_added_position_settlement",
 })
 SUBKEYS = {
-    "bill_holder_shift": frozenset({"absorbers"}),
+    "bill_holder_shift": frozenset({"absorbers", "stock_control"}),
     "bill_buyer_shift": frozenset({"holder", "size_bil", "build", "private_route"}),
     "fed_holdings_change": frozenset({"size_bil", "build"}),
     "holder_position_target": frozenset({
@@ -72,6 +72,10 @@ SUBKEYS = {
     }),
 }
 PHASES = ("quantity", "rates", "positions")
+# How a bill holder shift is delivered. "achieved_bill_stocks" adds a daily position control
+# that holds every other route at its baseline bill stock and gives the absorbers the realized
+# difference; "auction_shares_only" changes the auction shares and lets the stocks follow.
+BILL_STOCK_CONTROLS = ("achieved_bill_stocks", "auction_shares_only")
 STOCK_CLOSURE = Path("outputs/tdcsim_period_stock_closure.csv.gz")
 RUN_MANIFEST = "tdcsim_cbo_run_manifest.json"
 HOLDER_TARGET_TOLERANCE_BIL = 0.000001
@@ -640,7 +644,11 @@ def family_scenarios(
                         absorbers=[str(h) for h in item["bill_holder_shift"]["absorbers"]],
                     ),
                 }
-                overrides["holder_position_target"] = _write_bill_target(item, base["bills"], runs_root, output_dir)
+                control = item["bill_holder_shift"].get("stock_control")
+                if control not in BILL_STOCK_CONTROLS:
+                    raise ValueError(f"{item['role']}: bill_holder_shift.stock_control must be one of {BILL_STOCK_CONTROLS}")
+                if control == "achieved_bill_stocks":
+                    overrides["holder_position_target"] = _write_bill_target(item, base["bills"], runs_root, output_dir)
         if item.get("bill_buyer_shift"):
             if item.get("bill_share_change"):
                 raise ValueError(f"{item['role']}: a bill-buyer shift is sized on the opening bill share and cannot be combined with a bill_share_change")

@@ -381,7 +381,12 @@ def test_cost_family_writes_closing_bill_targets_only_for_banks_foreign(tmp_path
     out.mkdir()
     positions = family_scenarios(baseline, family, phase="positions", runs_root=runs, output_dir=out)
     assert list(positions) == ["03_shorter_banks_foreign.json", "06_longer_banks_foreign.json"]
-    for scenario in positions.values():
+    # The longer case declares auction shares only: holding every other route at its baseline
+    # bills is infeasible there, so it gets the auction-share change and no position control.
+    longer = positions["06_longer_banks_foreign.json"]["overrides"]
+    assert longer["holder_preferences"]["mode"] == "dated_static_shares"
+    assert "holder_position_target" not in longer
+    for scenario in (positions["03_shorter_banks_foreign.json"],):
         overrides = scenario["overrides"]
         assert overrides["holder_preferences"]["mode"] == "dated_static_shares"
         target = overrides["holder_position_target"]
@@ -389,6 +394,20 @@ def test_cost_family_writes_closing_bill_targets_only_for_banks_foreign(tmp_path
         assert [row["weight"] for row in target["bill_change_weights"]] == pytest.approx([0.4, 0.6])
         with (out / target["file"]["relative_path"]).open(newline="") as handle:
             assert len(list(csv.DictReader(handle))) == len(ht.PARTICIPANTS)
+
+
+def test_a_bill_holder_shift_must_declare_how_it_is_delivered(tmp_path, monkeypatch) -> None:
+    import write_scenario_family as writer
+    from test_tdcsim_cbo_closeout_interface import _runner_baseline_and_scenarios
+
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    monkeypatch.setattr(writer, "baseline_holder_shares", lambda _: BASE)
+    monkeypatch.setattr(writer, "baseline_bill_share", lambda _: 0.225)
+    family = json.loads((PROJECT_ROOT / "scenarios" / "cost_tdc_v1.json").read_text())
+    for item in family["scenarios"]:
+        item.get("bill_holder_shift", {}).pop("stock_control", None)
+    with pytest.raises(ValueError, match="stock_control must be one of"):
+        family_scenarios(baseline, family, phase="positions", runs_root=tmp_path, output_dir=tmp_path)
 
 
 def test_bill_holder_shift_rejects_a_cut_larger_than_the_absorbers_hold() -> None:

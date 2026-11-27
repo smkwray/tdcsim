@@ -15,7 +15,7 @@
   "calibration": {
     "issuance": "Bill-share target moves linearly from the package's opening bill share (about 22.5% of marketable debt) by +5 or -5 percentage points between 2026-06-21 and 2027-06-30 and stays there. The lower case returns to the middle of the 15-20% range the Treasury Borrowing Advisory Committee has recommended; the higher case extends recent bill-heavy issuance.",
     "rates": "Key-rate shift of the nominal curve: zero at two years and below, -25 (shorter) or +25 (longer) basis points at ten years and beyond, log-tenor linear between, from the start of the simulation. Mix-only cases leave the curve unchanged.",
-    "holders": "Proportional cases keep the baseline auction shares, which follow opening holdings of bills and of longer securities. Bank-and-foreign cases give banks and foreign accounts the whole change in the bill stock, in proportion to their baseline bill shares; every other holder keeps its baseline bill holdings in dollars."
+    "holders": "Proportional cases keep the baseline auction shares, which follow opening holdings of bills and of longer securities. Bank-and-foreign cases give banks and foreign accounts the change in the bill stock, in proportion to their baseline bill shares. In the shorter case a daily position control holds every other holder at its baseline bill stock and banks and foreign accounts take the realized difference, buying any remainder from other holders at model prices. In the longer case that control is infeasible: the bill stock falls by more than banks and foreign accounts hold, and the banks' share exceeds their bills by December 2029. The longer case therefore shifts auction shares only, and other holders' bill stocks also fall; the family's holder-stock table reports the achieved stocks."
   },
   "scenarios": [
     {
@@ -85,7 +85,8 @@
         "absorbers": [
           "Banks",
           "Foreign"
-        ]
+        ],
+        "stock_control": "achieved_bill_stocks"
       },
       "key_rate_shocks_bp": [
         {
@@ -164,7 +165,8 @@
         "absorbers": [
           "Banks",
           "Foreign"
-        ]
+        ],
+        "stock_control": "auction_shares_only"
       },
       "key_rate_shocks_bp": [
         {
