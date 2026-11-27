@@ -1460,7 +1460,7 @@ def load_opening_portfolio(
         source_available_as_of=ACTUALS_AVAILABLE_AS_OF,
         cusip_column="IssueID",
     )
-    aligned = _apply_opening_coupon_terms(aligned)
+    aligned = _apply_opening_coupon_terms(aligned, auctions_query=Path(auctions_query))
     aligned = aligned[BOND_PORTFOLIO_COLS]
     aligned = aligned.astype(PORTFOLIO_DTYPES, errors="ignore")
     bills = bill_mask(aligned)
@@ -1534,7 +1534,28 @@ def _portfolio_holder_totals(portfolio: pd.DataFrame) -> dict[str, float]:
     return totals
 
 
-def _apply_opening_coupon_terms(portfolio: pd.DataFrame) -> pd.DataFrame:
+def _treasury_dated_dates(portfolio: pd.DataFrame, auctions_query: Path) -> pd.Series:
+    """Each interest-bearing lot's dated date from Treasury's record of the auction that issued it.
+
+    Interest accrues from the dated date, which precedes the issue date when Treasury dates a
+    new security to a coupon date. Matched on the security's CUSIP and issue date; a coupon lot
+    with no auction record stops the build.
+    """
+
+    auctions = pd.read_csv(auctions_query, dtype=str, usecols=["cusip", "issue_date", "dated_date"])
+    auctions = auctions.dropna(subset=["dated_date"]).drop_duplicates(["cusip", "issue_date"])
+    dated = auctions.set_index(["cusip", "issue_date"])["dated_date"]
+    keys = list(zip(
+        portfolio["IssueID"].astype(str).str.strip(), pd.to_datetime(portfolio["IssueDate"]).dt.strftime("%Y-%m-%d"),
+    ))
+    found = pd.Series([dated.get(key) for key in keys], index=portfolio.index)
+    if found.isna().any():
+        missing = sorted({key for key, value in zip(keys, found) if pd.isna(value)})
+        raise ValueError(f"opening coupon lots have no Treasury dated date in the auction record: {missing[:10]}")
+    return pd.to_datetime(found)
+
+
+def _apply_opening_coupon_terms(portfolio: pd.DataFrame, *, auctions_query: Path) -> pd.DataFrame:
     out = portfolio.copy()
     for column in ("DatedDate", "OriginalDatedDate", "FirstInterestPaymentDate"):
         if column not in out.columns:
@@ -1545,12 +1566,16 @@ def _apply_opening_coupon_terms(portfolio: pd.DataFrame) -> pd.DataFrame:
     out["InterestPaymentFrequency"] = pd.to_numeric(out["InterestPaymentFrequency"], errors="coerce")
     issue = pd.to_datetime(out["IssueDate"], errors="coerce")
     maturity = pd.to_datetime(out["MaturityDate"], errors="coerce")
-    out["DatedDate"] = out["DatedDate"].fillna(issue)
-    out["OriginalDatedDate"] = out["OriginalDatedDate"].fillna(out["DatedDate"])
     security_type = out["SecurityType"].astype(str)
     coupon_rate = pd.to_numeric(out["CouponRate"], errors="coerce").fillna(0.0)
     frn_mask = security_type.eq("FRN")
     fixed_coupon_mask = security_type.isin(["Fixed", "TIPS"]) & (coupon_rate > TGA_FLOOR_TOLERANCE)
+    # Interest-bearing lots accrue from Treasury's dated date; a bill has no coupon to accrue.
+    bearing = frn_mask | fixed_coupon_mask
+    if bearing.any():
+        out.loc[bearing, "DatedDate"] = _treasury_dated_dates(out.loc[bearing], auctions_query)
+    out["DatedDate"] = out["DatedDate"].fillna(issue)
+    out["OriginalDatedDate"] = out["OriginalDatedDate"].fillna(out["DatedDate"])
     out.loc[frn_mask, "InterestPaymentFrequency"] = out.loc[frn_mask, "InterestPaymentFrequency"].fillna(4.0)
     out.loc[fixed_coupon_mask, "InterestPaymentFrequency"] = out.loc[
         fixed_coupon_mask, "InterestPaymentFrequency"

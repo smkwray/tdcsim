@@ -50,6 +50,7 @@ def _book_row(bond_id, face, maturity, cusip, holder, subbucket="", category="bi
 
 def _write_auctions(path: Path) -> None:
     issues = [
+        ("OLD-NOTE", "Note", "2026-01-02", "2028-06-15", 30, 5),
         ("N1", "Note", "2026-06-01", "2028-06-01", 55, 5),
         ("B1", "Bill", "2026-06-02", "2026-09-02", 20, 0),
         ("B2", "Bill", "2026-06-18", "2026-09-17", 8, 4),
@@ -59,7 +60,7 @@ def _write_auctions(path: Path) -> None:
         path,
         [
             {
-                "cusip": cusip, "security_type": kind, "issue_date": issue, "original_issue_date": issue,
+                "cusip": cusip, "security_type": kind, "issue_date": issue, "original_issue_date": issue, "dated_date": issue,
                 "maturity_date": maturity, "total_accepted": face * 10**9, "soma_accepted": soma * 10**9,
                 "int_rate": "3.0", "price_per100": "99.0", "high_investment_rate": "4.0", "high_yield": "3.1",
                 "floating_rate": "No", "inflation_index_security": "No",
@@ -289,3 +290,32 @@ def test_run_verifier_checks_acquisitions_at_the_date_of_purchase(tmp_path: Path
     ])
     with pytest.raises(VerificationError, match="ineligible pre-start money-fund acquisition on 2026-05-31"):
         _verify_mmf_eligibility(tmp_path, {"simulation": {"start_date": START, "end_date": "2026-07-01"}}, tmp_path)
+
+
+def test_opening_coupon_lots_accrue_from_treasurys_dated_date(tmp_path: Path) -> None:
+    """A bond issued on 2026-03-02 is dated 2026-02-15 by Treasury: interest from February 15
+    is already earned at the opening, so accruing from the issue date would book it as later
+    income. Every interest-bearing lot takes its dated date from the auction record, and a lot
+    the record does not cover stops the build."""
+
+    import pandas as pd
+
+    auctions = tmp_path / "auctions.csv"
+    auctions.write_text(
+        "cusip,issue_date,dated_date\n912810UT3,2026-03-02,2026-02-15\n91282CMX6,2026-04-30,2026-04-30\n",
+        encoding="utf-8",
+    )
+    book = pd.DataFrame([
+        {"IssueID": "912810UT3", "SecurityType": "Fixed", "IssueDate": "2026-03-02", "MaturityDate": "2056-02-15",
+         "CouponRate": 0.04625},
+        {"IssueID": "91282CMX6", "SecurityType": "FRN", "IssueDate": "2026-04-30", "MaturityDate": "2028-04-30",
+         "CouponRate": 0.0},
+        {"IssueID": "912797AB1", "SecurityType": "Fixed", "IssueDate": "2026-06-11", "MaturityDate": "2026-09-10",
+         "CouponRate": 0.0},
+    ])
+    termed = smoke._apply_opening_coupon_terms(book, auctions_query=auctions)
+    assert termed["DatedDate"].dt.strftime("%Y-%m-%d").tolist() == ["2026-02-15", "2026-04-30", "2026-06-11"]
+    assert termed.loc[0, "OriginalDatedDate"] == pd.Timestamp("2026-02-15")
+    unrecorded = book.assign(IssueDate=["2026-03-03", "2026-04-30", "2026-06-11"])
+    with pytest.raises(ValueError, match="no Treasury dated date"):
+        smoke._apply_opening_coupon_terms(unrecorded, auctions_query=auctions)
