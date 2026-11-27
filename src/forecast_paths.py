@@ -26,6 +26,11 @@ OPERATING_CASH_OPENING_STATE_ROLE = "opening_state_anchor"
 OPERATING_CASH_COMPARISON_ROLE = "nonbinding_comparison_target"
 FED_REMITTANCE_PATH_FILE = "tdcsim_fed_remittance_path.csv"
 FED_REMITTANCE_PATH_SCHEMA_VERSION = "tdcsim_fed_remittance_path_v1"
+CBO_FED_REMITTANCE_ROLE = "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+CBO_UNSUPPORTED_FED_COMPONENTS = ("fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response")
+CBO_FED_REMITTANCE_EXCLUDED_CLAIMS = tuple(
+    f"does_not_model_{component}" for component in CBO_UNSUPPORTED_FED_COMPONENTS
+)
 CBO_FED_REMITTANCE_STATUS = "fixed_cbo_path_fed_to_tga_no_reserve_or_deposit_effect"
 CBO_FED_REMITTANCE_OPENING_STATUS = "not_applicable_opening_row"
 

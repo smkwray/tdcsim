@@ -297,7 +297,7 @@
           "const": "beneficial_holder_with_model_dirty_value_settlement"
         },
         "remittance_role": {
-          "const": "not_modeled_in_cbo_lane"
+          "const": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
         },
         "excluded_claims": {
           "type": "array",

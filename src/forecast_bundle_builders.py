@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from forecast_paths import FED_REMITTANCE_PATH_SCHEMA_VERSION, operating_cash_runtime_role
+from forecast_paths import CBO_FED_REMITTANCE_ROLE, FED_REMITTANCE_PATH_SCHEMA_VERSION, operating_cash_runtime_role
 from simulation_calendar import SimulationPeriod, is_fedwire_business_day
 
 
@@ -123,7 +123,7 @@ def build_fed_remittance_path_rows(
             "source_role": "hard_input",
             "runtime_role": "hard_flow",
             "source_status": "cbo_table_4_3_net_of_dts_fytd" if year == splice_year else "cbo_table_4_3",
-            "claim_boundary": "fixed_remittance_cash_no_rate_response_or_fed_income_model",
+            "claim_boundary": CBO_FED_REMITTANCE_ROLE,
         })
     return rows
 

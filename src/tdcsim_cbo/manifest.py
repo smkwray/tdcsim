@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from forecast_paths import CBO_FED_REMITTANCE_ROLE, CBO_UNSUPPORTED_FED_COMPONENTS
 from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE
 
 from .baseline import CboBaselinePackage
@@ -16,13 +17,12 @@ RUN_CLAIM_BOUNDARY = {
     "cash_residual_role": "reconciliation_only_not_issuance_sizing",
     "net_interest_role": "diagnostic_nonbinding",
     "fed_holdings_role": "holder_stock_target_not_fed_auction_purchase",
-    "fed_remittance_deferred_asset": "unsupported_in_cbo_scenario_lane",
+    "remittance_role": CBO_FED_REMITTANCE_ROLE,
     "complete_budgetary_net_interest_mapping": "unsupported_partial_diagnostic_only",
 }
 
 RUN_UNSUPPORTED_COMPONENTS = [
-    "fed_remittances",
-    "fed_deferred_asset",
+    *CBO_UNSUPPORTED_FED_COMPONENTS,
     "complete_budgetary_net_interest_mapping",
 ]
 
@@ -318,9 +318,9 @@ def validation_from_boundary_checks(boundary_checks: Mapping[str, Any]) -> dict[
             "status": "pass" if boundary_checks.get("net_interest_role") == "diagnostic_nonbinding" else "fail",
         },
         {
-            "id": "remittance_deferred_asset_unsupported",
+            "id": "exogenous_fed_remittance_modeled",
             "status": "pass"
-            if boundary_checks.get("remittance_deferred_asset_status") == "unsupported_in_cbo_scenario_lane"
+            if boundary_checks.get("remittance_role") == CBO_FED_REMITTANCE_ROLE
             else "fail",
         },
     ]

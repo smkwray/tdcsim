@@ -38,7 +38,12 @@ from forecast_bundle_builders import (  # noqa: E402
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
-from forecast_paths import FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash  # noqa: E402
+from forecast_paths import (  # noqa: E402
+    CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
+    CBO_FED_REMITTANCE_ROLE,
+    FED_REMITTANCE_PATH_FILE,
+    verify_fed_remittance_cash,
+)
 from cbo_opening_actuals import (  # noqa: E402
     ACTUALS_AVAILABLE_AS_OF,
     DTS_CASH_SOURCE,
@@ -258,7 +263,7 @@ CLAIM_BOUNDARY_EXCLUSIONS = {
     "does_not_claim_receipts_outlays_decomposition",
     "does_not_use_cbo_net_interest_as_cash_or_issuance_plug",
     "does_not_claim_cbo_issuance_mix",
-    "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
+    *CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
 }
 APPROVED_TOP_LEVEL_MANIFEST_KEYS = {
     "schema_version",
@@ -294,6 +299,7 @@ APPROVED_CLAIM_BOUNDARY_KEYS = {
     "net_interest_role",
     "issuance_mix_role",
     "cash_role",
+    "remittance_role",
     "excluded_claims",
 }
 APPROVED_OPENING_PORTFOLIO_KEYS = {
@@ -1843,6 +1849,7 @@ def _verify_claim_boundary(manifest: Mapping[str, Any]) -> None:
         "net_interest_role": "partial_interest_financing_diagnostic_only",
         "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
         "cash_role": PACKAGE_CASH_ROLE,
+        "remittance_role": CBO_FED_REMITTANCE_ROLE,
     }
     for key, expected_value in expected.items():
         if boundary.get(key) != expected_value:

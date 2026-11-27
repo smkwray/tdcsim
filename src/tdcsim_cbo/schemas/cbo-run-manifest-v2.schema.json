@@ -60,7 +60,13 @@
       "type": "object"
     },
     "claim_boundary": {
-      "type": "object"
+      "type": "object",
+      "required": ["remittance_role"],
+      "properties": {
+        "remittance_role": {
+          "const": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+        }
+      }
     },
     "coupling_decisions": {
       "type": "object"
@@ -152,10 +158,15 @@
     "unsupported_components": {
       "type": "array",
       "items": {
-        "type": "string"
+        "enum": [
+          "fed_net_income",
+          "fed_deferred_asset",
+          "fed_remittance_rate_response",
+          "complete_budgetary_net_interest_mapping"
+        ]
       },
-      "minItems": 3,
-      "maxItems": 3,
+      "minItems": 4,
+      "maxItems": 4,
       "uniqueItems": true
     },
     "evidence_profile": {

@@ -229,7 +229,7 @@
         "cash_residual_role",
         "net_interest_role",
         "fed_holdings_role",
-        "fed_remittance_deferred_asset",
+        "remittance_role",
         "complete_budgetary_net_interest_mapping"
       ],
       "properties": {
@@ -242,8 +242,8 @@
         "fed_holdings_role": {
           "const": "holder_stock_target_not_fed_auction_purchase"
         },
-        "fed_remittance_deferred_asset": {
-          "const": "unsupported_in_cbo_scenario_lane"
+        "remittance_role": {
+          "const": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
         },
         "complete_budgetary_net_interest_mapping": {
           "const": "unsupported_partial_diagnostic_only"
@@ -347,13 +347,14 @@
       "type": "array",
       "items": {
         "enum": [
-          "fed_remittances",
+          "fed_net_income",
           "fed_deferred_asset",
+          "fed_remittance_rate_response",
           "complete_budgetary_net_interest_mapping"
         ]
       },
-      "minItems": 3,
-      "maxItems": 3,
+      "minItems": 4,
+      "maxItems": 4,
       "uniqueItems": true
     }
   },

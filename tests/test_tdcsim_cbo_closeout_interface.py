@@ -332,6 +332,13 @@ def test_run_cbo_scenario_fed_target_settles_with_fixed_remittance(tmp_path: Pat
     }
     assert fed_results["CB_Remittance"].tolist() == cash.tolist()
     assert fed_results["CB_DeferredAsset"].isna().all()
+    assert fed.run_manifest["claim_boundary"]["remittance_role"] == "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+    assert fed.run_manifest["boundary_checks"]["remittance_role"] == fed.run_manifest["claim_boundary"]["remittance_role"]
+    assert set(fed.run_manifest["unsupported_components"]) == {
+        "fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response",
+        "complete_budgetary_net_interest_mapping",
+    }
+    assert verify_scenario_run(fed.output_dir)["status"] == "pass"
     assert fed_results["CBORequiredFaceIssuance"].tolist() == pytest.approx(
         noop_results["CBORequiredFaceIssuance"].tolist()
     )
@@ -985,6 +992,20 @@ def test_verifier_rejects_claim_boundary_tamper(tmp_path: Path) -> None:
 
     with pytest.raises(VerificationError, match="claim_boundary|schema validation"):
         verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_invalid_fed_remittance_claims(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path, remittance_bil=1.0)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+
+    unsupported = set(manifest["unsupported_components"])
+    for component in ("fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response"):
+        for replacement in (set(), {"fed_remittances"}):
+            invalid = {**manifest, "unsupported_components": sorted((unsupported - {component}) | replacement)}
+            write_json(run.manifest_path, invalid)
+            with pytest.raises(VerificationError, match="unsupported_components"):
+                verify_scenario_run(run.output_dir)
 
 
 def test_verifier_rejects_hash_consistent_fabricated_output_replay(tmp_path: Path) -> None:
