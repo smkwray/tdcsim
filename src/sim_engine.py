@@ -1596,10 +1596,8 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
         retire_fraction = retire_amount / debt_base
         if holder == 'CB' and fed_basis is not None:
             forfeited = accrued_interest(pd.DataFrame([row]), current_date) * retire_fraction
-            lots = fed_basis['lots']
-            premium_retired = (
-                lots.pop(row['BondID']) if retire_amount >= debt_base - TGA_FLOOR_TOLERANCE
-                else lots.scale(row['BondID'], 1.0 - retire_fraction)
+            premium_retired = fed_basis['lots'].dispose(
+                row['BondID'], 1.0 if retire_amount >= debt_base - TGA_FLOOR_TOLERANCE else retire_fraction, current_date,
             )
             for kind in ACCRUAL_TYPES:
                 fed_basis['accrued_sold'][kind] += float(forfeited[kind].sum())
@@ -2185,10 +2183,8 @@ def _transfer_cb_marketable_debt_to_public(
         fraction_sold = sale_amount / debt_base
         if fed_basis is not None:
             sold_accrued = accrued_interest(pd.DataFrame([row]), current_date) * fraction_sold
-            lots = fed_basis['lots']
-            premium_sold = (
-                lots.pop(row['BondID']) if sale_amount >= debt_base - TGA_FLOOR_TOLERANCE
-                else lots.scale(row['BondID'], 1.0 - fraction_sold)
+            premium_sold = fed_basis['lots'].dispose(
+                row['BondID'], 1.0 if sale_amount >= debt_base - TGA_FLOOR_TOLERANCE else fraction_sold, current_date,
             )
             for kind in ACCRUAL_TYPES:
                 fed_basis['accrued_sold'][kind] += float(sold_accrued[kind].sum())

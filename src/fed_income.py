@@ -304,14 +304,22 @@ class FedLot:
     maturity: pd.Timestamp
     premium: float  # unamortized premium (positive) or discount (negative)
     bill: bool
-    acquired: pd.Timestamp  # amortization runs from the day after acquisition
+    through: pd.Timestamp  # amortization is booked through the close of this day
 
 
 class FedLotBook:
-    """Unamortized premium or discount of each Fed lot, keyed by the portfolio's BondID."""
+    """Unamortized premium or discount of each Fed lot, keyed by the portfolio's BondID.
+
+    Each lot amortizes straight line to maturity on its own clock, from the day after it was
+    acquired. A trade first books the existing lots through the trade day, so a top-up or a
+    sale never moves the day's amortization of what the Fed already held, and a purchase
+    starts earning the next day. Lots of one security share a maturity, so merging them
+    after that keeps each vintage's straight line exactly.
+    """
 
     def __init__(self) -> None:
         self.lots: dict[int, FedLot] = {}
+        self.earned = {"bill": 0.0, "coupon": 0.0}  # booked since the last close
 
     def add(self, bond_id, maturity, premium: float, bill: bool, acquired) -> None:
         key = int(bond_id)
@@ -322,50 +330,56 @@ class FedLotBook:
         self.lots[key] = FedLot(pd.Timestamp(maturity).normalize(), float(premium), bool(bill),
                                 pd.Timestamp(acquired).normalize())
 
-    def merge(self, bond_ids, new_id, maturity, bill: bool, acquired, added_premium: float) -> None:
-        """Combine existing lots of one security with a new purchase into one lot."""
+    def merge(self, bond_ids, new_id, maturity, bill: bool, day, added_premium: float) -> None:
+        """Combine existing lots of one security with a purchase made on ``day`` into one lot."""
 
-        premium = sum(self.pop(bond_id) for bond_id in bond_ids) + float(added_premium)
-        self.add(new_id, maturity, premium, bill, acquired)
+        premium = sum(self.dispose(bond_id, 1.0, day) for bond_id in bond_ids) + float(added_premium)
+        self.add(new_id, maturity, premium, bill, day)
 
-    def pop(self, bond_id) -> float:
-        lot = self.lots.pop(int(bond_id), None)
-        return 0.0 if lot is None else lot.premium
+    def dispose(self, bond_id, fraction: float, day) -> float:
+        """Remove a fraction of a lot on ``day`` at its carrying value; return the premium removed."""
 
-    def scale(self, bond_id, keep: float) -> float:
-        """Keep a fraction of a lot's premium; return the premium removed."""
-
-        lot = self.lots[int(bond_id)]
-        removed = lot.premium * (1.0 - keep)
+        key = int(bond_id)
+        self.accrue(day, [key])
+        lot = self.lots.get(key)
+        if lot is None:
+            return 0.0
+        if fraction >= 1.0:
+            del self.lots[key]
+            return lot.premium
+        removed = lot.premium * float(fraction)
         lot.premium -= removed
         return removed
 
     def total(self) -> float:
         return float(sum(lot.premium for lot in self.lots.values()))
 
-    def amortize(self, prev_day, day) -> tuple[float, float]:
-        """Amortize straight line to maturity; return (bill accretion, coupon amortization) as income."""
+    def accrue(self, day, keys=None) -> None:
+        """Book straight-line amortization through ``day`` on the given lots, or on all of them."""
 
-        prev_day, day = pd.Timestamp(prev_day).normalize(), pd.Timestamp(day).normalize()
-        bill_income = coupon_income = 0.0
-        for key in list(self.lots):
+        day = pd.Timestamp(day).normalize()
+        for key in list(self.lots) if keys is None else [key for key in keys if key in self.lots]:
             lot = self.lots[key]
-            if lot.acquired >= day:
+            days = (day - lot.through).days
+            if days <= 0:
                 continue
-            start = max(prev_day, lot.acquired)
-            days = (day - start).days
-            remaining = (lot.maturity - start).days
+            remaining = (lot.maturity - lot.through).days
             amount = lot.premium if remaining <= days else lot.premium * days / remaining
             lot.premium -= amount
-            if lot.bill:
-                bill_income -= amount
-            else:
-                coupon_income -= amount
+            lot.through = day
+            self.earned["bill" if lot.bill else "coupon"] -= amount
             if lot.maturity <= day:
                 if abs(lot.premium) > 1e-9:
                     raise FedIncomeError(f"Fed lot {key} matured with premium {lot.premium!r} unamortized")
                 del self.lots[key]
-        return bill_income, coupon_income
+
+    def close(self, day) -> tuple[float, float]:
+        """Book every lot through ``day``; return the period's (bill accretion, coupon amortization) as income."""
+
+        self.accrue(day)
+        earned = (self.earned["bill"], self.earned["coupon"])
+        self.earned = {"bill": 0.0, "coupon": 0.0}
+        return earned
 
 
 def opening_premiums(cb_rows: pd.DataFrame, day, treasury_net_premium: float) -> dict[int, tuple]:
@@ -460,7 +474,7 @@ class FedBook:
         day = pd.Timestamp(opening_day).normalize()
         self.lots = FedLotBook()
         for bond_id, (maturity, premium, bill) in treasury_book["premiums"].items():
-            self.lots.add(bond_id, maturity, premium, bill, day - pd.Timedelta(days=1))
+            self.lots.add(bond_id, maturity, premium, bill, day)
         self.accrued = dict(treasury_book["accrued"])
         self.treasury_face = float(treasury_book["stock"])
         # ON RRP and foreign repo balances: the routed ledger when the run has one, else the
@@ -579,7 +593,7 @@ class FedBook:
                 cash + treasury["accrued_end"][kind] - self.accrued[kind]
                 - treasury["accrued_purchased"][kind] + treasury["accrued_sold"][kind]
             )
-        bill_income, coupon_income = self.lots.amortize(prev_day, day)
+        bill_income, coupon_income = self.lots.close(day)
         flows.update({
             "CB_TIPSIndexation": float(treasury["tips_indexation"]),
             "CB_TIPSFloorTopup": float(treasury["floor_topup"]),

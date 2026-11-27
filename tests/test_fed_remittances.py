@@ -187,10 +187,7 @@ def test_a_bill_bought_at_99_earns_1_whatever_it_was_issued_at():
 
     book = FedLotBook()
     book.add(7, "2026-10-20", premium=99.0 - 100.0, bill=True, acquired="2026-09-30")
-    earned = 0.0
-    for day in pd.date_range("2026-10-01", "2026-10-20"):
-        bill, coupon = book.amortize(day - pd.Timedelta(days=1), day)
-        earned += bill + coupon
+    earned = sum(sum(book.close(day)) for day in pd.date_range("2026-10-01", "2026-10-20"))
     assert earned == pytest.approx(1.0)
     assert 7 not in book.lots
 
@@ -198,9 +195,44 @@ def test_a_bill_bought_at_99_earns_1_whatever_it_was_issued_at():
 def test_a_premium_purchase_amortizes_against_income_to_maturity():
     book = FedLotBook()
     book.add(8, "2026-10-11", premium=2.0, bill=False, acquired="2026-10-01")
-    daily = [sum(book.amortize(day - pd.Timedelta(days=1), day)) for day in pd.date_range("2026-10-02", "2026-10-11")]
+    daily = [sum(book.close(day)) for day in pd.date_range("2026-10-02", "2026-10-11")]
     assert sum(daily) == pytest.approx(-2.0)
     assert daily[0] == pytest.approx(-0.2)  # straight line over the ten days held
+
+
+def _ten_day_bill_probe(trade):
+    """The audit's probe: a ten-day bill bought at a discount of 10, a second purchase of the
+    same bill at a discount of 0.8 on day 2 (booked by ``trade``), half of everything sold on
+    day 6 and the rest held to maturity. Returns each day's accretion and the discount sold."""
+
+    book = FedLotBook()
+    book.add(1, "2026-10-10", premium=-10.0, bill=True, acquired="2026-09-30")
+    daily, sold = [], 0.0
+    for day in pd.date_range("2026-10-01", "2026-10-10"):
+        if day == pd.Timestamp("2026-10-02"):
+            trade(book, day)
+        if day == pd.Timestamp("2026-10-06"):
+            sold += sum(book.dispose(key, 0.5, day) for key in list(book.lots))
+        daily.append(book.close(day)[0])
+    assert not book.lots
+    return daily, sold
+
+
+def test_a_top_up_leaves_the_existing_holdings_amortization_unchanged():
+    """Buying more of a bill the Fed already owns must not stop the day's accretion on what it
+    held. Each day's accretion reaches the earnings balance the weekly payment reads, so the
+    merged holding must earn exactly what the two vintages earn held separately, every day
+    through a partial sale and maturity."""
+
+    merged, merged_sold = _ten_day_bill_probe(lambda book, day: book.merge([1], 1, "2026-10-10", True, day, -0.8))
+    separate, separate_sold = _ten_day_bill_probe(lambda book, day: book.add(2, "2026-10-10", -0.8, True, day))
+    assert merged == pytest.approx(separate)
+    assert merged_sold == pytest.approx(separate_sold)
+    # Day 2 still earns the first vintage's 1; the purchase earns its 0.1 a day from day 3.
+    assert merged == pytest.approx([1.0, 1.0, 1.1, 1.1, 1.1, 1.1, 0.55, 0.55, 0.55, 0.55])
+    # The day-6 sale goes at the carrying value after that day's accretion: half of 4.4.
+    assert merged_sold == pytest.approx(-2.2)
+    assert sum(merged) - merged_sold == pytest.approx(10.8)
 
 
 def test_a_secondary_purchase_is_carried_at_its_clean_cost(tmp_path):
