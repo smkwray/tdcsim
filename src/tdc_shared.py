@@ -48,14 +48,9 @@ PRIVATE_SUBBUCKETS = [
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
 ]
-MMF_DEPOSIT_PASS_THROUGH_DEFAULT = 0.97
-MMF_DEPOSIT_PASS_THROUGH_STATUS = (
-    'source_backed_measurement_regime_aware_static_0_97_tdcest_rrp_runoff_anchor'
-)
+MMF_DEPOSIT_PASS_THROUGH_DEFAULT = 1.0
+MMF_DEPOSIT_PASS_THROUGH_STATUS = 'ordinary_money_fund_cash_fully_settled_through_covered_deposits'
 MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID = [0.00, 0.50, 0.90, 0.95, 0.97, 1.00]
-# TODO: replace the static central weight with quarterly
-# w_deposit_q = 1 - capped_rrp_adjustment / treasury_increase from tdcest's
-# tdc_mmf_rrp_quarterly_adjustments.csv via the existing private-route seam.
 
 # --- Global Constants ---
 TGA_FLOOR_TOLERANCE = 1.0e-9

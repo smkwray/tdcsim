@@ -9,6 +9,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_STATUS
+
 import tdcsim_cbo.runner as runner_module
 from forecast_paths import compiled_forecast_input_paths
 from sim_engine import _handoff_append_payment
@@ -151,7 +153,7 @@ def test_run_cbo_scenario_writes_outputs_and_verifies(tmp_path: Path) -> None:
     )
     assert params["funding_rule"]["negative_required_issuance_action"] == "error"
     row_metadata = run.run_manifest["output_manifest"]["row_metadata"]
-    assert row_metadata["mmf_deposit_pass_through_status"] == "configured_default"
+    assert row_metadata["mmf_deposit_pass_through_status"] == MMF_DEPOSIT_PASS_THROUGH_STATUS
     assert row_metadata["fiscal_incidence_policy_status"] == "configured_default"
     assert row_metadata["issuance_profile_status"] == "configured_default"
     assert run.compiled.manifest["materialized_default_count"] == 3
@@ -179,7 +181,15 @@ def test_run_cbo_scenario_supports_mmf_and_operating_cash_beta_knobs(tmp_path: P
         },
     )
 
-    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-mmf-cash-beta")
+    from test_trc_routing import _routing
+
+    spec = CboScenarioSpec.from_file(scenario)
+    with pytest.raises(ValueError, match="money-fund covered-deposit and ON RRP shares must sum to one"):
+        run_cbo_scenario(baseline, spec, tmp_path / "missing-mmf-routing")
+
+    routing_path = tmp_path / "trc-routing.json"
+    write_json(routing_path, _routing(on_rrp_share=0.18))
+    run = run_cbo_scenario(baseline, spec, tmp_path / "run-mmf-cash-beta", trc_routing_path=routing_path)
     runtime = read_json(run.compiled.forecast_inputs_dir / "tdcsim_runtime_assumptions.json")
     cash = pd.read_csv(run.compiled.forecast_inputs_dir / "tdcsim_operating_cash_path.csv")
     params = build_runtime_params(
@@ -197,6 +207,9 @@ def test_run_cbo_scenario_supports_mmf_and_operating_cash_beta_knobs(tmp_path: P
     assert params["private_mmf_split"]["mmf_deposit_pass_through"] == pytest.approx(0.82)
     assert set(cash["construction_mode"]) == {"scenario_inflation_beta"}
     assert set(cash["inflation_beta"]) == {0.5}
+    assert verify_scenario_run(
+        run.output_dir, baseline_package=baseline.package_path, attestation=baseline.attestation.path,
+    )["status"] == "pass"
 
 
 def test_debt_path_runs_record_the_manifest_they_always_did(tmp_path: Path) -> None:
@@ -432,6 +445,37 @@ def test_verifier_rejects_tampered_output_bytes(tmp_path: Path) -> None:
         handle.write(b"tamper")
 
     with pytest.raises(VerificationError, match="output hash"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_a_run_with_an_ineligible_opening_money_fund_lot(tmp_path: Path) -> None:
+    from test_cbo_engine_integration import _opening_controlled_portfolio
+
+    opening = _opening_controlled_portfolio()
+    opening["HolderSubBucket"] = "mmf_cash_fund_route"
+    opening["MaturityDate"] = pd.Timestamp("2028-09-30")
+    package, attestation = _write_runner_package(tmp_path, opening_portfolio=opening)
+    baseline = CboBaselinePackage.open(package, attestation_path=attestation)
+    scenario = _write_scenario(tmp_path / "opening-ineligible.json", baseline, overrides={})
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run")
+    with pytest.raises(VerificationError, match="ineligible opening money-fund lots"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_checks_acquisition_maturity_on_the_event_date(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    manifest = read_json(run.manifest_path)
+    record = manifest["output_manifest"]["tdcsim_mmf_acquisition_maturities"]
+    relative = f"outputs/{record['path']}"
+    path = run.output_dir / relative
+    events = pd.read_csv(path).iloc[:0]
+    events.loc[0] = ["2026-09-21", "Fixed", "2027-11-01"]
+    events.to_csv(path, index=False)
+    _refresh_manifest_artifact(run.output_dir, manifest, relative)
+    manifest["output_hashes"] = hash_output_tree(run.output_dir / "outputs")
+    write_json(run.manifest_path, manifest)
+    with pytest.raises(VerificationError, match="ineligible money-fund acquisition on 2026-09-21"):
         verify_scenario_run(run.output_dir)
 
 

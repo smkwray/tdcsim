@@ -883,9 +883,10 @@ def test_reference_mode_row_budget_covers_both_daily_legs(tmp_path: Path) -> Non
     """The reference closure can issue a debt-path leg and a TGA-floor leg on the same
     day. Here a note matures every day, so the debt path calls for a reference leg each
     day and the bill discount leaves the TGA short, calling for a floor leg too; with
-    fourteen securities over five holder routes, a cap sized for one leg is exceeded."""
+    fourteen securities across eligible holders, an issuance cap sized for one leg is exceeded."""
 
     from issuance_calibration import BILL_TERM_WEEKS, COUPON_TENORS
+    from tdc_shared import HOLDER_TYPES
     from tdcsim_cbo.runner import _portfolio_row_budget
 
     # Every bill term and every nominal coupon (TIPS and FRN need curves this fixture lacks).
@@ -942,12 +943,10 @@ def test_reference_mode_row_budget_covers_both_daily_legs(tmp_path: Path) -> Non
     running = running[[is_fedwire_business_day(day) for day in running.index]]
     assert (running["CashFinancingProceeds"] > 0.0).mean() > 0.9
     assert (running["NewDebtIssued"] > running["CashFinancingFaceIssued"] + 1.0).mean() > 0.9
-    one_leg = dict(params, funding_rule={**params["funding_rule"], "mode": "cbo_operating_cash_target_financing_v1"})
     rows = len(portfolio)
-    # A day with both legs adds more rows than a one-leg cap allows any single period.
-    periods = len(pd.date_range(ENGINE_START, end, freq="D")) - 1
-    opening_rows = len(params["initial_bonds_df"])
-    one_leg_per_period = (_portfolio_row_budget(one_leg, start=ENGINE_START, end=end) - opening_rows - 64) / periods
+    # Compare with the conservative single-leg issuance allowance. This fixture has no
+    # Fed stock target, so its issued rows cannot use the allowance for Fed transfers.
+    one_leg_per_period = (len(BILL_TERM_WEEKS) + len(COUPON_TENORS["nominal"])) * (len(HOLDER_TYPES) + 1)
     new_rows_by_day = pd.to_datetime(portfolio["IssueDate"]).value_counts()
     assert new_rows_by_day.loc[running.index[running["CashFinancingProceeds"] > 0.0]].max() > one_leg_per_period
     assert rows <= _portfolio_row_budget(params, start=ENGINE_START, end=end)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -53,8 +54,8 @@ def _write_holder_absorption_path(path: Path, *, split_to_mmf: bool) -> None:
                 "holder_type": "Private",
                 "holder_subbucket": subbucket,
                 "bills_pct": 1.0,
-                "notes_pct": 1.0,
-                "bonds_pct": 1.0,
+                "notes_pct": 0.0 if split_to_mmf else 1.0,
+                "bonds_pct": 0.0 if split_to_mmf else 1.0,
             }
         ]
     ).to_csv(path, index=False)
@@ -149,7 +150,7 @@ def _split_params(tmp_path: Path, *, p: float, split_to_mmf: bool = True) -> dic
             HolderSubBucket=subbucket,
             FaceValue=100.0,
             CouponRate=0.04,
-            MaturityDate=pd.Timestamp("2027-01-01"),
+            MaturityDate=pd.Timestamp("2025-12-31"),
             OriginalMaturityYears=2.0,
             MaturityCategory="notes",
         ),
@@ -181,8 +182,14 @@ def _split_params(tmp_path: Path, *, p: float, split_to_mmf: bool = True) -> dic
 
 
 def _run_case(tmp_path: Path, *, p: float, split_to_mmf: bool = True) -> pd.DataFrame:
+    params = _split_params(tmp_path, p=p, split_to_mmf=split_to_mmf)
+    if p != 1.0:
+        path = Path(__file__).resolve().parents[1] / "trc_routing_onrrp_available_v1.json"
+        routing = json.loads(path.read_text())
+        routing["mmf_cash_fund_route"]["on_rrp_share"] = 1.0 - p
+        params["trc_routing"] = routing
     results, _ = run_simulation(
-        _split_params(tmp_path, p=p, split_to_mmf=split_to_mmf),
+        params,
         "2025-01-01",
         "2025-01-20",
         freq="W",

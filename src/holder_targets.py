@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import pandas as pd
 
+from mmf_eligibility import mmf_may_acquire
 from simulation_calendar import previous_securities_business_day
 from tdc_shared import (
     INTRAGOV_HOLDERS,
@@ -330,6 +331,7 @@ def rebalance_holder_positions(
     current_date: Any,
     price: Callable[[pd.Series, float], Mapping[str, float]],
     row_budget: int | None = None,
+    record_mmf_acquisition: Callable[[Any, str, Any], None] | None = None,
 ) -> tuple[pd.DataFrame, RebalanceReport]:
     """Close ``gaps`` by moving nominal bills from holders above target to holders below it.
 
@@ -350,6 +352,10 @@ def rebalance_holder_positions(
             while queue and (last or quota > DUST_BIL):
                 index, available = queue[0]
                 take = available if last or available <= quota + DUST_BIL else quota
+                if buyer == ("Private", PRIVATE_SUBBUCKET_MMF):
+                    lot = portfolio.loc[index]
+                    if not mmf_may_acquire(lot["SecurityType"], lot["MaturityDate"], day):
+                        raise HolderTargetError(f"money-fund transfer includes an ineligible bill on {day.date()}")
                 pieces.append((index, take, seller, buyer))
                 quota -= take
                 if take >= available - DUST_BIL:
@@ -362,6 +368,8 @@ def rebalance_holder_positions(
     holder_columns = ["HolderType", "HolderSubBucket", "TDCPrincipalHolderType", "TDCPrincipalHolderSubBucket"]
     for index, take, seller, buyer in pieces:
         row = portfolio.loc[index].copy()
+        if buyer == ("Private", PRIVATE_SUBBUCKET_MMF) and record_mmf_acquisition is not None:
+            record_mmf_acquisition(day, row["SecurityType"], row["MaturityDate"])
         face = float(row["FaceValue"])
         pricing = price(row, take)
         cash = float(pricing["dirty_value"])

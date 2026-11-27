@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_STATUS
+
 from evaluated_nominal_curve import (
     NOMINAL_EVALUATED_SHOCK_FILE,
     evaluated_nominal_contract_metadata,
@@ -67,8 +69,8 @@ def test_noop_compile_materializes_explicit_defaults_without_marking_csv_rows(tm
     )
     assert runtime["fiscal_incidence_policy_id"] == "central"
     assert runtime["fiscal_incidence_policy_status"] == "configured_default"
-    assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.97)
-    assert runtime["mmf_deposit_pass_through_status"] == "configured_default"
+    assert runtime["mmf_deposit_pass_through"] == 1.0
+    assert runtime["mmf_deposit_pass_through_status"] == MMF_DEPOSIT_PASS_THROUGH_STATUS
     assert opening["initial_values"] == pytest.approx(
         {"reserves": 3000.0, "tdc_level": 0.0, "tga": 100.0}
     )
@@ -1032,7 +1034,7 @@ def test_derived_fiscal_override_updates_status_without_resetting_inherited_mmf(
     assert runtime["fiscal_incidence_policy_id"] == "central"
     assert runtime["fiscal_incidence_policy_status"] == "scenario_override"
     assert runtime["mmf_deposit_pass_through"] == pytest.approx(0.73)
-    assert runtime["mmf_deposit_pass_through_status"] == "configured_default"
+    assert runtime["mmf_deposit_pass_through_status"] == "scenario_override"
 
 
 def test_compiler_rejects_directory_baseline_without_package_digest(tmp_path: Path) -> None:
@@ -1384,7 +1386,7 @@ def _write_compiler_package(
                 "fiscal_incidence_policy_id": "central",
                 "fiscal_incidence_policy_status": "configured_default",
                 "mmf_deposit_pass_through": 0.73,
-                "mmf_deposit_pass_through_status": "configured_default",
+                "mmf_deposit_pass_through_status": "scenario_override",
                 "source_role": "carried_derived_state_fixture",
                 "runtime_role": "fiscal_selector_and_deposit_channel_parameters",
                 "claim_boundary": "fixture",

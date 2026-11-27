@@ -75,7 +75,7 @@ Event-level issuance, redemption, interest, holder and reserve-routing tables si
 ## Limits
 
 - Changing issuance or holder mix moves rates only when the scenario also supplies a different yield curve.
-- Private holdings split into domestic nonbanks and MMFs. The share of MMF flows that moves bank deposits defaults to 0.97 unless a scenario overrides it.
+- Private holdings split into domestic nonbanks and MMFs. Ordinary MMF cash flows settle entirely through bank deposits. An explicit ON RRP route can assign a share of cash flows to the facility.
 - The CBO runner counts TIPS inflation accretion in financing cost by default; `tdc_config_optional.yaml` turns it off.
 - In the configuration runner, secondary trading moves holdings toward holder preferences once per step.
 

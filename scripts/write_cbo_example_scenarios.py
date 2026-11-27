@@ -119,7 +119,6 @@ def example_scenarios(
                 "fed_holdings": {"mode": "scale_path", "scale": 1.0},
                 "operating_cash": {"mode": "inflation_beta", "beta": 0.5},
                 "cash_reconciliation": {"mode": "zero", "funding_effect": "none"},
-                "mmf_deposit_pass_through": {"mode": "fixed_fraction", "value": 0.97},
                 "fiscal_incidence": {
                     "mode": "static_shares",
                     "domestic_ultimate_share": 0.50,

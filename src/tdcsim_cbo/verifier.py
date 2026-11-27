@@ -23,6 +23,7 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
+from mmf_eligibility import MmfEligibilityError, mmf_eligible_mask, mmf_may_acquire
 from sim_engine import (
     CBO_FUNDING_MODE,
     CASH_FINANCING_ISSUANCE_LEGS,
@@ -82,6 +83,8 @@ from .open04_campaign import (
 )
 from .output import (
     HANDOFF_TABLE_COLUMNS,
+    MMF_ACQUISITIONS_COLUMNS,
+    MMF_ACQUISITIONS_OUTPUT,
     TDC_AMOUNT_BASIS,
     TDC_COMPONENT_SPECS,
     TDC_HOLDER_SCOPE,
@@ -94,7 +97,7 @@ from .output import (
     write_scenario_outputs,
 )
 from .process_watchdog import THREAD_LIMIT_ENVIRONMENT_VARIABLES
-from tdc_shared import INTRAGOV_HOLDERS
+from tdc_shared import INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF
 from .runtime_identity import (
     assert_loaded_distribution_modules,
     distribution_identity,
@@ -339,6 +342,7 @@ def verify_scenario_run(
         raise VerificationError("remittance/deferred-asset status must remain unsupported")
     if boundaries.get("fed_auction_add_ons_roll_over_maturities") is not True:
         raise VerificationError("the Fed's auction add-ons exceed its maturing holdings")
+    _verify_mmf_eligibility(root, manifest, compiled_manifest_path.parent / "forecast_inputs")
     recomputed = _verify_output_invariants(root, manifest)
     return {
         "status": "pass",
@@ -1378,11 +1382,12 @@ def _verify_recompile(root: Path, manifest: dict[str, Any], baseline_package: st
 
 
 def _build_replay_runtime_params(
+    root: Path,
     manifest: Mapping[str, Any],
     inputs_dir: Path,
     *,
     row_metadata: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Reconstruct the runtime parameters recorded by the production runner."""
 
     simulation = manifest.get("simulation")
@@ -1392,7 +1397,7 @@ def _build_replay_runtime_params(
     end = str(simulation.get("end_date") or "")
     funding_closure_mode = _manifest_funding_closure_mode(manifest)
     engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
-    return runner_module.build_runtime_params(
+    params = runner_module.build_runtime_params(
         inputs_dir,
         actuals_available_as_of=str(
             row_metadata.get("actuals_available_as_of") or ""
@@ -1402,6 +1407,16 @@ def _build_replay_runtime_params(
         scenario_id=engine_scenario_id,
         funding_closure_mode=funding_closure_mode,
     )
+    params = runner_module._engine_runtime_params(params)
+    trc_binding = {}
+    if "tdcsim_trc_metadata" in manifest["output_manifest"]:
+        trc = _manifest(root / "outputs" / "tdcsim_trc_metadata.json")
+        for key in ("routing_source", "routing_config"):
+            if not isinstance(trc.get(key), dict):
+                raise VerificationError(f"TRC metadata lacks {key} for replay")
+            trc_binding[key] = trc[key]
+        params["trc_routing"] = trc_binding["routing_config"]
+    return params, trc_binding
 
 
 def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path) -> None:
@@ -1416,12 +1431,13 @@ def _verify_engine_replay(root: Path, manifest: dict[str, Any], inputs_dir: Path
     row_metadata = output_manifest.get("row_metadata", {})
     if not isinstance(row_metadata, dict):
         row_metadata = {}
-    params = _build_replay_runtime_params(
-        manifest, inputs_dir, row_metadata=row_metadata
+    params, trc_binding = _build_replay_runtime_params(
+        root, manifest, inputs_dir, row_metadata=row_metadata
     )
-    params = runner_module._engine_runtime_params(params)
     engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
     results, final_portfolio = run_simulation(params, start, end, freq="D", scenario_name=engine_scenario_id)
+    if trc_binding:
+        results.attrs["trc_metadata"].update(trc_binding)
     profile = str(output_manifest.get("profile") or "compact")
     compression = str(output_manifest.get("compression") or "gzip")
     with tempfile.TemporaryDirectory(prefix="tdcsim-cbo-verify-output-") as tmp:
@@ -1456,10 +1472,9 @@ def _verify_bounded_engine_replay(
     row_metadata = output_manifest.get("row_metadata", {})
     if not isinstance(row_metadata, dict):
         row_metadata = {}
-    params = _build_replay_runtime_params(
-        manifest, inputs_dir, row_metadata=row_metadata
+    params, trc_binding = _build_replay_runtime_params(
+        root, manifest, inputs_dir, row_metadata=row_metadata
     )
-    params = runner_module._engine_runtime_params(params)
     engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
     thresholds = bounded.get("memory_thresholds")
     if not isinstance(thresholds, dict):
@@ -1526,6 +1541,8 @@ def _verify_bounded_engine_replay(
         except Exception as exc:
             sink.abort(exc)
             raise VerificationError(f"bounded engine replay failed: {exc}") from exc
+        if trc_binding:
+            results.attrs["trc_metadata"].update(trc_binding)
         replay_summary = results.attrs.get("bounded_handoff_summary")
         if not isinstance(replay_summary, Mapping):
             raise VerificationError(
@@ -1572,7 +1589,9 @@ def _verify_bounded_engine_replay(
             compression=str(output_manifest.get("compression") or "gzip"),
             metadata=row_metadata,
         )
-        for logical_name in ("results", "final_portfolio"):
+        for logical_name in (
+            "results", "final_portfolio", MMF_ACQUISITIONS_OUTPUT, "tdcsim_trc_results", "tdcsim_trc_metadata",
+        ):
             expected = output_manifest.get(logical_name)
             actual = replay_manifest.get(logical_name)
             if expected is None and actual is None:
@@ -1587,6 +1606,38 @@ def _verify_bounded_engine_replay(
                         f"bounded engine replay output mismatch: "
                         f"{logical_name}.{field}"
                     )
+
+
+def _verify_mmf_eligibility(root: Path, manifest: dict[str, Any], inputs_dir: Path) -> None:
+    """Check opening lots and the longest maturity bought per security type and event date."""
+
+    start = _bounded_date(manifest["simulation"]["start_date"], label="simulation start")
+    end = _bounded_date(manifest["simulation"]["end_date"], label="simulation end")
+    columns = ("BondID", "Status", "HolderType", "HolderSubBucket", "SecurityType", "MaturityDate")
+    opening = pd.read_csv(inputs_dir / "tdcsim_opening_portfolio.csv", usecols=columns)
+    money_funds = opening.loc[
+        opening["Status"].eq("Active")
+        & opening["HolderType"].eq("Private")
+        & opening["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF)
+    ]
+    try:
+        ineligible = money_funds.loc[~mmf_eligible_mask(money_funds, start), "BondID"]
+        if not ineligible.empty:
+            raise VerificationError(f"ineligible opening money-fund lots on {start}: {ineligible.head().tolist()}")
+        path = _output_artifact_path(root, manifest, MMF_ACQUISITIONS_OUTPUT)
+        events = pd.read_csv(path, dtype=str, keep_default_na=False)
+        _require_columns(events, MMF_ACQUISITIONS_COLUMNS, label="money-fund acquisitions")
+        if events.duplicated(["acquisition_date", "security_type"]).any():
+            raise VerificationError("money-fund acquisition maturities repeat an event date and security type")
+        for day, security_type, maturity in events[list(MMF_ACQUISITIONS_COLUMNS)].itertuples(index=False, name=None):
+            acquisition = _bounded_date(day, label="money-fund acquisition date")
+            latest = _bounded_date(maturity, label="latest money-fund acquisition maturity")
+            if not start < acquisition <= end:
+                raise VerificationError(f"money-fund acquisition date {day} falls outside the run")
+            if not mmf_may_acquire(security_type, latest, acquisition):
+                raise VerificationError(f"ineligible money-fund acquisition on {day}: {security_type} maturing {maturity}")
+    except MmfEligibilityError as exc:
+        raise VerificationError(str(exc)) from exc
 
 
 def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:

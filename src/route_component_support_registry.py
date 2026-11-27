@@ -216,9 +216,8 @@ def build_route_component_verdict(registry: pd.DataFrame) -> pd.DataFrame:
         "mmf_onrrp_like": (
             "source_backed_measurement",
             (
-                "MMF deposit weight promoted only for the static central private-bucket "
-                "split: ON-RRP-drained regime plus tdcest 2025Q4 source-of-funds "
-                "anchor around 0.986, rounded conservatively to 0.97. Known limitation: "
+                "ON RRP source-of-funds measurements inform explicitly routed sensitivities. "
+                "The ordinary money-fund cash route settles through covered deposits. "
                 "SEC N-MFP fund scope does not identify the final deposit recipient."
             ),
         ),
