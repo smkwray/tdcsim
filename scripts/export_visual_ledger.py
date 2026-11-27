@@ -40,6 +40,7 @@ from issuance_calibration import (  # noqa: E402
 )
 from run_open04_reproduction import _assert_installed_distribution_import  # noqa: E402
 from simulation_calendar import is_fedwire_business_day, next_fedwire_business_day  # noqa: E402
+from tips_indexation import load_opening_tips_observation, opening_tips_at_simulation_start  # noqa: E402
 
 SCHEMA_VERSION = "tdcsim_visual_ledger_v2"
 HOLDER_COLUMNS = ("fed", "banks", "foreign", "mmf", "other_domestic")
@@ -227,12 +228,14 @@ def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame
         lookup.setdefault(key, set()).add(security_id)
     out = issues.copy()
     identified = set(opening["security_id"]) | set(issues.loc[~issues["is_reopening"], "security_id"])
-    for index, row in issues.loc[issues["is_reopening"]].iterrows():
+    for index, row in issues.iterrows():
         key = (row["security_type"], pd.Timestamp(row["maturity_date"]), round(float(row["coupon_rate"]), 9))
         if row["security_id"] in opening_terms and opening_terms[row["security_id"]] != key:
             raise SystemExit(f"reopening {row['security_id']} conflicts with the opening security terms")
-        if row["security_id"] in identified:
+        if not row["is_reopening"] or row["security_id"] in identified:
             continue
+        if not opening.attrs.get("legacy_issue_ids"):
+            raise SystemExit(f"reopening {row['security_id']} has no identified opening or issued security")
         matches = lookup.get(key)
         if not matches:
             continue
@@ -244,6 +247,9 @@ def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame
 
 def build_opening(run_dir: Path) -> pd.DataFrame:
     book = pd.read_csv(run_dir / OPENING_PORTFOLIO, low_memory=False)
+    observation = load_opening_tips_observation((run_dir / OPENING_PORTFOLIO).parent)
+    if observation and "IssueID" not in book:
+        raise SystemExit("opening portfolio requires complete issue IDs")
     source = pd.read_csv(run_dir / OPENING_SOURCE, low_memory=False)[["BondID", "cusip_or_synthetic_id", "MaturityDate"]]
     book = book.merge(source, on="BondID", how="left", suffixes=("", "_source"))
     joined = book["cusip_or_synthetic_id"].notna()
@@ -268,6 +274,7 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
         book["security_id"] = book["cusip_or_synthetic_id"].fillna(book["BondID"].map(added))
     if book["security_id"].isna().any():
         raise SystemExit("an opening row is neither in the source book nor a pre-start rollforward replacement")
+    book = opening_tips_at_simulation_start(book, observation)
     book["holder"] = [holder_column(h, s) for h, s in zip(book["HolderType"], book["HolderSubBucket"])]
     book["debt_basis"] = book["AdjustedPrincipal"].where(book["SecurityType"].eq("TIPS"), book["FaceValue"])
     keys = ["security_id", "kind", "IssueDate", "MaturityDate", "CouponRate"]
@@ -287,7 +294,9 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     face["maturity_payment_date"] = [payment_date(day) for day in pd.to_datetime(face["maturity_date"])]
     columns = ["security_id", "security_type", "issue_date", "maturity_date", "maturity_payment_date", "coupon_rate",
                "face_total", *(f"face_{c}" for c in HOLDER_COLUMNS), "debt_basis_total"]
-    return face[columns].sort_values(["maturity_date", "security_id"]).reset_index(drop=True)
+    output = face[columns].sort_values(["maturity_date", "security_id"]).reset_index(drop=True)
+    output.attrs["legacy_issue_ids"] = "IssueID" not in book
+    return output
 
 
 def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, issues: pd.DataFrame,
@@ -439,11 +448,11 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
 
 ## Files
 - `opening_book.csv`: every security outstanding at the {start} opening, by CUSIP. The source
-  book is Treasury's month-end statement for {record_date}; what matured between then and the
-  opening is reinvested, holder by holder, in the Treasury issues that settled on its payment
-  date, in proportion to their accepted auction amounts, so those issues appear under their own
-  CUSIPs. Face is par; TIPS par excludes inflation compensation, which `debt_basis_total`
-  includes. `maturity_payment_date` is when the principal is paid: the maturity date, or the
+  book rolls Treasury's month-end statement for {record_date} through the last open day
+  using actual auction settlements and maturities. Maturing positions are reinvested by holder
+  and net borrowing is allocated using the holder shares. Face is par. For TIPS,
+  `debt_basis_total` includes inflation compensation at the simulation start.
+  `maturity_payment_date` is when the principal is paid: the maturity date, or the
   next day Fedwire is open when the maturity date is a weekend or holiday.
 - `issues.csv`: every security the run issued, one row per security and settlement date, on
   Treasury's auction calendar: bills weekly (the 52-week bill every four weeks), 2-, 3- and
