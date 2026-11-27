@@ -1394,7 +1394,7 @@ def _write_compiler_package(
         )
 
     manifest = {
-        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v1",
+        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v2",
         "scenario_id": scenario_id,
         "date_range": {
             "opening_state_date": "2027-01-01",

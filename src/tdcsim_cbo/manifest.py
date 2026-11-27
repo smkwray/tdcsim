@@ -147,6 +147,9 @@ def build_run_manifest(
 
     validation = validation_from_boundary_checks(boundary_checks)
     bounded = dict(bounded_evidence or {})
+    if not bounded:
+        # The unbounded v1 contract carried CBO's fixed Table 4-3 remittance; it is retired.
+        raise ValueError("a run manifest needs bounded evidence")
     if bounded:
         if bounded.get("evidence_profile") != "bounded_period_closure_v1":
             raise ValueError("unsupported bounded evidence profile")
@@ -186,11 +189,7 @@ def build_run_manifest(
             ],
         }
     manifest = {
-        "schema_version": (
-            "tdcsim_cbo_scenario_run_manifest_v3"
-            if bounded
-            else "tdcsim_cbo_scenario_run_manifest_v1"
-        ),
+        "schema_version": "tdcsim_cbo_scenario_run_manifest_v3",
         "run_id": f"{scenario_id}-{scenario_sha256[:12]}",
         "status": "complete",
         "verification_grade": (

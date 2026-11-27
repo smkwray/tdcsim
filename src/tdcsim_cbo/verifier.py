@@ -145,9 +145,8 @@ REQUIRED_SUMMARY_KEYS = (
     "CBOFedAuctionRolloverAddons_max_abs",
 )
 
-RUN_MANIFEST_V1 = "tdcsim_cbo_scenario_run_manifest_v1"
-RUN_MANIFEST_V2 = "tdcsim_cbo_scenario_run_manifest_v2"
-# v3: modeled Fed remittances reach the TGA; v1 and v2 manifests carried the fixed Table 4-3 path.
+# v3 run manifests carry the modeled Fed-to-TGA remittance. The historical v1 (unbounded) and
+# v2 (bounded) contracts carried CBO's fixed Table 4-3 path; their schemas keep that meaning.
 RUN_MANIFEST_V3 = "tdcsim_cbo_scenario_run_manifest_v3"
 
 _BOUNDED_ARTIFACT_SPECS: dict[str, tuple[str, list[str]]] = {
@@ -898,8 +897,6 @@ def _verify_open04_output_contract(
 def _validate_run_manifest_schema(manifest: dict[str, Any]) -> None:
     schema_version = manifest.get("schema_version")
     schema_names = {
-        RUN_MANIFEST_V1: "cbo-run-manifest-v1.schema.json",
-        RUN_MANIFEST_V2: "cbo-run-manifest-v2.schema.json",
         RUN_MANIFEST_V3: "cbo-run-manifest-v3.schema.json",
     }
     schema_name = schema_names.get(schema_version)
@@ -915,7 +912,7 @@ def _validate_run_manifest_schema(manifest: dict[str, Any]) -> None:
         validate_schema(manifest, schema, label="run_manifest")
     except Exception as exc:
         raise VerificationError(f"run manifest schema validation failed: {exc}") from exc
-    if schema_version in {RUN_MANIFEST_V2, RUN_MANIFEST_V3}:
+    if schema_version == RUN_MANIFEST_V3:
         milestones = manifest.get("execution_milestones")
         has_acceptance = isinstance(milestones, list) and (
             "parent_watchdog_accepted" in milestones
@@ -946,7 +943,7 @@ def _verify_release_claims(manifest: dict[str, Any]) -> None:
 
 
 def _is_bounded_manifest(manifest: Mapping[str, Any]) -> bool:
-    return manifest.get("schema_version") in {RUN_MANIFEST_V2, RUN_MANIFEST_V3}
+    return manifest.get("schema_version") == RUN_MANIFEST_V3
 
 
 def _manifest_funding_closure_mode(manifest: Mapping[str, Any]) -> str:

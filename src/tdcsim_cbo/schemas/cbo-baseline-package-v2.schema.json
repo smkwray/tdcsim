@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tdcsim.local/schemas/cbo-baseline-package-v1.schema.json",
-  "title": "TDCSIM CBO baseline dependency package manifest v1",
+  "$id": "https://tdcsim.local/schemas/cbo-baseline-package-v2.schema.json",
+  "title": "TDCSIM CBO baseline dependency package manifest v2 (modeled Fed remittances)",
   "type": "object",
   "additionalProperties": false,
   "required": [

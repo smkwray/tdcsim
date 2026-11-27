@@ -794,7 +794,7 @@ def build_manifest(
     fy2026 = _row_by_key(fiscal_rows, "fiscal_year", 2026)
     first_curve = yield_rows[0]
     return {
-        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v1",
+        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v2",
         "status": "local_full_horizon_repaired_smoke_not_production_bundle",
         "scenario_id": SCENARIO_ID,
         "forecast_name": FORECAST_NAME,
@@ -1081,7 +1081,7 @@ def build_manifest(
         },
         "scope_claim_id": CLAIM_BOUNDARY,
         "claim_boundary": {
-            "schema_version": "tdcsim_cbo_package_claim_boundary_v1",
+            "schema_version": "tdcsim_cbo_package_claim_boundary_v2",
             "package_role": "cbo_baseline_forecast_evidence_package",
             "net_interest_role": "partial_interest_financing_diagnostic_only",
             "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",

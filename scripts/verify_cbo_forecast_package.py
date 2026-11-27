@@ -228,7 +228,7 @@ FORBIDDEN_NET_INTEREST_COLUMNS = {
 }
 
 TRUST_ANCHOR_SCHEMA_VERSION = "tdcsim_cbo_package_trust_anchor_v1"
-CLAIM_BOUNDARY_SCHEMA_VERSION = "tdcsim_cbo_package_claim_boundary_v1"
+CLAIM_BOUNDARY_SCHEMA_VERSION = "tdcsim_cbo_package_claim_boundary_v2"
 VERIFIER_VERSION = "tdcsim_cbo_package_verifier_semantic_v2"
 PENDING_RELEASE_STATUS = "pending_until_release_commit"
 PENDING_ZIP_STATUS = "pending_until_release_commit"

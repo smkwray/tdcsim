@@ -1265,6 +1265,60 @@ def test_cb_auction_preferences_rejected_with_baseline_fed_target(tmp_path: Path
         run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario), tmp_path / "run-cb-holder")
 
 
+def test_each_run_manifest_contract_keeps_its_own_identifier_and_meaning(tmp_path: Path) -> None:
+    """Runs carry the modeled Fed-to-TGA remittance under v3. The historical v1 and v2
+    contracts, which carried CBO's fixed Table 4-3 path, keep that meaning: a manifest
+    validates only against its own schema, no two schemas share an identifier a registry
+    could confuse, and no run is written or verified under a historical identifier."""
+
+    import copy
+    from importlib.resources import files
+
+    from tdcsim_cbo._schema import validate_schema
+
+    schemas = {}
+    for path in files("tdcsim_cbo").joinpath("schemas").iterdir():
+        if path.name.endswith(".schema.json"):
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            assert schema["$id"] == f"https://tdcsim.local/schemas/{path.name}"
+            schemas[path.name] = schema
+    assert len({schema["title"] for schema in schemas.values()}) == len(schemas)
+    fixed = "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+    v1 = schemas["cbo-run-manifest-v1.schema.json"]
+    assert v1["properties"]["claim_boundary"]["properties"]["remittance_role"]["const"] == fixed
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    current = read_json(run.manifest_path)
+    assert current["schema_version"] == "tdcsim_cbo_scenario_run_manifest_v3"
+    historical = copy.deepcopy(current)
+    historical["schema_version"] = "tdcsim_cbo_scenario_run_manifest_v2"
+    for block in ("boundary_checks", "claim_boundary"):
+        historical[block]["remittance_role"] = fixed
+    historical["unsupported_components"] = [
+        "fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response", "complete_budgetary_net_interest_mapping",
+    ]
+    v2, v3 = schemas["cbo-run-manifest-v2.schema.json"], schemas["cbo-run-manifest-v3.schema.json"]
+    validate_schema(current, v3, label="v3")
+    validate_schema(historical, v2, label="v2")
+    with pytest.raises(Exception):
+        validate_schema(current, v2, label="v3 as v2")
+    with pytest.raises(Exception):
+        validate_schema(historical, v3, label="v2 as v3")
+    write_json(run.manifest_path, historical)
+    with pytest.raises(VerificationError, match="unsupported run manifest schema_version"):
+        verify_scenario_run(run.output_dir)
+    unbounded = dict.fromkeys(
+        ("scenario_id", "scenario_sha256", "compiled_manifest_relpath", "scenario_relpath", "scenario_file_sha256",
+         "start_date", "end_date", "fiscal_incidence_policy_id", "generated_at_utc"), "",
+    )
+    with pytest.raises(ValueError, match="needs bounded evidence"):
+        runner_module.build_run_manifest(
+            **unbounded, compiled=None, baseline=None, scenario=None, scenario_referenced_files=[], outputs={},
+            output_hashes=[], boundary_checks=current["boundary_checks"], code_environment={}, bounded_evidence=None,
+        )
+
+
 def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     compile_dir = tmp_path / "cli-compile"
@@ -1555,7 +1609,7 @@ def _write_runner_package(
     _write_csv(inputs / "tdcsim_opening_tips_indexation_diagnostics.csv", [{"schema_version": "fixture"}])
 
     manifest = {
-        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v1",
+        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v2",
         "scenario_id": "baseline",
         "trust_anchor": {
             "schema_version": "tdcsim_cbo_package_trust_anchor_v1",

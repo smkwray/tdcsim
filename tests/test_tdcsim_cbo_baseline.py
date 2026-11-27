@@ -92,7 +92,7 @@ def _write_release_package(tmp_path: Path) -> tuple[Path, Path]:
     (package_dir / "requirements.lock.txt").write_text(lock_text, encoding="utf-8")
     lock_sha = sha256_file(package_dir / "requirements.lock.txt")
     manifest = {
-        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v1",
+        "schema_version": "tdcsim_cbo_forecast_smoke_manifest_v2",
         "scenario_id": "cbo_full_horizon_local_smoke_3m",
         "trust_anchor": {
             "schema_version": "tdcsim_cbo_package_trust_anchor_v1",

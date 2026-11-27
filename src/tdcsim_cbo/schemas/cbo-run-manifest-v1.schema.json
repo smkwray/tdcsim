@@ -243,7 +243,7 @@
           "const": "holder_stock_target_not_fed_auction_purchase"
         },
         "remittance_role": {
-          "const": "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
+          "const": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
         },
         "complete_budgetary_net_interest_mapping": {
           "const": "unsupported_partial_diagnostic_only"
@@ -347,17 +347,14 @@
       "type": "array",
       "items": {
         "enum": [
-          "fed_effective_interest_amortization",
-          "fed_mbs_payment_clock",
-          "fed_valuation_gains_and_losses",
-          "mbs_prepayment_rate_response",
-          "reserve_bank_level_remittances_under_system_deferred_asset",
-          "fed_policy_rate_response_to_scenarios",
+          "fed_net_income",
+          "fed_deferred_asset",
+          "fed_remittance_rate_response",
           "complete_budgetary_net_interest_mapping"
         ]
       },
-      "minItems": 7,
-      "maxItems": 7,
+      "minItems": 4,
+      "maxItems": 4,
       "uniqueItems": true
     }
   },

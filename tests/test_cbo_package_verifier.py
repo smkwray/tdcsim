@@ -889,7 +889,7 @@ def _source_row_selectors() -> dict:
 
 def _claim_boundary() -> dict:
     return {
-        "schema_version": "tdcsim_cbo_package_claim_boundary_v1",
+        "schema_version": "tdcsim_cbo_package_claim_boundary_v2",
         "package_role": "cbo_baseline_forecast_evidence_package",
         "net_interest_role": "partial_interest_financing_diagnostic_only",
         "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
