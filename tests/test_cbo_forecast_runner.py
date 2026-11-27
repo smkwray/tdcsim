@@ -65,9 +65,16 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
     net_par = float(summary["face_delta_bil"])
     revaluation = float(summary["opening_tips_indexation_bil"]) - float(summary["source_tips_indexation_bil"])
     assert net_par == pytest.approx(117.913081915642)
-    assert revaluation == pytest.approx(10.914079601088)
+    assert revaluation == pytest.approx(12.341160872041)
     assert opening["opening_rollforward_debt_base_delta_bil"] == pytest.approx(net_par + revaluation)
     assert opening["opening_cb_holdings_bil"] == pytest.approx(4487.31889707172)
+    assert opening["opening_tips_reconstructed_original_principal_bil"] == pytest.approx(1742.730388403704)
+    assert opening["opening_tips_adjusted_principal_bil"] == pytest.approx(2129.890190322236)
+    assert opening["simulation_start_tips_adjusted_principal_bil"] == pytest.approx(2131.690974147928)
+    with (bundle.inputs_dir / "tdcsim_debt_stock_path.csv").open(newline="") as handle:
+        first = next(csv.DictReader(handle))
+    assert first["period_end"] == "2026-06-22"
+    assert float(first["cbo_federal_debt_held_public_target_bil"]) == pytest.approx(31545.753832140905)
     assert manifest["opening_portfolio_construction"]["opening_tips_reference_cpi"] > 300.0
     assert "treasurydirect_tips_cpi_detail_join" in (
         manifest["opening_portfolio_construction"]["tips_initialization"]
@@ -186,7 +193,7 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
     )
     assert bundle.params["tips_params"]["ref_cpi_lag_months"] == 3
     assert bundle.params["tips_params"]["reference_cpi_start_level"] == pytest.approx(
-        manifest["opening_portfolio_construction"]["opening_tips_reference_cpi"]
+        332.08433
     )
 
     surface = load_yield_curve_surface(

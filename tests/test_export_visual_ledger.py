@@ -209,3 +209,39 @@ def test_reopening_uses_opening_cusip_for_a_ten_year_note(tmp_path) -> None:
     assert opening["security_type"].item() == renamed["security_type"].item() == "note"
     assert set(opening["security_id"]) | set(renamed["security_id"]) == {cusip}
     pd.testing.assert_frame_equal(renamed.drop(columns="security_id"), issues.drop(columns="security_id"))
+    issues["security_id"] = cusip
+    issues["coupon_rate"] = 0.05
+    with pytest.raises(SystemExit, match="conflicts with the opening security terms"):
+        ledger.name_reopened_opening_securities(issues, opening)
+
+    path = tmp_path / ledger.OPENING_PORTFOLIO
+    book = pd.read_csv(path).assign(IssueID=" ")
+    book.to_csv(path, index=False)
+    with pytest.raises(SystemExit, match="complete issue IDs"):
+        ledger.build_opening(tmp_path)
+
+
+def test_opening_tips_export_values_par_at_simulation_start(tmp_path) -> None:
+    import json
+    import export_visual_ledger as ledger
+
+    (tmp_path / ledger.OPENING_PORTFOLIO).parent.mkdir(parents=True)
+    (tmp_path / ledger.OPENING_SOURCE).parent.mkdir(parents=True)
+    pd.DataFrame([{
+        "BondID": 1, "IssueID": "TIPS-A", "SecurityType": "TIPS", "IssueDate": "2025-04-15",
+        "MaturityDate": "2030-04-15", "MaturityCategory": "notes", "CouponRate": 0.01,
+        "HolderType": "Banks", "HolderSubBucket": None, "FaceValue": 100.0,
+        "AdjustedPrincipal": 110.0, "OriginalPrincipal": 100.0,
+    }]).to_csv(tmp_path / ledger.OPENING_PORTFOLIO, index=False)
+    pd.DataFrame([{
+        "BondID": 1, "cusip_or_synthetic_id": "TIPS-A", "MaturityDate": "2030-04-15",
+    }]).to_csv(tmp_path / ledger.OPENING_SOURCE, index=False)
+    (tmp_path / ledger.OPENING_METADATA).write_text(json.dumps({
+        "simulation_start_tips_observation": {
+            "index_date": "2026-06-21", "index_ratios": {"TIPS-A": 1.11}, "reference_cpi": 332.08433,
+        },
+    }))
+
+    opening = ledger.build_opening(tmp_path)
+    assert opening["face_total"].item() == pytest.approx(100.0)
+    assert opening["debt_basis_total"].item() == pytest.approx(111.0)

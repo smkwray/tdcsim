@@ -56,6 +56,7 @@ from tdc_shared import (
     SECURITY_TYPES,
 )
 from tdc_validation import validate_events
+from tips_indexation import load_opening_tips_observation, opening_tips_at_simulation_start
 
 from ._json import read_json, sha256_file, write_json
 from ._schema import validate_schema
@@ -823,7 +824,10 @@ def build_runtime_params(
     """Build simulator params from compiled forecast inputs and scenario config."""
 
     inputs = Path(inputs_dir)
-    initial_portfolio = _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv")
+    initial_portfolio = opening_tips_at_simulation_start(
+        _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv"),
+        load_opening_tips_observation(inputs),
+    )
     base_tga = _opening_operating_cash_target(inputs / "tdcsim_operating_cash_path.csv")
     initial_values = _opening_runtime_initial_values(inputs, base_tga=base_tga)
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")
@@ -1389,6 +1393,7 @@ def _source_metadata(baseline: CboBaselinePackage, inputs_dir: Path) -> dict[str
     return {
         "actuals_available_as_of": actuals,
         "opening_state_date": opening,
+        "opening_close_date": str(date_range.get("opening_close_date") or ""),
         "source_vintage": str(baseline.manifest.get("forecast_publication_date") or baseline.package_id),
     }
 
@@ -1401,7 +1406,10 @@ def _validate_opening_alignment(start_date: str, source_metadata: Mapping[str, s
             f"got start_date={start_date}, opening_state_date={opening}"
         )
     actuals = str(source_metadata["actuals_available_as_of"])
-    if actuals > start_date:
+    close = source_metadata.get("opening_close_date")
+    if close and (close > start_date or close > actuals):
+        raise RunnerError("opening_close_date must be at or before the simulation start and publication vintage")
+    if not close and actuals > start_date:
         raise RunnerError(
             f"actuals_available_as_of must not be after simulation.start_date; "
             f"got actuals_available_as_of={actuals}, start_date={start_date}"

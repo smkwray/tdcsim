@@ -1813,6 +1813,8 @@ def _purchase_issues(portfolio, current):
     if marketable['_maturity'].isna().any():
         raise ValueError('Fed purchase book contains an active marketable security without a maturity')
     bills = bill_mask(marketable)
+    ids = fed_purchase_policy.issue_ids(marketable, bills)
+    fed_purchase_policy.validate_issue_terms(marketable, ids, bills)
     nominal_coupons = marketable.loc[marketable['SecurityType'].eq('Fixed') & ~bills]
     # The newest issue in each nominal tenor is on the run. Comparing maturity
     # within each tenor keeps reopening settlement dates out of the comparison.
@@ -1826,10 +1828,7 @@ def _purchase_issues(portfolio, current):
         & (marketable['_maturity'] <= current + pd.DateOffset(months=fed_purchase_policy.COUPON_SECTORS[-1].max_months))
     ].copy()
     eligible['_bill'] = bills.loc[eligible.index]
-    eligible['_issue_id'] = fed_purchase_policy.issue_ids(eligible, eligible['_bill'])
-    terms = eligible[['_issue_id', '_bill', 'SecurityType', '_maturity']].drop_duplicates()
-    if terms['_issue_id'].duplicated().any():
-        raise ValueError('a Fed purchase issue ID has inconsistent security terms')
+    eligible['_issue_id'] = ids.loc[eligible.index]
     issues = {}
     for key, issue in eligible.groupby('_issue_id', sort=True):
         is_bill, security_type, maturity = issue[['_bill', 'SecurityType', '_maturity']].iloc[0]
@@ -4173,9 +4172,10 @@ def run_simulation(
                 & bond_portfolio['CouponRate'].fillna(0.0).le(TGA_FLOOR_TOLERANCE)
                 & bond_portfolio['OriginalMaturityYears'].le(1.0 + TGA_FLOOR_TOLERANCE)
             )
-            bond_portfolio.loc[marketable, 'IssueID'] = fed_purchase_policy.issue_ids(
-                marketable_lots, opening_bills.loc[marketable],
-            )
+            opening_bills = opening_bills.loc[marketable]
+            ids = fed_purchase_policy.issue_ids(marketable_lots, opening_bills)
+            fed_purchase_policy.validate_issue_terms(marketable_lots, ids, opening_bills)
+            bond_portfolio.loc[marketable, 'IssueID'] = ids
             bond_portfolio['HolderSubBucket'] = (
                 bond_portfolio['HolderSubBucket']
                 .fillna('')

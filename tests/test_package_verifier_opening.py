@@ -41,6 +41,7 @@ def _write_rows(path: Path, rows: list[dict]) -> None:
 def _book_row(bond_id, face, maturity, cusip, holder, subbucket="", category="bills") -> dict:
     return {
         "BondID": bond_id, "SecurityType": "Fixed", "IssueDate": "2026-01-02", "MaturityDate": maturity,
+        "OriginalMaturityYears": 2.0 if category == "notes" else 0.5,
         "FaceValue": face, "CouponRate": "0.03" if category == "notes" else "0.0",
         "HolderType": holder, "HolderSubBucket": subbucket, "Status": "Active",
         "MaturityCategory": category, "cusip_or_synthetic_id": cusip,

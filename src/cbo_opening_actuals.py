@@ -18,7 +18,13 @@ from forecast_bundle_builders import (
 
 from issuance_calibration import prestart_rollforward, prestart_settlements
 from ratewall_input_builder import load_soma_cusip_holdings
-from tips_indexation import enrich_opening_tips_from_cpi_detail, load_tips_cpi_detail, opening_tips_to_par
+from simulation_calendar import previous_fedwire_business_day
+from tips_indexation import (
+    enrich_opening_tips_from_cpi_detail,
+    load_tips_cpi_detail,
+    observed_tips_cpi_months,
+    opening_tips_to_par,
+)
 
 SIMULATION_START_DATE = "2026-06-21"
 OPENING_CLOSE_DATE = "2026-06-18"
@@ -151,8 +157,9 @@ def roll_opening_marketables(
     """Reconcile contractual par first, then value the rolled book on the June close."""
     has_tips = book["SecurityType"].eq("TIPS").any()
     detail = load_tips_cpi_detail(tips_cpi_detail) if has_tips else None
+    valuation_date = previous_fedwire_business_day(OPENING_PORTFOLIO_RECORD_DATE).isoformat()
     par_book, ratio_sources = opening_tips_to_par(
-        book, detail=detail, record_date=OPENING_PORTFOLIO_RECORD_DATE,
+        book, detail=detail, valuation_date=valuation_date,
         auctions_path=auctions_query, cusip_column=cusip_column,
     )
     settlements = prestart_settlements(
@@ -192,6 +199,21 @@ def roll_opening_marketables(
         soma_close_debt_base_bil=summary["soma_close_bil"] + soma_indexation,
     )
     for row in tips_diagnostics:
-        row["par_source_date"] = OPENING_PORTFOLIO_RECORD_DATE
+        row["par_source_date"] = valuation_date
         row["par_source_method"] = ratio_sources[row["cusip"]]
+    if has_tips:
+        start, start_metadata, _ = enrich_opening_tips_from_cpi_detail(
+            valued, cpi_detail_path=tips_cpi_detail, index_date=SIMULATION_START_DATE,
+            detail=detail, cusip_column=cusip_column,
+        )
+        start_tips = start.loc[start["SecurityType"].eq("TIPS")]
+        tips_metadata.update(
+            observed_tips_cpi_by_month=observed_tips_cpi_months(detail, anchor_date=OPENING_CLOSE_DATE),
+            simulation_start_tips_observation={
+                "index_date": SIMULATION_START_DATE,
+                "reference_cpi": start_metadata["opening_tips_reference_cpi"],
+                "index_ratios": start_tips.set_index(cusip_column)["IndexRatio"].to_dict(),
+            },
+            simulation_start_tips_adjusted_principal_bil=start_metadata["opening_tips_adjusted_principal_bil"],
+        )
     return OpeningMarketables(valued, summary, diagnostics, tips_metadata, tips_diagnostics)

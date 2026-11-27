@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -36,8 +37,47 @@ def load_tips_cpi_detail(path: str | Path) -> pd.DataFrame:
     return frame
 
 
+def observed_tips_cpi_months(
+    detail: pd.DataFrame, *, anchor_date: str, lag_months: int = 3,
+) -> dict[str, float]:
+    """Read the two lagged CPI months from Treasury's first-of-month reference CPI."""
+    month = pd.Timestamp(anchor_date).replace(day=1)
+    observed = {}
+    for reference_date in (month, month + pd.DateOffset(months=1)):
+        values = detail.loc[detail["index_date"].eq(reference_date), "ref_cpi"].unique()
+        if len(values) != 1 or not np.isfinite(values[0]) or values[0] <= 0:
+            raise ValueError(f"Treasury CPI needs one reference CPI on {reference_date.date()}")
+        lagged_month = reference_date - pd.DateOffset(months=lag_months)
+        observed[lagged_month.date().isoformat()] = float(values[0])
+    return observed
+
+
+def opening_tips_at_simulation_start(
+    portfolio: pd.DataFrame, observation: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Carry the observed close to the start using published TIPS index ratios."""
+    if not observation:
+        return portfolio
+    result = portfolio.copy()
+    tips = result["SecurityType"].eq("TIPS")
+    ratios = result.loc[tips, "IssueID"].map(observation["index_ratios"]).astype(float)
+    if not np.isfinite(ratios).all() or (ratios <= 0).any():
+        raise ValueError("opening TIPS require a published simulation-start index ratio for every issue")
+    result.loc[tips, "IndexRatio"] = ratios
+    result.loc[tips, "AdjustedPrincipal"] = result.loc[tips, "OriginalPrincipal"] * ratios
+    result.loc[tips, "ReferenceCPI_Issue"] = float(observation["reference_cpi"]) / ratios
+    return result
+
+
+def load_opening_tips_observation(inputs: Path) -> dict[str, Any]:
+    path = inputs / "tdcsim_opening_portfolio_metadata.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8")).get("simulation_start_tips_observation", {})
+
+
 def opening_tips_to_par(
-    portfolio: pd.DataFrame, *, detail: pd.DataFrame | None, record_date: str,
+    portfolio: pd.DataFrame, *, detail: pd.DataFrame | None, valuation_date: str,
     auctions_path: str | Path, cusip_column: str,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     """Recover original par from MSPD adjusted principal at its observation date."""
@@ -47,10 +87,10 @@ def opening_tips_to_par(
     if detail is None:
         raise ValueError("recovering TIPS par requires Treasury reference CPI detail")
     cusips = portfolio.loc[tips, cusip_column]
-    source = detail.loc[detail["index_date"].eq(pd.Timestamp(record_date))]
+    source = detail.loc[detail["index_date"].eq(pd.Timestamp(valuation_date))]
     ratios = source.set_index("cusip")["index_ratio"]
     if not ratios.index.is_unique:
-        raise ValueError(f"duplicate TIPS index ratios on {record_date}")
+        raise ValueError(f"duplicate TIPS index ratios on {valuation_date}")
     selected = cusips.map(ratios)
     basis = {cusip: "treasurydirect_index_ratio" for cusip in cusips.unique()}
     missing = set(cusips[selected.isna()])
@@ -59,23 +99,23 @@ def opening_tips_to_par(
         # release. Treasury's index ratio is the daily reference CPI divided by
         # the security's published dated-date reference CPI, rounded to 5 places.
         if source["ref_cpi"].nunique() != 1:
-            raise ValueError(f"TIPS reference CPI is not unique on {record_date}")
+            raise ValueError(f"TIPS reference CPI is not unique on {valuation_date}")
         reference = Decimal(str(source["ref_cpi"].iloc[0]))
         auctions = pd.read_csv(auctions_path, dtype=str, usecols=[
             "cusip", "auction_date", "ref_cpi_on_dated_date",
         ])
         for cusip in missing:
             anchors = auctions.loc[
-                auctions["cusip"].eq(cusip) & auctions["auction_date"].le(record_date),
+                auctions["cusip"].eq(cusip) & auctions["auction_date"].le(valuation_date),
                 "ref_cpi_on_dated_date",
             ].dropna().map(Decimal).unique()
             if len(anchors) != 1 or not anchors[0].is_finite() or anchors[0] <= 0:
-                raise ValueError(f"missing unique published dated-date reference CPI for {cusip} at {record_date}")
+                raise ValueError(f"missing unique published dated-date reference CPI for {cusip} at {valuation_date}")
             ratios.loc[cusip] = float((reference / anchors[0]).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
             basis[cusip] = "treasury_daily_reference_cpi_divided_by_auction_dated_reference_cpi"
         selected = cusips.map(ratios)
     if not np.isfinite(selected).all() or (selected <= 0).any():
-        raise ValueError(f"invalid TIPS index ratios on {record_date}")
+        raise ValueError(f"invalid TIPS index ratios on {valuation_date}")
     adjusted = pd.to_numeric(portfolio.loc[tips, "AdjustedPrincipal"], errors="raise")
     if not np.isfinite(adjusted).all() or (adjusted <= 0).any():
         raise ValueError("MSPD TIPS adjusted principal must be finite and positive")
@@ -176,7 +216,7 @@ def enrich_opening_tips_from_cpi_detail(
         "opening_tips_indexation_accretion_embedded_bil": total_adjusted - total_original,
         "tips_initialization": (
             "treasurydirect_tips_cpi_detail_join_revalues_original_par; "
-            "original_par_recovered_at_mspd_record_date_before_revaluation"
+            "original_par_recovered_at_mspd_fedwire_valuation_date_before_revaluation"
         ),
     }
     return enriched, metadata, diagnostics
@@ -234,6 +274,8 @@ def build_monthly_tips_cpi_path_rows(
     simulation_start_date: str | pd.Timestamp,
     simulation_end_date: str | pd.Timestamp,
     opening_reference_cpi: float,
+    reference_cpi_anchor_date: str | None = None,
+    observed_cpi_by_month: Mapping[str, float] | None = None,
     reference_lag_months: int = 3,
     pricing_horizon_end_date: str | pd.Timestamp | None = None,
     observation_date: str,
@@ -294,6 +336,7 @@ def build_monthly_tips_cpi_path_rows(
         "tdcsim_terminal_extrapolation_beyond_cbo_horizon_final_cbo_cpi_segment_annualized_growth"
     )
     source_status_by_role = {
+        "treasury_observed": "treasurydirect_first_day_reference_cpi_at_tips_lag",
         "cbo_interpolated": "cbo_quarterly_cpi_u_interpolated_to_monthly_tips_nsa_assumption",
         "tdcsim_terminal": (
             f"{terminal_rule}_{terminal_growth_label}_"
@@ -301,6 +344,7 @@ def build_monthly_tips_cpi_path_rows(
         ),
     }
     claim_boundary_by_role = {
+        "treasury_observed": "observed_monthly_cpi_used_in_treasury_daily_reference_cpi",
         "cbo_interpolated": (
             "future_tips_cpi_uses_cbo_cpi_u_monthly_interpolation_not_observed_future_nsa_cpi"
         ),
@@ -308,27 +352,37 @@ def build_monthly_tips_cpi_path_rows(
             "post_cbo_horizon_tips_cpi_is_tdcsim_terminal_extrapolation_not_cbo_cpi_coverage"
         ),
     }
-    anchor_raw = _reference_cpi_for_date_from_monthly(
-        raw_by_month,
-        sim_start,
-        lag_months=reference_lag_months,
-    )
-    scale_factor = float(opening_reference_cpi) / anchor_raw if anchor_raw > 0.0 else 1.0
+    anchor_date = pd.Timestamp(reference_cpi_anchor_date or sim_start)
+    observed = {pd.Timestamp(month): value for month, value in (observed_cpi_by_month or {}).items()}
+    if observed:
+        observed_reference = _reference_cpi_for_date_from_monthly(
+            observed, anchor_date, lag_months=reference_lag_months,
+        )
+        if round(observed_reference, 5) != round(opening_reference_cpi, 5):
+            raise ValueError("observed monthly CPI does not reproduce the opening reference CPI")
+        last_observed_month = max(observed)
+        scale_factor = observed[last_observed_month] / raw_by_month[last_observed_month]
+    else:
+        anchor_raw = _reference_cpi_for_date_from_monthly(raw_by_month, anchor_date, lag_months=reference_lag_months)
+        scale_factor = float(opening_reference_cpi) / anchor_raw if anchor_raw > 0.0 else 1.0
     output: list[dict[str, Any]] = []
     for month in months:
         month_ts = pd.Timestamp(month).normalize()
         cbo_value = raw_by_month[month_ts]
-        horizon_role = "cbo_interpolated" if month_ts <= terminal_anchor_month else "tdcsim_terminal"
+        if month_ts in observed:
+            horizon_role = "treasury_observed"
+        else:
+            horizon_role = "cbo_interpolated" if month_ts <= terminal_anchor_month else "tdcsim_terminal"
         output.append(
             {
                 "schema_version": "tdcsim_tips_cpi_path_v1",
                 "scenario_id": scenario_id,
                 "month": month_ts.date().isoformat(),
                 "cbo_cpi_u_index": cbo_value,
-                "tips_cpi_u_index": cbo_value * scale_factor,
+                "tips_cpi_u_index": observed.get(month_ts, cbo_value * scale_factor),
                 "reference_lag_months": float(reference_lag_months),
                 "interpolation_method": "treasury_daily_linear_reference_cpi",
-                "anchor_date": sim_start.date().isoformat(),
+                "anchor_date": anchor_date.date().isoformat(),
                 "anchor_reference_cpi": float(opening_reference_cpi),
                 "scale_factor": scale_factor,
                 "source_role": "scenario_assumption",
@@ -365,16 +419,23 @@ def build_tips_daily_cpi_lookups_from_monthly_path(
     if rows.empty:
         return ({}, {})
     month_values = _monthly_tips_cpi_map(rows, default_value=default_value)
+    observed_months = set()
+    if "cpi_horizon_role" in rows:
+        observed_months = set(pd.to_datetime(rows.loc[rows["cpi_horizon_role"].eq("treasury_observed"), "month"]))
     cpi_lookup: dict[pd.Timestamp, float] = {}
     ref_lookup: dict[pd.Timestamp, float] = {}
     for value in dates:
         target = pd.Timestamp(value).normalize()
         cpi_lookup[target] = _daily_cpi_for_date_from_monthly(month_values, target)
-        ref_lookup[target] = _reference_cpi_for_date_from_monthly(
+        reference = _reference_cpi_for_date_from_monthly(
             month_values,
             target,
             lag_months=reference_lag_months,
         )
+        lagged_month = target.replace(day=1) - pd.DateOffset(months=reference_lag_months)
+        if {lagged_month, lagged_month + pd.DateOffset(months=1)} <= observed_months:
+            reference = round(reference, 5)
+        ref_lookup[target] = reference
     return cpi_lookup, ref_lookup
 
 
@@ -474,8 +535,9 @@ def _reference_cpi_for_date_from_monthly(
     target = pd.Timestamp(target_date).normalize()
     lagged_month = (target.replace(day=1) - pd.DateOffset(months=int(lag_months))).normalize()
     next_lagged_month = lagged_month + pd.DateOffset(months=1)
-    interpolation_date = lagged_month + pd.Timedelta(days=int(target.day) - 1)
-    return _interpolate_month_pair(month_values, lagged_month, next_lagged_month, interpolation_date)
+    start = _interpolate_month_pair(month_values, lagged_month, next_lagged_month, lagged_month)
+    end = _interpolate_month_pair(month_values, next_lagged_month, next_lagged_month, next_lagged_month)
+    return start + (end - start) * (target.day - 1) / target.days_in_month
 
 
 def _interpolate_month_pair(

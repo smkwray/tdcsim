@@ -115,8 +115,8 @@ def test_coupon_purchase_capacity_and_sellers_follow_issue_id_not_matching_terms
         {**_lot(1, "CB", 70.0, 500, tenor=5), "IssueID": "NOTE-A"},
         {**_lot(2, "Banks", 30.0, 500, tenor=5), "IssueID": "NOTE-A"},
         {**_lot(3, "Foreign", 100.0, 500, tenor=7), "IssueID": "NOTE-B"},
-        _lot(4, "Banks", 100.0, 1400, tenor=5),
-        _lot(5, "Banks", 100.0, 1500, tenor=7),
+        {**_lot(4, "Banks", 100.0, 1400, tenor=5), "IssueID": "NOTE-C"},
+        {**_lot(5, "Banks", 100.0, 1500, tenor=7), "IssueID": "NOTE-D"},
     )
     after, stock, sellers, _, cash, _ = _buy(book, 5.0)
     assert stock == pytest.approx(5)
@@ -126,3 +126,18 @@ def test_coupon_purchase_capacity_and_sellers_follow_issue_id_not_matching_terms
     assert sellers["Banks"] == 0
     assert sellers["Foreign"] == pytest.approx(cash)
     assert after.loc[6, "IssueID"] == "NOTE-B"
+
+
+@pytest.mark.parametrize(("column", "value", "error"), [
+    ("IssueID", " ", "complete issue IDs"),
+    ("CouponRate", 0.012, "inconsistent security terms"),
+])
+def test_coupon_purchase_rejects_incomplete_or_conflicting_issue_identity(column, value, error):
+    book = _book(
+        {**_lot(1, "CB", 70.0, 500, tenor=5), "IssueID": "NOTE-A"},
+        {**_lot(2, "Banks", 30.0, 500, tenor=5), "IssueID": "NOTE-A"},
+        {**_lot(3, "Banks", 100.0, 1400, tenor=5), "IssueID": "NOTE-B"},
+    )
+    book.loc[book["BondID"].eq(2), column] = value
+    with pytest.raises(ValueError, match=error):
+        _buy(book, 5.0)

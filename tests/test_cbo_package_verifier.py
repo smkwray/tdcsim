@@ -842,6 +842,7 @@ def _trust_anchor(lock_path: Path) -> dict:
 
 
 FIXTURE_PRESTART_ROLLFORWARD_ROWS = 35
+FIXTURE_OBSERVED_CPI = {"2026-03-01": 330.213, "2026-04-01": 333.020}
 
 
 def _write_source_opening_book(package: Path) -> None:
@@ -1152,18 +1153,20 @@ def _write_yield_and_frn_rate_paths(package: Path) -> None:
         macro_forecast_rows=macro_rows,
         simulation_start_date="2026-06-21",
         simulation_end_date="2036-09-30",
-        opening_reference_cpi=332.08433,
+        opening_reference_cpi=331.80363,
+        reference_cpi_anchor_date=OPENING_CLOSE_DATE,
+        observed_cpi_by_month=FIXTURE_OBSERVED_CPI,
         reference_lag_months=3,
         pricing_horizon_end_date="2046-10-01",
-        observation_date="2026-02-11",
-        available_date="2026-02-11",
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     real_yield_rows = build_tips_real_yield_path_rows(
         scenario_id="cbo_full_horizon_local_smoke_3m",
         yield_surface_rows=yield_rows,
         tips_cpi_path_rows=tips_cpi_rows,
-        observation_date="2026-02-11",
-        available_date="2026-02-11",
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     _write_csv(package / "forecast_inputs" / "tdcsim_yield_curve_surface.csv", list(yield_rows[0]), yield_rows)
     _write_csv(package / "forecast_inputs" / "tdcsim_frn_rate_path.csv", list(frn_rows[0]), frn_rows)
@@ -1255,10 +1258,16 @@ def _write_source_package(package: Path) -> dict:
     )
     _write_csv(
         package / "sources" / "fiscaldata" / "mspd_table_3_market_2026-05-31.csv",
-        ["record_date", "security_type_desc", "outstanding_amt"],
+        ["record_date", "security_type_desc", "security_class1_desc", "security_class2_desc",
+         "issued_amt", "redeemed_amt", "outstanding_amt"],
         [
             {"record_date": "2026-05-31", "security_type_desc": "Marketable", "outstanding_amt": str(i)}
             for i in range(2000)
+        ] + [
+            {"record_date": "2026-05-31", "security_type_desc": "Marketable",
+             "security_class1_desc": "Inflation-Protected Securities", "security_class2_desc": f"TIPS{i:03d}",
+             "issued_amt": "1600", "redeemed_amt": "-100", "outstanding_amt": "2000"}
+            for i in range(53)
         ],
     )
     _write_csv(
@@ -1297,8 +1306,13 @@ def _write_source_package(package: Path) -> dict:
         ["cusip", "original_issue_date", "index_date", "ref_cpi", "index_ratio"],
         [
             {"cusip": f"TIPS{index:03d}", "original_issue_date": "2026-01-01", "index_date": day,
-             "ref_cpi": "332.08433", "index_ratio": str(4 / 3)}
-            for index in range(53) for day in ("2026-05-31", OPENING_CLOSE_DATE)
+             "ref_cpi": reference, "index_ratio": str(4 / 3)}
+            for index in range(53)
+            for day, reference in (
+                ("2026-05-29", 329.88126), (OPENING_CLOSE_DATE, 331.80363), ("2026-06-21", 332.08433),
+                ("2026-06-01", FIXTURE_OBSERVED_CPI["2026-03-01"]),
+                ("2026-07-01", FIXTURE_OBSERVED_CPI["2026-04-01"]),
+            )
         ],
     )
     _write_csv(
@@ -1637,7 +1651,11 @@ def _roll_fixture_opening_book(package: Path) -> dict:
         tips_cpi_detail=sources / "fiscaldata" / "tips_cpi_data_detail.csv",
     )
     rolled, summary, diagnostics = roll.book, roll.summary, roll.diagnostics
-    rolled[opening_fields].to_csv(opening_path, index=False)
+    rolled["IssueID"] = rolled["cusip_or_synthetic_id"]
+    rolled[[*opening_fields, "IssueID"]].to_csv(opening_path, index=False)
+    _write_json(inputs / "tdcsim_opening_portfolio_metadata.json", {
+        "simulation_start_tips_observation": roll.tips_metadata["simulation_start_tips_observation"],
+    })
 
     dts = opening_cash_reconciliation(sources / DTS_CASH_SOURCE, sources / DTS_FLOWS_SOURCE)
     diagnostics.append({"row_type": "dts_cash_bridge", **dts})
@@ -1683,12 +1701,14 @@ def _roll_fixture_opening_book(package: Path) -> dict:
         "opening_tips_adjusted_principal_bil": 530.0,
         "opening_tips_reconstructed_original_principal_bil": 397.5,
         "opening_tips_indexation_accretion_embedded_bil": 132.5,
-        "opening_tips_reference_cpi": 332.08433,
+        "opening_tips_reference_cpi": 331.80363,
+        "simulation_start_tips_adjusted_principal_bil": 530.0,
         "opening_frn_face_value_bil": 120.0,
         "opening_frn_accrued_interest_bil": 4.0,
         "security_type_totals_bil": security_totals,
         "holder_totals_bil": holder_totals,
         "opening_cb_holdings_bil": holder_totals["CB"],
+        "simulation_start_cb_holdings_bil": holder_totals["CB"],
         "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
     }
 
