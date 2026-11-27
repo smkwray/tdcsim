@@ -24,6 +24,7 @@ from tdc_shared import (
     FRN_DAY_COUNT_BASIS,
     HOLDER_TYPES,
     INTRAGOV_HOLDERS,
+    JOURNAL_MIN_EVENT_BIL,
     MATURITY_CATEGORIES,
     MMF_ADDED_TDC_COLUMNS,
     MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
@@ -744,6 +745,7 @@ def _handoff_append_journal(
     deposit_change=0.0,
     settlement_scope='',
     is_intragovernmental=False,
+    drop_below=TGA_FLOOR_TOLERANCE,
 ):
     if row is not None:
         security_id = _handoff_security_id(row)
@@ -778,7 +780,7 @@ def _handoff_append_journal(
         reserve_change,
         deposit_change,
     )
-    if max(abs(float(value or 0.0)) for value in amounts) <= TGA_FLOOR_TOLERANCE:
+    if max(abs(float(value or 0.0)) for value in amounts) <= drop_below:
         return
     journal = handoff_tables.setdefault('tdcsim_accounting_journal', [])
     journal.append(
@@ -4519,6 +4521,8 @@ def run_simulation(
                     is_intragovernmental=(
                         str(tips_row['HolderType']) in INTRAGOV_HOLDERS
                     ),
+                    # The results count every lot's indexation, so the journal must too.
+                    drop_below=JOURNAL_MIN_EVENT_BIL,
                 )
             if include_tips_inflation_accretion:
                 tips_inflation_accretion_period = indexation_changes.sum()

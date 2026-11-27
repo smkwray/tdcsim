@@ -63,6 +63,10 @@ MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID = [0.00, 0.50, 0.90, 0.95, 0.97, 1.00]
 
 # --- Global Constants ---
 TGA_FLOOR_TOLERANCE = 1.0e-9
+# Smallest accounting-journal event the bounded ledger admits, in USD billions. Remeasurements
+# that the results count every day (TIPS indexation) are journaled down to this size, so a small
+# lot's daily indexation reaches both the results and the journal.
+JOURNAL_MIN_EVENT_BIL = 1.0e-12
 DAYS_PER_YEAR_ACTUAL = 365.25
 FRN_DAY_COUNT_BASIS = 360.0
 

@@ -35,6 +35,7 @@ import pandas as pd
 import holder_targets
 from tdc_shared import (
     HOLDER_TYPES,
+    JOURNAL_MIN_EVENT_BIL,
     INTRAGOV_HOLDERS,
     PREFERENCE_CATEGORIES,
     PRIVATE_SUBBUCKETS,
@@ -2296,7 +2297,7 @@ def _validated_journal_event(row: Mapping[str, Any]) -> dict[str, Any]:
             raise BoundedEvidenceError(f"accounting event is missing {column}")
         normalized[column] = value
         magnitude = max(magnitude, abs(value))
-    if magnitude <= 1e-12:
+    if magnitude <= JOURNAL_MIN_EVENT_BIL:
         raise BoundedEvidenceError("all-zero accounting event is not admissible")
     for column in (
         "period_start",
