@@ -16,7 +16,7 @@ from forecast_bundle_builders import (
     build_primary_deficit_path_rows,
 )
 from sim_engine import run_simulation
-from test_cbo_engine_integration import _minimal_engine_params, _single_period, _write_csv
+from test_cbo_engine_integration import _minimal_engine_params, _single_period, _write_csv, _write_fixture_remittance_path
 
 
 AUCTION_DATE = "2025-05-08"
@@ -30,6 +30,11 @@ PUBLISHED_PRICE_RATIO = 0.98911312
 
 def _auction_forecast_inputs(tmp_path: Path) -> dict[str, Path]:
     periods = _single_period(AUCTION_DATE, ISSUE_DATE)
+    primary_rows = build_primary_deficit_path_rows(
+        scenario_id="baseline",
+        periods=periods,
+        primary_deficit_by_fiscal_year_bil={2025: 0.0},
+    )
     return {
         "debt_stock_path_file": _write_csv(
             tmp_path / "tdcsim_debt_stock_path.csv",
@@ -47,12 +52,9 @@ def _auction_forecast_inputs(tmp_path: Path) -> dict[str, Path]:
         ),
         "primary_deficit_path_file": _write_csv(
             tmp_path / "tdcsim_primary_deficit_path.csv",
-            build_primary_deficit_path_rows(
-                scenario_id="baseline",
-                periods=periods,
-                primary_deficit_by_fiscal_year_bil={2025: 0.0},
-            ),
+            primary_rows,
         ),
+        "fed_remittance_path_file": _write_fixture_remittance_path(tmp_path, primary_rows),
         "operating_cash_path_file": _write_csv(
             tmp_path / "tdcsim_operating_cash_path.csv",
             build_operating_cash_path_rows(

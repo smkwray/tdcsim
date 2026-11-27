@@ -18,6 +18,15 @@ if str(SRC_DIR) not in sys.path:
 
 from scripts.verify_cbo_forecast_package import REQUIRED_FILES, create_package_zip, verify_package
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
+from forecast_bundle_builders import (
+    CBO_REMITTANCE_SOURCE_FILE,
+    DTS_REMITTANCE_SOURCE_FILE,
+    build_fed_remittance_path_rows,
+    build_primary_deficit_path_rows,
+    cbo_remittance_source_fixture,
+    read_dts_fed_earnings,
+)
+from forecast_paths import CBO_FED_REMITTANCE_OPENING_STATUS, CBO_FED_REMITTANCE_STATUS, FED_REMITTANCE_PATH_FILE
 from forecast_input_builder import (
     build_cbo_fiscal_baseline_rows,
     build_cbo_macro_forecast_path_rows,
@@ -27,6 +36,7 @@ from forecast_input_builder import (
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
 from issuance_calibration import SETTLEMENT_CALENDAR, build_issuance_calibration
 from sim_engine import _fiscal_year_close_dates
+from simulation_calendar import build_simulation_calendar
 from issuance_calibration import AUCTION_REQUIRED_COLUMNS
 from test_issuance_rule import _fixture_auctions, _write_auctions
 
@@ -282,7 +292,7 @@ def test_cbo_package_verifier_rejects_remittance_overclaim_with_refreshed_hashes
     )
     _refresh_manifest_hashes(package)
 
-    with pytest.raises(ValueError, match="CB_Remittance must remain blank/NaN"):
+    with pytest.raises(ValueError, match="Fed remittance cash path differs from CB_Remittance"):
         verify_package(package)
 
 
@@ -650,6 +660,8 @@ def _write_valid_package(package: Path) -> Path:
 
     _write_opening_files(package)
     _write_auxiliary_required_files(package)
+    source_package = _write_source_package(package)
+    remittance_by_end = _write_fed_remittance_inputs(package)
     debt_rows = _read_csv(package / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
     run_summaries = {}
     run_rows = {}
@@ -658,6 +670,10 @@ def _write_valid_package(package: Path) -> Path:
     ]["CB"]
     for run_id, run_dir in runs.items():
         rows = _result_rows(debt_rows, opening_cb_holdings=opening_cb_holdings)
+        for row in rows:
+            remittance = remittance_by_end.get(row["Date"], 0.0)
+            row["CBORemittanceCashEffect"] = remittance
+            row["CB_Remittance"] = remittance
         run_rows[run_id] = rows
         _write_csv(package / run_dir / "results_compact.csv", RESULT_COLUMNS, rows)
         summary = _summary(rows)
@@ -667,7 +683,6 @@ def _write_valid_package(package: Path) -> Path:
     _write_csv(package / "exports_baseline" / "final_portfolio_active.csv", ["col"], [{"col": "value"}])
     _write_csv(package / "exports_baseline" / "maturity_ledger.csv", ["col"], [{"col": "value"}])
     _write_net_interest_diagnostic(package, run_rows["baseline"])
-    source_package = _write_source_package(package)
     calibration = build_issuance_calibration(
         package / "sources" / "fiscaldata" / "auctions_query.csv",
         simulation_start_date="2026-06-21",
@@ -950,6 +965,24 @@ def _write_auxiliary_required_files(package: Path) -> None:
             _write_csv(path, ["col"], [{"col": "value"}])
         else:
             _write_json(path, {})
+
+
+def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:
+    inputs = package / "forecast_inputs"
+    splice = {"fiscal_actuals_through": "2026-05-31", "fiscal_year": 2026}
+    periods = build_simulation_calendar("2026-06-21", "2036-09-30", "daily")
+    primary = build_primary_deficit_path_rows(
+        scenario_id="cbo_full_horizon_local_smoke_3m",
+        periods=periods,
+        primary_deficit_by_fiscal_year_bil={year: 0.5 for year in range(2026, 2037)},
+    )
+    remittance = build_fed_remittance_path_rows(
+        primary, splice, read_dts_fed_earnings(package / "sources" / DTS_REMITTANCE_SOURCE_FILE, splice),
+    )
+    _write_csv(inputs / "tdcsim_current_fy_splice.csv", list(splice), [splice])
+    _write_csv(inputs / "tdcsim_primary_deficit_path.csv", list(primary[0]), primary)
+    _write_csv(inputs / FED_REMITTANCE_PATH_FILE, list(remittance[0]), remittance)
+    return {row["period_end"]: row["remittance_bil"] for row in remittance}
 
 
 def _write_cbo_source_fixtures(package: Path) -> None:
@@ -1254,6 +1287,16 @@ def _write_source_package(package: Path) -> dict:
         [{"cusip": f"AUC{index:03d}", **rollforward_fields, **row} for index, row in enumerate(_fixture_auctions())],
         columns=["record_date", *AUCTION_REQUIRED_COLUMNS, "cusip", *rollforward_fields],
     )
+    _write_json(package / "sources" / CBO_REMITTANCE_SOURCE_FILE, cbo_remittance_source_fixture())
+    dts_fed_earnings = {
+        "record_date": "2026-05-29",
+        "table_nbr": "II",
+        "account_type": "Treasury General Account (TGA)",
+        "transaction_type": "Deposits",
+        "transaction_catg": "Federal Reserve Earnings",
+        "transaction_fytd_amt": "5562",
+    }
+    _write_csv(package / "sources" / DTS_REMITTANCE_SOURCE_FILE, list(dts_fed_earnings), [dts_fed_earnings])
     for rel in (
         "opening/tdcsim_initial_portfolio_cohorts.csv",
         "opening/tdcsim_ratewall_input_manifest.json",
@@ -1267,6 +1310,8 @@ def _write_source_package(package: Path) -> dict:
         "fiscaldata/mspd_table_3_market_2026-05-31.csv",
         "treasury/debt_to_penny_public_debt_2026-05-29.csv",
         "treasury/base_curve_2026-06-16.json",
+        CBO_REMITTANCE_SOURCE_FILE,
+        DTS_REMITTANCE_SOURCE_FILE,
     ):
         path = package / "sources" / rel
         source_entries[rel] = {
@@ -1435,11 +1480,11 @@ def _result_rows(debt_rows: list[dict[str, str]], *, opening_cb_holdings: float)
                 if index > 0
                 else "opening_stock_target_match_nonsettling"
             ),
-            "CBORemittanceStatus": "not_modeled_cbo_primary_deficit_embeds_baseline_revenues",
+            "CBORemittanceStatus": CBO_FED_REMITTANCE_STATUS if index > 0 else CBO_FED_REMITTANCE_OPENING_STATUS,
             "CB_TreasuryInterestCashReceived": 0.0,
-            "CB_NetIncome": "" if index > 0 else 0.0,
-            "CB_Remittance": "" if index > 0 else 0.0,
-            "CB_DeferredAsset": "" if index > 0 else 0.0,
+            "CB_NetIncome": "",
+            "CB_Remittance": 0.0,
+            "CB_DeferredAsset": "",
             "CBONetInterestDiagnostic": 0.0,
             "CBOTotalDeficitDiagnostic": 0.0,
             "NetInterestDiagnosticStatus": "cbo_reported_check_only",

@@ -70,6 +70,7 @@ CBO_CONFIG_BLOCK_SCHEMAS = {
         'current_fy_splice_file': None,
         'debt_stock_path_file': None,
         'primary_deficit_path_file': None,
+        'fed_remittance_path_file': None,
         'operating_cash_path_file': None,
         'cash_reconciliation_residual_file': None,
         'macro_forecast_path_file': None,

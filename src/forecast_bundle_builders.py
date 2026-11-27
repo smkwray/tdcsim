@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import csv
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
-from forecast_paths import operating_cash_runtime_role
+from forecast_paths import FED_REMITTANCE_PATH_SCHEMA_VERSION, operating_cash_runtime_role
 from simulation_calendar import SimulationPeriod, is_fedwire_business_day
 
 
@@ -22,6 +25,108 @@ MTS_TABLE_9_NET_INTEREST_SELECTOR = "classification_desc=Net Interest"
 MSPD_TOTAL_NONMARKETABLE_SELECTOR = "security_type_desc=Total Nonmarketable"
 MSPD_TOTAL_PUBLIC_DEBT_SELECTOR = "security_type_desc=Total Public Debt Outstanding"
 DTS_TGA_CLOSING_BALANCE_SELECTOR = "account_type=Treasury General Account (TGA) Closing Balance"
+CBO_REMITTANCE_SOURCE_FILE = "cbo/fed_remittances_table_4_3.json"
+DTS_REMITTANCE_SOURCE_FILE = "fiscaldata/dts_federal_reserve_earnings.csv"
+CBO_REMITTANCE_PDF_SHA256 = "e101aa05f85c93f5c37667015bf8e15a17f618611a8942c58650efe2a4c4ba84"
+
+
+def cbo_remittance_source_fixture() -> dict[str, Any]:
+    """Transcription of the published levels and totals, in USD billions."""
+
+    return {
+        "source_url": "https://www.govinfo.gov/content/pkg/CMR-Y10-00199317/pdf/CMR-Y10-00199317.pdf",
+        "source_sha256": CBO_REMITTANCE_PDF_SHA256,
+        "pdf_page": 102,
+        "printed_page": 94,
+        "table": "4-3",
+        "row": "Federal Reserve remittances",
+        "levels_bil": {
+            str(year): value
+            for year, value in enumerate(
+                ("7.9", "8.6", "9.2", "14.8", "37.9", "93.9", "129.7", "140.5", "152.9", "164.5", "176.4"),
+                start=2026,
+            )
+        },
+        "published_totals_bil": {"2027-2031": "164.3", "2027-2036": "928.4"},
+    }
+
+
+def read_dts_fed_earnings_rows(path: str | Path, fiscal_year: int) -> list[dict[str, str]]:
+    """Read only the fiscal year's DTS Table II Fed earnings observations."""
+
+    start = federal_fiscal_year_start(fiscal_year).isoformat()
+    end = federal_fiscal_year_end(fiscal_year).isoformat()
+    with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        selector = {
+            "table_nbr": "II",
+            "account_type": "Treasury General Account (TGA)",
+            "transaction_type": "Deposits",
+            "transaction_catg": "Federal Reserve Earnings",
+        }
+        if not {*selector, "record_date", "transaction_fytd_amt"} <= set(reader.fieldnames or ()):
+            raise ValueError("DTS Table II source is missing Federal Reserve Earnings columns")
+        return [
+            row for row in reader
+            if all(row[key] == value for key, value in selector.items())
+            and start <= row["record_date"] <= end
+        ]
+
+
+def read_dts_fed_earnings(path: str | Path, splice: Mapping[str, Any]) -> dict[str, str]:
+    """Select the Table II TGA deposit row for the splice's last DTS date."""
+
+    cutoff = _as_date(splice["fiscal_actuals_through"])
+    dts_day = cutoff
+    while not is_fedwire_business_day(dts_day):
+        dts_day -= timedelta(days=1)
+    matches = [
+        row for row in read_dts_fed_earnings_rows(path, int(splice["fiscal_year"]))
+        if row["record_date"] == dts_day.isoformat()
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one DTS Federal Reserve Earnings row on {dts_day}; found {len(matches)}")
+    return matches[0]
+
+
+def build_fed_remittance_path_rows(
+    primary_rows: Sequence[Mapping[str, Any]],
+    splice: Mapping[str, Any],
+    dts_row: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Apply the primary flow's Fedwire-day weights to the fixed remittance levels."""
+
+    amounts = {
+        int(year): Decimal(value) for year, value in cbo_remittance_source_fixture()["levels_bil"].items()
+    }
+    splice_year = int(splice["fiscal_year"])
+    try:
+        fytd_mil = Decimal(dts_row["transaction_fytd_amt"])
+    except (InvalidOperation, TypeError) as exc:
+        raise ValueError("invalid FYTD Federal Reserve Earnings in DTS Table II") from exc
+    if not fytd_mil.is_finite() or fytd_mil < 0:
+        raise ValueError("invalid FYTD Federal Reserve Earnings in DTS Table II")
+    amounts[splice_year] -= fytd_mil / 1_000
+    if amounts[splice_year] < 0:
+        raise ValueError(f"remaining FY{splice_year} Fed remittances are negative")
+    rows = []
+    for primary in primary_rows:
+        year = int(primary["source_fiscal_year"])
+        annual = float(amounts[year])
+        rows.append({
+            "schema_version": FED_REMITTANCE_PATH_SCHEMA_VERSION,
+            "scenario_id": primary["scenario_id"],
+            "period_start": primary["period_start"],
+            "period_end": primary["period_end"],
+            "source_fiscal_year": year,
+            "remittance_bil": annual * float(primary["day_count_weight"]),
+            "annual_or_remaining_remittance_bil": annual,
+            "source_role": "hard_input",
+            "runtime_role": "hard_flow",
+            "source_status": "cbo_table_4_3_net_of_dts_fytd" if year == splice_year else "cbo_table_4_3",
+            "claim_boundary": "fixed_remittance_cash_no_rate_response_or_fed_income_model",
+        })
+    return rows
 
 
 def build_current_fy_splice_row(

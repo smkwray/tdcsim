@@ -77,11 +77,14 @@ from settlement_routes import MmfAddedPosition, TRC_RESULT_COLUMNS, TrcLedger, p
 from tdc_validation import is_coarse_frequency
 from tips_indexation import build_projected_cpi_lookup_from_macro, build_tips_daily_cpi_lookups_from_monthly_path
 from forecast_paths import (
+    CBO_FED_REMITTANCE_OPENING_STATUS,
+    CBO_FED_REMITTANCE_STATUS,
     load_cbo_fiscal_baseline,
     load_cash_reconciliation_residual,
     load_debt_stock_path,
     load_fiscal_incidence_policy,
     load_fed_holdings_path,
+    load_fed_remittance_path,
     load_frn_rate_path,
     load_yield_curve_surface as load_forecast_yield_curve_surface,
     load_macro_forecast_path,
@@ -290,6 +293,7 @@ def _load_cbo_engine_inputs(params, scenario_name):
     required_paths = {
         'debt_stock_path_file': paths.debt_stock_path_file,
         'primary_deficit_path_file': paths.primary_deficit_path_file,
+        'fed_remittance_path_file': paths.fed_remittance_path_file,
         'operating_cash_path_file': paths.operating_cash_path_file,
         'cash_reconciliation_residual_file': paths.cash_reconciliation_residual_file,
         'fiscal_incidence_policy_file': paths.fiscal_incidence_policy_file,
@@ -304,6 +308,11 @@ def _load_cbo_engine_inputs(params, scenario_name):
     )
     primary_deficit = load_primary_deficit_path(
         paths.primary_deficit_path_file,
+        actuals_available_as_of=actuals_available_as_of,
+        allow_lookahead=allow_lookahead,
+    )
+    fed_remittance = load_fed_remittance_path(
+        paths.fed_remittance_path_file,
         actuals_available_as_of=actuals_available_as_of,
         allow_lookahead=allow_lookahead,
     )
@@ -385,6 +394,7 @@ def _load_cbo_engine_inputs(params, scenario_name):
         'scenario_id': funding_cfg.get('scenario_id') or scenario_name,
         'debt_stock': debt_stock,
         'primary_deficit': primary_deficit,
+        'fed_remittance': fed_remittance,
         'operating_cash': operating_cash,
         'cash_residual': cash_residual,
         'fiscal_incidence': fiscal_incidence,
@@ -4070,8 +4080,8 @@ def run_simulation(
     if cbo_funding_mode:
         results.loc[t0, 'CBOFedStockMode'] = 'synthetic_cb_treasury_stock_target_beneficial_holder'
         results.loc[t0, 'CBOFedSettlementScope'] = 'not_applicable_opening_row'
-        results.loc[t0, 'CBORemittanceStatus'] = 'not_modeled_cbo_primary_deficit_embeds_baseline_revenues'
-        results.loc[t0, ['CB_Remittance', 'CB_DeferredAsset']] = np.nan
+        results.loc[t0, 'CBORemittanceStatus'] = CBO_FED_REMITTANCE_OPENING_STATUS
+        results.loc[t0, 'CBORemittanceCashEffect'] = 0.0
     if not bond_portfolio.empty:
         active_bonds_initial = bond_portfolio[bond_portfolio['Status'] == 'Active'].copy()
         active_bonds_initial['DebtBase'] = np.where(active_bonds_initial['SecurityType'] == 'TIPS', active_bonds_initial['AdjustedPrincipal'].fillna(active_bonds_initial['FaceValue']), active_bonds_initial['FaceValue'])
@@ -4130,7 +4140,8 @@ def run_simulation(
     results.loc[t0, ['ReserveChange', 'TDC_Change', 'TGAChange']] = 0.0
     results.loc[t0, 'CB_TreasuryInterestCashReceived'] = 0.0
     if cbo_funding_mode:
-        results.loc[t0, ['CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset']] = np.nan
+        results.loc[t0, ['CB_NetIncome', 'CB_DeferredAsset']] = np.nan
+        results.loc[t0, 'CB_Remittance'] = 0.0
     else:
         results.loc[t0, ['CB_NetIncome', 'CB_Remittance']] = 0.0
     max_existing_id = 0
@@ -4516,6 +4527,16 @@ def run_simulation(
                 'CBO primary deficit path',
             )
             cbo_period_primary_deficit = float(cbo_primary_row['primary_deficit_bil'])
+            cbo_remittance_row = _cbo_period_row(
+                cbo_inputs['fed_remittance'],
+                cbo_scenario_id,
+                prev_date,
+                current_date,
+                'Fed remittance path',
+            )
+            cbo_period_remittance = float(cbo_remittance_row['remittance_bil'])
+            if not payments_open and cbo_period_remittance > 0.0:
+                raise ValueError(f'Fed remittance on {current_date.date()}, a day Fedwire is closed')
             if not payments_open and abs(cbo_period_primary_deficit) > TGA_FLOOR_TOLERANCE:
                 raise ValueError(
                     f'the primary deficit path books {cbo_period_primary_deficit} billion on '
@@ -4540,25 +4561,29 @@ def run_simulation(
         results.loc[current_date, 'PrimaryDeficit'] = gov_spending_period - taxes_period
         fiscal_reserve_change = gov_spending_period - taxes_period
         if cbo_funding_mode:
-            signed_flow = cbo_period_primary_deficit
+            # Remove Fed remittance revenue from ordinary fiscal settlement.
+            fiscal_reserve_change += cbo_period_remittance
             fiscal_deposit_change = (
-                signed_flow * float(cbo_incidence['du_share'])
+                fiscal_reserve_change * float(cbo_incidence['du_share'])
                 if cbo_incidence is not None
                 else 0.0
             )
-            results.loc[current_date, 'CBOPrimaryDeficitFlow'] = signed_flow
+            results.loc[current_date, 'CBOPrimaryDeficitFlow'] = cbo_period_primary_deficit
             results.loc[current_date, 'FiscalIncidenceStatus'] = cbo_fiscal_incidence_status
         else:
             fiscal_deposit_change = (
                 gov_spending_period * float(du_share_spending)
                 - taxes_period * float(du_share_taxes)
             )
-        fiscal_tga_change = taxes_period - gov_spending_period
+        fiscal_tga_change = -fiscal_reserve_change
+        # The two CBO fiscal legs net to -P. Use the original P for financing
+        # to preserve cash needs and their threshold decisions at float precision.
+        net_fiscal_tga_change = -cbo_period_primary_deficit if cbo_funding_mode else fiscal_tga_change
         reserve_change_period += fiscal_reserve_change
         if trc_ledger is not None:
             trc_ledger.record_public_cash('FiscalFlow', fiscal_reserve_change, 'covered_deposit_settled')
         deposit_change_period += fiscal_deposit_change
-        tga_change_period += fiscal_tga_change
+        tga_change_period += net_fiscal_tga_change
         _handoff_append_journal(
             handoff_tables,
             prev_date,
@@ -5015,12 +5040,10 @@ def run_simulation(
         cb_treasury_interest_cash_received_period = interest_paid_by_holder.get('CB', 0.0)
         if cbo_funding_mode:
             cb_net_income_period = np.nan
-            cb_remittance_period = np.nan
+            cb_remittance_period = cbo_period_remittance
             current_deferred_asset = np.nan
-            cb_remit_tga_change = 0.0
-            results.loc[current_date, 'CBORemittanceStatus'] = (
-                'not_modeled_cbo_primary_deficit_embeds_baseline_revenues'
-            )
+            cb_remit_tga_change = cb_remittance_period
+            results.loc[current_date, 'CBORemittanceStatus'] = CBO_FED_REMITTANCE_STATUS
         else:
             prev_deferred_asset = results.loc[prev_date, 'CB_DeferredAsset']
             cb_net_income_period = cb_treasury_interest_cash_received_period - cb_net_expense
@@ -5041,7 +5064,8 @@ def run_simulation(
         results.loc[current_date, 'CB_DeferredAsset'] = current_deferred_asset
         if cbo_funding_mode:
             results.loc[current_date, 'CBORemittanceCashEffect'] = cb_remit_tga_change
-        tga_change_period += cb_remit_tga_change
+        else:
+            tga_change_period += cb_remit_tga_change
         _handoff_append_journal(
             handoff_tables,
             prev_date,
@@ -5057,7 +5081,10 @@ def run_simulation(
             settlement_scope='central_bank_remittance_settlement',
         )
         prev_tga = results.loc[prev_date, 'TGA']
-        tga_change_before_issuance = fiscal_tga_change + debt_service_tga_change + (tga_inflow_secondary_mkt - tga_drain_secondary_mkt) + cb_remit_tga_change + reserve_transfer + money_minting_transfers
+        tga_change_before_issuance = net_fiscal_tga_change + debt_service_tga_change + (tga_inflow_secondary_mkt - tga_drain_secondary_mkt)
+        if not cbo_funding_mode:
+            tga_change_before_issuance += cb_remit_tga_change
+        tga_change_before_issuance = tga_change_before_issuance + reserve_transfer + money_minting_transfers
         projected_tga_pre_issuance = prev_tga + tga_change_before_issuance
         funding_needed = max(0, tga_target - projected_tga_pre_issuance)
         min_issuance_for_floor = max(0, tga_floor - projected_tga_pre_issuance)

@@ -490,3 +490,34 @@ def test_fed_holdings_ramp_must_start_after_the_opening() -> None:
     rows = [{"period_end": "2026-06-21", "cbo_fed_holdings_target_bil": "4000.0"}]
     with pytest.raises(ValueError, match="after the opening"):
         fed_holdings_rows(rows, size_bil=500.0, build=["2026-06-21", "2028-09-30"])
+
+
+def test_family_fed_interest_remittance_uses_cash_paid_and_fiscal_coverage():
+    import pandas as pd
+
+    from tdcsim_cbo.scenario_family_export import _fed_interest_remittance_rows
+
+    payments = pd.DataFrame({
+        "holder_sector": ["CB", "CB", "CB", "Private", "CB", "CB"],
+        "period_end": ["2026-09-30"] * 4 + ["2026-10-01", "2026-06-21"],
+        "payment_type": ["fixed_coupon", "bill_discount", "tips_indexation", "fixed_coupon", "frn_interest", "tips_coupon"],
+        "amount_bil": [5.0, 2.0, 4.0, 3.0, 7.0, 11.0],
+    })
+    results = pd.DataFrame(
+        {"CBORemittanceCashEffect": [0.0, 1.341, 8.6]}, index=["2026-06-21", "2026-09-30", "2026-10-01"]
+    )
+    coverage = [
+        {"coverage_start_exclusive": "2026-06-21", "coverage_end_inclusive": "2026-09-30"},
+        {"coverage_start_exclusive": "2026-09-30", "coverage_end_inclusive": "2026-10-01"},
+    ]
+    rows = _fed_interest_remittance_rows(payments, results, coverage)
+    assert rows[0] == pytest.approx({
+        "treasury_interest_paid_to_fed_bil": 7.0,
+        "fed_remittances_to_tga_bil": 1.341,
+        "treasury_interest_less_fed_remittances_bil": 5.659,
+    })
+    assert rows[1] == pytest.approx({
+        "treasury_interest_paid_to_fed_bil": 7.0,
+        "fed_remittances_to_tga_bil": 8.6,
+        "treasury_interest_less_fed_remittances_bil": -1.6,
+    })

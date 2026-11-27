@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,9 @@ from forecast_bundle_builders import (
 )
 from forecast_input_builder import write_forecast_rows_csv
 from forecast_paths import (
+    CBO_FED_REMITTANCE_STATUS,
+    FED_REMITTANCE_PATH_FILE,
+    FED_REMITTANCE_PATH_SCHEMA_VERSION,
     load_cash_reconciliation_residual,
     load_debt_stock_path,
     load_fed_holdings_path,
@@ -67,6 +71,25 @@ class CboContractRun:
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> Path:
     write_forecast_rows_csv(path, rows)
     return path
+
+
+def _write_fixture_remittance_path(tmp_path, primary_rows, remittance_bil=0.0):
+    return _write_csv(tmp_path / FED_REMITTANCE_PATH_FILE, [
+        {
+            "schema_version": FED_REMITTANCE_PATH_SCHEMA_VERSION,
+            "scenario_id": row["scenario_id"],
+            "period_start": row["period_start"],
+            "period_end": row["period_end"],
+            "source_fiscal_year": row["source_fiscal_year"],
+            "remittance_bil": remittance_bil * row["day_count_weight"],
+            "annual_or_remaining_remittance_bil": remittance_bil,
+            "source_role": "hard_input",
+            "runtime_role": "hard_flow",
+            "source_status": "fixture",
+            "claim_boundary": "fixture",
+        }
+        for row in primary_rows
+    ])
 
 
 def _single_period(period_start: str = "2026-09-20", period_end: str = "2026-09-30") -> list[SimulationPeriod]:
@@ -321,6 +344,7 @@ def _build_temp_forecast_inputs(
     base_cash_balance_bil: float = 800.0,
     cash_residual_bil: float = 0.0,
     signed_primary_flow_bil: float = 40.0,
+    remittance_bil: float = 0.0,
     cbo_net_interest_bil: float = 120.0,
     later_fiscal_years: dict[int, tuple[float, float]] | None = None,
 ) -> dict[str, Path]:
@@ -382,6 +406,7 @@ def _build_temp_forecast_inputs(
     return {
         "debt_stock_path_file": _write_csv(tmp_path / "tdcsim_debt_stock_path.csv", debt_rows),
         "primary_deficit_path_file": _write_csv(tmp_path / "tdcsim_primary_deficit_path.csv", primary_rows),
+        "fed_remittance_path_file": _write_fixture_remittance_path(tmp_path, primary_rows, remittance_bil),
         "operating_cash_path_file": _write_csv(tmp_path / "tdcsim_operating_cash_path.csv", operating_cash_rows),
         "cash_reconciliation_residual_file": _write_csv(
             tmp_path / "tdcsim_cash_reconciliation_residual.csv",
@@ -1520,6 +1545,37 @@ def test_operating_cash_target_and_residual_do_not_resize_required_face_issuance
     )
 
 
+def test_fed_remittance_changes_fiscal_incidence_without_changing_financing(tmp_path: Path) -> None:
+    start, end = "2026-09-20", "2026-09-30"
+    periods = build_simulation_calendar(start, end, "daily")
+    runs = []
+    for remittance in (0.0, 2.338):
+        paths = _build_temp_forecast_inputs(
+            tmp_path / str(remittance), periods=periods, remittance_bil=remittance,
+        )
+        params = _minimal_engine_params(paths)
+        routing_path = Path(__file__).resolve().parents[1] / "trc_routing_open04_v2.json"
+        params["trc_routing"] = json.loads(routing_path.read_text(encoding="utf-8"))
+        results, _ = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+        runs.append(results)
+    baseline, remitting = runs
+    assert remitting["CBORemittanceCashEffect"].sum() == pytest.approx(2.338)
+    assert remitting["TDC_Level"].iloc[-1] - baseline["TDC_Level"].iloc[-1] == pytest.approx(2.31462)
+    assert (
+        remitting.attrs["trc_results"]["TRC_Cumulative"].iloc[-1]
+        - baseline.attrs["trc_results"]["TRC_Cumulative"].iloc[-1]
+    ) == pytest.approx(2.338)
+    for column in ("PrimaryDeficit", "TGA", "NewDebtIssued", "AuctionProceeds", "TotalDebt_Agg"):
+        pd.testing.assert_series_equal(remitting[column], baseline[column], check_exact=True)
+    transfers = [
+        row for row in remitting.attrs["handoff_tables"]["tdcsim_accounting_journal"]
+        if row["leg_type"] == "central_bank_remittance"
+    ]
+    assert sum(row["treasury_cash_change_bil"] for row in transfers) == pytest.approx(2.338)
+    assert all(row["holder_sector"] == "Treasury" and row["counterparty_sector"] == "CB" for row in transfers)
+    assert all(row["deposit_change_bil"] == row["reserve_change_bil"] == 0.0 for row in transfers)
+
+
 def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_path: Path) -> None:
     paths = _build_temp_forecast_inputs(tmp_path, cbo_public_debt_target_bil=1_250.0)
     fed_rows = build_fed_holdings_path_rows(
@@ -1572,7 +1628,7 @@ def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_pat
     assert period["CBOFedSettlementScope"] == "beneficial_holder_with_model_dirty_value_settlement"
     assert period["CBOFedAcquisitionChannel"] == "synthetic_secondary_purchase_to_hit_cbo_stock_path"
     assert period["CBORemittanceCashEffect"] == pytest.approx(0.0)
-    assert period["CBORemittanceStatus"] == "not_modeled_cbo_primary_deficit_embeds_baseline_revenues"
+    assert period["CBORemittanceStatus"] == CBO_FED_REMITTANCE_STATUS
     assert period["DebtHeld_CentralBank"] == pytest.approx(50.0)
     assert period["CBOFedHoldingsTargetError"] == pytest.approx(0.0)
     assert period["DebtHeld_DomesticNonBanks"] == pytest.approx(1_075.0)
