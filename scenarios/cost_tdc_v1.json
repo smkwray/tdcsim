@@ -4,7 +4,7 @@
   "as_of_date": "2026-11-15",
   "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
   "export_holder_stocks": true,
-  "description": "Illustrative issuance-maturity scenarios over the CBO baseline horizon. Treasury moves the bill share of marketable debt up or down by 5 percentage points over the first year. Each issuance change runs three times: without a yield change, to isolate the issuance mix; with the yield change and the change in the bill stock spread across holders in proportion to their bill holdings; and with the yield change and banks and foreign accounts taking up the whole change. Financing cost depends on the issuance mix and the yield; the deposit effect depends on who buys or gives up the bills.",
+  "description": "Illustrative issuance-maturity scenarios over the CBO baseline horizon. Treasury moves the bill share of marketable debt up or down by 5 percentage points over the first year. Each issuance change runs three times: without a yield change, to isolate the issuance mix; with the yield change and the change in the bill stock spread across holders in proportion to their bill holdings; and with the yield change and banks and foreign accounts taking up the change: held to every other holder's baseline bill stock in the shorter case, through auction shares only in the longer case, where banks and foreign accounts hold too few bills for the stock version. Financing cost depends on the issuance mix and the yield; the deposit effect depends on who buys or gives up the bills.",
   "boundaries": [
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "The 10-year yield shift is a stated assumption, not an estimated response to the issuance change",
@@ -150,7 +150,7 @@
     {
       "role": "longer_banks_foreign",
       "scenario_id": "tdcsim_cost_tdc_v1_longer_banks_foreign",
-      "label": "Bill share -5 points, 10-year yield +25 bp, banks and foreign accounts give up the bills",
+      "label": "Bill share -5 points, 10-year yield +25 bp, auction shares shifted so banks and foreign accounts give up the bills",
       "bill_share_change": [
         {
           "date": "2026-06-21",
