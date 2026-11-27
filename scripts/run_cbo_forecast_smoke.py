@@ -1366,7 +1366,7 @@ def load_opening_portfolio(
         source_cusips = source["CUSIP"]
     else:
         source_cusips = pd.Series([""] * len(source), index=source.index)
-    portfolio["_SourceCUSIP"] = source_cusips.astype("string").str.strip()
+    portfolio["IssueID"] = source_cusips.astype("string").str.strip()
     for date_column in (
         "IssueDate",
         "MaturityDate",
@@ -1399,7 +1399,7 @@ def load_opening_portfolio(
     if abs(source_active_debt_base - OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL) > 1e-6:
         raise ValueError("source opening book does not reconcile to May MSPD Table 1 Total Marketable")
     opening = roll_opening_marketables(
-        portfolio, cusip_column="_SourceCUSIP", noncb_weights=manifest_initial["noncb_weights"],
+        portfolio, cusip_column="IssueID", noncb_weights=manifest_initial["noncb_weights"],
         auctions_query=Path(auctions_query), soma_holdings=Path(soma_holdings), tips_cpi_detail=Path(tips_cpi_detail),
     )
     aligned, rollforward, rollforward_diagnostics = opening.book, opening.summary, opening.diagnostics
@@ -1408,9 +1408,9 @@ def load_opening_portfolio(
         frn_daily_indexes_path=frn_daily_indexes,
         opening_date=OPENING_CLOSE_DATE,
         source_available_as_of=ACTUALS_AVAILABLE_AS_OF,
+        cusip_column="IssueID",
     )
     aligned = _apply_opening_coupon_terms(aligned)
-    aligned = aligned.drop(columns=["_SourceCUSIP"], errors="ignore")
     aligned = aligned[BOND_PORTFOLIO_COLS]
     aligned = aligned.astype(PORTFOLIO_DTYPES, errors="ignore")
 

@@ -1803,12 +1803,7 @@ def _purchase_issue_allocations(issues, amount):
 
 
 def _purchase_issues(portfolio, current):
-    """Identify operational issues using the opening book's economic security terms.
-
-    The runtime book carries lot IDs. Regular bills of the same maturity are
-    fungible. Coupon issues and their reopenings share type, maturity and coupon,
-    with spread for FRNs and the original reference CPI for TIPS.
-    """
+    """Identify the distinct outstanding issues eligible for a reserve-management purchase."""
     marketable = portfolio.loc[
         portfolio['Status'].eq('Active') & portfolio['SecurityType'].isin(PUBLIC_MARKETABLE_SECURITY_TYPES)
     ].sort_values('BondID', kind='stable')
@@ -1831,15 +1826,13 @@ def _purchase_issues(portfolio, current):
         & (marketable['_maturity'] <= current + pd.DateOffset(months=fed_purchase_policy.COUPON_SECTORS[-1].max_months))
     ].copy()
     eligible['_bill'] = bills.loc[eligible.index]
-    eligible['_coupon'] = eligible['CouponRate'].where(~eligible['_bill'], 0.0)
-    eligible['_term_detail'] = eligible['FixedSpread'].where(
-        eligible['SecurityType'].eq('FRN'), eligible['ReferenceCPI_Issue'].where(eligible['SecurityType'].eq('TIPS'), 0.0)
-    )
+    eligible['_issue_id'] = fed_purchase_policy.issue_ids(eligible, eligible['_bill'])
+    terms = eligible[['_issue_id', '_bill', 'SecurityType', '_maturity']].drop_duplicates()
+    if terms['_issue_id'].duplicated().any():
+        raise ValueError('a Fed purchase issue ID has inconsistent security terms')
     issues = {}
-    for key, issue in eligible.groupby(
-        ['_bill', 'SecurityType', '_maturity', '_coupon', '_term_detail'], dropna=False, sort=True
-    ):
-        is_bill, security_type, maturity, _, _ = key
+    for key, issue in eligible.groupby('_issue_id', sort=True):
+        is_bill, security_type, maturity = issue[['_bill', 'SecurityType', '_maturity']].iloc[0]
         sector = fed_purchase_policy.purchase_sector(current, maturity, bill=is_bill)
         if sector is None:
             continue
@@ -1858,7 +1851,7 @@ def _purchase_issues(portfolio, current):
             raise ValueError(f'Fed purchase issue {key} has invalid public debt stock')
         issues[key] = {
             'sector': sector, 'public_stock': stock, 'capacity': cap * stock / public_par,
-            'sellers': sellers.index, 'cb': issue.index[cb],
+            'sellers': sellers.index, 'cb': issue.index[cb], 'bill': is_bill, 'security_type': security_type,
         }
     return issues
 
@@ -1908,8 +1901,8 @@ def _transfer_public_marketable_debt_to_cb(
     fed_rows = []
     retired_indices = []
     for key, quantity in allocations.items():
-        is_bill, security_type, _, _, _ = key
         issue = issues[key]
+        is_bill, security_type = issue['bill'], issue['security_type']
         fraction = quantity / issue['public_stock']
         indices = issue['sellers'].append(issue['cb'])
         priced = portfolio.loc[indices].copy()
@@ -1953,6 +1946,7 @@ def _transfer_public_marketable_debt_to_cb(
         lot[scalable] = (
             pd.concat([cb_lots[scalable], sellers[scalable] * fraction]).sum(min_count=1)
         )
+        lot['IssueID'] = key
         lot['IssuePriceRatio'] = lot['IssueProceeds'] / lot['FaceValue']
         lot['DirtyPriceRatio'] = lot['DirtyValue'] / _bond_debt_base(lot)
         if cb_lots.empty:
@@ -2378,12 +2372,11 @@ def _quote_rule_allocations(allocations, *, face_target_mode, issuance_leg, curr
 def _live_frn_accrued_per_face(bond_portfolio, template):
     """Accrued FRN interest per unit face on the live rows of a template's security."""
 
-    rows = bond_portfolio[
-        (bond_portfolio['Status'] == 'Active')
-        & (bond_portfolio['SecurityType'] == 'FRN')
-        & (pd.to_datetime(bond_portfolio['MaturityDate']).dt.normalize() == template['maturity_date'])
-        & ((pd.to_numeric(bond_portfolio['FixedSpread'], errors='coerce') - template['spread']).abs() <= 1e-12)
+    rows = bond_portfolio.loc[
+        bond_portfolio['Status'].eq('Active') & bond_portfolio['SecurityType'].eq('FRN')
     ]
+    ids = fed_purchase_policy.issue_ids(rows, pd.Series(False, index=rows.index))
+    rows = rows.loc[ids.eq(template['security_label'])]
     face = float(pd.to_numeric(rows['FaceValue'], errors='coerce').sum())
     if face <= TGA_FLOOR_TOLERANCE:
         raise ValueError(f"no outstanding FRN maturing {template['maturity_date'].date()} to reopen")
@@ -2415,6 +2408,7 @@ def _opening_issue_registry(bond_portfolio, calendar_rules, opening_date):
         if rows.empty:
             continue
         latest = rows.loc[pd.to_datetime(rows['IssueDate']).idxmax()]
+        issue_id = fed_purchase_policy.issue_ids(rows.loc[[latest.name]], pd.Series(False, index=[latest.name])).iloc[0]
         maturity = pd.Timestamp(latest['MaturityDate']).normalize()
         dated = maturity - relativedelta(years=int(round(tenor)))
         if rule.dated == 'month_end':
@@ -2425,7 +2419,7 @@ def _opening_issue_registry(bond_portfolio, calendar_rules, opening_date):
             'coupon': float(latest['CouponRate'] or 0.0),
             'spread': float(latest['FixedSpread'] or 0.0) if security_type == 'FRN' else 0.0,
             'reference_cpi_issue': float(latest['ReferenceCPI_Issue']) if security_type == 'TIPS' else np.nan,
-            'security_label': f"{security_type.lower()}-{tenor:g}y-{maturity.date()}",
+            'security_label': issue_id,
         }
     return registry
 
@@ -2523,9 +2517,15 @@ def _quote_settlements(
                 & (bond_portfolio['SecurityType'] == 'Fixed')
                 & (pd.to_numeric(bond_portfolio['CouponRate'], errors='coerce').fillna(0.0) <= TGA_FLOOR_TOLERANCE)
                 & (pd.to_datetime(bond_portfolio['MaturityDate']).dt.normalize() == maturity)
+                & ~bond_portfolio.get('IsCashManagementBill', pd.Series(False, index=bond_portfolio.index)).eq(True)
             ]
+            ids = fed_purchase_policy.issue_ids(outstanding, pd.Series(True, index=outstanding.index)).unique()
+            if len(ids) > 1:
+                raise ValueError(f'regular bill reopening on {current.date()} matches distinct issues maturing {maturity.date()}')
+            label = ids[0] if len(ids) else f'bill-{maturity.date()}'
+            issue_registry[key]['security_label'] = label
             extra['is_reopening'] = issue_kind == 'reopening' or not outstanding.empty
-            item.update(extra, maturity_date=maturity, dated_date=current, security_label=f'bill-{maturity.date()}')
+            item.update(extra, maturity_date=maturity, dated_date=current, security_label=label)
             schedule.append(item)
             continue
         if issue_kind == 'new':
@@ -4165,6 +4165,16 @@ def run_simulation(
         except Exception:
             bond_portfolio = pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES)
         if not bond_portfolio.empty:
+            marketable = bond_portfolio['SecurityType'].isin(PUBLIC_MARKETABLE_SECURITY_TYPES)
+            marketable_lots = bond_portfolio.loc[marketable]
+            opening_bills = (
+                bond_portfolio['SecurityType'].eq('Fixed')
+                & bond_portfolio['CouponRate'].fillna(0.0).le(TGA_FLOOR_TOLERANCE)
+                & bond_portfolio['OriginalMaturityYears'].le(1.0 + TGA_FLOOR_TOLERANCE)
+            )
+            bond_portfolio.loc[marketable, 'IssueID'] = fed_purchase_policy.issue_ids(
+                marketable_lots, opening_bills.loc[marketable],
+            )
             bond_portfolio['HolderSubBucket'] = (
                 bond_portfolio['HolderSubBucket']
                 .fillna('')
@@ -4180,13 +4190,12 @@ def run_simulation(
             bond_portfolio = _ensure_tdc_principal_route_columns(bond_portfolio)
             issue_price_missing = bond_portfolio['IssuePriceRatio'].isna() | (bond_portfolio['IssuePriceRatio'] <= TGA_FLOOR_TOLERANCE)
             bond_portfolio.loc[issue_price_missing, 'IssuePriceRatio'] = 1.0
-            non_bill_mask = ~((bond_portfolio['SecurityType'] == 'Fixed') & (bond_portfolio['CouponRate'].fillna(0.0) <= TGA_FLOOR_TOLERANCE) & (bond_portfolio['OriginalMaturityYears'].fillna(np.inf) <= 1.0 + TGA_FLOOR_TOLERANCE))
+            non_bill_mask = ~opening_bills
             issue_proceeds_missing = bond_portfolio['IssueProceeds'].isna() | (bond_portfolio['IssueProceeds'] <= TGA_FLOOR_TOLERANCE)
             bond_portfolio.loc[issue_proceeds_missing & non_bill_mask, 'IssueProceeds'] = bond_portfolio.loc[issue_proceeds_missing & non_bill_mask, 'FaceValue'] * bond_portfolio.loc[issue_proceeds_missing & non_bill_mask, 'IssuePriceRatio']
             issue_yield_missing = bond_portfolio['IssueYieldAtIssue'].isna()
             bond_portfolio.loc[issue_yield_missing & non_bill_mask, 'IssueYieldAtIssue'] = bond_portfolio.loc[issue_yield_missing & non_bill_mask, 'CouponRate']
-            bill_mask = (bond_portfolio['SecurityType'] == 'Fixed') & (bond_portfolio['CouponRate'].fillna(0.0) <= TGA_FLOOR_TOLERANCE) & (bond_portfolio['OriginalMaturityYears'].fillna(np.inf) <= 1.0 + TGA_FLOOR_TOLERANCE)
-            bill_needs_inference = bill_mask & (bond_portfolio['IssueYieldAtIssue'].isna() | bond_portfolio['IssueProceeds'].isna() | (bond_portfolio['IssueProceeds'] >= bond_portfolio['FaceValue'] - 1e-12))
+            bill_needs_inference = opening_bills & (bond_portfolio['IssueYieldAtIssue'].isna() | bond_portfolio['IssueProceeds'].isna() | (bond_portfolio['IssueProceeds'] >= bond_portfolio['FaceValue'] - 1e-12))
             if bill_needs_inference.any():
                 inferred_issue_data = bond_portfolio.loc[bill_needs_inference].apply(lambda row: pd.Series(infer_issue_data_for_loaded_bill(row['FaceValue'], row['OriginalMaturityYears'], row.get('IssueYieldAtIssue'), current_yield_curve_years, current_yield_curve_rates), index=['IssuePriceRatio', 'IssueProceeds', 'IssueYieldAtIssue']), axis=1)
                 bond_portfolio.loc[bill_needs_inference, ['IssuePriceRatio', 'IssueProceeds', 'IssueYieldAtIssue']] = inferred_issue_data.values
@@ -6025,6 +6034,7 @@ def run_simulation(
                         if sec_type == 'Fixed':
                             maturity_category_val = get_maturity_category(mat_yrs, issuance_profile)
                         new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'TDCPrincipalHolderType': holder, 'TDCPrincipalHolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': dated_date_val, 'OriginalDatedDate': dated_date_val, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': adjusted_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': accrued_frn_val, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
+                        new_tranche['IssueID'] = details.get('security_label')
                         if details.get('settlement_kind') == CASH_MANAGEMENT_BILL_KIND:
                             new_tranche['IsCashManagementBill'] = True
                         new_bonds_added_list.append(new_tranche)
@@ -6097,6 +6107,9 @@ def run_simulation(
                     runtime_columns.append('IsCashManagementBill')
                 new_bonds_df = new_bonds_df[runtime_columns]
                 new_bonds_df = new_bonds_df.astype(PORTFOLIO_DTYPES, errors='ignore')
+                marketable = new_bonds_df['SecurityType'].isin(PUBLIC_MARKETABLE_SECURITY_TYPES)
+                marketable_lots = new_bonds_df.loc[marketable]
+                new_bonds_df.loc[marketable, 'IssueID'] = fed_purchase_policy.issue_ids(marketable_lots, bill_mask(marketable_lots))
                 if bounded_handoff:
                     handoff_tables.check_portfolio_rows(
                         len(bond_portfolio),

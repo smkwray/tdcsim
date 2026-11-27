@@ -115,6 +115,7 @@ def test_opening_builder_and_verifier_roll_net_issuance_soma_and_mmf(tmp_path: P
     assert smoke.SIMULATION_START_DATE == START
     assert metadata["opening_close_date"] == "2026-06-18"
     assert portfolio["FaceValue"].sum() == pytest.approx(90 + 55 + 20 + 8 - 45)
+    assert set(portfolio["IssueID"]) == {"N1", "B1", "B2", "OLD-NOTE", "KEEP-BILL"}
     assert portfolio.loc[portfolio["HolderType"].eq("CB"), "FaceValue"].sum() == pytest.approx(17)
     diagnostics = metadata["opening_rollforward_diagnostic_rows"]
     assert diagnostics[0]["mmf_reinvestment_deferred_bil"] == 10

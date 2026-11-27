@@ -48,7 +48,9 @@ def opening_tips_to_par(
         raise ValueError("recovering TIPS par requires Treasury reference CPI detail")
     cusips = portfolio.loc[tips, cusip_column]
     source = detail.loc[detail["index_date"].eq(pd.Timestamp(record_date))]
-    ratios = source.set_index("cusip", verify_integrity=True)["index_ratio"]
+    ratios = source.set_index("cusip")["index_ratio"]
+    if not ratios.index.is_unique:
+        raise ValueError(f"duplicate TIPS index ratios on {record_date}")
     selected = cusips.map(ratios)
     basis = {cusip: "treasurydirect_index_ratio" for cusip in cusips.unique()}
     missing = set(cusips[selected.isna()])
