@@ -21,6 +21,10 @@ Rules:
   excluding field is blank). N-MFP reports value, not par; its principal field is a
   legacy field that N-MFP3 filings leave blank.
 - Maturity: the MSPD maturity date, else the filing's final legal maturity.
+- Coverage: every selected filing must carry a complete schedule. Each floating-rate note
+  outstanding in MSPD at a report month-end that no fund holds gets an explicit zero row
+  (class source "mspd_outstanding_not_held"), so a missing row means missing coverage,
+  never zero holdings.
 
 Usage:
   python -I scripts/extract_sec_nmfp_mmf_holdings.py \
@@ -84,7 +88,9 @@ def _tsv(archive: zipfile.ZipFile, name: str, columns: list[str]) -> pd.DataFram
     return pd.read_csv(archive.open(name), sep="\t", dtype=str, usecols=columns, low_memory=False)
 
 
-def _mspd_cusips(path: Path, month_ends: list[pd.Timestamp]) -> pd.DataFrame:
+def _mspd_cusips(path: Path, month_ends: list[pd.Timestamp]) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Return MSPD class and maturity by CUSIP, and the FRNs outstanding at each month-end."""
+
     mspd = pd.read_csv(path, dtype=str)
     record = pd.to_datetime(mspd["record_date"])
     missing = [day.date().isoformat() for day in month_ends if day not in set(record)]
@@ -106,7 +112,14 @@ def _mspd_cusips(path: Path, month_ends: list[pd.Timestamp]) -> pd.DataFrame:
     ).drop_duplicates()
     if cusips["cusip"].duplicated().any():
         raise ValueError(f"{path.name} gives a CUSIP two classes or maturities")
-    return cusips.set_index("cusip")
+    outstanding = mspd.loc[
+        mspd["security_class1_desc"].eq("Floating Rate Notes") & pd.to_numeric(mspd["outstanding_amt"], errors="coerce").gt(0)
+    ]
+    frns = {
+        day.date().isoformat(): sorted(set(outstanding.loc[pd.to_datetime(outstanding["record_date"]).eq(day), "security_class2_desc"]))
+        for day in month_ends
+    }
+    return cusips.set_index("cusip"), frns
 
 
 def _read_filings(zips: list[Path], months: set[str], filed_through: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -184,12 +197,15 @@ def extract(
         raise ValueError(f"empty month range {first_month}..{last_month}")
     months = {period.strftime("%Y-%m") for period in month_index}
     month_ends = [period.to_timestamp(how="end").normalize() for period in month_index]
-    cusips = _mspd_cusips(mspd_table_3_market, month_ends)
+    cusips, outstanding_frns = _mspd_cusips(mspd_table_3_market, month_ends)
     sub, schedule = _read_filings(sorted(zips, key=lambda path: path.name), months, pd.Timestamp(filed_through))
     absent = sorted(months - set(sub["month"]))
     if absent:
         raise ValueError(f"the zips hold no N-MFP filing for report months {absent}")
     chosen = sub.loc[sub["selected"], ["ACCESSION_NUMBER", "zip", "fund_id", "month", "feeder", "complete"]]
+    incomplete = chosen.loc[~chosen["complete"]]
+    if not incomplete.empty:
+        raise ValueError(f"selected filings without a complete schedule: {sorted(incomplete['ACCESSION_NUMBER'])}")
     held = schedule.merge(chosen, on=["ACCESSION_NUMBER", "zip"], how="inner")
     treasury = _classify(held, cusips)
     feeders = treasury.loc[treasury["feeder"]]
@@ -204,7 +220,25 @@ def extract(
     ).reset_index()
     if holdings.duplicated(["report_date", "cusip"]).any():
         raise ValueError("one CUSIP is typed as two security classes in one report month")
-    holdings = holdings.sort_values(["report_date", "security_class", "cusip"]).reset_index(drop=True)
+    held_pairs = set(zip(holdings["report_date"].dt.date.astype(str), holdings["cusip"]))
+    zeros = pd.DataFrame(
+        [
+            {
+                "report_date": pd.Timestamp(day),
+                "cusip": cusip,
+                "security_class": "frn",
+                "maturity_date": cusips.loc[cusip, "maturity_date"],
+                "value_bil": 0.0,
+                "class_source": "mspd_outstanding_not_held",
+                "series_count": 0,
+            }
+            for day, frns in outstanding_frns.items()
+            for cusip in frns
+            if (day, cusip) not in held_pairs
+        ],
+        columns=list(holdings.columns),
+    )
+    holdings = pd.concat([holdings, zeros], ignore_index=True).sort_values(["report_date", "security_class", "cusip"]).reset_index(drop=True)
     holdings["report_date"] = holdings["report_date"].dt.date.astype(str)
     holdings["maturity_date"] = holdings["maturity_date"].dt.date.astype("string").fillna("")
     by_month = direct.groupby(["month", "class_source"])["value_bil"].sum().unstack(fill_value=0.0)
@@ -235,6 +269,7 @@ def extract(
             ]
             for month, group in sub.loc[sub["selected"]].groupby("month")
         },
+        "frn_zero_rows_by_month": {day: int(zeros["report_date"].eq(pd.Timestamp(day)).sum()) for day in outstanding_frns},
         "rows": int(len(holdings)),
     }
     return holdings[OUTPUT_COLUMNS], provenance

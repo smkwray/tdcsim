@@ -100,6 +100,9 @@ NMFP_MIX_BUCKETS = ("total", "bills", "frn", "coupon_le397")
 # supply: four two-year FRNs, each a new issue and two reopenings, measured on N-MFP
 # month-ends through April 2026.
 FRN_AUCTION_SHARE_WINDOW = ("2025-04-01", "2026-03-31")
+# Each two-year FRN is a new issue and two monthly reopenings, in this order.
+FRN_TRANCHE_REOPENING_FLAGS = ("No", "Yes", "Yes")
+FRN_NEW_ISSUE_TERM = "2-Year"
 OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
 # WAMEST records each sector's Financial Accounts level basis. A market value (an LM series,
 # as for foreign holders) converts to par with its group's factor. Any other level (the FL
@@ -497,10 +500,20 @@ def calibrate_mmf_frn_auction_share(holdings: pd.DataFrame, auctions_path: Path)
     therefore one observation: money-fund holdings at the month-end one month after its
     last tranche, over the public amount accepted (total less SOMA) across its tranches.
     The share is the amount-weighted mean of the observations.
+
+    An FRN must show exactly that tranche structure with positive public amounts, so a
+    dropped or duplicated tranche cannot move its denominator or measurement month. The
+    extract must cover the FRN in the measurement month: a zero there is a verified zero
+    (the producer writes one for every outstanding FRN no fund holds), and a missing row
+    is missing coverage.
     """
 
     auctions = pd.read_csv(auctions_path, dtype=str)
-    missing = [column for column in ("cusip", "issue_date", "floating_rate", "total_accepted", "soma_accepted") if column not in auctions]
+    columns = (
+        "cusip", "issue_date", "maturity_date", "floating_rate", "reopening", "original_issue_date",
+        "security_term", "total_accepted", "soma_accepted",
+    )
+    missing = [column for column in columns if column not in auctions]
     if missing:
         raise ValueError(f"{auctions_path.name} lacks FRN auction columns {missing}")
     frns = auctions.loc[auctions["floating_rate"].eq("Yes")].assign(issue=pd.to_datetime(auctions["issue_date"], errors="coerce"))
@@ -515,15 +528,30 @@ def calibrate_mmf_frn_auction_share(holdings: pd.DataFrame, auctions_path: Path)
         tranches = frns.loc[frns["cusip"].eq(cusip)].sort_values("issue")
         if not tranches["issue"].between(start, end).all():
             raise ValueError(f"FRN {cusip} has tranches outside the calibration window {FRN_AUCTION_SHARE_WINDOW}")
+        new_issue = tranches["issue"].iloc[0]
+        if (
+            tuple(tranches["reopening"]) != FRN_TRANCHE_REOPENING_FLAGS
+            or tranches["issue"].duplicated().any()
+            or tranches["maturity_date"].nunique() != 1
+            or tranches["security_term"].iloc[0] != FRN_NEW_ISSUE_TERM
+            or not pd.to_datetime(tranches["original_issue_date"].iloc[1:], errors="coerce").eq(new_issue).all()
+        ):
+            raise ValueError(
+                f"FRN {cusip} is not a {FRN_NEW_ISSUE_TERM} new issue and two reopenings of it: "
+                f"{list(zip(tranches['issue_date'], tranches['reopening']))}"
+            )
         accepted = pd.to_numeric(tranches["total_accepted"], errors="coerce")
         soma = pd.to_numeric(tranches["soma_accepted"], errors="coerce")
-        if accepted.isna().any() or soma.isna().any():
-            raise ValueError(f"{auctions_path.name} lacks accepted amounts for a tranche of FRN {cusip}")
-        public = float((accepted - soma).sum()) / 1e9
+        public_by_tranche = (accepted - soma) / 1e9
+        if not (public_by_tranche > 0.0).all():
+            raise ValueError(f"{auctions_path.name} lacks a positive public amount for a tranche of FRN {cusip}")
+        public = float(public_by_tranche.sum())
         measured = (tranches["issue"].iloc[-1] + pd.offsets.MonthEnd(0) + pd.offsets.MonthEnd(1)).date().isoformat()
         if measured not in report_dates:
             raise ValueError(f"N-MFP holdings have no report at {measured}, a month after FRN {cusip}'s last tranche")
-        held = float(filed.get((measured, cusip), 0.0))
+        if (measured, cusip) not in filed.index:
+            raise ValueError(f"N-MFP holdings at {measured} do not cover FRN {cusip}; a missing row is not a zero")
+        held = float(filed[(measured, cusip)])
         observations.append(
             {
                 "cusip": cusip,
@@ -573,7 +601,9 @@ def _apply_mmf_frn_holdings(candidate_rows: list[dict], targets: dict[str, float
     by_cusip = {}
     for cusip, items in sorted(frn_items.items()):
         before = held(items, MMF_OPENING_ROUTE)
-        target = targets.get(cusip, 0.0)
+        if cusip not in targets:
+            raise ValueError(f"N-MFP money-fund holdings do not cover FRN {cusip}; a missing row is not a zero")
+        target = targets[cusip]
         noncb = sum(held(items, route) for route in NONCB_OPENING_ROUTES)
         if target > noncb + tolerance:
             raise ValueError(f"money funds filed {target:.6f} bn of {cusip}, more than its non-Fed outstanding {noncb:.6f} bn")
