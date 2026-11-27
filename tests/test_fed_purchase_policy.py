@@ -109,3 +109,20 @@ def test_coupon_fallback_only_after_bills_exhausted_and_exclusions_apply():
     with pytest.raises(RuntimeError, match=r"capacity exhausted.*shortfall=12.500000000000"):
         _buy(book, 100.0)
     pd.testing.assert_frame_equal(book, before)
+
+def test_coupon_purchase_capacity_and_sellers_follow_issue_id_not_matching_terms():
+    book = _book(
+        {**_lot(1, "CB", 70.0, 500, tenor=5), "IssueID": "NOTE-A"},
+        {**_lot(2, "Banks", 30.0, 500, tenor=5), "IssueID": "NOTE-A"},
+        {**_lot(3, "Foreign", 100.0, 500, tenor=7), "IssueID": "NOTE-B"},
+        _lot(4, "Banks", 100.0, 1400, tenor=5),
+        _lot(5, "Banks", 100.0, 1500, tenor=7),
+    )
+    after, stock, sellers, _, cash, _ = _buy(book, 5.0)
+    assert stock == pytest.approx(5)
+    assert after.loc[1, "FaceValue"] == pytest.approx(70)
+    assert after.loc[2, "FaceValue"] == pytest.approx(30)
+    assert after.loc[3, "FaceValue"] == pytest.approx(95)
+    assert sellers["Banks"] == 0
+    assert sellers["Foreign"] == pytest.approx(cash)
+    assert after.loc[6, "IssueID"] == "NOTE-B"

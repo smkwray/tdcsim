@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -59,7 +60,13 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
     assert opening["prestart_matured_rows"] > 0
     assert opening["prestart_rollforward_rows"] > 0
     assert opening["opening_rollforward_status"] == "actual_settlement_face_reconciled_through_opening_close"
-    assert opening["opening_rollforward_debt_base_delta_bil"] == pytest.approx(117.913081915642)
+    with (bundle.inputs_dir / "tdcsim_opening_rollforward_diagnostics.csv").open(newline="") as handle:
+        summary, = [row for row in csv.DictReader(handle) if row["row_type"] == "summary"]
+    net_par = float(summary["face_delta_bil"])
+    revaluation = float(summary["opening_tips_indexation_bil"]) - float(summary["source_tips_indexation_bil"])
+    assert net_par == pytest.approx(117.913081915642)
+    assert revaluation == pytest.approx(10.914079601088)
+    assert opening["opening_rollforward_debt_base_delta_bil"] == pytest.approx(net_par + revaluation)
     assert opening["opening_cb_holdings_bil"] == pytest.approx(4487.31889707172)
     assert manifest["opening_portfolio_construction"]["opening_tips_reference_cpi"] > 300.0
     assert "treasurydirect_tips_cpi_detail_join" in (

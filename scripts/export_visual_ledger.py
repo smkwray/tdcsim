@@ -222,7 +222,10 @@ def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame
         key = (kind, pd.Timestamp(maturity), round(float(coupon), 9))
         lookup.setdefault(key, set()).add(security_id)
     out = issues.copy()
+    identified = set(opening["security_id"]) | set(issues.loc[~issues["is_reopening"], "security_id"])
     for index, row in issues.loc[issues["is_reopening"]].iterrows():
+        if row["security_id"] in identified:
+            continue
         key = (row["security_type"], pd.Timestamp(row["maturity_date"]), round(float(row["coupon_rate"]), 9))
         matches = lookup.get(key)
         if not matches:
@@ -249,11 +252,12 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     )
     if not book["kind"].isin(("bill", "note", "bond", "TIPS", "FRN")).all():
         raise SystemExit("opening portfolio contains an unclassifiable security")
-    # Rows not in the source book are the pre-start rollforward's reinvestment in Treasury
-    # issues settling before the opening; the run's rollforward diagnostics name their CUSIPs.
-    rollforward = pd.read_csv(run_dir / ROLLFORWARD, low_memory=False)
-    added = rollforward[rollforward["row_type"] == "replacement"].set_index("replacement_bond_id")["replacement_cusip"]
-    book["security_id"] = book["cusip_or_synthetic_id"].fillna(book["BondID"].map(added))
+    if "IssueID" in book and book["IssueID"].notna().all():
+        book["security_id"] = book["IssueID"]
+    else:
+        rollforward = pd.read_csv(run_dir / ROLLFORWARD, low_memory=False)
+        added = rollforward[rollforward["row_type"] == "replacement"].set_index("replacement_bond_id")["replacement_cusip"]
+        book["security_id"] = book["cusip_or_synthetic_id"].fillna(book["BondID"].map(added))
     if book["security_id"].isna().any():
         raise SystemExit("an opening row is neither in the source book nor a pre-start rollforward replacement")
     book["holder"] = [holder_column(h, s) for h, s in zip(book["HolderType"], book["HolderSubBucket"])]

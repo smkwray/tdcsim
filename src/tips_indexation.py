@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -35,20 +36,65 @@ def load_tips_cpi_detail(path: str | Path) -> pd.DataFrame:
     return frame
 
 
+def opening_tips_to_par(
+    portfolio: pd.DataFrame, *, detail: pd.DataFrame | None, record_date: str,
+    auctions_path: str | Path, cusip_column: str,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Recover original par from MSPD adjusted principal at its observation date."""
+    tips = portfolio["SecurityType"].eq("TIPS")
+    if not tips.any():
+        return portfolio, {}
+    if detail is None:
+        raise ValueError("recovering TIPS par requires Treasury reference CPI detail")
+    cusips = portfolio.loc[tips, cusip_column]
+    source = detail.loc[detail["index_date"].eq(pd.Timestamp(record_date))]
+    ratios = source.set_index("cusip")["index_ratio"]
+    if not ratios.index.is_unique:
+        raise ValueError(f"duplicate TIPS index ratios on {record_date}")
+    selected = cusips.map(ratios)
+    basis = {cusip: "treasurydirect_index_ratio" for cusip in cusips.unique()}
+    missing = set(cusips[selected.isna()])
+    if missing:
+        # The CPI releases may omit a just-issued CUSIP until the next monthly
+        # release. Treasury's index ratio is the daily reference CPI divided by
+        # the security's published dated-date reference CPI, rounded to 5 places.
+        if source["ref_cpi"].nunique() != 1:
+            raise ValueError(f"TIPS reference CPI is not unique on {record_date}")
+        reference = Decimal(str(source["ref_cpi"].iloc[0]))
+        auctions = pd.read_csv(auctions_path, dtype=str, usecols=[
+            "cusip", "auction_date", "ref_cpi_on_dated_date",
+        ])
+        for cusip in missing:
+            anchors = auctions.loc[
+                auctions["cusip"].eq(cusip) & auctions["auction_date"].le(record_date),
+                "ref_cpi_on_dated_date",
+            ].dropna().map(Decimal).unique()
+            if len(anchors) != 1 or not anchors[0].is_finite() or anchors[0] <= 0:
+                raise ValueError(f"missing unique published dated-date reference CPI for {cusip} at {record_date}")
+            ratios.loc[cusip] = float((reference / anchors[0]).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
+            basis[cusip] = "treasury_daily_reference_cpi_divided_by_auction_dated_reference_cpi"
+        selected = cusips.map(ratios)
+    if not np.isfinite(selected).all() or (selected <= 0).any():
+        raise ValueError(f"invalid TIPS index ratios on {record_date}")
+    adjusted = pd.to_numeric(portfolio.loc[tips, "AdjustedPrincipal"], errors="raise")
+    if not np.isfinite(adjusted).all() or (adjusted <= 0).any():
+        raise ValueError("MSPD TIPS adjusted principal must be finite and positive")
+    result = portfolio.copy()
+    result.loc[tips, "FaceValue"] = adjusted / selected
+    result.loc[tips, "OriginalPrincipal"] = result.loc[tips, "FaceValue"]
+    result.loc[tips, "IndexRatio"] = selected
+    return result, basis
+
+
 def enrich_opening_tips_from_cpi_detail(
     portfolio: pd.DataFrame,
     *,
     cpi_detail_path: str | Path,
     index_date: str | pd.Timestamp,
+    detail: pd.DataFrame | None = None,
     cusip_column: str = "_SourceCUSIP",
 ) -> tuple[pd.DataFrame, dict[str, Any], list[dict[str, Any]]]:
-    """Set opening TIPS original par and index ratios from TreasuryDirect detail.
-
-    The input opening cohort book is already scaled to MSPD adjusted principal.
-    This helper preserves that adjusted stock and reconstructs source-backed
-    original par as ``AdjustedPrincipal / IndexRatio``.
-    """
-
+    """Value original TIPS par at the opening index date."""
     if cusip_column not in portfolio.columns:
         raise ValueError(f"opening portfolio must include {cusip_column!r} for TIPS enrichment")
     enriched = portfolio.copy()
@@ -56,7 +102,8 @@ def enrich_opening_tips_from_cpi_detail(
     if not tips_mask.any():
         return enriched, _empty_tips_metadata(cpi_detail_path, index_date), []
 
-    detail = load_tips_cpi_detail(cpi_detail_path)
+    if detail is None:
+        detail = load_tips_cpi_detail(cpi_detail_path)
     target_date = pd.Timestamp(index_date).normalize()
     detail_on_date = detail.loc[detail["index_date"].eq(target_date)].copy()
     if detail_on_date.empty:
@@ -83,10 +130,12 @@ def enrich_opening_tips_from_cpi_detail(
         if index_ratio <= 0.0:
             raise ValueError(f"TIPS CPI detail has nonpositive index_ratio for {cusip}: {index_ratio}")
         source_ref_cpi = float(source["ref_cpi"])
-        adjusted = float(pd.to_numeric(enriched.at[idx, "AdjustedPrincipal"], errors="coerce"))
-        original = adjusted / index_ratio
+        original = float(enriched.at[idx, "FaceValue"])
+        if not np.isfinite(original) or original <= 0:
+            raise ValueError(f"TIPS {cusip} has invalid original par")
+        adjusted = original * index_ratio
         reference_cpi_issue = source_ref_cpi / index_ratio
-        enriched.at[idx, "FaceValue"] = original
+        enriched.at[idx, "AdjustedPrincipal"] = adjusted
         enriched.at[idx, "OriginalPrincipal"] = original
         enriched.at[idx, "ReferenceCPI_Issue"] = reference_cpi_issue
         enriched.at[idx, "IndexRatio"] = index_ratio
@@ -126,8 +175,8 @@ def enrich_opening_tips_from_cpi_detail(
         "opening_tips_reconstructed_original_principal_bil": total_original,
         "opening_tips_indexation_accretion_embedded_bil": total_adjusted - total_original,
         "tips_initialization": (
-            "treasurydirect_tips_cpi_detail_join_preserves_mspd_adjusted_principal; "
-            "opening_original_principal_reconstructed_as_adjusted_principal_divided_by_source_index_ratio"
+            "treasurydirect_tips_cpi_detail_join_revalues_original_par; "
+            "original_par_recovered_at_mspd_record_date_before_revaluation"
         ),
     }
     return enriched, metadata, diagnostics

@@ -3,7 +3,7 @@
 
 # --- Core Columns ---
 BOND_PORTFOLIO_COLS = [
-    'BondID', 'SecurityType', 'IssueDate', 'MaturityDate',
+    'BondID', 'IssueID', 'SecurityType', 'IssueDate', 'MaturityDate',
     'DatedDate', 'OriginalDatedDate', 'FirstInterestPaymentDate', 'InterestPaymentFrequency',
     'OriginalMaturityYears', 'FaceValue', 'CouponRate', 'HolderType', 'HolderSubBucket',
     'TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket', 'Status',
@@ -69,6 +69,7 @@ FRN_DAY_COUNT_BASIS = 360.0
 # --- Data Types ---
 PORTFOLIO_DTYPES = {
     'BondID': 'Int64',
+    'IssueID': 'string',
     'SecurityType': 'string',
     'IssueDate': 'datetime64[ns]',
     'MaturityDate': 'datetime64[ns]',

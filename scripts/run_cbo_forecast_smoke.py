@@ -58,6 +58,7 @@ from cbo_opening_actuals import (
     build_opening_fy_splice,
     dts_fiscal_selectors,
     opening_cash_reconciliation,
+    roll_opening_marketables,
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
@@ -70,6 +71,7 @@ from forecast_bundle_builders import (
     build_operating_cash_path_rows,
     build_primary_deficit_path_rows,
     calculate_public_debt_bridge_components,
+    opening_cbo_public_debt_bil,
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
@@ -92,10 +94,7 @@ from issuance_calibration import (
     PRESTART_ROLLFORWARD_RULE,
     build_issuance_calibration,
     engine_rule_profile,
-    prestart_rollforward,
-    prestart_settlements,
 )
-from ratewall_input_builder import load_soma_cusip_holdings
 from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _fiscal_year_close_dates, run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar, previous_securities_business_day
 from tdc_shared import (
@@ -108,7 +107,6 @@ from tdcsim_cbo.bounded_output import BoundedResourceLimits, BoundedScenarioEvid
 from tips_indexation import (
     build_monthly_tips_cpi_path_rows,
     build_tips_real_yield_path_rows,
-    enrich_opening_tips_from_cpi_detail,
 )
 
 
@@ -414,9 +412,10 @@ def build_forecast_bundle(
         scenario_id=SCENARIO_ID,
         periods=periods,
         opening_state_date=OPENING_STATE_DATE,
-        opening_cbo_federal_debt_held_public_bil=(
-            OPENING_CBO_FEDERAL_DEBT_HELD_PUBLIC_BIL
-            + opening_portfolio_metadata["opening_rollforward_debt_base_delta_bil"]
+        opening_cbo_federal_debt_held_public_bil=opening_cbo_public_debt_bil(
+            _portfolio_total_debt_base(initial_portfolio),
+            bridge["public_nonmarketable_treasury_bil"],
+            bridge["non_treasury_and_definition_residual_bil"],
         ),
         cbo_fy_end_public_debt_targets_bil={
             int(row["fiscal_year"]): float(row["debt_held_public_end_bil"])
@@ -802,6 +801,8 @@ def build_manifest(
                 "debt_held_public_end_bil": float(fy2026["debt_held_public_end_bil"]),
             },
             "current_fy_splice": {
+                "source_status": current_fy_splice["source_status"],
+                "claim_boundary": current_fy_splice["claim_boundary"],
                 "actual_total_deficit_fytd_bil": float(current_fy_splice["actual_total_deficit_fytd_bil"]),
                 "actual_net_interest_fytd_bil": float(current_fy_splice["actual_net_interest_fytd_bil"]),
                 "actual_primary_deficit_fytd_bil": float(
@@ -1366,7 +1367,7 @@ def load_opening_portfolio(
         source_cusips = source["CUSIP"]
     else:
         source_cusips = pd.Series([""] * len(source), index=source.index)
-    portfolio["_SourceCUSIP"] = source_cusips.astype("string").str.strip()
+    portfolio["IssueID"] = source_cusips.astype("string").str.strip()
     for date_column in (
         "IssueDate",
         "MaturityDate",
@@ -1395,42 +1396,27 @@ def load_opening_portfolio(
     portfolio["Status"] = portfolio["Status"].fillna("Active")
     if not portfolio["Status"].astype(str).eq("Active").all():
         raise ValueError("opening source book contains non-active rows")
-    settlements = prestart_settlements(
-        auctions_query, record_date=record_date, opening_close_date=OPENING_CLOSE_DATE
-    )
-    soma_date, soma = load_soma_cusip_holdings(Path(soma_holdings))
-    if soma_date != SOMA_SNAPSHOT_DATE:
-        raise ValueError(f"opening SOMA snapshot must be dated {SOMA_SNAPSHOT_DATE}, found {soma_date}")
-    aligned, rollforward, rollforward_diagnostics = prestart_rollforward(
-        portfolio,
-        settlements,
-        opening_close_date=OPENING_CLOSE_DATE,
-        cusip_column="_SourceCUSIP",
-        noncb_weights=manifest_initial["noncb_weights"],
-        soma=soma,
-        soma_as_of_date=soma_date,
-    )
     source_active_debt_base = _portfolio_total_debt_base(portfolio)
     if abs(source_active_debt_base - OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL) > 1e-6:
         raise ValueError("source opening book does not reconcile to May MSPD Table 1 Total Marketable")
-    aligned, tips_metadata, tips_diagnostics = enrich_opening_tips_from_cpi_detail(
-        aligned,
-        cpi_detail_path=tips_cpi_detail,
-        index_date=OPENING_CLOSE_DATE,
+    opening = roll_opening_marketables(
+        portfolio, cusip_column="IssueID", noncb_weights=manifest_initial["noncb_weights"],
+        auctions_query=Path(auctions_query), soma_holdings=Path(soma_holdings), tips_cpi_detail=Path(tips_cpi_detail),
     )
+    aligned, rollforward, rollforward_diagnostics = opening.book, opening.summary, opening.diagnostics
     aligned, frn_metadata, frn_diagnostics = enrich_opening_frn_from_daily_indexes(
         aligned,
         frn_daily_indexes_path=frn_daily_indexes,
         opening_date=OPENING_CLOSE_DATE,
         source_available_as_of=ACTUALS_AVAILABLE_AS_OF,
+        cusip_column="IssueID",
     )
     aligned = _apply_opening_coupon_terms(aligned)
-    aligned = aligned.drop(columns=["_SourceCUSIP"], errors="ignore")
     aligned = aligned[BOND_PORTFOLIO_COLS]
     aligned = aligned.astype(PORTFOLIO_DTYPES, errors="ignore")
 
     debt_total = _portfolio_total_debt_base(aligned)
-    if abs(debt_total - rollforward["opening_face_bil"]) > 1e-6:
+    if abs(debt_total - rollforward["opening_debt_base_bil"]) > 1e-6:
         raise ValueError("enrichment changed the opening marketable debt base")
 
     metadata = {
@@ -1458,9 +1444,9 @@ def load_opening_portfolio(
         "opening_rollforward_aligned_debt_base_bil": debt_total,
         "opening_rollforward_debt_base_delta_bil": debt_total - source_active_debt_base,
         "opening_rollforward_diagnostic_rows": rollforward_diagnostics,
-        **tips_metadata,
+        **opening.tips_metadata,
         "tips_cpi_detail_source_sha256": _sha256_file(tips_cpi_detail),
-        "tips_indexation_diagnostic_rows": tips_diagnostics,
+        "tips_indexation_diagnostic_rows": opening.tips_diagnostics,
         **frn_metadata,
         "frn_daily_indexes_source_sha256": _sha256_file(frn_daily_indexes),
         "frn_indexation_diagnostic_rows": frn_diagnostics,
@@ -1468,7 +1454,7 @@ def load_opening_portfolio(
         "holder_totals_bil": _portfolio_holder_totals(aligned),
         "noncb_weights": manifest_initial["noncb_weights"],
         "wamest_date": manifest_initial.get("wamest_date"),
-        "soma_as_of_date": soma_date,
+        "soma_as_of_date": SOMA_SNAPSHOT_DATE,
         "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
     }
     return aligned, metadata

@@ -42,6 +42,26 @@ COUPON_LIMITS = (
 )
 
 
+def issue_ids(lots: pd.DataFrame, bills: pd.Series) -> pd.Series:
+    """Use the carried issue ID. Derive a contractual key for older model books."""
+    ids = lots.get("IssueID", pd.Series(pd.NA, index=lots.index)).astype("string").str.strip()
+    missing = ids.isna() | ids.eq("")
+    for index, lot in lots.loc[missing].iterrows():
+        maturity = pd.Timestamp(lot["MaturityDate"]).date()
+        if bills.at[index]:
+            ids.at[index] = f"bill-{maturity}"
+            continue
+        original = next(
+            (lot[field] for field in ("OriginalDatedDate", "DatedDate", "IssueDate") if pd.notna(lot.get(field))),
+            pd.NaT,
+        )
+        term = lot.get("OriginalMaturityYears")
+        coupon = lot.get("CouponRate")
+        detail = {"FRN": "FixedSpread", "TIPS": "ReferenceCPI_Issue"}.get(lot["SecurityType"])
+        ids.at[index] = f"{lot['SecurityType']}-{original}-{maturity}-{term}-{coupon}-{lot.get(detail)}"
+    return ids
+
+
 def purchase_sector(current: pd.Timestamp, maturity: pd.Timestamp, *, bill: bool) -> Sector | None:
     if (maturity - current).days <= EXCLUDED_MATURITY_DAYS:
         return None

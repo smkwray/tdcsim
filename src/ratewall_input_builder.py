@@ -408,6 +408,7 @@ def load_soma_cusip_holdings(path: Path) -> tuple[str, pd.DataFrame]:
             "cusip": cusips,
             "security_type": frame["Security Type"].astype(str).str.strip(),
             "amount_mil": amount_mil,
+            "par_mil": par / 1.0e6,
             "maturity_date": maturity.dt.date.astype(str),
         }
     )

@@ -1630,6 +1630,35 @@ def _verify_mmf_eligibility(root: Path, manifest: dict[str, Any], inputs_dir: Pa
         ineligible = money_funds.loc[~mmf_eligible_mask(money_funds, start), "BondID"]
         if not ineligible.empty:
             raise VerificationError(f"ineligible opening money-fund lots on {start}: {ineligible.head().tolist()}")
+        diagnostics_path = inputs_dir / "tdcsim_opening_rollforward_diagnostics.csv"
+        metadata_path = inputs_dir / "tdcsim_opening_portfolio_metadata.json"
+        opening_metadata = _manifest(metadata_path) if metadata_path.is_file() else {}
+        history_required = {"record_date", "opening_close_date"}.issubset(opening_metadata)
+        if history_required and not diagnostics_path.is_file():
+            raise VerificationError("package opening roll lacks pre-start money-fund evidence")
+        if diagnostics_path.is_file():
+            history = pd.read_csv(diagnostics_path, dtype=str, keep_default_na=False)
+            has_history = {"row_type", "source_record_date", "mmf_acquisition_rows"}.issubset(history.columns)
+            if history_required and not has_history:
+                raise VerificationError("package opening roll lacks pre-start money-fund evidence")
+            if has_history:
+                summary = history.loc[history["row_type"].eq("summary")]
+                if len(summary) != 1:
+                    raise VerificationError("pre-start money-fund history requires one roll summary")
+                first = _bounded_date(summary.iloc[0]["source_record_date"], label="opening source record date")
+                close = _bounded_date(summary.iloc[0]["opening_close_date"], label="opening close")
+                events = history.loc[history["row_type"].eq("mmf_acquisition")]
+                if not first <= close <= start or str(len(events)) != summary.iloc[0]["mmf_acquisition_rows"]:
+                    raise VerificationError("pre-start money-fund acquisition coverage differs from opening roll")
+                for day, security_type, maturity in events[
+                    ["acquisition_date", "security_type", "maturity_date"]
+                ].itertuples(index=False, name=None):
+                    acquired = _bounded_date(day, label="pre-start money-fund acquisition date")
+                    due = _bounded_date(maturity, label="pre-start money-fund maturity")
+                    if not first <= acquired <= close or not mmf_may_acquire(security_type, due, acquired):
+                        raise VerificationError(
+                            f"ineligible pre-start money-fund acquisition on {day}: {security_type} maturing {maturity}"
+                        )
         path = _output_artifact_path(root, manifest, MMF_ACQUISITIONS_OUTPUT)
         events = pd.read_csv(path, dtype=str, keep_default_na=False)
         _require_columns(events, MMF_ACQUISITIONS_COLUMNS, label="money-fund acquisitions")

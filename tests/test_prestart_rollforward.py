@@ -68,7 +68,7 @@ WINDOW = [
 ]
 
 
-def _roll(tmp_path: Path, auctions: list[dict[str, str]]):
+def _roll(tmp_path: Path, auctions: list[dict[str, str]], *, soma_rows=()):
     settlements = prestart_settlements(
         _write_auctions(tmp_path / "auctions.csv", auctions), record_date=RECORD, opening_close_date=CLOSE,
     )
@@ -77,9 +77,9 @@ def _roll(tmp_path: Path, auctions: list[dict[str, str]]):
         f"Private/{PRIVATE_SUBBUCKET_MMF}": 0.25,
     }
     return prestart_rollforward(
-        BOOK, settlements, opening_close_date=CLOSE, cusip_column="_cusip",
+        BOOK, settlements, opening_close_date=CLOSE, record_date=RECORD, cusip_column="_cusip",
         noncb_weights={"bills": shares, "nonbills": shares},
-        soma=pd.DataFrame(columns=["cusip", "amount_mil", "maturity_date"]), soma_as_of_date="2026-06-17",
+        soma=pd.DataFrame(soma_rows, columns=["cusip", "amount_mil", "maturity_date"]), soma_as_of_date="2026-06-17",
     )
 
 
@@ -113,3 +113,10 @@ def test_unreconstructable_windows_raise(tmp_path) -> None:
     wrong = [*WINDOW[:3], _auction("RB", "Bill", "2026-06-02", "2026-07-07", 50, original="2026-03-03"), *WINDOW[4:]]
     with pytest.raises(IssuanceCalibrationError, match="disagree on the terms of RB"):
         _roll(tmp_path, wrong)
+
+def test_soma_transfer_keeps_reopened_bill_tranche_proceeds(tmp_path) -> None:
+    opening, _, _ = _roll(tmp_path, WINDOW, soma_rows=[("RB", 30_000, "2026-06-30")])
+    bill = opening.loc[opening["_cusip"].eq("RB")]
+    assert bill.groupby("IssuePriceRatio")["FaceValue"].sum().to_dict() == pytest.approx({0.988: 10, 0.99: 50})
+    assert bill["IssueProceeds"].sum() == pytest.approx(10 * 0.988 + 50 * 0.99)
+    assert bill.loc[bill["HolderType"].eq("CB"), "FaceValue"].sum() == pytest.approx(30)

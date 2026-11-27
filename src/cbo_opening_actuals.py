@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from forecast_bundle_builders import (
     MTS_TABLE_1_DEFICIT_SELECTOR,
     MTS_TABLE_9_NET_INTEREST_SELECTOR,
     build_current_fy_splice_row,
 )
+
+from issuance_calibration import prestart_rollforward, prestart_settlements
+from ratewall_input_builder import load_soma_cusip_holdings
+from tips_indexation import enrich_opening_tips_from_cpi_detail, load_tips_cpi_detail, opening_tips_to_par
 
 SIMULATION_START_DATE = "2026-06-21"
 OPENING_CLOSE_DATE = "2026-06-18"
@@ -124,5 +131,67 @@ def build_opening_fy_splice(
         mts_table_9_selector=MTS_NET_INTEREST_SELECTOR,
         observation_date=OPENING_CLOSE_DATE,
         available_date=ACTUALS_AVAILABLE_AS_OF,
-        source_status="may_mts_fytd_and_june_dts_cash_flows_spliced_to_cbo_full_year_primary_deficit",
+        source_status="may_mts_fytd_plus_june_dts_cash_proxy_spliced_to_cbo_full_year_primary_deficit",
+        claim_boundary="june_stub_is_a_dts_cash_proxy_tga_residual_tests_only_the_cash_identity",
     )
+
+@dataclass(frozen=True)
+class OpeningMarketables:
+    book: pd.DataFrame
+    summary: dict[str, Any]
+    diagnostics: list[dict[str, Any]]
+    tips_metadata: dict[str, Any]
+    tips_diagnostics: list[dict[str, Any]]
+
+
+def roll_opening_marketables(
+    book: pd.DataFrame, *, cusip_column: str, noncb_weights: Mapping[str, Mapping[str, float]],
+    auctions_query: Path, soma_holdings: Path, tips_cpi_detail: Path,
+) -> OpeningMarketables:
+    """Reconcile contractual par first, then value the rolled book on the June close."""
+    has_tips = book["SecurityType"].eq("TIPS").any()
+    detail = load_tips_cpi_detail(tips_cpi_detail) if has_tips else None
+    par_book, ratio_sources = opening_tips_to_par(
+        book, detail=detail, record_date=OPENING_PORTFOLIO_RECORD_DATE,
+        auctions_path=auctions_query, cusip_column=cusip_column,
+    )
+    settlements = prestart_settlements(
+        auctions_query, record_date=OPENING_PORTFOLIO_RECORD_DATE, opening_close_date=OPENING_CLOSE_DATE,
+    )
+    soma_date, soma = load_soma_cusip_holdings(soma_holdings)
+    if soma_date != SOMA_SNAPSHOT_DATE:
+        raise ValueError(f"opening SOMA snapshot must be dated {SOMA_SNAPSHOT_DATE}, found {soma_date}")
+    rolled, summary, diagnostics = prestart_rollforward(
+        par_book, settlements, opening_close_date=OPENING_CLOSE_DATE, record_date=OPENING_PORTFOLIO_RECORD_DATE,
+        cusip_column=cusip_column, noncb_weights=noncb_weights,
+        soma=soma.assign(amount_mil=soma["par_mil"]), soma_as_of_date=soma_date,
+    )
+    valued, tips_metadata, tips_diagnostics = enrich_opening_tips_from_cpi_detail(
+        rolled, cpi_detail_path=tips_cpi_detail, index_date=OPENING_CLOSE_DATE, detail=detail, cusip_column=cusip_column,
+    )
+    source_tips = par_book.loc[par_book["SecurityType"].eq("TIPS")]
+    close_tips = valued.loc[valued["SecurityType"].eq("TIPS")]
+    # No indexed issues settle in the declared window. Preserve TIPS par by
+    # CUSIP and show valuation changes separately from net nominal borrowing.
+    source_live = source_tips.loc[source_tips["MaturityDate"].gt(pd.Timestamp(OPENING_CLOSE_DATE))]
+    source_live_par = source_live.groupby(cusip_column)["FaceValue"].sum()
+    close_tips_par = close_tips.groupby(cusip_column)["FaceValue"].sum()
+    if not source_live_par.index.equals(close_tips_par.index) or (source_live_par - close_tips_par).abs().max() > 1e-8:
+        raise ValueError("opening roll changed outstanding TIPS par by CUSIP")
+    source_indexation = float((source_tips["AdjustedPrincipal"] - source_tips["FaceValue"]).sum())
+    close_indexation = float((close_tips["AdjustedPrincipal"] - close_tips["FaceValue"]).sum())
+    fed_tips = close_tips.loc[close_tips["HolderType"].eq("CB")]
+    soma_indexation = float((fed_tips["AdjustedPrincipal"] - fed_tips["FaceValue"]).sum())
+    summary.update(
+        source_tips_indexation_bil=source_indexation,
+        opening_tips_indexation_bil=close_indexation,
+        source_debt_base_bil=summary["source_face_bil"] + source_indexation,
+        opening_debt_base_bil=summary["opening_face_bil"] + close_indexation,
+        soma_snapshot_indexation_bil=float((soma["amount_mil"] - soma["par_mil"]).sum()) / 1000,
+        soma_close_indexation_bil=soma_indexation,
+        soma_close_debt_base_bil=summary["soma_close_bil"] + soma_indexation,
+    )
+    for row in tips_diagnostics:
+        row["par_source_date"] = OPENING_PORTFOLIO_RECORD_DATE
+        row["par_source_method"] = ratio_sources[row["cusip"]]
+    return OpeningMarketables(valued, summary, diagnostics, tips_metadata, tips_diagnostics)

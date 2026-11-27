@@ -115,8 +115,12 @@ def test_opening_builder_and_verifier_roll_net_issuance_soma_and_mmf(tmp_path: P
     assert smoke.SIMULATION_START_DATE == START
     assert metadata["opening_close_date"] == "2026-06-18"
     assert portfolio["FaceValue"].sum() == pytest.approx(90 + 55 + 20 + 8 - 45)
+    assert set(portfolio["IssueID"]) == {"N1", "B1", "B2", "OLD-NOTE", "KEEP-BILL"}
     assert portfolio.loc[portfolio["HolderType"].eq("CB"), "FaceValue"].sum() == pytest.approx(17)
-    assert metadata["opening_rollforward_diagnostic_rows"][0]["mmf_reinvestment_deferred_bil"] == 10
+    diagnostics = metadata["opening_rollforward_diagnostic_rows"]
+    assert diagnostics[0]["mmf_reinvestment_deferred_bil"] == 10
+    assert {"row_type": "mmf_acquisition", "acquisition_date": "2026-06-02",
+            "security_type": "Fixed", "maturity_date": "2026-09-02"} in diagnostics
     mmf = portfolio.loc[portfolio["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF)]
     assert mmf["FaceValue"].sum() == pytest.approx(11)
     assert all(
@@ -139,8 +143,10 @@ def test_opening_builder_and_verifier_roll_net_issuance_soma_and_mmf(tmp_path: P
     # two years left is an upstream defect, not something the roll may quietly reassign.
     rows = list(csv.DictReader(book.open(newline="")))
     rows[6]["HolderSubBucket"] = PRIVATE_SUBBUCKET_MMF
+    rows[6]["MaturityDate"] = "2027-07-15"
     _write_rows(book, rows)
-    with pytest.raises(ValueError, match="ineligible OLD-NOTE"):
+    assert mmf_may_acquire("Fixed", "2027-07-15", "2026-06-18")
+    with pytest.raises(ValueError, match="ineligible OLD-NOTE on 2026-05-31"):
         smoke.load_opening_portfolio(book, simulation_start_date=START, **arguments)
 
 
@@ -229,3 +235,56 @@ def test_worktree_builds_record_the_same_portable_paths(tmp_path: Path, monkeypa
     assert smoke._portable_path(sibling) == "other/data/x.csv"
     assert smoke._portable_path(main / "data" / "inputs.json") == "data/inputs.json"
     assert smoke._portable_path(worktree / "scripts" / "run.py") == "scripts/run.py"
+
+
+def test_debt_verifier_reconstructs_first_period_end_from_rolled_opening(tmp_path: Path) -> None:
+    from forecast_bundle_builders import build_debt_stock_path_rows, opening_cbo_public_debt_bil
+    from simulation_calendar import build_simulation_calendar
+    from scripts.verify_cbo_forecast_package import _verify_debt_stock_path
+
+    inputs = tmp_path / "forecast_inputs"
+    _write_rows(inputs / "tdcsim_opening_portfolio.csv", [
+        {"SecurityType": "Fixed", "FaceValue": 100, "AdjustedPrincipal": 0},
+        {"SecurityType": "TIPS", "FaceValue": 10, "AdjustedPrincipal": 20},
+    ])
+    _write_rows(inputs / "tdcsim_cbo_fiscal_baseline.csv", [
+        {"fiscal_year": 2026, "debt_held_public_end_bil": 221},
+    ])
+    nonmarketable, residual = 4, -3
+    periods = build_simulation_calendar("2026-06-21", "2026-09-30", "daily")
+    rows = build_debt_stock_path_rows(
+        scenario_id="cbo_full_horizon_local_smoke_3m", periods=periods,
+        opening_state_date="2026-06-21",
+        opening_cbo_federal_debt_held_public_bil=opening_cbo_public_debt_bil(120, nonmarketable, residual),
+        cbo_fy_end_public_debt_targets_bil={2026: 221},
+        public_nonmarketable_treasury_bil=nonmarketable, non_treasury_and_definition_residual_bil=residual,
+        observation_date="2026-06-18", available_date="2026-06-22",
+    )
+    assert rows[0]["period_end"] == "2026-06-22"
+    assert rows[0]["cbo_federal_debt_held_public_target_bil"] == pytest.approx(121 + 100 / 101)
+    _write_rows(inputs / "tdcsim_debt_stock_path.csv", rows)
+    _verify_debt_stock_path(tmp_path, {"date_range": {"simulation_start_date": "2026-06-21"}, "source_values": {
+        "row_counts": {"period_rows": len(rows)},
+        "debt_bridge": {"treasury_public_debt_bil": 104, "public_nonmarketable_treasury_bil": nonmarketable,
+                        "non_treasury_and_definition_residual_bil": residual},
+    }})
+
+def test_run_verifier_checks_acquisitions_at_the_date_of_purchase(tmp_path: Path) -> None:
+    from tdcsim_cbo.verifier import VerificationError, _verify_mmf_eligibility
+
+    _write_rows(tmp_path / "tdcsim_opening_portfolio.csv", [
+        {"BondID": 1, "Status": "Active", "HolderType": "Private", "HolderSubBucket": PRIVATE_SUBBUCKET_MMF,
+         "SecurityType": "Fixed", "MaturityDate": "2027-07-15"},
+    ])
+    fields = dict.fromkeys(
+        ("row_type", "source_record_date", "opening_close_date", "mmf_acquisition_rows",
+         "acquisition_date", "security_type", "maturity_date"), "",
+    )
+    _write_rows(tmp_path / "tdcsim_opening_rollforward_diagnostics.csv", [
+        {**fields, "row_type": "summary", "source_record_date": "2026-05-31", "opening_close_date": "2026-06-18",
+         "mmf_acquisition_rows": 1},
+        {**fields, "row_type": "mmf_acquisition", "acquisition_date": "2026-05-31",
+         "security_type": "Fixed", "maturity_date": "2027-07-15"},
+    ])
+    with pytest.raises(VerificationError, match="ineligible pre-start money-fund acquisition on 2026-05-31"):
+        _verify_mmf_eligibility(tmp_path, {"simulation": {"start_date": START, "end_date": "2026-07-01"}}, tmp_path)

@@ -12,10 +12,11 @@ from tips_indexation import (
     build_tips_daily_cpi_lookups_from_monthly_path,
     build_tips_real_yield_path_rows,
     enrich_opening_tips_from_cpi_detail,
+    opening_tips_to_par,
 )
 
 
-def test_enrich_opening_tips_reconstructs_original_par_from_source_index_ratio(tmp_path: Path) -> None:
+def test_enrich_opening_tips_values_original_par_at_the_close(tmp_path: Path) -> None:
     cpi_detail = tmp_path / "tips_cpi.csv"
     pd.DataFrame(
         [
@@ -38,9 +39,9 @@ def test_enrich_opening_tips_reconstructs_original_par_from_source_index_ratio(t
                 "HolderType": "Private",
                 "HolderSubBucket": "DomesticNonbank",
                 "MaturityDate": pd.Timestamp("2030-01-15"),
-                "FaceValue": 110.0,
-                "OriginalPrincipal": 110.0,
-                "AdjustedPrincipal": 110.0,
+                "FaceValue": 100.0,
+                "OriginalPrincipal": 100.0,
+                "AdjustedPrincipal": 109.0,
                 "ReferenceCPI_Issue": 100.0,
                 "IndexRatio": 1.0,
                 "_SourceCUSIP": "912TEST00",
@@ -324,3 +325,20 @@ def test_tips_real_yield_path_and_issue_price_support_premiums(tmp_path: Path) -
     assert real_yield < 0.0
     assert coupon >= 0.00125
     assert price > 1.0
+
+def test_opening_par_uses_may_ratio_and_published_auction_cpi_for_new_cusip(tmp_path: Path) -> None:
+    book = pd.DataFrame([
+        {"SecurityType": "TIPS", "CUSIP": "SEASONED", "AdjustedPrincipal": 110.0, "FaceValue": 110.0},
+        {"SecurityType": "TIPS", "CUSIP": "NEW", "AdjustedPrincipal": 101.57, "FaceValue": 101.57},
+    ])
+    detail = pd.DataFrame([
+        {"index_date": pd.Timestamp("2026-05-31"), "cusip": "SEASONED", "index_ratio": 1.10, "ref_cpi": 330.10242},
+        {"index_date": pd.Timestamp("2026-06-18"), "cusip": "NEW", "index_ratio": 1.01790, "ref_cpi": 331.80363},
+    ])
+    auctions = tmp_path / "auctions.csv"
+    pd.DataFrame([{"cusip": "NEW", "auction_date": "2026-04-23", "ref_cpi_on_dated_date": 325.0}]).to_csv(auctions, index=False)
+    par, sources = opening_tips_to_par(
+        book, detail=detail, auctions_path=auctions, record_date="2026-05-31", cusip_column="CUSIP",
+    )
+    assert par["FaceValue"].tolist() == pytest.approx([100, 100], abs=1e-6)
+    assert sources["NEW"] == "treasury_daily_reference_cpi_divided_by_auction_dated_reference_cpi"
