@@ -413,7 +413,8 @@ def _tampered_runner_run(tmp_path, tamper, *, refresh_output_manifest: bool = Tr
 
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path, remittance_bil=1.0)
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
-    assert verify_scenario_run(run.output_dir)["status"] == "pass"
+    verified = verify_scenario_run(run.output_dir)
+    assert verified["status"] == "pass" and verified["recomputed"]["fed_lots_bound_to_final_portfolio"] is True
     results = pd.read_csv(run.results_path)
     tamper(results)
     results.to_csv(run.results_path, index=False)

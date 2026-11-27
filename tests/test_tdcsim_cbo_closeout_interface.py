@@ -1448,6 +1448,7 @@ def _write_runner_package(
     cbo_public_debt_target_bil: float = 1_250.0,
     fed_holdings_target_bil: float = 100.0,
     remittance_bil: float = 0.0,
+    fed_income: dict[str, float] | None = None,
 ) -> tuple[Path, Path]:
     package_dir = tmp_path / "runner_pkg"
     inputs = package_dir / "forecast_inputs"
@@ -1463,6 +1464,7 @@ def _write_runner_package(
         period_end="2026-09-30",
         cbo_public_debt_target_bil=cbo_public_debt_target_bil,
         remittance_bil=remittance_bil,
+        fed_income=fed_income,
     )
     extra_paths = {
         "tdcsim_yield_curve_surface.csv": _dynamic_surface_path(tmp_path / "raw_inputs"),

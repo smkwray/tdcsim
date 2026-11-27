@@ -243,6 +243,59 @@ def test_transformed_rollforward_export_carries_one_verified_world(tmp_path: Pat
         transformed_control.write_bytes(original_control)
 
 
+def _noop_run(baseline: CboBaselinePackage, tmp_path: Path, name: str, start: str, end: str):
+    scenario_path = _write_scenario(tmp_path / f"{name}.json", baseline, overrides={})
+    scenario = read_json(scenario_path)
+    scenario["simulation"] = {"frequency": "daily", "start_date": start, "end_date": end}
+    write_json(scenario_path, scenario)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenario_path), tmp_path / name, output_profile="compact")
+    return run, pd.read_csv(run.results_path).set_index("Date")
+
+
+def test_a_reopened_state_earns_each_fed_lot_on_its_own_premium(tmp_path: Path) -> None:
+    """The Fed opens with half of the 2028 note at a premium and buys the seasoned 2027 note
+    at market, so its two lots carry different premiums per unit of stock. Re-spreading their
+    sum over stock and remaining life at a reopening would move income between maturities;
+    the reopened run must earn, owe and remit exactly what the continuous run does."""
+
+    from test_cbo_engine_integration import _opening_controlled_portfolio
+
+    seasoned = _opening_controlled_portfolio(900.0)
+    on_the_run = _opening_controlled_portfolio(100.0)
+    on_the_run.loc[:, ["BondID", "FaceValue", "OriginalPrincipal", "AdjustedPrincipal", "IssueProceeds"]] = [2, 50.0, 50.0, 50.0, 50.0]
+    on_the_run.loc[:, "IssueDate"] = pd.Timestamp("2026-03-30")
+    on_the_run.loc[:, "MaturityDate"] = pd.Timestamp("2028-03-30")
+    fed_share = on_the_run.assign(BondID=3, HolderType="CB", HolderSubBucket="")
+    baseline = _baseline_with_dates(
+        tmp_path,
+        opening_portfolio=pd.concat([seasoned, on_the_run, fed_share], ignore_index=True),
+        fed_holdings_target_bil=100.0,
+        fed_income={"h41_reserve_balances_bil": 3_000.0, "h41_tga_bil": 0.0, "other_income_bil": 0.5,
+                    "h41_earnings_remittances_due_bil": 0.0, "h41_treasury_net_premium_bil": 0.5},
+    )
+    _, continuous = _noop_run(baseline, tmp_path, "continuous", "2026-09-20", "2026-09-30")
+    rollforward, _ = _noop_run(baseline, tmp_path, "rollforward", "2026-09-20", "2026-09-25")
+    window = ForecastStateWindow(state_period=2027, state_id="fed_lots::2026-09-25",
+                                 opening_state_date="2026-09-25", horizon_end_date="2026-09-30")
+    exported = export_forecast_state_package(
+        baseline, state_window=window, rollforward_run_dir=rollforward.output_dir,
+        output_zip=tmp_path / "state.zip", output_attestation=tmp_path / "state.attestation.json",
+        output_manifest=tmp_path / "state.export.json",
+    )
+    derived = CboBaselinePackage.open(exported.package_zip, attestation_path=exported.attestation_path)
+    _, reopened = _noop_run(derived, tmp_path, "reopened", "2026-09-25", "2026-09-30")
+
+    closing = continuous.loc["2026-09-25"]
+    assert continuous.loc["2026-09-21":, "CB_PremiumAcquired"].abs().sum() > 0.0  # the Fed bought the 2027 note
+    for column in ("CB_CouponPremiumAmortization", "CB_BillDiscountAccretion", "CB_TreasuryUnamortizedPremium",
+                   "CB_NetIncome", "CB_EarningsRemittancesDue", "CB_Remittance"):
+        assert reopened.loc["2026-09-26":, column].to_numpy() == pytest.approx(
+            continuous.loc["2026-09-26":, column].to_numpy(), abs=1e-9), column
+    assert float(reopened.loc["2026-09-25", "CB_TreasuryUnamortizedPremium"]) == pytest.approx(
+        float(closing["CB_TreasuryUnamortizedPremium"]))
+    assert continuous.loc["2026-09-30", "CB_Remittance"] > 0.0
+
+
 def test_no_shock_forecast_state_caller_keeps_source_grade_contract(
     tmp_path: Path,
 ) -> None:
@@ -276,8 +329,8 @@ def test_no_shock_forecast_state_caller_keeps_source_grade_contract(
     )
 
 
-def _baseline_with_dates(tmp_path: Path) -> CboBaselinePackage:
-    package, attestation_path = _write_runner_package(tmp_path)
+def _baseline_with_dates(tmp_path: Path, **package_options) -> CboBaselinePackage:
+    package, attestation_path = _write_runner_package(tmp_path, **package_options)
     package_dir = tmp_path / "runner_pkg"
     manifest_path = package_dir / "manifest.json"
     manifest = read_json(manifest_path)

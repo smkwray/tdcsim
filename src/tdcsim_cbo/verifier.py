@@ -1774,14 +1774,15 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         return _read_results(root / "outputs" / str(entry["path"])) if entry else None
 
     try:
-        if FED_LOT_JOURNAL_OUTPUT not in output_manifest or "final_portfolio" not in output_manifest:
-            raise ValueError("the run does not deliver the Fed lot journal and the final portfolio it closes on")
+        if FED_LOT_JOURNAL_OUTPUT not in output_manifest:
+            raise ValueError("the run does not deliver the Fed lot journal")
         fed_checks = verify_fed_remittances(
             results,
             inputs_dir,
             lots=evidence(FED_LOT_JOURNAL_OUTPUT),
             opening_portfolio=_engine_opening_portfolio(inputs_dir, str(manifest["simulation"]["start_date"])),
             final_portfolio=evidence("final_portfolio"),
+            carried_lots=runner_module.opening_fed_lots(inputs_dir),
             trc_results=evidence("tdcsim_trc_results"),
             ledger=evidence("ledger"),
             payments=evidence("payment"),
@@ -1839,6 +1840,7 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         "max_abs_fed_auction_face": fed_face,
         **bounded_limits,
         "max_abs_remittance_cash_effect": remittance_cash,
+        "fed_lots_bound_to_final_portfolio": fed_checks["fed_lots_bound_to_final_portfolio"],
         **recomputed_cash,
         **bounded,
     }

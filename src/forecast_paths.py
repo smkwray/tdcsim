@@ -1137,8 +1137,18 @@ def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series) -> dict:
             _close(premium[matured], np.zeros(matured.size), "premium left on a matured Fed lot")
             live[matured] = False
         closing[i] = premium[live].sum()
-    lots = {key: float(premium[[index for index in held if live[index]]].sum())
-            for key, held in vintages.items() if any(live[index] for index in held)}
+    lots = {}
+    for key, held in vintages.items():
+        held = [index for index in held if live[index]]
+        if not held:
+            continue
+        if len(set(maturity[held])) != 1 or len(set(bill[held])) != 1:
+            raise ValueError(f"Fed lot {key} holds vintages of different securities")
+        lots[key] = {
+            "maturity_date": str(np.datetime64(int(maturity[held[0]]), "D")),
+            "bill": bool(bill[held[0]]),
+            "premium_bil": float(premium[held].sum()),
+        }
     return {**flows, "closing_premium": closing, "lots": lots}
 
 
@@ -1173,9 +1183,11 @@ def check_fed_balance_sheet_closes(results: pd.DataFrame) -> None:
 
 
 def _check_fed_lot_boundaries(lots: pd.DataFrame, rebuilt: dict, *, opening_portfolio: pd.DataFrame,
-                              final_portfolio: pd.DataFrame, dates: pd.Series, net_premium: float) -> None:
-    """The journal opens exactly the Fed's opening lots at the class approximation, and the
-    lots it leaves open are exactly the Fed's lots in the final portfolio."""
+                              final_portfolio: pd.DataFrame | None, dates: pd.Series, net_premium: float,
+                              carried_lots: Mapping[int, float] | None) -> None:
+    """The journal opens exactly the Fed's opening lots, each at the premium a carried state
+    closed it with or, at an observed opening, at the class approximation; and the lots it
+    leaves open are exactly the Fed's lots in the final portfolio, when the run delivers one."""
 
     from fed_income import TOLERANCE_BIL, is_bill, opening_premiums, stock
 
@@ -1200,17 +1212,25 @@ def _check_fed_lot_boundaries(lots: pd.DataFrame, rebuilt: dict, *, opening_port
     if (pd.to_datetime(opened["maturity_date"]).dt.normalize().to_numpy()
             != pd.to_datetime(cb.loc[keys, "MaturityDate"]).dt.normalize().to_numpy()).any():
         raise ValueError("Fed lot journal opens a lot at a maturity the opening portfolio does not hold")
-    # A bill's opening discount rests on its issue proceeds: the portfolio's where it states a
-    # discount price, else the engine's inference from the opening curve, below par.
-    face = pd.to_numeric(cb.loc[keys, "FaceValue"], errors="raise")
-    stated = pd.to_numeric(cb.loc[keys, "IssueProceeds"], errors="coerce")
-    priced = bills & stated.gt(TOLERANCE_BIL) & stated.lt(face - 1e-12)
-    _close(opened.loc[priced, "cash_bil"], stated[priced], "opening Fed bill issue proceeds")
-    used = pd.to_numeric(opened["cash_bil"], errors="raise")
-    if not (used[bills].gt(0.0) & used[bills].le(face[bills] + TOLERANCE_BIL)).all():
-        raise ValueError("Fed lot journal opens a bill at issue proceeds outside zero to par")
-    expected = opening_premiums(cb.assign(IssueProceeds=used.to_numpy()), dates.iloc[0], net_premium)
-    _close(opened["premium_bil"], [expected[key][1] for key in keys], "opening Fed lot premium")
+    if carried_lots is not None:
+        if set(carried_lots) != set(keys):
+            raise ValueError("the carried Fed lots are not the Fed's lots in the opening portfolio")
+        _close(opened["premium_bil"], [carried_lots[key] for key in keys], "carried opening Fed lot premium")
+        _close([sum(carried_lots.values())], [net_premium], "carried Fed lots against the opening net premium")
+    else:
+        # A bill's opening discount rests on its issue proceeds: the portfolio's where it states
+        # a discount price, else the engine's inference from the opening curve, below par.
+        face = pd.to_numeric(cb.loc[keys, "FaceValue"], errors="raise")
+        stated = pd.to_numeric(cb.loc[keys, "IssueProceeds"], errors="coerce")
+        priced = bills & stated.gt(TOLERANCE_BIL) & stated.lt(face - 1e-12)
+        _close(opened.loc[priced, "cash_bil"], stated[priced], "opening Fed bill issue proceeds")
+        used = pd.to_numeric(opened["cash_bil"], errors="raise")
+        if not (used[bills].gt(0.0) & used[bills].le(face[bills] + TOLERANCE_BIL)).all():
+            raise ValueError("Fed lot journal opens a bill at issue proceeds outside zero to par")
+        expected = opening_premiums(cb.assign(IssueProceeds=used.to_numpy()), dates.iloc[0], net_premium)
+        _close(opened["premium_bil"], [expected[key][1] for key in keys], "opening Fed lot premium")
+    if final_portfolio is None:
+        return
     last = dates.iloc[-1]
     final = fed_rows(final_portfolio)
     alive = final.loc[pd.to_datetime(final["MaturityDate"]).dt.normalize() > last, "BondID"]
@@ -1224,7 +1244,8 @@ def verify_fed_remittances(
     *,
     lots: pd.DataFrame,
     opening_portfolio: pd.DataFrame,
-    final_portfolio: pd.DataFrame,
+    final_portfolio: pd.DataFrame | None,
+    carried_lots: Mapping[int, float] | None = None,
     trc_results: pd.DataFrame | None = None,
     ledger: pd.DataFrame | None = None,
     payments: pd.DataFrame | None = None,
@@ -1233,11 +1254,13 @@ def verify_fed_remittances(
 
     Inputs come from the compiled package: the Table 4-3 path, the Fed income path and the
     policy-rate path. The Fed's amortization, premiums and realized gains are rebuilt from
-    its lot journal (``lots``): the opening lots at the opening approximation applied to
-    ``opening_portfolio``, then each trade's quantity and price, bound to the run's trade
-    cash and to the Fed's lots in ``final_portfolio``. When the run's settlement evidence is
-    given, the Fed's Treasury cash receipts, the TGA, the modeled remittance and the Table
-    4-3 fiscal flow are bound to it. Returns the opening and closing earnings due, the
+    its lot journal (``lots``): the opening lots at the premiums a derived state carried
+    (``carried_lots``) or, at an observed opening, at the class approximation applied to
+    ``opening_portfolio``; then each trade's quantity and price, bound to the run's trade
+    cash and to the Fed's lots in ``final_portfolio`` (None when the run delivers no final
+    portfolio; the result says whether the lots were bound to it). When the run's settlement
+    evidence is given, the Fed's Treasury cash receipts, the TGA, the modeled remittance and
+    the Table 4-3 fiscal flow are bound to it. Returns the opening and closing earnings due, the
     cumulative net income and remittances and the largest remittance.
     """
 
@@ -1310,7 +1333,8 @@ def verify_fed_remittances(
         _close(flows[output], rebuilt[name], f"{output} against the Fed lot journal")
     _close(out["CB_TreasuryUnamortizedPremium"], rebuilt["closing_premium"], "Fed unamortized premium against its lots")
     _check_fed_lot_boundaries(lots, rebuilt, opening_portfolio=opening_portfolio, final_portfolio=final_portfolio,
-                              dates=dates, net_premium=float(first["h41_treasury_net_premium_bil"]))
+                              dates=dates, net_premium=float(first["h41_treasury_net_premium_bil"]),
+                              carried_lots=carried_lots)
     lot_days = pd.to_datetime(lots["date"]).dt.normalize()
     lot_cash = pd.to_numeric(lots["cash_bil"], errors="coerce")
     for event, output in (("purchase", "CBOFedSecondaryPurchaseCash"), ("sale", "CBOFedSecondarySaleCash")):
@@ -1443,6 +1467,7 @@ def verify_fed_remittances(
         "cumulative_net_income_bil": float(net_income.sum()),
         "cumulative_remittances_bil": float(flows["CBORemittanceCashEffect"].sum()),
         "max_remittance_bil": float(max(paid, default=0.0)),
+        "fed_lots_bound_to_final_portfolio": final_portfolio is not None,
     }
 
 

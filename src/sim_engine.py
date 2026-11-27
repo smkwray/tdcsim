@@ -114,6 +114,7 @@ from fed_income import (
     FedIncomeError,
     FedOpening,
     accrued_interest,
+    carried_premiums as carried_fed_premiums,
     is_bill as fed_is_bill,
     opening_premiums,
     stock as fed_lot_stock,
@@ -4511,7 +4512,11 @@ def run_simulation(
             opening_day=t0,
             tga=float(results.loc[t0, 'TGA']),
             treasury_book={
-                'premiums': opening_premiums(fed_cb_rows, t0, fed_opening.treasury_net_premium),
+                'premiums': (
+                    opening_premiums(fed_cb_rows, t0, fed_opening.treasury_net_premium)
+                    if params.get('fed_opening_lots') is None
+                    else carried_fed_premiums(fed_cb_rows, params['fed_opening_lots'])
+                ),
                 'accrued': _fed_accrued_by_type(fed_cb_rows, t0, _fed_frn_unposted_accrual(
                     fed_cb_rows, t0, t0=t0, cbo_inputs=cbo_inputs, scenario_id=cbo_scenario_id, last_payment_date=t0,
                 )),

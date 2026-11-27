@@ -477,6 +477,24 @@ def opening_premiums(cb_rows: pd.DataFrame, day, treasury_net_premium: float) ->
     }
 
 
+def carried_premiums(cb_rows: pd.DataFrame, carried) -> dict[int, tuple]:
+    """The Fed's lots at a carried opening: each keeps the premium it closed with."""
+
+    ids = pd.to_numeric(cb_rows["BondID"], errors="raise").astype(int)
+    if set(ids) != set(carried):
+        raise FedIncomeError("the carried Fed lots are not the Fed's lots in the opening portfolio")
+    bills = is_bill(cb_rows)
+    face = pd.to_numeric(cb_rows["FaceValue"], errors="coerce").fillna(0.0)
+    proceeds = pd.to_numeric(cb_rows["IssueProceeds"], errors="coerce").fillna(face)
+    lot_stock = stock(cb_rows)
+    maturity = pd.to_datetime(cb_rows["MaturityDate"]).dt.normalize()
+    return {
+        int(ids.at[idx]): (maturity.at[idx], float(carried[int(ids.at[idx])]), bool(bills.at[idx]),
+                           float(lot_stock.at[idx]), float(proceeds.at[idx]))
+        for idx in cb_rows.index
+    }
+
+
 # --- Daily close ----------------------------------------------------------------------
 
 

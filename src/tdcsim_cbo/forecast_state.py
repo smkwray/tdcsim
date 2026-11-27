@@ -13,12 +13,13 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from forecast_paths import FED_INCOME_PATH_FILE
+from forecast_paths import FED_INCOME_PATH_FILE, rebuild_fed_lot_income
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
 from .compiler import digest_input_tree, input_tree_hashes
 from .contract import CboScenarioSpec
+from .output import FED_LOT_JOURNAL_OUTPUT
 from .runner import run_cbo_scenario
 
 
@@ -697,6 +698,23 @@ def _verified_closing_state(
     if not year_ends.empty:
         fed_balance_sheet["year_end_date"] = year_ends.iloc[-1].date().isoformat()
         fed_balance_sheet["year_end_due_bil"] = float(due[year_ends.index[-1]])
+    # Each surviving Fed lot carries the premium it closed with, rebuilt from the verified
+    # rollforward's lot journal, so the next opening amortizes it on the Fed's own basis.
+    journal_path, journal_sha = _run_output_artifact(source.root, source.manifest, FED_LOT_JOURNAL_OUTPUT)
+    try:
+        closing_lots = rebuild_fed_lot_income(pd.read_csv(journal_path), dates)["lots"]
+    except ValueError as exc:
+        raise ForecastStateExportError(f"rollforward Fed lot journal does not rebuild: {exc}") from exc
+    fed_rows = final_portfolio["HolderType"].astype(str).eq("CB") & (
+        pd.to_datetime(final_portfolio["MaturityDate"]).dt.normalize() > opening
+    )
+    if set(pd.to_numeric(final_portfolio.loc[fed_rows, "BondID"]).astype(int)) != set(closing_lots):
+        raise ForecastStateExportError("the rollforward's Fed lots differ from the Fed's lots in its final portfolio")
+    carried_premium = sum(lot["premium_bil"] for lot in closing_lots.values())
+    if abs(carried_premium - fed_balance_sheet["h41_treasury_net_premium_bil"]) > 1e-6:
+        raise ForecastStateExportError("the rollforward's Fed lots do not sum to its closing unamortized premium")
+    if sha256_file(journal_path) != journal_sha:
+        raise ForecastStateExportError("rollforward Fed lot journal changed while reading the closing state")
     if sha256_file(source.results_path) != source.results_sha256:
         raise ForecastStateExportError("rollforward results changed while reading the closing state")
     if sha256_file(source.final_portfolio_path) != source.final_portfolio_sha256:
@@ -719,6 +737,7 @@ def _verified_closing_state(
             "relationship_status": "verified",
         },
         "fed_balance_sheet": fed_balance_sheet,
+        "fed_lots": [{"bond_id": key, **closing_lots[key]} for key in sorted(closing_lots)],
         "source_run_manifest_sha256": source.manifest_sha256,
         "source_results_sha256": source.results_sha256,
         "source_final_portfolio_sha256": source.final_portfolio_sha256,
@@ -1019,6 +1038,7 @@ def _write_opening_runtime_state(
             "opening_state_date": state_window.opening_state_date,
             "initial_values": dict(initial_values),
             "fed_state": dict(fed_state),
+            "fed_lots": list(closing_state["fed_lots"]),
             "closing_state_digest": closing_state_digest,
             "source_run_manifest_sha256": closing_state["source_run_manifest_sha256"],
             "source_results_sha256": closing_state["source_results_sha256"],

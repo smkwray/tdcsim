@@ -921,6 +921,7 @@ def build_runtime_params(
             },
         },
         "baseline_input_paths": compiled_forecast_input_paths(inputs),
+        "fed_opening_lots": opening_fed_lots(inputs),
         "data_vintage": {
             "actuals_available_as_of": actuals_available_as_of or _max_available_date(inputs) or "1900-01-01",
             "allow_lookahead": False,
@@ -1503,6 +1504,23 @@ def _opening_runtime_initial_values(inputs: Path, *, base_tga: float) -> dict[st
                 "source baseline opening runtime state configured_default_count must be 2"
             )
     return values
+
+
+def opening_fed_lots(inputs: Path) -> dict[int, float] | None:
+    """The premium each Fed lot closed with in the run a derived state continues, or None at
+    an observed opening, where the Fed's lots open at the class approximation to the H.4.1
+    net premium."""
+
+    payload = read_json(inputs / OPENING_RUNTIME_STATE_FILE)
+    if payload.get("state_kind") == "source_baseline_configured_defaults":
+        return None
+    lots = payload.get("fed_lots")
+    if not isinstance(lots, list):
+        raise RunnerError("a carried opening state must carry the premium of each Fed lot")
+    try:
+        return {int(item["bond_id"]): float(item["premium_bil"]) for item in lots}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunnerError("the carried Fed lots must name a bond_id and a numeric premium_bil") from exc
 
 
 def _opening_state_date(inputs_dir: Path) -> str | None:
