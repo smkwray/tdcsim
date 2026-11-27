@@ -429,16 +429,17 @@ def _engine_params(
     profile,
     mode: str,
     rate_shift: float = 0.0,
+    start: str = ENGINE_START,
     end: str = ENGINE_END,
     later_fiscal_years: dict | None = None,
     debt_target: float = 1_080.0,
     primary_flow: float = 60.0,
 ) -> dict:
-    periods = build_simulation_calendar(ENGINE_START, end, "daily")
+    periods = build_simulation_calendar(start, end, "daily")
     paths = _build_temp_forecast_inputs(
         tmp_path,
         periods=periods,
-        period_start=ENGINE_START,
+        period_start=start,
         period_end=end,
         cbo_public_debt_target_bil=debt_target,
         pre_issuance_controlled_debt_bil=1_000.0,

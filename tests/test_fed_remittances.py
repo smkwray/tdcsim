@@ -9,6 +9,7 @@ and check each channel, and that the verifier rejects books that do not close.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -180,6 +181,83 @@ def test_a_long_yield_shock_leaves_iorb_and_on_rrp_unchanged(tmp_path):
         pd.testing.assert_series_equal(base[column], shocked[column], check_exact=True)
     assert base["CB_IORBRatePct"].iloc[1] == pytest.approx(4.02)
     assert base["CB_ONRRPRatePct"].iloc[1] == pytest.approx(3.87)
+
+
+FRN_DAILY = 500.0 * (0.05 + 0.001) / 360.0  # the Fed's FRN: 500 at a 5% benchmark plus 0.1%
+
+
+def _fed_frn_run(tmp_path, start: str, end: str, *, coupon: str, due: float, other_income: float):
+    """The operating-cash lane, where Treasury pays only when Fedwire is open, with the Fed
+    holding a 500 FRN whose quarterly coupons fall on the first of the month."""
+
+    import csv
+
+    from test_cbo_engine_integration import (
+        _frn_rate_path_row, _opening_frn_portfolio, _write_fixture_fed_income_path, _write_frn_rate_path,
+    )
+    from test_issuance_rule import _engine_params, _portfolio, _portfolio_row
+    from test_treasury_calendar import _profile
+
+    opening = pd.Timestamp(start)
+    params = _engine_params(tmp_path, profile=_profile(nominal_only=True), mode="cbo_operating_cash_target_financing_v1",
+                            start=start, end=end, later_fiscal_years={opening.year + 1 + (opening.month >= 10): (1_100.0, 0.0)})
+    params["data_vintage"]["actuals_available_as_of"] = start
+    paths = params["baseline_input_paths"]
+    paths["frn_rate_path_file"] = str(_write_frn_rate_path(tmp_path, rows=[
+        {**_frn_rate_path_row(period_start=period.period_start.isoformat(), period_end=period.period_end.isoformat(),
+                              rate_decimal=0.05), "observation_date": start, "available_date": start}
+        for period in build_simulation_calendar(start, end, "daily")
+    ]))
+    with open(paths["primary_deficit_path_file"], newline="") as handle:
+        primary = list(csv.DictReader(handle))
+    paths["fed_income_path_file"] = str(_write_fixture_fed_income_path(
+        tmp_path, primary, **{**SMALL_FED, "other_income_bil": other_income, "h41_earnings_remittances_due_bil": due},
+    ))
+    frn = _opening_frn_portfolio(face_value=500.0, accrued_interest=0.0, first_interest_payment_date=coupon,
+                                 maturity_date="2029-10-01", last_accrued=start).to_dict("records")[0]
+    frn.update(BondID=50, HolderType="CB", HolderSubBucket="")
+    params["initial_bonds_df"] = _portfolio([
+        _portfolio_row(1, security_type="Fixed", years=28 / 365.25, maturity=str((opening + pd.Timedelta(days=27)).date()),
+                       face=100.0),
+        _portfolio_row(4, security_type="Fixed", years=2.0, maturity="2029-09-30", face=400.0),
+        frn,
+    ])
+    results, _ = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+    _verify(results, {"fed_income_path_file": Path(paths["fed_income_path_file"])})
+    return results
+
+
+def test_fed_frn_interest_accrues_on_a_closed_tuesday_and_sizes_wednesdays_payment(tmp_path):
+    """Treasury pays the FRN coupon dated Saturday 2028-07-01 on Monday and catches up
+    Independence Day (a Tuesday) on Wednesday, but the Fed earns the interest every
+    calendar day. Wednesday's payment is capped by Tuesday's balance, so a Tuesday that
+    earned nothing would shrink it."""
+
+    results = _fed_frn_run(tmp_path, "2028-06-28", "2028-07-06", coupon="2028-07-01", due=50.0, other_income=0.0)
+    accrual, receivable = results["CB_FRNAccrual"].iloc[1:], results["CB_TreasuryAccruedInterest"]
+    assert accrual.to_numpy() == pytest.approx([FRN_DAILY] * len(accrual))
+    # The coupon due on Saturday stays in the receivable until Monday pays it.
+    assert receivable.loc["2028-07-02"] == pytest.approx(4 * FRN_DAILY)
+    assert results.loc["2028-07-03", "CB_FRNCash"] == pytest.approx(3 * FRN_DAILY)
+    assert receivable.loc["2028-07-03"] == pytest.approx(2 * FRN_DAILY)
+    # Net income is negative, so the closed Tuesday's balance sets Wednesday's cap, and
+    # that balance includes Tuesday's FRN interest.
+    due = results["CB_EarningsRemittancesDue"]
+    assert due.loc["2028-07-04"] < due.loc["2028-06-28"]
+    assert results.loc["2028-07-05", "CB_Remittance"] == pytest.approx(due.loc["2028-07-04"])
+    assert due.loc["2028-07-04"] - due.loc["2028-07-03"] == pytest.approx(results.loc["2028-07-04", "CB_NetIncome"])
+
+
+def test_fed_frn_interest_earned_on_a_closed_fiscal_year_end_stays_in_that_year(tmp_path):
+    """2028-09-30 is a Saturday: the FRN interest the Fed earns that day belongs to fiscal
+    2028 even though Treasury next pays on Monday, in fiscal 2029."""
+
+    results = _fed_frn_run(tmp_path, "2028-09-27", "2028-10-03", coupon="2028-10-01", due=0.0, other_income=0.5)
+    fiscal_2028 = results.loc["2028-09-28":"2028-09-30", "CB_FRNAccrual"]
+    assert fiscal_2028.sum() == pytest.approx(3 * FRN_DAILY)
+    assert results.loc["2028-09-30", "CB_TreasuryAccruedInterest"] == pytest.approx(3 * FRN_DAILY)
+    assert results.loc["2028-10-02", "CB_FRNCash"] == pytest.approx(4 * FRN_DAILY)
+    assert results.loc["2028-10-02", "CB_FRNAccrual"] == pytest.approx(FRN_DAILY)
 
 
 def test_a_bill_bought_at_99_earns_1_whatever_it_was_issued_at():

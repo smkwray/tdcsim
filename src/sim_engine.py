@@ -595,9 +595,11 @@ def _fed_rates(policy_rate_path, day, opening_day):
     }
 
 
-def _fed_accrued_by_type(rows, day):
+def _fed_accrued_by_type(rows, day, frn_unposted=0.0):
     accrued = accrued_interest(rows, day)
-    return {kind: float(accrued[kind].sum()) for kind in ACCRUAL_TYPES}
+    totals = {kind: float(accrued[kind].sum()) for kind in ACCRUAL_TYPES}
+    totals['frn'] += float(frn_unposted)
+    return totals
 
 
 def _register_new_fed_lots(bond_portfolio, fed_basis, day):
@@ -3607,6 +3609,76 @@ def _frn_rate_date_for_accrual_day(bond, accrual_date, lockout_business_days):
     return accrual_day
 
 
+def _frn_daily_rate(bond, accrual_day, fixed_spread, context):
+    """One day's FRN interest per unit face and its benchmark rate.
+
+    ``context`` holds the run's opening day ``t0``, the FRN rate path ``frame`` with its
+    ``scenario_id`` and date ``lookup``, the ``fallback_row`` for a date the path does not
+    cover, and the nominal-curve ``yield`` and ``basis`` used when there is no path.
+    """
+
+    rate_date = _frn_rate_date_for_accrual_day(bond, accrual_day, context['lockout'])
+    rate_row = None
+    benchmark_rate = float(context['yield'])
+    rate_day_count = context['basis']
+    if accrual_day <= context['t0'] and pd.notna(bond.get("BenchmarkRate_FRN")):
+        # The observed opening reset carries across the
+        # pre-simulation days before the forecast rates apply.
+        benchmark_rate = float(bond["BenchmarkRate_FRN"])
+        rate_day_count = FRN_DAY_COUNT_BASIS
+    elif isinstance(context['frame'], pd.DataFrame) and not context['frame'].empty:
+        rate_row = _frn_rate_path_row_for_date(
+            context['frame'], context['scenario_id'], rate_date, lookup=context['lookup'],
+        )
+        if rate_row is None:
+            rate_row = context['fallback_row']
+        if rate_row is None:
+            raise ValueError(f'the FRN rate path has no rate for {pd.Timestamp(rate_date).date()}')
+        benchmark_rate = float(rate_row['benchmark_rate_decimal'])
+        rate_day_count = float(rate_row.get('day_count_basis', FRN_DAY_COUNT_BASIS) or FRN_DAY_COUNT_BASIS)
+    daily_rate = (benchmark_rate + fixed_spread) / rate_day_count
+    if rate_row is None:
+        daily_rate = max(0.0, daily_rate)
+    return daily_rate, benchmark_rate
+
+
+def _fed_frn_unposted_accrual(cb_rows, day, *, t0, cbo_inputs, scenario_id, last_payment_date):
+    """FRN interest the Fed has earned but the portfolio has not yet accrued.
+
+    The portfolio accrues FRN interest only when Fedwire is open and catches up the closed
+    days on the next business day. The Fed earns it every calendar day: each FRN lot accrues
+    from its last accrual date through ``day`` (and no later than maturity) at the rate the
+    catch-up will apply. A coupon or redemption interest falling due on a closed day stays
+    in the receivable until it is paid.
+    """
+
+    day = pd.Timestamp(day).normalize()
+    frn = cb_rows[cb_rows['SecurityType'].astype(str).eq('FRN')]
+    last_accrued = pd.to_datetime(frn['LastAccrualDate']).dt.normalize().fillna(pd.Timestamp(last_payment_date).normalize())
+    ends = pd.to_datetime(frn['MaturityDate']).dt.normalize().clip(upper=day)
+    if not last_accrued.lt(ends).any():
+        return 0.0
+    frame = cbo_inputs.get('frn_rate_path')
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        raise ValueError(f"the Fed's FRN interest on {day.date()}, a day Fedwire is closed, needs the FRN rate path")
+    lookup = cbo_inputs.get('frn_rate_path_date_lookup', {})
+    fallback_row = _frn_rate_path_row_for_date(frame, scenario_id, day, lookup=lookup)
+    context = {
+        't0': pd.Timestamp(t0).normalize(), 'frame': frame, 'scenario_id': scenario_id, 'lookup': lookup,
+        'fallback_row': fallback_row, 'yield': np.nan, 'basis': FRN_DAY_COUNT_BASIS,
+        'lockout': _frn_lockout_business_days(fallback_row),
+    }
+    total = 0.0
+    for idx, bond in frn.loc[last_accrued.lt(ends)].iterrows():
+        end = ends.at[idx]
+        face = float(pd.to_numeric(bond['FaceValue'], errors='raise'))
+        spread = pd.to_numeric(bond.get('FixedSpread'), errors='coerce')
+        spread = 0.0 if pd.isna(spread) else float(spread)
+        for accrual_day in pd.date_range(last_accrued.at[idx] + pd.Timedelta(days=1), end, freq='D'):
+            total += face * _frn_daily_rate(bond, accrual_day, spread, context)[0]
+    return total
+
+
 def _frn_rate_path_row_for_date(frame, scenario_id, date_value, lookup=None):
     target = pd.Timestamp(date_value).normalize()
     if frame is None or frame.empty:
@@ -4436,7 +4508,9 @@ def run_simulation(
             tga=float(results.loc[t0, 'TGA']),
             treasury_book={
                 'premiums': opening_premiums(fed_cb_rows, t0, fed_opening.treasury_net_premium),
-                'accrued': _fed_accrued_by_type(fed_cb_rows, t0),
+                'accrued': _fed_accrued_by_type(fed_cb_rows, t0, _fed_frn_unposted_accrual(
+                    fed_cb_rows, t0, t0=t0, cbo_inputs=cbo_inputs, scenario_id=cbo_scenario_id, last_payment_date=t0,
+                )),
                 'stock': float(fed_lot_stock(fed_cb_rows).sum()),
             },
             path_row=fed_first_row,
@@ -4810,6 +4884,11 @@ def run_simulation(
                 bond_portfolio.loc[frn_indices, 'BenchmarkRate_FRN'] = benchmark_rates
                 bond_portfolio.loc[frn_indices, 'LastAccrualDate'] = accrual_day
             else:
+                frn_rate_context = {
+                    't0': t0, 'frame': frn_path_frame, 'scenario_id': cbo_scenario_id, 'lookup': frn_path_date_lookup,
+                    'fallback_row': frn_path_row, 'yield': frn_yield, 'basis': day_count_basis,
+                    'lockout': lockout_business_days,
+                }
                 for idx, bond in bond_portfolio.loc[frn_mask].copy().iterrows():
                     face_value = pd.to_numeric(bond.get('FaceValue'), errors='coerce')
                     face_value = 0.0 if pd.isna(face_value) else float(face_value)
@@ -4829,29 +4908,7 @@ def run_simulation(
                             continue
                         if pd.notna(maturity_date) and accrual_day > maturity_date:
                             break
-                        rate_date = _frn_rate_date_for_accrual_day(bond, accrual_day, lockout_business_days)
-                        rate_row = None
-                        benchmark_rate = float(frn_yield)
-                        rate_day_count = day_count_basis
-                        if accrual_day <= t0 and pd.notna(bond.get("BenchmarkRate_FRN")):
-                            # The observed opening reset carries across the
-                            # pre-simulation days before the forecast rates apply.
-                            benchmark_rate = float(bond["BenchmarkRate_FRN"])
-                            rate_day_count = FRN_DAY_COUNT_BASIS
-                        elif isinstance(frn_path_frame, pd.DataFrame) and not frn_path_frame.empty:
-                            rate_row = _frn_rate_path_row_for_date(
-                                frn_path_frame,
-                                cbo_scenario_id,
-                                rate_date,
-                                lookup=frn_path_date_lookup,
-                            )
-                            if rate_row is None:
-                                rate_row = frn_path_row
-                            benchmark_rate = float(rate_row['benchmark_rate_decimal'])
-                            rate_day_count = float(rate_row.get('day_count_basis', FRN_DAY_COUNT_BASIS) or FRN_DAY_COUNT_BASIS)
-                        daily_rate = (benchmark_rate + fixed_spread) / rate_day_count
-                        if rate_row is None:
-                            daily_rate = max(0.0, daily_rate)
+                        daily_rate, benchmark_rate = _frn_daily_rate(bond, accrual_day, fixed_spread, frn_rate_context)
                         accrued_balance += face_value * daily_rate
                         last_benchmark_rate = benchmark_rate
                         last_accrual_date = accrual_day
@@ -7125,7 +7182,10 @@ def run_simulation(
                         'tips': tips_coupon_interest_paid_by_holder.get('CB', 0.0),
                         'frn': frn_interest_paid_by_holder.get('CB', 0.0),
                     },
-                    'accrued_end': _fed_accrued_by_type(fed_cb_rows, current_date),
+                    'accrued_end': _fed_accrued_by_type(fed_cb_rows, current_date, _fed_frn_unposted_accrual(
+                        fed_cb_rows, current_date, t0=t0, cbo_inputs=cbo_inputs, scenario_id=cbo_scenario_id,
+                        last_payment_date=last_payment_date,
+                    )),
                     'accrued_purchased': fed_basis['accrued_purchased'],
                     'accrued_sold': fed_basis['accrued_sold'],
                     'tips_indexation': cb_tips_indexation_period,
