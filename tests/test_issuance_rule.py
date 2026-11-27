@@ -1064,3 +1064,27 @@ def test_operating_cash_results_verifier_rejects_each_broken_claim(tmp_path: Pat
     tampered.loc[row, column] = (tampered.loc[row, column] + value) if column != "EarlySettlementProceeds" else value
     with pytest.raises(VerificationError, match=message):
         _verify_operating_cash_financing_results(tampered)
+
+
+def test_controlled_debt_and_bills_do_not_depend_on_row_order():
+    # The package verifier rebuilds the calibration from the written opening book, whose
+    # rows may be ordered differently from the builder's frame; the recorded bill share
+    # must rebuild bit for bit, so the sums cannot depend on order.
+    import numpy as np
+    import pandas as pd
+
+    from issuance_calibration import controlled_debt_and_bills
+
+    rng = np.random.default_rng(7)
+    n = 400
+    frame = pd.DataFrame({
+        "Status": "Active",
+        "SecurityType": "Fixed",
+        "HolderType": "Banks",
+        "OriginalMaturityYears": np.where(np.arange(n) % 3 == 0, 0.5, 5.0),
+        "FaceValue": rng.uniform(1e-6, 1e3, n) * 10.0 ** rng.integers(-3, 3, n),
+        "AdjustedPrincipal": np.nan,
+    })
+    expected = controlled_debt_and_bills(frame)
+    for seed in range(5):
+        assert controlled_debt_and_bills(frame.sample(frac=1, random_state=seed)) == expected

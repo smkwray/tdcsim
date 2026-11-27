@@ -626,7 +626,9 @@ def controlled_debt_and_bills(frame: pd.DataFrame | None) -> tuple[float, float]
     if rows.empty:
         return 0.0, 0.0
     weights = debt_base(rows)
-    return float(weights.sum()), float(weights.loc[bill_mask(rows)].sum())
+    # Exactly rounded sums: the package rebuilds this from a written book whose row order
+    # can differ from the builder's, and a recorded calibration must rebuild bit for bit.
+    return math.fsum(weights), math.fsum(weights.loc[bill_mask(rows)])
 
 
 # --- The rule --------------------------------------------------------------------------
