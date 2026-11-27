@@ -1038,6 +1038,110 @@ def _per_period(evidence: pd.DataFrame, dates: pd.Series, value: str, mask) -> n
     return totals.reindex(dates.iloc[1:]).fillna(0.0).to_numpy()
 
 
+def rebuild_fed_lot_income(journal: pd.DataFrame, dates: pd.Series) -> dict:
+    """Rebuild the Fed's acquisition-basis income from its lot journal, vintage by vintage.
+
+    Every opening lot and every acquisition is its own vintage, amortized straight line to
+    its maturity from the day after it was acquired; nothing is ever merged. A merge only
+    relabels vintages, and a sale or retirement removes the same fraction of every vintage
+    of the lot at its carrying value after that day's amortization. An acquisition's premium
+    is its dirty cash less accrued interest less stock. Returns per-period flows, the closing
+    premium of each simulated day and the premium of every lot left at the close.
+    """
+
+    from fed_income import FED_LOT_ACQUISITIONS, FED_LOT_DISPOSALS, FED_LOT_JOURNAL_COLUMNS
+
+    missing = [column for column in FED_LOT_JOURNAL_COLUMNS if column not in journal.columns]
+    if missing:
+        raise ValueError(f"Fed lot journal omits {missing}")
+    day_numbers = (pd.to_datetime(dates).dt.normalize().to_numpy().astype("datetime64[D]").astype(np.int64))
+    position = {int(day): i for i, day in enumerate(day_numbers)}
+    events = journal.reset_index(drop=True)
+    event_days = pd.to_datetime(events["date"], errors="raise").to_numpy().astype("datetime64[D]").astype(np.int64)
+    maturities = pd.to_datetime(events["maturity_date"], errors="raise").to_numpy().astype("datetime64[D]").astype(np.int64)
+    kinds = events["event"].astype(str).to_numpy()
+    unknown = set(kinds) - {"open", "merge", *FED_LOT_ACQUISITIONS, *FED_LOT_DISPOSALS}
+    if unknown:
+        raise ValueError(f"Fed lot journal has unknown events {sorted(unknown)}")
+    if any(int(day) not in position for day in event_days):
+        raise ValueError("Fed lot journal books an event on a day the run did not simulate")
+    if ((kinds == "open") != (event_days == day_numbers[0])).any():
+        raise ValueError("Fed lot journal opens lots only at the opening and trades only after it")
+    numbers = {column: pd.to_numeric(events[column], errors="coerce").to_numpy(dtype=float) for column in (
+        "fraction", "stock_bil", "cash_bil", "accrued_interest_bil", "premium_bil")}
+    bond_ids = pd.to_numeric(events["bond_id"], errors="raise").astype(np.int64).to_numpy()
+    bills = pd.to_numeric(events["bill"], errors="raise").astype(bool).to_numpy()
+    capacity = int(np.isin(kinds, ("open", *FED_LOT_ACQUISITIONS)).sum())
+    premium = np.zeros(capacity)
+    through = np.zeros(capacity, dtype=np.int64)
+    maturity = np.zeros(capacity, dtype=np.int64)
+    bill = np.zeros(capacity, dtype=bool)
+    live = np.zeros(capacity, dtype=bool)
+    vintages: dict[int, list[int]] = {}
+    periods = len(dates) - 1
+    flows = {name: np.zeros(periods) for name in (
+        "bill_accretion", "coupon_amortization", "premium_acquired", "premium_sold", "realized_gains",
+        "accrued_purchased", "accrued_sold")}
+    closing = np.zeros(len(dates))
+    order = np.argsort(event_days, kind="stable")
+    cursor, count = 0, 0
+    for i, day in enumerate(day_numbers):
+        if i:
+            held = np.flatnonzero(live)
+            elapsed = day - through[held]
+            remaining = maturity[held] - through[held]
+            amount = np.where(remaining <= elapsed, premium[held], premium[held] * elapsed / np.maximum(remaining, 1))
+            premium[held] -= amount
+            through[held] = day
+            flows["bill_accretion"][i - 1] = -amount[bill[held]].sum()
+            flows["coupon_amortization"][i - 1] = -amount[~bill[held]].sum()
+        while cursor < len(order) and event_days[order[cursor]] == day:
+            row = order[cursor]
+            cursor += 1
+            kind, key = kinds[row], int(bond_ids[row])
+            stock_bil, cash, accrued = numbers["stock_bil"][row], numbers["cash_bil"][row], numbers["accrued_interest_bil"][row]
+            if kind == "merge":
+                into = int(pd.to_numeric(events.at[row, "into_bond_id"], errors="raise"))
+                vintages.setdefault(into, []).extend(vintages.pop(key, []))
+                continue
+            if kind in FED_LOT_DISPOSALS:
+                held = [index for index in vintages.get(key, []) if live[index]]
+                if not held:
+                    raise ValueError(f"Fed lot journal disposes of lot {key}, which the Fed does not hold")
+                fraction = numbers["fraction"][row]
+                if not 0.0 < fraction <= 1.0:
+                    raise ValueError(f"Fed lot journal disposes of an invalid fraction {fraction!r} of lot {key}")
+                removed = fraction * premium[held].sum()
+                premium[held] *= 1.0 - fraction
+                if fraction >= 1.0:
+                    live[held] = False
+                    vintages.pop(key)
+                _close([numbers["premium_bil"][row]], [removed], f"premium removed from Fed lot {key}")
+                flows["premium_sold"][i - 1] += removed
+                flows["realized_gains"][i - 1] += cash - accrued - stock_bil - removed
+                flows["accrued_sold"][i - 1] += accrued
+                continue
+            acquired = numbers["premium_bil"][row] if kind == "open" else cash - accrued - stock_bil
+            if kind != "open":
+                _close([numbers["premium_bil"][row]], [acquired], f"premium acquired on Fed lot {key}")
+                flows["premium_acquired"][i - 1] += acquired
+                flows["accrued_purchased"][i - 1] += accrued
+            if not np.isfinite(acquired):
+                raise ValueError(f"Fed lot {key} opens with a nonfinite premium")
+            premium[count], through[count], maturity[count] = acquired, day, maturities[row]
+            bill[count], live[count] = bills[row], True
+            vintages.setdefault(key, []).append(count)
+            count += 1
+        matured = np.flatnonzero(live & (maturity <= day))
+        if matured.size:
+            _close(premium[matured], np.zeros(matured.size), "premium left on a matured Fed lot")
+            live[matured] = False
+        closing[i] = premium[live].sum()
+    lots = {key: float(premium[[index for index in held if live[index]]].sum())
+            for key, held in vintages.items() if any(live[index] for index in held)}
+    return {**flows, "closing_premium": closing, "lots": lots}
+
+
 def check_earnings_due_closes(results: pd.DataFrame, opening_due: float) -> None:
     """Closing check 1: opening earnings due plus distributable income less cash remitted."""
 
@@ -1068,10 +1172,59 @@ def check_fed_balance_sheet_closes(results: pd.DataFrame) -> None:
         raise ValueError("reserve balances fall below zero")
 
 
+def _check_fed_lot_boundaries(lots: pd.DataFrame, rebuilt: dict, *, opening_portfolio: pd.DataFrame,
+                              final_portfolio: pd.DataFrame, dates: pd.Series, net_premium: float) -> None:
+    """The journal opens exactly the Fed's opening lots at the class approximation, and the
+    lots it leaves open are exactly the Fed's lots in the final portfolio."""
+
+    from fed_income import TOLERANCE_BIL, is_bill, opening_premiums, stock
+
+    def fed_rows(portfolio: pd.DataFrame) -> pd.DataFrame:
+        held = portfolio["HolderType"].astype(str).eq("CB")
+        if "Status" in portfolio.columns:
+            held &= portfolio["Status"].astype(str).eq("Active")
+        return portfolio.loc[held]
+
+    is_open = lots["event"].astype(str).eq("open")
+    opened = lots.loc[is_open].set_index(pd.to_numeric(lots.loc[is_open, "bond_id"], errors="raise").astype(int))
+    cb = fed_rows(opening_portfolio)
+    cb = cb.set_index(pd.to_numeric(cb["BondID"], errors="raise").astype(int), drop=False)
+    keys = sorted(cb.index)
+    if opened.index.has_duplicates or set(opened.index) != set(keys):
+        raise ValueError("Fed lot journal does not open exactly the Fed's opening lots")
+    opened = opened.loc[keys]
+    _close(opened["stock_bil"], stock(cb).loc[keys], "opening Fed lot stock")
+    bills = is_bill(cb).loc[keys]
+    if (opened["bill"].astype(int).to_numpy() != bills.astype(int).to_numpy()).any():
+        raise ValueError("Fed lot journal misclassifies an opening bill")
+    if (pd.to_datetime(opened["maturity_date"]).dt.normalize().to_numpy()
+            != pd.to_datetime(cb.loc[keys, "MaturityDate"]).dt.normalize().to_numpy()).any():
+        raise ValueError("Fed lot journal opens a lot at a maturity the opening portfolio does not hold")
+    # A bill's opening discount rests on its issue proceeds: the portfolio's where it states a
+    # discount price, else the engine's inference from the opening curve, below par.
+    face = pd.to_numeric(cb.loc[keys, "FaceValue"], errors="raise")
+    stated = pd.to_numeric(cb.loc[keys, "IssueProceeds"], errors="coerce")
+    priced = bills & stated.gt(TOLERANCE_BIL) & stated.lt(face - 1e-12)
+    _close(opened.loc[priced, "cash_bil"], stated[priced], "opening Fed bill issue proceeds")
+    used = pd.to_numeric(opened["cash_bil"], errors="raise")
+    if not (used[bills].gt(0.0) & used[bills].le(face[bills] + TOLERANCE_BIL)).all():
+        raise ValueError("Fed lot journal opens a bill at issue proceeds outside zero to par")
+    expected = opening_premiums(cb.assign(IssueProceeds=used.to_numpy()), dates.iloc[0], net_premium)
+    _close(opened["premium_bil"], [expected[key][1] for key in keys], "opening Fed lot premium")
+    last = dates.iloc[-1]
+    final = fed_rows(final_portfolio)
+    alive = final.loc[pd.to_datetime(final["MaturityDate"]).dt.normalize() > last, "BondID"]
+    if set(pd.to_numeric(alive, errors="raise").astype(int)) != set(rebuilt["lots"]):
+        raise ValueError("the Fed lots left open by the journal are not the Fed's lots in the final portfolio")
+
+
 def verify_fed_remittances(
     results: pd.DataFrame,
     inputs_dir: str | os.PathLike[str],
     *,
+    lots: pd.DataFrame,
+    opening_portfolio: pd.DataFrame,
+    final_portfolio: pd.DataFrame,
     trc_results: pd.DataFrame | None = None,
     ledger: pd.DataFrame | None = None,
     payments: pd.DataFrame | None = None,
@@ -1079,10 +1232,13 @@ def verify_fed_remittances(
     """Rebuild the Fed's earnings, balance sheet and remittances from a run's outputs.
 
     Inputs come from the compiled package: the Table 4-3 path, the Fed income path and the
-    policy-rate path. When the run's settlement evidence is given, the Fed's Treasury cash
-    receipts, the TGA, the modeled remittance and the Table 4-3 fiscal flow are bound to it.
-    Returns the opening and closing earnings due, the cumulative net income and remittances
-    and the largest remittance.
+    policy-rate path. The Fed's amortization, premiums and realized gains are rebuilt from
+    its lot journal (``lots``): the opening lots at the opening approximation applied to
+    ``opening_portfolio``, then each trade's quantity and price, bound to the run's trade
+    cash and to the Fed's lots in ``final_portfolio``. When the run's settlement evidence is
+    given, the Fed's Treasury cash receipts, the TGA, the modeled remittance and the Table
+    4-3 fiscal flow are bound to it. Returns the opening and closing earnings due, the
+    cumulative net income and remittances and the largest remittance.
     """
 
     from simulation_calendar import is_fedwire_business_day, next_fedwire_business_day
@@ -1143,6 +1299,27 @@ def verify_fed_remittances(
     _close(np.diff(out["CB_TreasuryUnamortizedPremium"]),
            flows["CB_PremiumAcquired"] - flows["CB_PremiumSold"] + flows["CB_BillDiscountAccretion"]
            + flows["CB_CouponPremiumAmortization"], "Fed unamortized premium")
+    # The acquisition basis rebuilt lot by lot from the opening and each trade's evidence.
+    rebuilt = rebuild_fed_lot_income(lots, dates)
+    for name, output in (
+        ("bill_accretion", "CB_BillDiscountAccretion"), ("coupon_amortization", "CB_CouponPremiumAmortization"),
+        ("premium_acquired", "CB_PremiumAcquired"), ("premium_sold", "CB_PremiumSold"),
+        ("realized_gains", "CB_RealizedGains"), ("accrued_purchased", "CB_AccruedInterestPurchased"),
+        ("accrued_sold", "CB_AccruedInterestSold"),
+    ):
+        _close(flows[output], rebuilt[name], f"{output} against the Fed lot journal")
+    _close(out["CB_TreasuryUnamortizedPremium"], rebuilt["closing_premium"], "Fed unamortized premium against its lots")
+    _check_fed_lot_boundaries(lots, rebuilt, opening_portfolio=opening_portfolio, final_portfolio=final_portfolio,
+                              dates=dates, net_premium=float(first["h41_treasury_net_premium_bil"]))
+    lot_days = pd.to_datetime(lots["date"]).dt.normalize()
+    lot_cash = pd.to_numeric(lots["cash_bil"], errors="coerce")
+    for event, output in (("purchase", "CBOFedSecondaryPurchaseCash"), ("sale", "CBOFedSecondarySaleCash")):
+        traded = lot_cash[lots["event"].eq(event)].groupby(lot_days[lots["event"].eq(event)]).sum()
+        reported = pd.to_numeric(results[output], errors="raise").fillna(0.0).to_numpy(dtype=float)[1:]
+        _close(reported, traded.reindex(dates.iloc[1:]).fillna(0.0), f"Fed lot journal against {output}")
+    retired = lots["event"].eq("retirement")
+    _close(lot_cash[retired], pd.to_numeric(lots.loc[retired, "stock_bil"], errors="raise"),
+           "a retired Fed lot is paid its stock")
     if payments is not None:
         fed = payments["holder_sector"].astype(str).eq("CB")
         for kind, output in (("fixed_coupon", "CB_CouponCash"), ("tips_coupon", "CB_TIPSCouponCash"),

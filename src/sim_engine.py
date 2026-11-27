@@ -109,6 +109,7 @@ from forecast_paths import (
 from fed_income import (
     ACCRUAL_TYPES,
     FED_INCOME_RESULT_COLUMNS,
+    FED_LOT_JOURNAL_COLUMNS,
     FedBook,
     FedIncomeError,
     FedOpening,
@@ -615,15 +616,16 @@ def _register_new_fed_lots(bond_portfolio, fed_basis, day):
     if new_lots.empty:
         return
     new_accrued = accrued_interest(new_lots, day)
-    new_premiums = (
-        pd.to_numeric(new_lots['IssueProceeds'], errors='raise') - new_accrued.sum(axis=1) - fed_lot_stock(new_lots)
-    )
+    proceeds = pd.to_numeric(new_lots['IssueProceeds'], errors='raise')
+    new_stock = fed_lot_stock(new_lots)
     for kind in ACCRUAL_TYPES:
         fed_basis['accrued_purchased'][kind] += float(new_accrued[kind].sum())
-    fed_basis['premium_acquired'] += float(new_premiums.sum())
     new_bills = fed_is_bill(new_lots)
     for idx, lot in new_lots.iterrows():
-        fed_basis['lots'].add(lot['BondID'], lot['MaturityDate'], float(new_premiums.at[idx]), bool(new_bills.at[idx]), day)
+        fed_basis['premium_acquired'] += fed_basis['lots'].acquire(
+            'auction', lot['BondID'], lot['MaturityDate'], bool(new_bills.at[idx]), day,
+            stock=float(new_stock.at[idx]), cash=float(proceeds.at[idx]), accrued=float(new_accrued.loc[idx].sum()),
+        )
 
 
 def _new_fed_basis(lots):
@@ -1598,8 +1600,10 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
         retire_fraction = retire_amount / debt_base
         if holder == 'CB' and fed_basis is not None:
             forfeited = accrued_interest(pd.DataFrame([row]), current_date) * retire_fraction
+            # The Fed is paid the stock it retires and forfeits the accrued interest.
             premium_retired = fed_basis['lots'].dispose(
-                row['BondID'], 1.0 if retire_amount >= debt_base - TGA_FLOOR_TOLERANCE else retire_fraction, current_date,
+                'retirement', row['BondID'], 1.0 if retire_amount >= debt_base - TGA_FLOOR_TOLERANCE else retire_fraction,
+                current_date, stock=retire_amount, cash=retire_amount, accrued=float(forfeited.to_numpy().sum()),
             )
             for kind in ACCRUAL_TYPES:
                 fed_basis['accrued_sold'][kind] += float(forfeited[kind].sum())
@@ -2078,13 +2082,12 @@ def _transfer_public_marketable_debt_to_cb(
         lot[['HolderType', 'HolderSubBucket', 'TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket']] = ['CB', '', 'CB', '']
         if fed_basis is not None:
             bought_accrued = accrued_interest(sellers, current) * fraction
-            premium = float(proceeds.sum()) - float(bought_accrued.to_numpy().sum()) - float(quantity)
             for kind in ACCRUAL_TYPES:
                 fed_basis['accrued_purchased'][kind] += float(bought_accrued[kind].sum())
-            fed_basis['premium_acquired'] += premium
-            fed_basis['lots'].merge(
-                cb_lots['BondID'].tolist(), lot['BondID'], lot['MaturityDate'],
-                bool(fed_is_bill(pd.DataFrame([lot])).iloc[0]), current, premium,
+            fed_basis['premium_acquired'] += fed_basis['lots'].acquire(
+                'purchase', lot['BondID'], lot['MaturityDate'], bool(fed_is_bill(pd.DataFrame([lot])).iloc[0]), current,
+                stock=float(quantity), cash=float(proceeds.sum()), accrued=float(bought_accrued.to_numpy().sum()),
+                merge_ids=cb_lots['BondID'].tolist(),
             )
         fed_rows.append(lot)
         retired_indices.extend(issue['cb'])
@@ -2186,7 +2189,8 @@ def _transfer_cb_marketable_debt_to_public(
         if fed_basis is not None:
             sold_accrued = accrued_interest(pd.DataFrame([row]), current_date) * fraction_sold
             premium_sold = fed_basis['lots'].dispose(
-                row['BondID'], 1.0 if sale_amount >= debt_base - TGA_FLOOR_TOLERANCE else fraction_sold, current_date,
+                'sale', row['BondID'], 1.0 if sale_amount >= debt_base - TGA_FLOOR_TOLERANCE else fraction_sold,
+                current_date, stock=sale_amount, cash=pricing['dirty_value'], accrued=float(sold_accrued.to_numpy().sum()),
             )
             for kind in ACCRUAL_TYPES:
                 fed_basis['accrued_sold'][kind] += float(sold_accrued[kind].sum())
@@ -7436,6 +7440,8 @@ def run_simulation(
     else:
         results.attrs['handoff_tables'] = handoff_tables
     results.attrs['mmf_acquisition_maturities'] = mmf_acquisition_maturities
+    if cbo_funding_mode:
+        results.attrs['fed_lot_journal'] = pd.DataFrame(fed_book.lots.journal, columns=FED_LOT_JOURNAL_COLUMNS)
     results.attrs['run_metadata'] = {
         'scenario_name': scenario_name,
         'start_date': str(start_date),

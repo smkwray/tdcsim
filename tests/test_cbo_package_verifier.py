@@ -37,7 +37,9 @@ from forecast_bundle_builders import (
     fed_income_source_fixture,
     read_dts_fed_earnings,
 )
-from fed_income import ACCRUAL_TYPES, FED_INCOME_RESULT_COLUMNS, FedBook, FedOpening
+from fed_income import (
+    ACCRUAL_TYPES, FED_INCOME_RESULT_COLUMNS, FED_LOT_JOURNAL_COLUMNS, FedBook, FedOpening, opening_premiums,
+)
 from forecast_paths import (
     CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
     CBO_FED_REMITTANCE_OPENING_STATUS,
@@ -191,6 +193,26 @@ def test_cbo_package_verifier_rejects_semantic_results_tampering_with_refreshed_
     _refresh_manifest_hashes(package)
 
     with pytest.raises(ValueError, match="debt drift identity"):
+        verify_package(package)
+
+
+def test_cbo_package_verifier_rebuilds_fed_amortization_from_its_lots(tmp_path: Path) -> None:
+    """The audit's probe: an extra billion of bill accretion on the last day, carried through
+    every Fed total and the deferred asset, with the result hashes refreshed. Only rebuilding
+    the Fed's amortization from its opening lots and trades exposes it."""
+
+    package = _write_valid_package(tmp_path / "pkg")
+    results_path = package / "exports_baseline" / "results_compact.csv"
+    results = pd.read_csv(results_path)
+    last = results.index[-1]
+    for column in ("CB_BillDiscountAccretion", "CB_TreasuryUnamortizedPremium", "CB_TreasuryInterestIncome",
+                   "CB_NetIncome", "CB_EarningsRemittancesDue"):
+        results.loc[last, column] += 1.0
+    results.loc[last, "CB_DeferredAsset"] = max(0.0, -results.loc[last, "CB_EarningsRemittancesDue"])
+    results.to_csv(results_path, index=False)
+    _refresh_manifest_hashes(package)
+
+    with pytest.raises(ValueError, match="CB_BillDiscountAccretion against the Fed lot journal"):
         verify_package(package)
 
 
@@ -774,7 +796,6 @@ def _write_valid_package(package: Path) -> Path:
         run_summaries[run_id] = summary
         _write_json(package / run_dir / "summary.json", summary)
 
-    _write_csv(package / "exports_baseline" / "final_portfolio_active.csv", ["col"], [{"col": "value"}])
     _write_csv(package / "exports_baseline" / "maturity_ledger.csv", ["col"], [{"col": "value"}])
     _write_net_interest_diagnostic(package, run_rows["baseline"])
     calibration = build_issuance_calibration(
@@ -1052,12 +1073,16 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
 
     policy = load_policy_rate_path(package / "forecast_inputs" / POLICY_RATE_PATH_FILE)
     opening_day = rows[0]["Date"]
+    opening = pd.read_csv(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")
+    fed_lots = opening.loc[opening["HolderType"].eq("CB") & opening["Status"].eq("Active")]
     book = FedBook(
         FedOpening.from_row(path[0]),
         opening_day=opening_day,
         tga=float(rows[0]["TGA"]),
-        treasury_book={"premiums": {}, "accrued": dict.fromkeys(ACCRUAL_TYPES, 0.0),
-                       "stock": float(rows[0]["DebtHeld_CentralBank"])},
+        treasury_book={
+            "premiums": opening_premiums(fed_lots, opening_day, float(path[0]["h41_treasury_net_premium_bil"])),
+            "accrued": dict.fromkeys(ACCRUAL_TYPES, 0.0), "stock": float(rows[0]["DebtHeld_CentralBank"]),
+        },
         path_row=path[0],
         route_balances=None,
     )
@@ -1071,8 +1096,8 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
         row, prev = rows[index], rows[index - 1]
         paid = book.remittance(row["Date"])
         face, cash = float(row["CBOFedSecondaryPurchaseFace"]), float(row["CBOFedSecondaryPurchaseCash"])
-        if face > 0.0:
-            book.lots.add(index, "2040-01-02", cash - face, False, row["Date"])
+        bought = book.lots.acquire("purchase", 10**6 + index, "2040-01-02", False, row["Date"], stock=face, cash=cash,
+                                   accrued=0.0) if face > 0.0 else 0.0
         effect = cash - (float(row["TGA"]) - float(prev["TGA"]) - paid)
         legacy += effect
         values = book.close_day(
@@ -1081,12 +1106,22 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
                 "cash": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_end": dict.fromkeys(ACCRUAL_TYPES, 0.0),
                 "accrued_purchased": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_sold": dict.fromkeys(ACCRUAL_TYPES, 0.0),
                 "tips_indexation": 0.0, "floor_topup": 0.0, "realized_gains": 0.0,
-                "premium_acquired": cash - face, "premium_sold": 0.0, "stock": float(row["DebtHeld_CentralBank"]),
+                "premium_acquired": bought, "premium_sold": 0.0, "stock": float(row["DebtHeld_CentralBank"]),
             },
             path_row=path[index - 1], rates=_fed_rates(policy, row["Date"], opening_day), route_balances=None,
         )
         row.update({**zeros, **values, "CBOTable43RemittanceInFiscalFlow": row["CBOTable43RemittanceInFiscalFlow"],
                     "CBORemittanceCashEffect": paid, "Reserves": legacy})
+    # The Fed's lot journal and the lots it leaves in the final portfolio.
+    exports = package / "exports_baseline"
+    exports.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(book.lots.journal, columns=FED_LOT_JOURNAL_COLUMNS).to_csv(exports / "fed_lot_journal.csv", index=False)
+    final = pd.DataFrame(
+        [{"BondID": key, "HolderType": "CB", "Status": "Active", "MaturityDate": lot.maturity.date().isoformat()}
+         for key, lot in book.lots.lots.items()],
+        columns=["BondID", "HolderType", "Status", "MaturityDate"],
+    )
+    final.to_csv(exports / "final_portfolio_active.csv", index=False)
 
 
 def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:

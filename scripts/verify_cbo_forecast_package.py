@@ -93,6 +93,7 @@ from tips_indexation import (  # noqa: E402
     load_tips_cpi_detail,
     observed_tips_cpi_months,
     build_tips_real_yield_path_rows,
+    value_opening_tips,
 )
 
 
@@ -129,6 +130,7 @@ REQUIRED_FILES = {
     "exports_baseline/results_compact.csv",
     "exports_baseline/final_portfolio_active.csv",
     "exports_baseline/maturity_ledger.csv",
+    "exports_baseline/fed_lot_journal.csv",
     "tdcsim_partial_interest_financing_diagnostic.csv",
     "sources/source_manifest.json",
     "sources/cbo/51118-2026-02-Budget-Projections.xlsx",
@@ -709,7 +711,18 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
             raise ValueError(f"manifest missing run summary: {run_id}")
         _verify_run_summary(f"manifest {run_id}", manifest_summary, metrics)
         # The Fed's books close last: they rest on the Treasury cash and Fed stock checked above.
-        verify_fed_remittances(pd.read_csv(root / run_dir / "results_compact.csv"), root / "forecast_inputs")
+        compact = pd.read_csv(root / run_dir / "results_compact.csv")
+        verify_fed_remittances(
+            compact,
+            root / "forecast_inputs",
+            lots=pd.read_csv(root / run_dir / "fed_lot_journal.csv"),
+            # The Fed opens on the portfolio the engine opens: TIPS valued at the simulation start.
+            opening_portfolio=value_opening_tips(
+                pd.read_csv(root / "forecast_inputs" / "tdcsim_opening_portfolio.csv"), root / "forecast_inputs",
+                simulation_start_date=str(compact["Date"].iloc[0]),
+            ),
+            final_portfolio=pd.read_csv(root / run_dir / "final_portfolio_active.csv"),
+        )
         run_metrics[run_id] = metrics
 
     _verify_partial_interest_financing_diagnostic(root, run_metrics["baseline"])

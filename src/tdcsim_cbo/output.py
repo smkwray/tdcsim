@@ -731,6 +731,21 @@ def _write_mmf_acquisitions(
     outputs[MMF_ACQUISITIONS_OUTPUT] = _artifact_record(out, path)
 
 
+FED_LOT_JOURNAL_OUTPUT = "tdcsim_fed_lot_journal"
+
+
+def _write_fed_lot_journal(
+    results: pd.DataFrame, out: Path, outputs: dict[str, Any], *, suffix: str, compression: str,
+) -> None:
+    """The Fed's lot journal: the evidence that rebuilds its acquisition-basis income."""
+
+    if "fed_lot_journal" not in results.attrs:
+        return
+    path = out / f"{FED_LOT_JOURNAL_OUTPUT}{suffix}"
+    _write_frame(results.attrs["fed_lot_journal"], path, compression=compression)
+    outputs[FED_LOT_JOURNAL_OUTPUT] = _artifact_record(out, path)
+
+
 def _write_trc_outputs(
     results: pd.DataFrame,
     out: Path,
@@ -813,6 +828,7 @@ def write_scenario_outputs(
 
     _write_trc_outputs(results, out, outputs, suffix=suffix, compression=compression)
     _write_mmf_acquisitions(results, out, outputs, suffix=suffix, compression=compression)
+    _write_fed_lot_journal(results, out, outputs, suffix=suffix, compression=compression)
     if catalog_sqlite:
         catalog_path = out / "catalog.sqlite"
         _write_catalog(catalog_path, outputs)
@@ -915,6 +931,7 @@ def write_bounded_scenario_outputs(
     outputs["deterministic_evidence_artifacts"] = dict(deterministic)
     _write_trc_outputs(results, out, outputs, suffix=suffix, compression=compression)
     _write_mmf_acquisitions(results, out, outputs, suffix=suffix, compression=compression)
+    _write_fed_lot_journal(results, out, outputs, suffix=suffix, compression=compression)
     return outputs
 
 

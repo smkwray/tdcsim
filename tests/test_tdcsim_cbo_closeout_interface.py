@@ -1645,26 +1645,10 @@ def _opening_retirement_route_portfolio() -> pd.DataFrame:
 
 
 def _refresh_result_hashes(run_dir: Path, manifest: dict) -> None:
+    """Refresh every record of the results file, as a coordinated tamper would."""
+
     result_item = next(item for item in manifest["outputs"] if str(item["logical_name"]).startswith("results_"))
-    result_rel = result_item["relative_path"]
-    result_path = run_dir / result_rel
-    result_record = {
-        "logical_name": result_path.name,
-        "relative_path": result_rel,
-        "sha256": sha256_file(result_path),
-        "bytes": result_path.stat().st_size,
-        "media_type": "text/csv",
-    }
-    for index, item in enumerate(manifest["outputs"]):
-        if item["relative_path"] == result_rel:
-            manifest["outputs"][index] = result_record
-    for index, item in enumerate(manifest["output_hashes"]):
-        if item["path"] == Path(result_rel).name:
-            manifest["output_hashes"][index] = {
-                "path": Path(result_rel).name,
-                "bytes": result_path.stat().st_size,
-                "sha256": sha256_file(result_path),
-            }
+    _refresh_manifest_artifact(run_dir, manifest, result_item["relative_path"])
 
 
 def _refresh_manifest_artifact(run_dir: Path, manifest: dict, relative_path: str) -> None:

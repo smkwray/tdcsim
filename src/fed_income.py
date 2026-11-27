@@ -307,6 +307,25 @@ class FedLot:
     through: pd.Timestamp  # amortization is booked through the close of this day
 
 
+# One row per change to a Fed lot, in the order the engine books them: the evidence a verifier
+# needs to rebuild the Fed's acquisition-basis income without the engine's lot book.
+FED_LOT_JOURNAL_COLUMNS = (
+    "date",
+    "event",  # open, auction, purchase, merge, sale or retirement
+    "bond_id",
+    "into_bond_id",  # merge: the lot this one joins
+    "maturity_date",
+    "bill",
+    "fraction",  # sale or retirement: the share of the lot disposed of
+    "stock_bil",  # stock acquired or disposed of (indexed principal for TIPS)
+    "cash_bil",  # dirty cash paid or received; a retirement receives the stock retired
+    "accrued_interest_bil",  # accrued interest bought, sold or forfeited
+    "premium_bil",  # premium or discount opened, acquired or removed at carrying value
+)
+FED_LOT_ACQUISITIONS = ("auction", "purchase")
+FED_LOT_DISPOSALS = ("sale", "retirement")
+
+
 class FedLotBook:
     """Unamortized premium or discount of each Fed lot, keyed by the portfolio's BondID.
 
@@ -314,12 +333,14 @@ class FedLotBook:
     acquired. A trade first books the existing lots through the trade day, so a top-up or a
     sale never moves the day's amortization of what the Fed already held, and a purchase
     starts earning the next day. Lots of one security share a maturity, so merging them
-    after that keeps each vintage's straight line exactly.
+    after that keeps each vintage's straight line exactly. Every change is written to
+    ``journal`` with its trade evidence.
     """
 
     def __init__(self) -> None:
         self.lots: dict[int, FedLot] = {}
         self.earned = {"bill": 0.0, "coupon": 0.0}  # booked since the last close
+        self.journal: list[tuple] = []
 
     def add(self, bond_id, maturity, premium: float, bill: bool, acquired) -> None:
         key = int(bond_id)
@@ -330,16 +351,57 @@ class FedLotBook:
         self.lots[key] = FedLot(pd.Timestamp(maturity).normalize(), float(premium), bool(bill),
                                 pd.Timestamp(acquired).normalize())
 
-    def merge(self, bond_ids, new_id, maturity, bill: bool, day, added_premium: float) -> None:
-        """Combine existing lots of one security with a purchase made on ``day`` into one lot."""
+    def _record(self, day, event, key, *, into="", fraction=np.nan, stock=np.nan, cash=np.nan, accrued=np.nan,
+                premium=np.nan, lot: FedLot | None = None) -> None:
+        lot = lot or self.lots[key]
+        self.journal.append((
+            pd.Timestamp(day).date().isoformat(), event, key, into, lot.maturity.date().isoformat(), int(lot.bill),
+            float(fraction), float(stock), float(cash), float(accrued), float(premium),
+        ))
 
-        premium = sum(self.dispose(bond_id, 1.0, day) for bond_id in bond_ids) + float(added_premium)
-        self.add(new_id, maturity, premium, bill, day)
+    def open(self, bond_id, maturity, premium: float, bill: bool, day, *, stock: float, proceeds: float) -> None:
+        """An inherited lot at the opening, carrying ``premium`` through ``day``; ``proceeds``
+        are the issue proceeds the opening approximation read."""
 
-    def dispose(self, bond_id, fraction: float, day) -> float:
-        """Remove a fraction of a lot on ``day`` at its carrying value; return the premium removed."""
+        self.add(bond_id, maturity, premium, bill, day)
+        self._record(day, "open", int(bond_id), stock=stock, cash=proceeds, premium=premium)
 
+    def acquire(self, event, bond_id, maturity, bill: bool, day, *, stock: float, cash: float, accrued: float,
+                merge_ids=()) -> float:
+        """Buy ``stock`` for dirty ``cash`` on ``day``; merge the Fed's lots ``merge_ids`` of the
+        same security into ``bond_id``. Returns the premium acquired: the clean cost less the stock."""
+
+        if event not in FED_LOT_ACQUISITIONS:
+            raise FedIncomeError(f"unknown Fed lot acquisition: {event!r}")
         key = int(bond_id)
+        premium = float(cash) - float(accrued) - float(stock)
+        carried = 0.0
+        for source in (int(value) for value in merge_ids):
+            if source not in self.lots:
+                continue
+            if source != key:
+                self._record(day, "merge", source, into=key)
+            carried += self._remove(source, 1.0, day)
+        self.add(key, maturity, carried + premium, bill, day)
+        self._record(day, event, key, stock=stock, cash=cash, accrued=accrued, premium=premium)
+        return premium
+
+    def dispose(self, event, bond_id, fraction: float, day, *, stock: float, cash: float, accrued: float) -> float:
+        """Sell or retire a fraction of a lot on ``day`` at its carrying value; return the premium removed."""
+
+        if event not in FED_LOT_DISPOSALS:
+            raise FedIncomeError(f"unknown Fed lot disposal: {event!r}")
+        key = int(bond_id)
+        lot = self.lots.get(key)
+        if lot is None:
+            raise FedIncomeError(f"Fed lot {key} is not on the book on {pd.Timestamp(day).date()}")
+        fraction = min(float(fraction), 1.0)
+        removed = self._remove(key, fraction, day)
+        self._record(day, event, key, fraction=fraction, stock=stock, cash=cash, accrued=accrued, premium=removed,
+                     lot=lot)
+        return removed
+
+    def _remove(self, key: int, fraction: float, day) -> float:
         self.accrue(day, [key])
         lot = self.lots.get(key)
         if lot is None:
@@ -347,7 +409,7 @@ class FedLotBook:
         if fraction >= 1.0:
             del self.lots[key]
             return lot.premium
-        removed = lot.premium * float(fraction)
+        removed = lot.premium * fraction
         lot.premium -= removed
         return removed
 
@@ -385,6 +447,8 @@ class FedLotBook:
 def opening_premiums(cb_rows: pd.DataFrame, day, treasury_net_premium: float) -> dict[int, tuple]:
     """One opening approximation per class for the inherited Fed lots.
 
+    Returns each lot's (maturity, premium, bill, stock, issue proceeds).
+
     Bills keep their remaining issue discount, straight line from issue to maturity. Coupon
     securities share the rest of the H.4.1 Treasury net premium in proportion to stock times
     remaining life, so every coupon lot amortizes at the same rate per unit of stock and the
@@ -405,8 +469,10 @@ def opening_premiums(cb_rows: pd.DataFrame, day, treasury_net_premium: float) ->
     # With no coupon securities to carry it, the residual stays in other assets.
     ratio = coupon_premium / float(coupon_weight.sum()) if coupon_weight.sum() > TOLERANCE_BIL else 0.0
     premium = bill_discount.where(bills, coupon_weight * ratio)
+    lot_stock = stock(cb_rows)
     return {
-        int(row_id): (maturity.at[idx], float(premium.at[idx]), bool(bills.at[idx]))
+        int(row_id): (maturity.at[idx], float(premium.at[idx]), bool(bills.at[idx]), float(lot_stock.at[idx]),
+                      float(proceeds.at[idx]))
         for idx, row_id in cb_rows["BondID"].items()
     }
 
@@ -473,8 +539,8 @@ class FedBook:
         self.opening = opening
         day = pd.Timestamp(opening_day).normalize()
         self.lots = FedLotBook()
-        for bond_id, (maturity, premium, bill) in treasury_book["premiums"].items():
-            self.lots.add(bond_id, maturity, premium, bill, day)
+        for bond_id, (maturity, premium, bill, lot_stock, proceeds) in treasury_book["premiums"].items():
+            self.lots.open(bond_id, maturity, premium, bill, day, stock=lot_stock, proceeds=proceeds)
         self.accrued = dict(treasury_book["accrued"])
         self.treasury_face = float(treasury_book["stock"])
         # ON RRP and foreign repo balances: the routed ledger when the run has one, else the

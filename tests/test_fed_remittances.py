@@ -14,9 +14,14 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from fed_income import FedLotBook, first_remittance_day_of_year, remittance_basis_date, remittance_week, weekly_remittance
+from fed_income import (
+    FED_LOT_JOURNAL_COLUMNS, FedLotBook, first_remittance_day_of_year, remittance_basis_date, remittance_week,
+    weekly_remittance,
+)
 from forecast_bundle_builders import build_fed_income_path_rows, fed_income_source_fixture, fed_net_premiums_bil
-from forecast_paths import check_earnings_due_closes, check_fed_balance_sheet_closes, verify_fed_remittances
+from forecast_paths import (
+    check_earnings_due_closes, check_fed_balance_sheet_closes, rebuild_fed_lot_income, verify_fed_remittances,
+)
 from sim_engine import run_simulation
 from simulation_calendar import build_simulation_calendar
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
@@ -60,8 +65,16 @@ def _run(tmp_path, *, fed_coupon: float = 0.04, remittance_bil: float = 0.0, rat
         [portfolio, pd.DataFrame([_fed_note(500.0, fed_coupon)], columns=BOND_PORTFOLIO_COLS)],
         ignore_index=True,
     ).astype(PORTFOLIO_DTYPES, errors="ignore")
-    results, _ = run_simulation(params, START, END, freq="D", scenario_name="baseline")
-    return results, paths
+    return _simulate(params, START, END), paths
+
+
+def _simulate(params, start: str, end: str):
+    """Run the engine and keep the portfolios the verifier binds the Fed's lot journal to."""
+
+    opening = params["initial_bonds_df"].copy()
+    results, final = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+    results.attrs.update(opening_portfolio=opening, final_portfolio=final)
+    return results
 
 
 def _frame(results):
@@ -69,7 +82,10 @@ def _frame(results):
 
 
 def _verify(results, paths) -> dict:
-    return verify_fed_remittances(_frame(results), paths["fed_income_path_file"].parent)
+    return verify_fed_remittances(
+        _frame(results), paths["fed_income_path_file"].parent, lots=results.attrs["fed_lot_journal"],
+        opening_portfolio=results.attrs["opening_portfolio"], final_portfolio=results.attrs["final_portfolio"],
+    )
 
 
 def test_weekly_payment_is_the_lower_of_two_credit_balances_and_nothing_on_a_debit():
@@ -222,7 +238,7 @@ def _fed_frn_run(tmp_path, start: str, end: str, *, coupon: str, due: float, oth
         _portfolio_row(4, security_type="Fixed", years=2.0, maturity="2029-09-30", face=400.0),
         frn,
     ])
-    results, _ = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+    results = _simulate(params, start, end)
     _verify(results, {"fed_income_path_file": Path(paths["fed_income_path_file"])})
     return results
 
@@ -284,15 +300,20 @@ def _ten_day_bill_probe(trade):
     day 6 and the rest held to maturity. Returns each day's accretion and the discount sold."""
 
     book = FedLotBook()
-    book.add(1, "2026-10-10", premium=-10.0, bill=True, acquired="2026-09-30")
+    book.open(1, "2026-10-10", premium=-10.0, bill=True, day="2026-09-30", stock=100.0, proceeds=90.0)
     daily, sold = [], 0.0
     for day in pd.date_range("2026-10-01", "2026-10-10"):
         if day == pd.Timestamp("2026-10-02"):
             trade(book, day)
         if day == pd.Timestamp("2026-10-06"):
-            sold += sum(book.dispose(key, 0.5, day) for key in list(book.lots))
+            sold += sum(book.dispose("sale", key, 0.5, day, stock=50.0, cash=49.8, accrued=0.0) for key in list(book.lots))
         daily.append(book.close(day)[0])
     assert not book.lots
+    # The verifier rebuilds the same days from the journal alone, never merging vintages.
+    journal = pd.DataFrame(book.journal, columns=FED_LOT_JOURNAL_COLUMNS)
+    rebuilt = rebuild_fed_lot_income(journal, pd.Series(pd.date_range("2026-09-30", "2026-10-10")))
+    assert rebuilt["bill_accretion"] == pytest.approx(daily)
+    assert rebuilt["premium_sold"].sum() == pytest.approx(sold)
     return daily, sold
 
 
@@ -302,8 +323,12 @@ def test_a_top_up_leaves_the_existing_holdings_amortization_unchanged():
     merged holding must earn exactly what the two vintages earn held separately, every day
     through a partial sale and maturity."""
 
-    merged, merged_sold = _ten_day_bill_probe(lambda book, day: book.merge([1], 1, "2026-10-10", True, day, -0.8))
-    separate, separate_sold = _ten_day_bill_probe(lambda book, day: book.add(2, "2026-10-10", -0.8, True, day))
+    def buy(bond_id, merge_ids):
+        return lambda book, day: book.acquire("purchase", bond_id, "2026-10-10", True, day, stock=100.0, cash=99.2,
+                                              accrued=0.0, merge_ids=merge_ids)
+
+    merged, merged_sold = _ten_day_bill_probe(buy(1, [1]))
+    separate, separate_sold = _ten_day_bill_probe(buy(2, []))
     assert merged == pytest.approx(separate)
     assert merged_sold == pytest.approx(separate_sold)
     # Day 2 still earns the first vintage's 1; the purchase earns its 0.1 a day from day 3.
@@ -374,9 +399,15 @@ def test_verifier_rejects_a_tampered_remittance_and_income(tmp_path):
         _verify(tampered, paths)
 
 
-def _tampered_runner_run(tmp_path, tamper):
+def _tampered_runner_run(tmp_path, tamper, *, refresh_output_manifest: bool = True):
+    """A production run whose results are rewritten after the fact, with every hash of the
+    results file in the run manifest refreshed to match (or, without
+    ``refresh_output_manifest``, every hash but the output manifest's own record)."""
+
+    from functools import partial
+
     from tdcsim_cbo import CboScenarioSpec, run_cbo_scenario
-    from tdcsim_cbo._json import read_json, write_json
+    from tdcsim_cbo._json import read_json, sha256_file, write_json
     from tdcsim_cbo.verifier import verify_scenario_run
     from test_tdcsim_cbo_closeout_interface import _refresh_result_hashes, _runner_baseline_and_scenarios
 
@@ -387,9 +418,55 @@ def _tampered_runner_run(tmp_path, tamper):
     tamper(results)
     results.to_csv(run.results_path, index=False)
     manifest = read_json(run.manifest_path)
-    _refresh_result_hashes(run.output_dir, manifest)
+    if refresh_output_manifest:
+        _refresh_result_hashes(run.output_dir, manifest)
+    else:  # the audit's refresh: the output inventories, not the output manifest's own record
+        record = {"sha256": sha256_file(run.results_path), "bytes": run.results_path.stat().st_size}
+        for item in manifest["outputs"]:
+            if item["relative_path"] == run.results_path.relative_to(run.output_dir).as_posix():
+                item.update(record)
+        for item in manifest["output_hashes"]:
+            if item["path"] == run.results_path.name:
+                item.update(record)
     write_json(run.manifest_path, manifest)
-    return run.output_dir, verify_scenario_run
+    replay = partial(verify_scenario_run, baseline_package=baseline.package_path, attestation=baseline.attestation.path)
+    return run.output_dir, verify_scenario_run, replay
+
+
+def _fabricate_closing_bill_accretion(results):
+    """The audit's probe: 1 billion of bill accretion on the last day, carried consistently
+    through the premium, Treasury income, net income, earnings due and deferred asset."""
+
+    last = results.index[-1]
+    for column in ("CB_BillDiscountAccretion", "CB_TreasuryUnamortizedPremium", "CB_TreasuryInterestIncome",
+                   "CB_NetIncome", "CB_EarningsRemittancesDue"):
+        results.loc[last, column] += 1.0
+    results.loc[last, "CB_DeferredAsset"] = max(0.0, -results.loc[last, "CB_EarningsRemittancesDue"])
+
+
+def test_verifier_rebuilds_fed_amortization_from_the_lots_not_the_reported_totals(tmp_path):
+    """Every hash refreshed and every reported total consistent: only rebuilding the Fed's
+    amortization from its opening lots and trades exposes the extra billion, locally and
+    in the attested replay."""
+
+    output_dir, verify, replay = _tampered_runner_run(tmp_path, _fabricate_closing_bill_accretion)
+    with pytest.raises(ValueError, match="CB_BillDiscountAccretion against the Fed lot journal"):
+        verify(output_dir)
+    # The replay recomputes the results, which now differ from the delivered ones.
+    with pytest.raises(ValueError, match="bounded engine replay output mismatch: results.sha256"):
+        replay(output_dir)
+
+
+def test_replay_is_bound_to_the_results_file_delivered(tmp_path):
+    """The audit's refresh left the output manifest's own record of the results stale, so the
+    replay matched the original bytes while the consumer received others."""
+
+    output_dir, verify, replay = _tampered_runner_run(
+        tmp_path, _fabricate_closing_bill_accretion, refresh_output_manifest=False,
+    )
+    for check in (verify, replay):
+        with pytest.raises(ValueError, match="output manifest record differs from the delivered file: results"):
+            check(output_dir)
 
 
 def test_verifier_binds_fed_treasury_income_to_settlement_evidence(tmp_path):
@@ -401,7 +478,7 @@ def test_verifier_binds_fed_treasury_income_to_settlement_evidence(tmp_path):
         results.loc[row, "CB_CouponAccrual"] -= 1.0
         results.loc[row, "CB_BillDiscountAccretion"] += 1.0
 
-    output_dir, verify = _tampered_runner_run(tmp_path, move)
+    output_dir, verify, _ = _tampered_runner_run(tmp_path, move)
     with pytest.raises(ValueError, match="Fed remittance verification failed"):
         verify(output_dir)
 
@@ -412,7 +489,7 @@ def test_verifier_binds_the_tga_to_the_treasury_cash_journal(tmp_path):
     def cut(results):
         results.loc[3, "TGA"] -= 1.0
 
-    output_dir, verify = _tampered_runner_run(tmp_path, cut)
+    output_dir, verify, _ = _tampered_runner_run(tmp_path, cut)
     with pytest.raises(ValueError):
         verify(output_dir)
 

@@ -85,6 +85,7 @@ from .open04_campaign import (
 )
 from .output import (
     HANDOFF_TABLE_COLUMNS,
+    FED_LOT_JOURNAL_OUTPUT,
     MMF_ACQUISITIONS_COLUMNS,
     MMF_ACQUISITIONS_OUTPUT,
     TDC_AMOUNT_BASIS,
@@ -101,6 +102,7 @@ from .output import (
 )
 from .process_watchdog import THREAD_LIMIT_ENVIRONMENT_VARIABLES
 from fed_income import FED_INCOME_RESULT_COLUMNS
+from tips_indexation import value_opening_tips
 from tdc_shared import INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF
 from .runtime_identity import (
     assert_loaded_distribution_modules,
@@ -325,6 +327,7 @@ def verify_scenario_run(
     if manifest.get("output_hashes") != hash_output_tree(outputs):
         raise VerificationError("run output hash list mismatch")
     _verify_manifest_artifacts(root, manifest.get("outputs"), base=root)
+    _verify_output_manifest_records(root, manifest)
     _verify_manifest_artifacts(root, manifest.get("compiled_inputs"), base=root)
     _verify_exact_compiled_input_artifacts(manifest, compiled_manifest)
     _verify_scenario_copy(root, manifest)
@@ -1300,6 +1303,41 @@ def _verify_manifest_artifacts(root: Path, artifacts: Any, *, base: Path) -> Non
             raise VerificationError(f"manifest artifact byte count mismatch: {rel}")
 
 
+def _engine_opening_portfolio(inputs_dir: Path, start_date: str) -> pd.DataFrame:
+    """The opening portfolio as the engine opens it: loaded and with TIPS valued at the start."""
+
+    portfolio = runner_module._load_opening_portfolio(inputs_dir / "tdcsim_opening_portfolio.csv")
+    return value_opening_tips(portfolio, inputs_dir, simulation_start_date=start_date)
+
+
+def _verify_output_manifest_records(root: Path, manifest: dict[str, Any]) -> None:
+    """Every file the output manifest names is the file delivered, so a replay compared
+    against it is compared against the delivered bytes, and the results the verifier reads
+    are the results the output manifest names."""
+
+    output_manifest = manifest.get("output_manifest")
+    if not isinstance(output_manifest, dict):
+        raise VerificationError("run manifest output_manifest must be an object")
+    delivered = {
+        str(item.get("path")): item for item in manifest.get("output_hashes") or [] if isinstance(item, dict)
+    }
+    for logical_name, record in output_manifest.items():
+        if not isinstance(record, dict) or "path" not in record:
+            continue
+        listed = delivered.get(str(record["path"]))
+        if (
+            listed is None
+            or listed.get("sha256") != record.get("sha256")
+            or listed.get("bytes") != record.get("bytes")
+        ):
+            raise VerificationError(f"output manifest record differs from the delivered file: {logical_name}")
+    results = output_manifest.get("results")
+    if not isinstance(results, dict) or (
+        _result_artifact_path(root, manifest).resolve() != (root / "outputs" / str(results.get("path"))).resolve()
+    ):
+        raise VerificationError("the results the verifier reads are not the results the output manifest names")
+
+
 def _verify_scenario_copy(root: Path, manifest: dict[str, Any]) -> None:
     scenario = manifest.get("scenario")
     if not isinstance(scenario, dict):
@@ -1602,7 +1640,8 @@ def _verify_bounded_engine_replay(
             metadata=row_metadata,
         )
         for logical_name in (
-            "results", "final_portfolio", MMF_ACQUISITIONS_OUTPUT, "tdcsim_trc_results", "tdcsim_trc_metadata",
+            "results", "final_portfolio", MMF_ACQUISITIONS_OUTPUT, FED_LOT_JOURNAL_OUTPUT, "tdcsim_trc_results",
+            "tdcsim_trc_metadata",
         ):
             expected = output_manifest.get(logical_name)
             actual = replay_manifest.get(logical_name)
@@ -1735,9 +1774,14 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         return _read_results(root / "outputs" / str(entry["path"])) if entry else None
 
     try:
+        if FED_LOT_JOURNAL_OUTPUT not in output_manifest or "final_portfolio" not in output_manifest:
+            raise ValueError("the run does not deliver the Fed lot journal and the final portfolio it closes on")
         fed_checks = verify_fed_remittances(
             results,
             inputs_dir,
+            lots=evidence(FED_LOT_JOURNAL_OUTPUT),
+            opening_portfolio=_engine_opening_portfolio(inputs_dir, str(manifest["simulation"]["start_date"])),
+            final_portfolio=evidence("final_portfolio"),
             trc_results=evidence("tdcsim_trc_results"),
             ledger=evidence("ledger"),
             payments=evidence("payment"),

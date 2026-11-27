@@ -169,6 +169,7 @@ SOURCE_PACKAGE_INPUTS = {
 SCENARIO_ID = "cbo_full_horizon_local_smoke_3m"
 BASELINE_RUN_ID = "baseline"
 BASELINE_EXPORT_DIR = "exports_baseline"
+FED_LOT_JOURNAL_FILE = "fed_lot_journal.csv"
 PACKAGE_CASH_ROLE = "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path"
 SIMULATION_END_DATE = "2036-09-30"
 BASE_CURVE_OBSERVATION_DATE = "2026-06-16"
@@ -1258,6 +1259,7 @@ def write_run_evidence(
     active.to_csv(out / "final_portfolio_active.csv", index=False)
     matured = portfolio[portfolio["Status"] == "Matured"].copy()
     matured.to_csv(out / "maturity_ledger.csv", index=False)
+    results.attrs["fed_lot_journal"].to_csv(out / FED_LOT_JOURNAL_FILE, index=False)
     if not active.empty:
         active_debt_base = active["FaceValue"].copy()
         tips_mask = active["SecurityType"].astype(str).eq("TIPS")
