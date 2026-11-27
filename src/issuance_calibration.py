@@ -1608,7 +1608,9 @@ def prestart_rollforward(
             public = group.loc[~group_fed]
             if public.empty:
                 category = str(template["MaturityCategory"])
-                buyers = _eligible_route_shares(shares.get(category, shares["notes"]), eligible_at_close)
+                if category not in shares:
+                    raise IssuanceCalibrationError(f"SOMA redistribution for {cusip} has unknown maturity category {category!r}")
+                buyers = _eligible_route_shares(shares[category], eligible_at_close)
             else:
                 face_by_route = public.assign(HolderSubBucket=public["HolderSubBucket"].fillna("")).groupby(
                     ["HolderType", "HolderSubBucket"]
