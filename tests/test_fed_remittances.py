@@ -630,6 +630,43 @@ def test_the_fed_earns_a_tips_deflation_floor_and_the_exports_show_it(tmp_path):
     assert FED_INCOME_EXPORT_FLOWS["CB_TIPSFloorTopup"] == "fed_tips_floor_topup_bil"
 
 
+def test_gse_debt_earns_each_lots_coupon_until_it_matures_and_no_2025_realized_loss_is_grown():
+    """GSE debt earns its coupon only while a lot is outstanding (the last matures 2032-07-15),
+    and realized Treasury gains and losses come only from the run's own sales; neither may be
+    grown from the 2025 statements forever."""
+
+    from datetime import date as day
+
+    source = fed_income_source_fixture()
+    lots = source["soma_agency_debt"]["lots"]
+    rows = pd.DataFrame(build_fed_income_path_rows(
+        scenario_id="baseline", periods=build_simulation_calendar("2026-06-21", "2032-12-31", "daily"),
+    )).set_index("period_end")
+    par = sum(float(lot["par"]) for lot in lots) / 1e9
+    daily_coupon = sum(float(lot["par"]) / 1e9 * float(lot["coupon_pct"]) / 100 for lot in lots) / 365.25
+    assert rows.loc["2026-06-22", "agency_debt_start_bil"] == pytest.approx(par)
+    assert rows.loc["2026-06-22", "agency_debt_interest_bil"] == pytest.approx(daily_coupon)
+    # The class premium at the June 17 holdings date, shared by par times remaining life, is four
+    # days into its straight line at the June 21 opening.
+    as_of, opening = day(2026, 6, 17), day(2026, 6, 21)
+    life = {lot["cusip"]: (day.fromisoformat(lot["maturity_date"]) - as_of).days for lot in lots}
+    weight = {lot["cusip"]: float(lot["par"]) * life[lot["cusip"]] for lot in lots}
+    expected = sum(fed_net_premiums_bil()["gse"] * weight[key] / sum(weight.values()) * (life[key] - (opening - as_of).days)
+                   / life[key] for key in life)
+    assert rows.loc["2026-06-22", "agency_debt_premium_start_bil"] == pytest.approx(expected)
+    # The first lot (486 million) is repaid on 2029-05-15 and stops earning that day.
+    assert rows.loc["2029-05-15", "agency_debt_start_bil"] - rows.loc["2029-05-15", "agency_debt_end_bil"] == pytest.approx(0.486)
+    after = rows.loc["2032-07-16":]
+    assert (after[["agency_debt_end_bil", "agency_debt_interest_bil", "agency_debt_premium_end_bil"]] == 0.0).all().all()
+    banks = source["reserve_banks_2025_mil"]["other_income"]
+    kept = sum(float(value) for key, value in banks.items()
+               if key not in {"treasury_securities_losses_net", "gse_debt_securities"}) / 1000
+    first = rows.iloc[0]
+    year_fraction = (pd.Timestamp(first.name) - pd.Timestamp(first["period_start"])).days / 365.25
+    growth = (1.04 ** ((day(2026, 6, 22) - day(2025, 7, 2)).days / 365.25))
+    assert first["other_income_bil"] == pytest.approx(kept * growth * year_fraction, rel=1e-3)
+
+
 def test_mbs_income_follows_the_nyfed_runoff_path_from_the_h41_opening():
     source = fed_income_source_fixture()
     periods = build_simulation_calendar("2026-06-21", "2036-09-30", "daily")
@@ -731,6 +768,14 @@ def test_fed_income_transcription_matches_the_source_documents():
     effr = json.loads((root / Path(source["documents"]["nyfed_effr"]["file"]).name).read_text())
     opening_effr = [row for row in effr["refRates"] if row["effectiveDate"] == "2026-06-18"]
     assert [str(row["percentRate"]) for row in opening_effr] == [rates["effective_federal_funds_rate_2026_06_18"]]
+    holdings = json.loads((root / Path(source["documents"]["soma_agency_holdings"]["file"]).name).read_text())
+    debts = sorted(
+        (row["cusip"], row["maturityDate"], row["coupon"], row["parValue"])
+        for row in (holdings["soma"]["holdings"] if "soma" in holdings else holdings)
+        if row["securityType"] == "Agency Debts"
+    )
+    assert debts == sorted((lot["cusip"], lot["maturity_date"], lot["coupon_pct"], lot["par"])
+                           for lot in source["soma_agency_debt"]["lots"])
     operations = json.loads((root / Path(source["documents"]["nyfed_reverse_repo_operations"]["file"]).name).read_text())
     june_18 = [op for op in operations["repo"]["operations"] if op["operationDate"] == "2026-06-18"]
     assert [op["totalAmtAccepted"] / 1e9 for op in june_18] == [float(source["opening_domestic_on_rrp"]["total_accepted_bil"])]

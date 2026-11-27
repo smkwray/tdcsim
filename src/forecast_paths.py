@@ -28,7 +28,7 @@ OPERATING_CASH_COMPARISON_ROLE = "nonbinding_comparison_target"
 FED_REMITTANCE_PATH_FILE = "tdcsim_fed_remittance_path.csv"
 FED_REMITTANCE_PATH_SCHEMA_VERSION = "tdcsim_fed_remittance_path_v1"
 FED_INCOME_PATH_FILE = "tdcsim_fed_income_path.csv"
-FED_INCOME_PATH_SCHEMA_VERSION = "tdcsim_fed_income_path_v2"
+FED_INCOME_PATH_SCHEMA_VERSION = "tdcsim_fed_income_path_v3"
 POLICY_RATE_PATH_FILE = "tdcsim_policy_rate_path.csv"
 POLICY_RATE_PATH_SCHEMA_VERSION = "tdcsim_policy_rate_path_v1"
 # The Table 4-3 path stays in the ordinary fiscal flow (CBO counts remittances as receipts);
@@ -505,6 +505,11 @@ FED_INCOME_PATH_COLUMNS = frozenset(
         "soma_mbs_interest_bil",
         "soma_mbs_premium_start_bil",
         "soma_mbs_premium_end_bil",
+        "agency_debt_start_bil",
+        "agency_debt_end_bil",
+        "agency_debt_interest_bil",
+        "agency_debt_premium_start_bil",
+        "agency_debt_premium_end_bil",
         "currency_start_bil",
         "currency_end_bil",
         "other_deposits_start_bil",
@@ -1020,6 +1025,7 @@ _FED_FLOW_OUTPUTS = (
     "CB_TIPSIndexation", "CB_TIPSFloorTopup", "CB_BillDiscountAccretion", "CB_CouponPremiumAmortization",
     "CB_RealizedGains", "CB_TreasuryInterestIncome", "CB_AccruedInterestPurchased", "CB_AccruedInterestSold",
     "CB_PremiumAcquired", "CB_PremiumSold", "CB_MBSCouponIncome", "CB_MBSPremiumAmortization", "CB_MBSIncome",
+    "CB_AgencyDebtCouponIncome", "CB_AgencyDebtPremiumAmortization", "CB_AgencyDebtIncome",
     "CB_OtherIncome", "CB_IORBExpense", "CB_FMUInterestExpense", "CB_DomesticONRRPExpense", "CB_ForeignRepoExpense",
     "CB_OperatingExpenses", "CB_Dividends", "CB_InterestPosted", "CB_ForeignRepoInterestReinvested",
     "CB_TreasuryReserveEffect", "CBOTable43RemittanceInFiscalFlow", "CB_NetIncome", "CB_Remittance",
@@ -1027,7 +1033,8 @@ _FED_FLOW_OUTPUTS = (
 )
 _FED_LEVEL_OUTPUTS = (
     "CB_PolicyRatePct", "CB_IORBRatePct", "CB_ONRRPRatePct", "CB_TreasuryUnamortizedPremium",
-    "CB_TreasuryAccruedInterest", "CB_MBSHoldings", "CB_MBSUnamortizedPremium", "CB_OtherAssets", "CB_Currency",
+    "CB_TreasuryAccruedInterest", "CB_MBSHoldings", "CB_MBSUnamortizedPremium", "CB_AgencyDebtHoldings",
+    "CB_AgencyDebtUnamortizedPremium", "CB_OtherAssets", "CB_Currency",
     "CB_DomesticONRRP", "CB_ForeignRepo", "CB_ForeignOfficialDeposits", "CB_OtherDeposits", "CB_FMUBalances",
     "CB_OtherLiabilitiesAndCapital", "CB_InterestPayable", "CB_ForeignRepoInterestPayable",
     "CB_EarningsRemittancesDue", "CB_ReserveBalances", "CB_DeferredAsset", "TGA",
@@ -1168,14 +1175,16 @@ def check_fed_balance_sheet_closes(results: pd.DataFrame) -> None:
 
     out = {column: pd.to_numeric(results[column], errors="raise").to_numpy(dtype=float) for column in (
         "DebtHeld_CentralBank", "CB_TreasuryUnamortizedPremium", "CB_TreasuryAccruedInterest", "CB_MBSHoldings",
-        "CB_MBSUnamortizedPremium", "CB_OtherAssets", "CB_Currency", "TGA", "CB_DomesticONRRP", "CB_ForeignRepo",
+        "CB_MBSUnamortizedPremium", "CB_AgencyDebtHoldings", "CB_AgencyDebtUnamortizedPremium", "CB_OtherAssets",
+        "CB_Currency", "TGA", "CB_DomesticONRRP", "CB_ForeignRepo",
         "CB_ForeignOfficialDeposits", "CB_OtherDeposits", "CB_OtherLiabilitiesAndCapital", "CB_EarningsRemittancesDue",
         "CB_InterestPayable", "CB_ForeignRepoInterestPayable", "CB_ReserveBalances",
     )}
     other_assets = out["CB_OtherAssets"]
     _close(other_assets, np.full(len(other_assets), other_assets[0]), "constant other assets")
     assets = (out["DebtHeld_CentralBank"] + out["CB_TreasuryUnamortizedPremium"] + out["CB_TreasuryAccruedInterest"]
-              + out["CB_MBSHoldings"] + out["CB_MBSUnamortizedPremium"] + other_assets)
+              + out["CB_MBSHoldings"] + out["CB_MBSUnamortizedPremium"] + out["CB_AgencyDebtHoldings"]
+              + out["CB_AgencyDebtUnamortizedPremium"] + other_assets)
     liabilities = (out["CB_Currency"] + out["TGA"] + out["CB_DomesticONRRP"] + out["CB_ForeignRepo"]
                    + out["CB_ForeignOfficialDeposits"] + out["CB_OtherDeposits"] + out["CB_OtherLiabilitiesAndCapital"]
                    + out["CB_EarningsRemittancesDue"] + out["CB_InterestPayable"] + out["CB_ForeignRepoInterestPayable"])
@@ -1286,6 +1295,7 @@ def verify_fed_remittances(
     first = path.iloc[0]
     for column, output in (
         ("soma_mbs_interest_bil", "CB_MBSCouponIncome"),
+        ("agency_debt_interest_bil", "CB_AgencyDebtCouponIncome"),
         ("other_income_bil", "CB_OtherIncome"),
         ("operating_expenses_bil", "CB_OperatingExpenses"),
         ("dividends_bil", "CB_Dividends"),
@@ -1293,11 +1303,16 @@ def verify_fed_remittances(
         _close(flows[output], path[column], output)
     for stem, output in (
         ("soma_mbs", "CB_MBSHoldings"), ("soma_mbs_premium", "CB_MBSUnamortizedPremium"), ("currency", "CB_Currency"),
+        ("agency_debt", "CB_AgencyDebtHoldings"), ("agency_debt_premium", "CB_AgencyDebtUnamortizedPremium"),
         ("other_deposits", "CB_OtherDeposits"), ("other_liabilities_and_capital", "CB_OtherLiabilitiesAndCapital"),
     ):
         _close(out[output], [first[f"{stem}_start_bil"], *path[f"{stem}_end_bil"]], output)
     _close(flows["CB_MBSPremiumAmortization"], -np.diff(out["CB_MBSUnamortizedPremium"]), "CB_MBSPremiumAmortization")
     _close(flows["CB_MBSIncome"], flows["CB_MBSCouponIncome"] - flows["CB_MBSPremiumAmortization"], "CB_MBSIncome")
+    _close(flows["CB_AgencyDebtPremiumAmortization"], -np.diff(out["CB_AgencyDebtUnamortizedPremium"]),
+           "CB_AgencyDebtPremiumAmortization")
+    _close(flows["CB_AgencyDebtIncome"], flows["CB_AgencyDebtCouponIncome"] - flows["CB_AgencyDebtPremiumAmortization"],
+           "CB_AgencyDebtIncome")
     _close(out["CB_FMUBalances"], out["CB_OtherDeposits"] * float(first["remunerated_other_deposit_share"]), "FMU balances")
     # Administered rates come from the compiled policy-rate path, not from any curve.
     policy = load_policy_rate_path(inputs / POLICY_RATE_PATH_FILE)
@@ -1425,10 +1440,12 @@ def verify_fed_remittances(
         _close(flows[output], rate[1:] / 100.0 * balance[1:] * accrual, f"{output} on the day's closing balance")
     _close(np.diff(out["CB_ReserveBalances"]),
            flows["CB_TreasuryReserveEffect"] + flows["CB_InterestPosted"] + np.diff(out["CB_MBSHoldings"])
-           - flows["CB_MBSCouponIncome"] - np.diff(out["CB_Currency"]) - np.diff(out["CB_OtherDeposits"])
+           - flows["CB_MBSCouponIncome"] + np.diff(out["CB_AgencyDebtHoldings"]) - flows["CB_AgencyDebtCouponIncome"]
+           - np.diff(out["CB_Currency"]) - np.diff(out["CB_OtherDeposits"])
            - np.diff(out["CB_OtherLiabilitiesAndCapital"]) - flows["CB_OtherIncome"] + flows["CB_OperatingExpenses"]
            + flows["CB_Dividends"], "reserve balances roll-forward")
-    net_income = (flows["CB_TreasuryInterestIncome"] + flows["CB_MBSIncome"] + flows["CB_OtherIncome"] - expenses
+    net_income = (flows["CB_TreasuryInterestIncome"] + flows["CB_MBSIncome"] + flows["CB_AgencyDebtIncome"]
+                  + flows["CB_OtherIncome"] - expenses
                   - flows["CB_OperatingExpenses"] - flows["CB_Dividends"])
     _close(flows["CB_NetIncome"], net_income, "CB_NetIncome")
     # The pooled account and the Financial Accounting Manual's weekly rule (paragraph 60.55).

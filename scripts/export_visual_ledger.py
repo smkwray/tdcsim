@@ -525,7 +525,9 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   the balance on which later IORB accrues. Interest credited to FMU accounts leaves
   `fed_fmu_balances_bil` on its other-deposits path: the model assumes the FMUs pass it on to banks, so
   it raises `fed_reserve_balances_bil` by the same amount. Foreign repo pool interest is reinvested in
-  the pool. `fed_mbs_income_bil` (coupon less premium amortization on the agency MBS
+  the pool. `fed_agency_debt_income_bil` is each GSE debt lot's coupon until it matures less its premium
+  amortization, with repaid par settling through reserves. `fed_mbs_income_bil` (coupon less premium
+  amortization on the agency MBS
   runoff path), `fed_other_income_bil`, `fed_operating_expenses_bil` and `fed_dividends_bil` are
   smoothed daily proxies with no payment clock: they accrue every calendar day, and the MBS runoff,
   coupon and the other lines (including net government-agency reimbursements) settle through bank

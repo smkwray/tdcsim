@@ -207,6 +207,18 @@ def fed_income_source_fixture() -> dict[str, Any]:
             "reverse_repo_rate_foreign_official_pct": "3.50",
             "tables": "7a, 7b (balances at amortized cost, March 31, 2026), 6 (par), 16 (reverse repo rates)",
         },
+        "soma_agency_debt": {
+            "as_of_date": "2026-06-17",
+            "lots": [
+                {"cusip": "31359MEU3", "maturity_date": "2029-05-15", "coupon_pct": "6.250", "par": "486000000"},
+                {"cusip": "31359MFJ7", "maturity_date": "2030-01-15", "coupon_pct": "7.125", "par": "665000000"},
+                {"cusip": "31359MFP3", "maturity_date": "2030-05-15", "coupon_pct": "7.250", "par": "285000000"},
+                {"cusip": "31359MGK3", "maturity_date": "2030-11-15", "coupon_pct": "6.625", "par": "382000000"},
+                {"cusip": "3134A4AA2", "maturity_date": "2031-03-15", "coupon_pct": "6.750", "par": "316000000"},
+                {"cusip": "3134A4KX1", "maturity_date": "2032-07-15", "coupon_pct": "6.250", "par": "213000000"},
+            ],
+            "method": "every Agency Debts CUSIP in the NY Fed's SOMA agency holdings at the opening",
+        },
         "soma_agency_mbs": {
             "as_of_date": "2026-06-17",
             "current_face_mil": "1964797.733684066",
@@ -306,7 +318,7 @@ def fed_net_premiums_bil() -> dict[str, float]:
 
     The 2026Q1 report gives each class's amortized cost and par (net premium = the
     difference); the class amounts are scaled so they sum to the June 17 H.4.1 net of
-    unamortized premiums and discounts. GSE debt, not modeled, stays in other assets.
+    unamortized premiums and discounts. GSE debt carries its own share.
     """
 
     source = fed_income_source_fixture()
@@ -339,7 +351,12 @@ def build_fed_income_path_rows(
     growth = Decimal(projection["liability_growth_pct"])
     banks = source["reserve_banks_2025_mil"]
     base_day = date(2025, 7, 2)
-    other_income = sum(Decimal(value) for value in banks["other_income"].values()) / 1000
+    # Realized Treasury gains and losses come only from the run's own sales and retirements, and
+    # GSE debt earns lot by lot until it matures, so neither is grown from the 2025 statements.
+    other_income = sum(
+        Decimal(value) for key, value in banks["other_income"].items()
+        if key not in {"treasury_securities_losses_net", "gse_debt_securities"}
+    ) / 1000
     operating = Decimal(banks["operating_expenses"]) / 1000
     dividends = Decimal(banks["dividends_on_capital_stock"]) / 1000
     wac = float(source["soma_agency_mbs"]["weighted_average_coupon_pct"]) / 100
@@ -355,6 +372,26 @@ def build_fed_income_path_rows(
 
     def mbs(day: date) -> float:
         return h41_mbs * _mbs_projection_level(day, projection["agency_mbs_year_end_bil"]) / mbs_anchor
+
+    # GSE debt: each lot earns its coupon until it matures, when its par is repaid; the class
+    # premium is shared by par times remaining life and amortized straight line to maturity.
+    agency = [
+        (date.fromisoformat(lot["maturity_date"]), float(Decimal(lot["par"]) / 10**9), float(lot["coupon_pct"]) / 100)
+        for lot in source["soma_agency_debt"]["lots"]
+    ]
+    weights = [par * (maturity - as_of).days for maturity, par, _ in agency]
+    agency_premium = [premiums["gse"] * weight / sum(weights) for weight in weights]
+
+    def agency_par(day: date) -> float:
+        return sum(par for maturity, par, _ in agency if maturity > day)
+
+    def agency_premium_at(day: date) -> float:
+        return sum(premium * max(0, (maturity - day).days) / (maturity - as_of).days
+                   for (maturity, _, _), premium in zip(agency, agency_premium))
+
+    def agency_interest(first: date, last: date) -> float:
+        return sum(par * coupon * max(0, (min(last, maturity) - first).days) / DAYS_PER_YEAR
+                   for maturity, par, coupon in agency)
 
     def grown(level: Decimal, day: date) -> float:
         return float(level) * _fed_growth(as_of, day, growth)
@@ -398,6 +435,11 @@ def build_fed_income_path_rows(
             "soma_mbs_interest_bil": wac * mbs(first) * year_fraction,
             "soma_mbs_premium_start_bil": premiums["mbs"] * mbs(first) / h41_mbs,
             "soma_mbs_premium_end_bil": premiums["mbs"] * mbs(last) / h41_mbs,
+            "agency_debt_start_bil": agency_par(first),
+            "agency_debt_end_bil": agency_par(last),
+            "agency_debt_interest_bil": agency_interest(first, last),
+            "agency_debt_premium_start_bil": agency_premium_at(first),
+            "agency_debt_premium_end_bil": agency_premium_at(last),
             "currency_start_bil": grown(bil("federal_reserve_notes_net"), first),
             "currency_end_bil": grown(bil("federal_reserve_notes_net"), last),
             "other_deposits_start_bil": grown(bil("other_deposits"), first),

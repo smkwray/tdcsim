@@ -14,7 +14,9 @@ Earnings are accrual basis on the Fed's own acquisition basis:
   discount, coupon securities share the rest of the H.4.1 net premium in proportion to
   stock.
 - Agency MBS income is a smoothed proxy: coupon on a daily runoff path less premium
-  amortization in proportion to runoff. Operating expenses, dividends and other income are
+  amortization in proportion to runoff. GSE debt earns each lot's coupon until it matures,
+  less its share of the class premium amortized straight line to maturity; repaid par and
+  coupons, like MBS principal and coupons, settle through reserves. Operating expenses, dividends and other income are
   smoothed daily proxies too; none of these has a payment clock.
 
 Expenses accrue on each day's closing balances: IORB on reserves and on designated
@@ -71,6 +73,9 @@ FED_INCOME_FLOW_COLUMNS = (
     "CB_MBSCouponIncome",
     "CB_MBSPremiumAmortization",
     "CB_MBSIncome",
+    "CB_AgencyDebtCouponIncome",
+    "CB_AgencyDebtPremiumAmortization",
+    "CB_AgencyDebtIncome",
     "CB_OtherIncome",
     "CB_IORBExpense",
     "CB_FMUInterestExpense",
@@ -91,6 +96,8 @@ FED_BALANCE_COLUMNS = (
     "CB_TreasuryAccruedInterest",
     "CB_MBSHoldings",
     "CB_MBSUnamortizedPremium",
+    "CB_AgencyDebtHoldings",
+    "CB_AgencyDebtUnamortizedPremium",
     "CB_OtherAssets",
     "CB_Currency",
     "CB_DomesticONRRP",
@@ -110,6 +117,7 @@ FED_INCOME_RESULT_COLUMNS = (*FED_INCOME_FLOW_COLUMNS, *FED_BALANCE_COLUMNS)
 NET_INCOME_TERMS = {
     "CB_TreasuryInterestIncome": 1.0,
     "CB_MBSIncome": 1.0,
+    "CB_AgencyDebtIncome": 1.0,
     "CB_OtherIncome": 1.0,
     "CB_IORBExpense": -1.0,
     "CB_FMUInterestExpense": -1.0,
@@ -143,6 +151,7 @@ FED_INCOME_EXPORT_FLOWS = {
     "CB_RealizedGains": "fed_realized_gains_bil",
     "CB_MBSIncome": "fed_mbs_income_bil",
     "CB_MBSPremiumAmortization": "fed_mbs_premium_amortization_bil",
+    "CB_AgencyDebtIncome": "fed_agency_debt_income_bil",
     "CB_OtherIncome": "fed_other_income_bil",
     "CB_IORBExpense": "fed_iorb_on_reserves_expense_bil",
     "CB_FMUInterestExpense": "fed_iorb_on_fmu_balances_expense_bil",
@@ -162,6 +171,7 @@ FED_INCOME_EXPORT_LEVELS = {
     "CB_FMUBalances": "fed_fmu_balances_bil",
     "CB_Currency": "fed_currency_bil",
     "CB_MBSHoldings": "fed_mbs_holdings_bil",
+    "CB_AgencyDebtHoldings": "fed_agency_debt_holdings_bil",
     "CB_OtherLiabilitiesAndCapital": "fed_other_liabilities_and_capital_bil",
     "CB_TreasuryUnamortizedPremium": "fed_treasury_unamortized_premium_bil",
     "CB_TreasuryAccruedInterest": "fed_treasury_accrued_interest_bil",
@@ -574,6 +584,8 @@ class FedBook:
         self.foreign_repo_reinvested = 0.0
         self.mbs = float(path_row["soma_mbs_start_bil"])
         self.mbs_premium = float(path_row["soma_mbs_premium_start_bil"])
+        self.agency = float(path_row["agency_debt_start_bil"])
+        self.agency_premium = float(path_row["agency_debt_premium_start_bil"])
         self.currency = float(path_row["currency_start_bil"])
         self.other_deposits = float(path_row["other_deposits_start_bil"])
         self.other_liabilities = float(path_row["other_liabilities_and_capital_start_bil"])
@@ -606,7 +618,8 @@ class FedBook:
         return self.foreign_repo_base + self.foreign_repo_reinvested
 
     def _assets_ex_other(self) -> float:
-        return self.treasury_face + self.lots.total() + sum(self.accrued.values()) + self.mbs + self.mbs_premium
+        return (self.treasury_face + self.lots.total() + sum(self.accrued.values()) + self.mbs + self.mbs_premium
+                + self.agency + self.agency_premium)
 
     def _liabilities(self, tga: float) -> float:
         return (
@@ -639,6 +652,8 @@ class FedBook:
             "CB_TreasuryAccruedInterest": sum(self.accrued.values()),
             "CB_MBSHoldings": self.mbs,
             "CB_MBSUnamortizedPremium": self.mbs_premium,
+            "CB_AgencyDebtHoldings": self.agency,
+            "CB_AgencyDebtUnamortizedPremium": self.agency_premium,
             "CB_OtherAssets": self.other_assets,
             "CB_Currency": self.currency,
             "CB_DomesticONRRP": self.domestic_rrp,
@@ -701,6 +716,11 @@ class FedBook:
         flows["CB_MBSCouponIncome"] = float(path_row["soma_mbs_interest_bil"])
         flows["CB_MBSPremiumAmortization"] = self.mbs_premium - mbs_premium_end
         flows["CB_MBSIncome"] = flows["CB_MBSCouponIncome"] - flows["CB_MBSPremiumAmortization"]
+        agency_end = float(path_row["agency_debt_end_bil"])
+        agency_premium_end = float(path_row["agency_debt_premium_end_bil"])
+        flows["CB_AgencyDebtCouponIncome"] = float(path_row["agency_debt_interest_bil"])
+        flows["CB_AgencyDebtPremiumAmortization"] = self.agency_premium - agency_premium_end
+        flows["CB_AgencyDebtIncome"] = flows["CB_AgencyDebtCouponIncome"] - flows["CB_AgencyDebtPremiumAmortization"]
         flows["CB_OtherIncome"] = float(path_row["other_income_bil"])
         flows["CB_OperatingExpenses"] = float(path_row["operating_expenses_bil"])
         flows["CB_Dividends"] = float(path_row["dividends_bil"])
@@ -725,6 +745,8 @@ class FedBook:
             + posted
             + (mbs_end - self.mbs)
             - flows["CB_MBSCouponIncome"]
+            + (agency_end - self.agency)
+            - flows["CB_AgencyDebtCouponIncome"]
             - (currency_end - self.currency)
             - (other_deposits_end - self.other_deposits)
             - (other_liabilities_end - self.other_liabilities)
@@ -733,6 +755,7 @@ class FedBook:
             + flows["CB_Dividends"]
         )
         self.mbs, self.mbs_premium, self.currency = mbs_end, mbs_premium_end, currency_end
+        self.agency, self.agency_premium = agency_end, agency_premium_end
         self.other_deposits, self.other_liabilities = other_deposits_end, other_liabilities_end
         self.domestic_rrp, self.foreign_repo_base, self.foreign_deposits = domestic_rrp_end, foreign_base_end, foreign_deposits_end
         if not math.isfinite(self.reserves) or self.reserves < 0.0:
