@@ -338,12 +338,26 @@ def test_run_cbo_scenario_fed_target_settles_with_fixed_remittance(tmp_path: Pat
 
 
 def test_cb_beneficial_holder_maturity_creates_no_private_principal_tdc(tmp_path: Path) -> None:
-    opening = _opening_controlled_portfolio(1_000.0)
-    opening.loc[:, "SecurityType"] = "Fixed"
+    # Both routes already own the bill at opening. The Fed cannot acquire it
+    # near redemption, and needs a separate eligible issue to reinvest afterward.
+    private = _opening_controlled_portfolio(900.0)
+    cb = _opening_controlled_portfolio(100.0)
+    cb.loc[:, "BondID"] = 2
+    cb.loc[:, "HolderType"] = "CB"
+    cb.loc[:, "HolderSubBucket"] = ""
+    opening = pd.concat([private, cb], ignore_index=True)
     opening.loc[:, "MaturityDate"] = pd.Timestamp("2026-09-25")
     opening.loc[:, "OriginalMaturityYears"] = 0.25
     opening.loc[:, "CouponRate"] = 0.0
     opening.loc[:, "MaturityCategory"] = "bills"
+    reinvestment = _opening_controlled_portfolio(700.0)
+    reinvestment.loc[:, "BondID"] = 3
+    reinvestment.loc[:, "IssueDate"] = pd.Timestamp("2026-06-25")
+    reinvestment.loc[:, "MaturityDate"] = pd.Timestamp("2026-12-24")
+    reinvestment.loc[:, "OriginalMaturityYears"] = 0.5
+    reinvestment.loc[:, "CouponRate"] = 0.0
+    reinvestment.loc[:, "MaturityCategory"] = "bills"
+    opening = pd.concat([opening, reinvestment], ignore_index=True)
     package, attestation = _write_runner_package(tmp_path, opening_portfolio=opening)
     baseline = CboBaselinePackage.open(package, attestation_path=attestation)
     scenario = _write_scenario(tmp_path / "fed-principal-route.json", baseline, overrides={})
@@ -1439,7 +1453,14 @@ def _write_runner_package(
         ],
     )
     if opening_portfolio is None:
-        opening_portfolio = _opening_controlled_portfolio(1_000.0)
+        # The first-day Fed purchase has to come from a seasoned note, with a
+        # separate on-the-run issue of the same tenor. Both pay a September coupon.
+        seasoned = _opening_controlled_portfolio(900.0)
+        on_the_run = _opening_controlled_portfolio(100.0)
+        on_the_run.loc[:, "BondID"] = 2
+        on_the_run.loc[:, "IssueDate"] = pd.Timestamp("2026-03-30")
+        on_the_run.loc[:, "MaturityDate"] = pd.Timestamp("2028-03-30")
+        opening_portfolio = pd.concat([seasoned, on_the_run], ignore_index=True)
     opening_cb = opening_portfolio[
         opening_portfolio["HolderType"].astype(str).eq("CB")
         & opening_portfolio["Status"].astype(str).eq("Active")

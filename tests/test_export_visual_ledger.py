@@ -31,18 +31,33 @@ def test_issues_keep_the_engines_terms_and_a_reopening_stays_one_security() -> N
         _event("2026-08-17", "Banks", "", 10.0, reopening=False),
         _event("2026-08-17", "CB", "", 2.0, reopening=False),
         _event("2026-09-15", "Private", "mmf_cash_fund_route", 5.0, reopening=True),
-        _event("2026-09-30", "Foreign", "", 3.0, reopening=True, kind="fiscal_year_close"),
+        _event("2026-09-30", "Foreign", "", 3.0, reopening=True, kind="early_settlement"),
     ]
     issues = build_issues(flows)
     assert issues["security_id"].tolist() == ["fixed-10y-2036-08-15"] * 3
     assert issues["is_reopening"].tolist() == [False, True, True]
-    assert issues["settlement_day_kind"].tolist() == ["calendar", "calendar", "fiscal_year_close"]
+    assert issues["settlement_day_kind"].tolist() == ["calendar", "calendar", "early_settlement"]
     assert issues.loc[0, "face_fed"] == 2.0 and issues.loc[0, "face_total"] == 12.0
     assert set(issues["maturity_date"]) == {pd.Timestamp("2036-08-15")}
     assert security_type("Fixed", 7.0) == "note" and security_type("Fixed", 20.0) == "bond"
     del flows[0]["security_label"]
     with pytest.raises(SystemExit, match="issue terms"):
         build_issues(flows)
+
+
+def test_issues_keep_cash_management_bills_separate_and_reject_the_sweep_kind() -> None:
+    from issuance_calibration import CASH_MANAGEMENT_BILL_KIND, CASH_MANAGEMENT_BILL_WEEKS, bill_maturity_years
+
+    bill = _event("2026-09-30", "Banks", "", 3.0, reopening=False, kind=CASH_MANAGEMENT_BILL_KIND)
+    bill.update(security_label="cash_management_bill-2026-09-30", weighted_original_term_years=bill_maturity_years(
+        CASH_MANAGEMENT_BILL_WEEKS), dated_date="2026-09-30", maturity_date="2026-10-14",
+        coupon_rate_decimal=0.0)
+    issues = build_issues([bill])
+    assert issues.loc[0, "security_type"] == "bill"
+    assert issues.loc[0, "settlement_day_kind"] == CASH_MANAGEMENT_BILL_KIND
+    assert issues.loc[0, "maturity_payment_date"] == pd.Timestamp("2026-10-14")
+    with pytest.raises(SystemExit, match="unknown settlement kind"):
+        build_issues([{**bill, "settlement_kind": "fiscal_year_close"}])
 
 
 def test_payment_dates_move_off_weekends_and_holidays_but_not_contract_dates() -> None:

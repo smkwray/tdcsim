@@ -1583,14 +1583,14 @@ def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_pat
         periods=_single_period(),
         opening_state_date="2026-09-20",
         opening_cb_holdings_bil=0.0,
-        cbo_fy_end_fed_holdings_bil={2026: 50.0},
+        cbo_fy_end_fed_holdings_bil={2026: 20.0},
         observation_date="2026-09-20",
         available_date="2026-09-20",
     )
     paths["fed_holdings_path_file"] = _write_csv(tmp_path / "tdcsim_fed_holdings_path.csv", fed_rows)
 
     loaded_fed_path = load_fed_holdings_path(paths["fed_holdings_path_file"])
-    assert loaded_fed_path["cbo_fed_holdings_target_bil"].iloc[-1] == pytest.approx(50.0)
+    assert loaded_fed_path["cbo_fed_holdings_target_bil"].iloc[-1] == pytest.approx(20.0)
 
     results, _ = run_simulation(
         _minimal_engine_params(paths, private_bills=1.0, banks_bills=0.0),
@@ -1605,10 +1605,10 @@ def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_pat
     assert period["NewDebtIssued"] == pytest.approx(125.0)
     assert period["AuctionProceeds"] == pytest.approx(119.04761904761904)
     assert period["TGA"] == pytest.approx(859.047619047619)
-    assert period["CBOFedHoldingsTarget"] == pytest.approx(50.0)
+    assert period["CBOFedHoldingsTarget"] == pytest.approx(20.0)
     assert period["CBOFedHoldingsTargetApplicable"] == pytest.approx(1.0)
     assert period["CBOFedAuctionShare"] == pytest.approx(0.0)
-    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(50.0)
+    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(20.0)
     assert period["CBOFedSecondaryPurchaseCash"] > 0.0
     assert period["CBOFedSecondaryPurchaseCash"] != pytest.approx(
         period["CBOFedSecondaryPurchaseFace"]
@@ -1619,19 +1619,19 @@ def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_pat
     assert period["CBOFedSecondaryPurchaseDepositEffect"] == pytest.approx(
         period["CBOFedSecondaryPurchaseCash"]
     )
-    assert period["CBOFedSyntheticSecondaryPurchases"] == pytest.approx(50.0)
+    assert period["CBOFedSyntheticSecondaryPurchases"] == pytest.approx(20.0)
     assert period["CBOFedBeginStock"] == pytest.approx(0.0)
-    assert period["CBOFedEndStock"] == pytest.approx(50.0)
-    assert period["CBOFedNetStockChange"] == pytest.approx(50.0)
-    assert period["CBOFedGrossStockFlow"] == pytest.approx(50.0)
+    assert period["CBOFedEndStock"] == pytest.approx(20.0)
+    assert period["CBOFedNetStockChange"] == pytest.approx(20.0)
+    assert period["CBOFedGrossStockFlow"] == pytest.approx(20.0)
     assert period["CBOFedStockMode"] == "synthetic_cb_treasury_stock_target_beneficial_holder"
     assert period["CBOFedSettlementScope"] == "beneficial_holder_with_model_dirty_value_settlement"
     assert period["CBOFedAcquisitionChannel"] == "synthetic_secondary_purchase_to_hit_cbo_stock_path"
     assert period["CBORemittanceCashEffect"] == pytest.approx(0.0)
     assert period["CBORemittanceStatus"] == CBO_FED_REMITTANCE_STATUS
-    assert period["DebtHeld_CentralBank"] == pytest.approx(50.0)
+    assert period["DebtHeld_CentralBank"] == pytest.approx(20.0)
     assert period["CBOFedHoldingsTargetError"] == pytest.approx(0.0)
-    assert period["DebtHeld_DomesticNonBanks"] == pytest.approx(1_075.0)
+    assert period["DebtHeld_DomesticNonBanks"] == pytest.approx(1_105.0)
     assert period["Reserves"] == pytest.approx(
         940.952380952381 + period["CBOFedSecondaryPurchaseReserveEffect"]
     )
@@ -1653,7 +1653,7 @@ def test_bounded_cbo_sink_matches_legacy_fed_transfer_fixture(tmp_path: Path) ->
         periods=_single_period(),
         opening_state_date="2026-09-20",
         opening_cb_holdings_bil=0.0,
-        cbo_fy_end_fed_holdings_bil={2026: 50.0},
+        cbo_fy_end_fed_holdings_bil={2026: 20.0},
         observation_date="2026-09-20",
         available_date="2026-09-20",
     )
@@ -1707,7 +1707,7 @@ def test_cbo_fed_secondary_purchase_from_bank_creates_reserves_not_deposits(tmp_
         periods=_single_period(),
         opening_state_date="2026-09-20",
         opening_cb_holdings_bil=0.0,
-        cbo_fy_end_fed_holdings_bil={2026: 50.0},
+        cbo_fy_end_fed_holdings_bil={2026: 20.0},
         observation_date="2026-09-20",
         available_date="2026-09-20",
     )
@@ -1727,7 +1727,7 @@ def test_cbo_fed_secondary_purchase_from_bank_creates_reserves_not_deposits(tmp_
     )
 
     period = results.iloc[-1]
-    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(50.0)
+    assert period["CBOFedSecondaryPurchaseFace"] == pytest.approx(20.0)
     assert period["CBOFedSecondaryPurchaseCash"] > 0.0
     assert period["CBOFedSecondaryPurchaseReserveEffect"] == pytest.approx(
         period["CBOFedSecondaryPurchaseCash"]
@@ -1751,7 +1751,8 @@ def test_cbo_fed_secondary_purchase_fails_closed_when_security_cannot_be_priced(
     paths["fed_holdings_path_file"] = _write_csv(tmp_path / "tdcsim_fed_holdings_path.csv", fed_rows)
     params = _minimal_engine_params(paths)
     params["initial_bonds_df"].loc[:, "CouponRate"] = float("nan")
-    # Mature it before the day's new bills, so it is the security the Fed must buy first.
+    # Put the invalid rate on an eligible bill inside the purchase maturity window.
+    params["initial_bonds_df"].loc[:, "OriginalMaturityYears"] = 1.0
     params["initial_bonds_df"].loc[:, "MaturityDate"] = pd.Timestamp("2027-06-30")
 
     with pytest.raises(ValueError, match="invalid coupon rate"):

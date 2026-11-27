@@ -17,6 +17,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
@@ -61,6 +63,7 @@ from issuance_calibration import (  # noqa: E402
     build_issuance_calibration,
     prestart_rollforward,
     prestart_settlements,
+    verify_fiscal_close_cash,
 )
 from sim_engine import _fiscal_year_close_dates  # noqa: E402
 from tips_indexation import (  # noqa: E402
@@ -518,8 +521,6 @@ def _verify_directory(root: Path, *, package_zip_sha256: str | None) -> dict[str
 def _verify_issuance_calibration(root: Path, manifest: Mapping[str, Any]) -> None:
     """The issuance calibration must rebuild exactly from the packaged auctions and opening book."""
 
-    import pandas as pd
-
     path = root / "forecast_inputs" / CALIBRATION_FILE
     recorded = _read_json(path)
     source_rel = "sources/fiscaldata/auctions_query.csv"
@@ -582,8 +583,6 @@ def _verify_opening_counts_against_source_book(
     root: Path, manifest: Mapping[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Rebuild counts and stock-flow diagnostics from the packaged source book."""
-    import pandas as pd
-
     opening = manifest["opening_portfolio_construction"]
     source_path = root / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv"
     book = pd.read_csv(source_path, low_memory=False).reindex(columns=[*BOND_PORTFOLIO_COLS, "cusip_or_synthetic_id"])
@@ -741,7 +740,8 @@ def _compute_run_metrics(
         "IssuanceNeedProceeds",
         "PendingIssuanceProceeds",
         "EarlySettlementProceeds",
-        "FiscalYearCloseSettlementProceeds",
+        "FedRolloverCashSizingDifference",
+        "CashManagementBillProceeds",
         "CashFinancingProceeds",
         "NewDebtIssued",
         "AuctionProceeds",
@@ -815,7 +815,8 @@ def _compute_run_metrics(
             raise ValueError(f"{run_id} row {row_index} reports a binding CBO debt target")
         tga = _float(row, "TGA")
         pending = _float(row, "PendingIssuanceProceeds")
-        excess = tga + pending - _float(row, "CBOOperatingCashTarget")
+        rollover_difference = _float(row, "FedRolloverCashSizingDifference")
+        excess = tga + pending - _float(row, "CBOOperatingCashTarget") - rollover_difference
         if tga < -NUMERIC_TOLERANCE or pending < -NUMERIC_TOLERANCE or excess < -NUMERIC_TOLERANCE:
             raise ValueError(f"{run_id} row {row_index} TGA is negative or below target beyond pending issuance")
         if _float(row, "IssuanceNeedProceeds") > NUMERIC_TOLERANCE and abs(excess) > NUMERIC_TOLERANCE:
@@ -843,9 +844,11 @@ def _compute_run_metrics(
         day.date().isoformat()
         for day in _fiscal_year_close_dates({"settlement_calendar": settlement_calendar}, dates[0], dates[-1])
     ]
-    for day in fiscal_year_closes:
-        if abs(_float(by_date[day], "PendingIssuanceProceeds")) > NUMERIC_TOLERANCE:
-            raise ValueError(f"{run_id} has pending issuance at the fiscal-year end {day}")
+    try:
+        verify_fiscal_close_cash(pd.DataFrame(rows), {"settlement_calendar": settlement_calendar},
+                                 tolerance=NUMERIC_TOLERANCE)
+    except ValueError as exc:
+        raise ValueError(f"{run_id} {exc}") from exc
     fed_errors = [
         _float(row, "CBOFedHoldingsTargetError")
         for row in rows

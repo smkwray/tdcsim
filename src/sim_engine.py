@@ -4,6 +4,7 @@
 import bisect
 import copy
 import functools
+import json
 import time
 import traceback
 from collections import defaultdict
@@ -35,12 +36,16 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_MMF_ADDED,
     PRIVATE_SUBBUCKETS,
     PRIVATE_SUBBUCKET_SHARES_KEY,
+    PUBLIC_MARKETABLE_SECURITY_TYPES,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
     TRANSFER_SCALABLE_COLUMNS,
 )
 import holder_targets
+import fed_purchase_policy
 from issuance_calibration import (
+    CASH_MANAGEMENT_BILL_KIND,
+    CASH_MANAGEMENT_BILL_WEEKS,
     active_special_categories,
     bill_days,
     bill_issuance_amount,
@@ -123,15 +128,17 @@ OPERATING_CASH_RESULT_COLUMNS = (
     'IssuanceNeedProceeds',
     'PendingIssuanceProceeds',
     'EarlySettlementProceeds',
-    'FiscalYearCloseSettlementProceeds',
+    'CashManagementBillProceeds',
     'FedRolloverFace',
     'FedRolloverProceeds',
+    'FedRolloverReallocatedStock',
     'FedRedeemedFace',
 )
 # The Fed's add-ons at auction: not operating-cash financing, and paid for by the Fed.
 FED_ROLLOVER_ISSUANCE_LEG = 'fed_rollover_add_on'
 CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
+_CASH_MANAGEMENT_BILL_KEY = (CASH_MANAGEMENT_BILL_KIND, float(CASH_MANAGEMENT_BILL_WEEKS))
 
 
 def _is_cbo_funding_mode(params):
@@ -1759,6 +1766,103 @@ def _earliest_lot(bond_portfolio, eligible_indices):
     return holder_targets.economic_lot_order(bond_portfolio.loc[tied])[0]
 
 
+def _purchase_issue_allocations(issues, amount):
+    """Water-fill pro rata by non-SOMA par, expressing both sides in path stock units."""
+    allocations = {}
+    remaining = amount
+    for sectors in (fed_purchase_policy.BILL_SECTORS, fed_purchase_policy.COUPON_SECTORS):
+        initial = remaining
+        eligible = {sector: {key: row for key, row in issues.items() if row['sector'] == sector}
+                    for sector in sectors}
+
+        def fill(sector, target):
+            pool = {
+                key: (row['public_stock'], row['capacity'] - allocations.get(key, 0.0))
+                for key, row in eligible[sector].items()
+                if row['capacity'] - allocations.get(key, 0.0) > TGA_FLOOR_TOLERANCE
+            }
+            while pool and target > TGA_FLOOR_TOLERANCE:
+                scale = target / sum(weight for weight, _ in pool.values())
+                capped = [key for key, (weight, cap) in pool.items() if weight * scale >= cap]
+                if not capped:
+                    for key, (weight, _) in pool.items():
+                        allocations[key] = allocations.get(key, 0.0) + weight * scale
+                    return 0.0
+                for key in capped:
+                    _, cap = pool.pop(key)
+                    allocations[key] = allocations.get(key, 0.0) + cap
+                    target -= cap
+            return target
+
+        remaining = sum(fill(sector, initial * sector.weight) for sector in sectors)
+        for sector in sectors:
+            remaining = fill(sector, remaining)
+        if remaining <= TGA_FLOOR_TOLERANCE:
+            break
+    return allocations, remaining
+
+
+def _purchase_issues(portfolio, current):
+    """Identify operational issues using the opening book's economic security terms.
+
+    The runtime book carries lot IDs. Regular bills of the same maturity are
+    fungible. Coupon issues and their reopenings share type, maturity and coupon,
+    with spread for FRNs and the original reference CPI for TIPS.
+    """
+    marketable = portfolio.loc[
+        portfolio['Status'].eq('Active') & portfolio['SecurityType'].isin(PUBLIC_MARKETABLE_SECURITY_TYPES)
+    ].sort_values('BondID', kind='stable')
+    if marketable.empty:
+        return {}
+    marketable = marketable.assign(_maturity=pd.to_datetime(marketable['MaturityDate']).dt.normalize())
+    if marketable['_maturity'].isna().any():
+        raise ValueError('Fed purchase book contains an active marketable security without a maturity')
+    bills = bill_mask(marketable)
+    nominal_coupons = marketable.loc[marketable['SecurityType'].eq('Fixed') & ~bills]
+    # The newest issue in each nominal tenor is on the run. Comparing maturity
+    # within each tenor keeps reopening settlement dates out of the comparison.
+    tenors = nominal_coupons['OriginalMaturityYears'].round()
+    on_the_run = nominal_coupons.groupby(tenors)['_maturity'].transform('max').eq(nominal_coupons['_maturity'])
+
+    eligible = marketable.loc[
+        ~marketable.index.isin(on_the_run.index[on_the_run])
+        & ~marketable.get('IsCashManagementBill', pd.Series(False, index=marketable.index)).fillna(False)
+        & (marketable['_maturity'] > current + pd.Timedelta(days=fed_purchase_policy.EXCLUDED_MATURITY_DAYS))
+        & (marketable['_maturity'] <= current + pd.DateOffset(months=fed_purchase_policy.COUPON_SECTORS[-1].max_months))
+    ].copy()
+    eligible['_bill'] = bills.loc[eligible.index]
+    eligible['_coupon'] = eligible['CouponRate'].where(~eligible['_bill'], 0.0)
+    eligible['_term_detail'] = eligible['FixedSpread'].where(
+        eligible['SecurityType'].eq('FRN'), eligible['ReferenceCPI_Issue'].where(eligible['SecurityType'].eq('TIPS'), 0.0)
+    )
+    issues = {}
+    for key, issue in eligible.groupby(
+        ['_bill', 'SecurityType', '_maturity', '_coupon', '_term_detail'], dropna=False, sort=True
+    ):
+        is_bill, security_type, maturity, _, _ = key
+        sector = fed_purchase_policy.purchase_sector(current, maturity, bill=is_bill)
+        if sector is None:
+            continue
+        face = issue['FaceValue']
+        if not np.isfinite(face).all() or (face < 0.0).any():
+            raise ValueError(f'Fed purchase issue {key} has invalid par outstanding')
+        cb = issue['HolderType'].eq('CB')
+        sellers = issue.loc[issue['HolderType'].isin(('Banks', 'Private', 'Foreign')) & face.gt(0.0)]
+        public_par = float(sellers['FaceValue'].sum())
+        cap = min(public_par, fed_purchase_policy.par_capacity(float(face.sum()), float(face[cb].sum()), bill=is_bill))
+        if cap <= TGA_FLOOR_TOLERANCE:
+            continue
+        # Apply the issue limits to par. The SOMA path is in indexed stock for TIPS.
+        stock = float(sellers['AdjustedPrincipal'].sum()) if security_type == 'TIPS' else public_par
+        if not np.isfinite(stock) or stock <= 0.0:
+            raise ValueError(f'Fed purchase issue {key} has invalid public debt stock')
+        issues[key] = {
+            'sector': sector, 'public_stock': stock, 'capacity': cap * stock / public_par,
+            'sellers': sellers.index, 'cb': issue.index[cb],
+        }
+    return issues
+
+
 def _transfer_public_marketable_debt_to_cb(
     bond_portfolio,
     amount_to_purchase,
@@ -1772,106 +1876,109 @@ def _transfer_public_marketable_debt_to_cb(
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
     portfolio_row_budget=None,
+    operation_summary=None,
 ):
-    """Move public marketable debt to CB and return dirty-value settlement by seller."""
-    if bond_portfolio is None or bond_portfolio.empty:
-        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), 0.0
-    remaining = max(0.0, float(amount_to_purchase))
-    sold_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+    """Buy eligible issues and settle the same fraction of every seller lot of an issue."""
+    sold_by_holder = dict.fromkeys(HOLDER_TYPES, 0.0)
     sold_by_private_route = _zero_private_routes()
-    holder_order = ['Private', 'Banks', 'Foreign']
-    next_bond_id = None
-    purchased_total = 0.0
-    purchase_cash = 0.0
-    new_rows = []
-    while remaining > TGA_FLOOR_TOLERANCE:
-        idx = None
-        for holder in holder_order:
-            holder_mask = (
-                (bond_portfolio['Status'] == 'Active')
-                & (bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS', 'FRN']))
-                & (bond_portfolio['HolderType'] == holder)
-            )
-            if not holder_mask.any():
-                continue
-            holder_rows = bond_portfolio.loc[holder_mask, ['SecurityType', 'FaceValue', 'AdjustedPrincipal', 'MaturityDate']]
-            holder_debt_base = np.where(
-                holder_rows['SecurityType'] == 'TIPS',
-                holder_rows['AdjustedPrincipal'].fillna(holder_rows['FaceValue']),
-                holder_rows['FaceValue'],
-            )
-            eligible_indices = holder_rows.index[pd.Series(holder_debt_base, index=holder_rows.index) > TGA_FLOOR_TOLERANCE]
-            if len(eligible_indices) == 0:
-                continue
-            idx = _earliest_lot(bond_portfolio, eligible_indices)
-            break
-        if idx is None:
-            break
-        row = bond_portfolio.loc[idx].copy()
-        debt_base = _bond_debt_base(row)
-        if debt_base <= TGA_FLOOR_TOLERANCE:
-            bond_portfolio.loc[idx, 'FaceValue'] = 0.0
-            continue
-        purchase_amount = min(remaining, debt_base)
-        pricing = _fed_secondary_dirty_value(
-            row,
-            purchase_amount,
-            current_date,
-            yield_curve_years,
-            yield_curve_rates,
-            interpolation_method=interpolation_method,
-            floor_zero=floor_zero,
-            nominal_shock=nominal_shock,
-            tips_real_curve_years=tips_real_curve_years,
-            tips_real_curve_rates=tips_real_curve_rates,
-        )
-        full_pricing = {**pricing}
-        scale_to_full = debt_base / purchase_amount
-        for key in ('clean_value', 'accrued_interest', 'dirty_value'):
-            full_pricing[key] *= scale_to_full
-        _cache_fed_transfer_price(bond_portfolio, idx, full_pricing)
-        fraction = purchase_amount / debt_base
-        holder = str(row['HolderType'])
-        dirty_value = pricing['dirty_value']
-        sold_by_holder[holder] = sold_by_holder.get(holder, 0.0) + dirty_value
-        if holder == 'Private':
-            route = _private_subbucket(row)
-            sold_by_private_route[route] += dirty_value
-        if purchase_amount >= debt_base - TGA_FLOOR_TOLERANCE:
-            bond_portfolio.loc[idx, 'HolderType'] = 'CB'
-            bond_portfolio.loc[idx, 'HolderSubBucket'] = ''
-            bond_portfolio.loc[idx, 'TDCPrincipalHolderType'] = 'CB'
-            bond_portfolio.loc[idx, 'TDCPrincipalHolderSubBucket'] = ''
-        else:
-            cb_row = bond_portfolio.loc[idx].copy()
-            if next_bond_id is None:
-                next_bond_id = _next_portfolio_bond_id(bond_portfolio)
-            cb_row['BondID'] = next_bond_id
-            next_bond_id += 1
-            cb_row['HolderType'] = 'CB'
-            cb_row['HolderSubBucket'] = ''
-            cb_row['TDCPrincipalHolderType'] = 'CB'
-            cb_row['TDCPrincipalHolderSubBucket'] = ''
-            for col in _FED_TRANSFER_SCALABLE_COLUMNS:
-                if col in bond_portfolio.columns and pd.notna(bond_portfolio.loc[idx, col]):
-                    original_value = float(bond_portfolio.loc[idx, col])
-                    cb_row[col] = original_value * fraction
-                    bond_portfolio.loc[idx, col] = original_value * (1.0 - fraction)
-            new_rows.append(cb_row)
-        purchased_total += purchase_amount
-        purchase_cash += dirty_value
-        remaining -= purchase_amount
-    if new_rows:
-        if (
-            portfolio_row_budget is not None
-            and len(bond_portfolio) + len(new_rows) > int(portfolio_row_budget)
-        ):
-            raise RuntimeError(
-                'Portfolio-row budget would be exceeded by a Fed secondary purchase split.'
-            )
-        bond_portfolio = pd.concat([bond_portfolio, pd.DataFrame(new_rows)], ignore_index=True)
-    return bond_portfolio, purchased_total, sold_by_holder, sold_by_private_route, purchase_cash
+    if amount_to_purchase <= TGA_FLOOR_TOLERANCE:
+        return bond_portfolio, 0.0, sold_by_holder, sold_by_private_route, 0.0
+    current = pd.Timestamp(current_date).normalize()
+    issues = _purchase_issues(bond_portfolio, current) if bond_portfolio is not None else {}
+    allocations, shortfall = _purchase_issue_allocations(issues, amount_to_purchase)
+    if shortfall > TGA_FLOOR_TOLERANCE:
+        raise RuntimeError(f'Fed purchase capacity exhausted on {current.date()}: shortfall={shortfall:.12f} billion')
 
+    row_growth = sum(1 - len(issues[key]['cb']) for key in allocations)
+    if portfolio_row_budget is not None and len(bond_portfolio) + row_growth > int(portfolio_row_budget):
+        raise RuntimeError('Portfolio-row budget would be exceeded by a Fed secondary purchase split.')
+
+    portfolio = bond_portfolio.copy()
+    next_bond_id = _next_portfolio_bond_id(portfolio)
+    price = functools.partial(
+        _fed_secondary_dirty_value, current_date=current, yield_curve_years=yield_curve_years,
+        yield_curve_rates=yield_curve_rates, interpolation_method=interpolation_method,
+        floor_zero=floor_zero, nominal_shock=nominal_shock, tips_real_curve_years=tips_real_curve_years,
+        tips_real_curve_rates=tips_real_curve_rates,
+    )
+    scalable = [col for col in TRANSFER_SCALABLE_COLUMNS if col in portfolio]
+    sector_totals = {}
+    route_totals = defaultdict(lambda: {'par': 0.0, 'cash': 0.0})
+    seller_updates = []
+    fed_rows = []
+    retired_indices = []
+    for key, quantity in allocations.items():
+        is_bill, security_type, _, _, _ = key
+        issue = issues[key]
+        fraction = quantity / issue['public_stock']
+        indices = issue['sellers'].append(issue['cb'])
+        priced = portfolio.loc[indices].copy()
+        face = priced['FaceValue']
+        # All bills of an issue have one market price. FRN accrued interest and
+        # coupon cash on opening lots retain the existing dirty valuation.
+        if is_bill:
+            quote = price(priced.iloc[0], float(face.iloc[0]))
+            for column, value in [('CleanPrice', 'clean_value'), ('AccruedInterest', 'accrued_interest'),
+                                  ('DirtyValue', 'dirty_value')]:
+                priced[column] = face * (quote[value] / face.iloc[0])
+            priced['DiscountYield'] = quote['discount_yield']
+            priced['TimeToMaturity'] = quote['time_to_maturity']
+        else:
+            quotes = [
+                price(row, value) if (value := _bond_debt_base(row)) > TGA_FLOOR_TOLERANCE
+                else dict.fromkeys(('clean_value', 'accrued_interest', 'dirty_value', 'discount_yield', 'time_to_maturity'), np.nan)
+                for _, row in priced.iterrows()
+            ]
+            for column, value in [('CleanPrice', 'clean_value'), ('AccruedInterest', 'accrued_interest'),
+                                  ('DirtyValue', 'dirty_value'), ('DiscountYield', 'discount_yield'),
+                                  ('TimeToMaturity', 'time_to_maturity')]:
+                priced[column] = [quote[value] for quote in quotes]
+        stock = priced['AdjustedPrincipal'] if security_type == 'TIPS' else face
+        priced['DirtyPriceRatio'] = priced['DirtyValue'] / stock
+        sellers = priced.loc[issue['sellers']].copy()
+        cb_lots = priced.loc[issue['cb']]
+        proceeds = sellers['DirtyValue'] * fraction
+        for idx, row in sellers.iterrows():
+            cash = float(proceeds.at[idx])
+            holder = str(row['HolderType'])
+            route = holder
+            sold_by_holder[holder] += cash
+            if holder == 'Private':
+                route = _private_subbucket(row)
+                sold_by_private_route[route] += cash
+            route_totals[route]['cash'] += cash
+            route_totals[route]['par'] += float(row['FaceValue']) * fraction
+
+        lot = (cb_lots if not cb_lots.empty else sellers).sort_values(['IssueDate', 'BondID']).iloc[0].copy()
+        lot[scalable] = (
+            pd.concat([cb_lots[scalable], sellers[scalable] * fraction]).sum(min_count=1)
+        )
+        lot['IssuePriceRatio'] = lot['IssueProceeds'] / lot['FaceValue']
+        lot['DirtyPriceRatio'] = lot['DirtyValue'] / _bond_debt_base(lot)
+        if cb_lots.empty:
+            lot['BondID'] = next_bond_id
+            next_bond_id += 1
+        lot[['HolderType', 'HolderSubBucket', 'TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket']] = ['CB', '', 'CB', '']
+        fed_rows.append(lot)
+        retired_indices.extend(issue['cb'])
+
+        sector = sector_totals.setdefault(issue['sector'].name, {
+            'par': 0.0, 'stock': 0.0, 'cash': 0.0, 'issues': 0, 'capacity_binds': 0,
+        })
+        sector['par'] += float(sellers['FaceValue'].sum()) * fraction
+        sector['stock'] += quantity
+        sector['cash'] += float(proceeds.sum())
+        sector['issues'] += 1
+        sector['capacity_binds'] += int(issue['capacity'] - quantity <= TGA_FLOOR_TOLERANCE)
+        sellers[scalable] *= 1.0 - fraction
+        seller_updates.append(sellers)
+
+    sellers = pd.concat(seller_updates)
+    portfolio.loc[sellers.index, sellers.columns] = sellers
+    portfolio = pd.concat([portfolio.drop(index=retired_indices), pd.DataFrame(fed_rows)], ignore_index=True)
+    if operation_summary is not None:
+        operation_summary.update(source=fed_purchase_policy.SOURCE_URL, sectors=sector_totals, seller_routes=dict(route_totals))
+    return portfolio, sum(allocations.values()), sold_by_holder, sold_by_private_route, sum(sold_by_holder.values())
 
 def _transfer_cb_marketable_debt_to_public(
     bond_portfolio,
@@ -2340,7 +2447,7 @@ def _quote_settlements(
     """Price the securities settling today on Treasury's terms.
 
     A calendar settlement is a new issue or a reopening as the calendar says; a
-    settlement off the calendar (early, or at the fiscal-year close) reopens the
+    settlement off the calendar for the cash floor reopens the
     security's latest issue, or is a new issue if none is outstanding yet. A new coupon
     issue is dated on its calendar dated date and matures tenor years later; its coupon
     comes from the issue kernel at the tenor's auction yield. One settling after its
@@ -2357,6 +2464,21 @@ def _quote_settlements(
     schedule = []
     for key, security_type, maturity_years, weekly_days, amount in settled:
         if amount <= TGA_FLOOR_TOLERANCE:
+            continue
+        if key == _CASH_MANAGEMENT_BILL_KEY:
+            maturity = pd.Timestamp(bill_maturity(current.date(), CASH_MANAGEMENT_BILL_WEEKS))
+            days_to_maturity = int((maturity - current).days)
+            item = _quote_supply_item(
+                'Fixed', days_to_maturity / DAYS_PER_YEAR_ACTUAL, amount,
+                face_target_mode=False, issuance_leg=issuance_leg, current_date=current,
+                bill_term_days=weekly_days, bill_days_to_maturity=days_to_maturity, pricing=pricing,
+            )
+            item.update(
+                supply_key=key, maturity_date=maturity, dated_date=current,
+                security_label=f'{CASH_MANAGEMENT_BILL_KIND}-{current.date()}',
+                settlement_kind=CASH_MANAGEMENT_BILL_KIND, is_reopening=False,
+            )
+            schedule.append(item)
             continue
         event = due_events.get(key)
         settlement_kind = 'calendar' if event is not None else off_calendar_kind[key]
@@ -2554,46 +2676,37 @@ def _settlement_unit_prices(keys, *, issuance_profile, due_events, current_date,
     }
 
 
-def _fed_rollover_allocation(stock_by_class, *, due_events, pending, issuance_profile, unit_prices):
-    """Split the Fed's rollover across the securities settling today on the calendar.
+def _fed_rollover_allocation(stock_by_class, *, offering_face, issuance_profile, prices):
+    """Allocate each class's rollover stock in proportion to the public offering face.
 
-    The New York Fed rolls maturing bills into the bills auctioned on their maturity date
-    and maturing coupon securities into the coupon securities, in proportion to the
-    amounts offered. The face already pending for each security stands in for its offering
-    size (the calibrated shares when nothing is pending in that class). ``stock_by_class``
-    is the Fed's principal to roll, ``{'bills': ..., 'coupons': ...}``, in stock units
-    (adjusted principal for TIPS). Returns ``{supply_key: (face, cash per unit face, stock
-    per unit face)}``; a class with nothing settling today is redeemed.
+    TIPS count at adjusted principal against the class total. If a class has calendar
+    auctions but no public issuance today, use the calibrated shares for Fed-only
+    add-ons. A class with no calendar auctions today is redeemed.
     """
-
     allocation = {}
+    fed_only_classes = []
     for security_class, stock in stock_by_class.items():
         if stock <= TGA_FLOOR_TOLERANCE:
             continue
-        keys = sorted(key for key in due_events if (key[0] == 'bill') == (security_class == 'bills'))
+        keys = [key for key in sorted(prices) if (key[0] == 'bill') == (security_class == 'bills')]
         if not keys:
             continue
-        prices = unit_prices(keys)
-        weights = {key: float(pending[key][3]) / prices[key][0] if key in pending else 0.0 for key in keys}
+        weights = {key: offering_face.get(key, 0.0) for key in keys}
         if sum(weights.values()) <= TGA_FLOOR_TOLERANCE:
-            shares = {bill_supply_key(int(term['weeks'])): float(term['share']) for term in issuance_profile['bill_terms']}
-            shares.update(
-                {coupon_supply_key(term['security_type'], term['maturity_years']): float(term['share'])
-                 for term in issuance_profile['coupon_terms']}
-            )
+            fed_only_classes.append(security_class)
+            if security_class == 'bills':
+                shares = {bill_supply_key(int(term['weeks'])): float(term['share']) for term in issuance_profile['bill_terms']}
+            else:
+                shares = {
+                    coupon_supply_key(term['security_type'], term['maturity_years']): float(term['share'])
+                    for term in issuance_profile['coupon_terms']
+                }
             weights = {key: shares[key] for key in keys}
-        # Face in proportion to what is offered, scaled so the stock added is the stock
-        # to roll (a TIPS adds its index ratio of stock per unit face).
-        scale_base = sum(weights[key] * prices[key][1] for key in keys)
-        if scale_base <= TGA_FLOOR_TOLERANCE:
-            continue
+        scale = stock / sum(weights[key] * prices[key][1] for key in keys)
         for key in keys:
-            if weights[key] <= TGA_FLOOR_TOLERANCE:
-                continue
-            price, stock_per_face = prices[key]
-            allocation[key] = (stock * weights[key] / scale_base, price, stock_per_face)
-    return allocation
-
+            if weights[key] > 0.0:
+                allocation[key] = (scale * weights[key], *prices[key])
+    return allocation, fed_only_classes
 
 def _build_bill_share_supply_schedule(
     amount,
@@ -2773,8 +2886,7 @@ def _build_issuance_supply_schedule(
 
 
 def _fiscal_year_close_dates(issuance_profile, start_date, end_date):
-    """Last business days of the close months in ``[start_date, end_date]``: the books
-    close and everything pending settles there."""
+    """Last business days of the configured close months in the run window."""
 
     return [
         pd.Timestamp(value)
@@ -2798,6 +2910,42 @@ def _due_settlement_events(settlement_schedule, settlement_dates, prev_date, cur
     return due
 
 
+def _last_settlements_before_close(settlement_schedule, close_dates):
+    """Last calendar settlement of each key in each fiscal-year segment."""
+    schedule = iter(settlement_schedule.items())
+    next_event = next(schedule, None)
+    last_by_close = {}
+    for close in close_dates:
+        last = {}
+        while next_event is not None and next_event[0] <= close:
+            day, events = next_event
+            last.update(dict.fromkeys(events, day))
+            next_event = next(schedule, None)
+        last_by_close[close] = last
+    return last_by_close
+
+
+def _redirect_financing_before_close(allocations, issuance_profile, last_settlements, current_date):
+    """Redirect a lapsed security's need to regular bills available through the close."""
+    available = {key for key, day in last_settlements.items() if day >= current_date}
+    eligible = [item for item in allocations if item[0] in available]
+    stranded = sum(item[-1] for item in allocations if item[0] not in available)
+    if stranded <= TGA_FLOOR_TOLERANCE:
+        return eligible
+    bills = [
+        (term, bill_supply_key(int(term['weeks']))) for term in issuance_profile['bill_terms']
+        if bill_supply_key(int(term['weeks'])) in available
+    ]
+    if not bills:
+        weeks = CASH_MANAGEMENT_BILL_WEEKS
+        return [*eligible, (_CASH_MANAGEMENT_BILL_KEY, 'Fixed', bill_maturity_years(weeks), bill_days(weeks), stranded)]
+    shares = sum(float(term['share']) for term, _ in bills)
+    for term, key in bills:
+        proceeds = stranded * float(term['share']) / shares
+        eligible.append((key, *_supply_terms(key, issuance_profile), proceeds))
+    return eligible
+
+
 def _decide_and_settle_pending(
     pending,
     *,
@@ -2807,7 +2955,8 @@ def _decide_and_settle_pending(
     due_keys,
     projected_tga_without_settlement,
     current_date,
-    settle_all=False,
+    last_settlements=None,
+    fiscal_close_today=False,
     can_settle=True,
 ):
     """Add the day's split to pending balances and release the ones due today.
@@ -2815,8 +2964,8 @@ def _decide_and_settle_pending(
     The split counts pending face as already issued. If settling only what is due would
     leave the TGA negative, every pending bill settles early the same day, and pending
     coupon securities too if the bills are not enough. Mutates ``pending``; returns the
-    settling allocations, the proceeds settled early and the proceeds settled by the
-    fiscal-year close (an accounting close) that were not otherwise due.
+    settling allocations and proceeds settled early. Any cash-management bill
+    decided after the last regular bill settlement settles on the fiscal close.
     """
 
     controlled_debt, controlled_bills = pre_issuance_position
@@ -2831,6 +2980,10 @@ def _decide_and_settle_pending(
         controlled_bills=controlled_bills,
         current_date=current_date,
     )
+    if last_settlements is not None:
+        allocations = _redirect_financing_before_close(
+            allocations, issuance_profile, last_settlements, current_date,
+        )
     for key, security_type, maturity_years, weekly_days, amount in allocations:
         if amount <= TGA_FLOOR_TOLERANCE:
             continue
@@ -2840,19 +2993,19 @@ def _decide_and_settle_pending(
             pending[key] = [security_type, maturity_years, weekly_days, amount]
     if not can_settle:
         # The securities market is closed: nothing settles, so the TGA must not need it.
-        if due_keys or settle_all or projected_tga_without_settlement < 0.0:
+        if due_keys or fiscal_close_today or projected_tga_without_settlement < 0.0:
             raise RuntimeError(
                 f'issuance would have to settle on {pd.Timestamp(current_date).date()}, '
                 'a day the securities market is closed'
             )
-        return [], 0.0, 0.0
+        return [], 0.0
     settling = [key for key in due_keys if key in pending]
-    sweep = 0.0
-    if settle_all:
-        for key, item in pending.items():
-            if key not in settling:
-                settling.append(key)
-                sweep += item[3]
+    if fiscal_close_today:
+        if _CASH_MANAGEMENT_BILL_KEY in pending:
+            settling.append(_CASH_MANAGEMENT_BILL_KEY)
+        stranded_keys = set(pending).difference(settling)
+        if stranded_keys:
+            raise RuntimeError(f'Pending financing missed the fiscal close on {current_date.date()}: {sorted(stranded_keys)}')
     settled_cash = sum(pending[key][3] for key in settling)
     early = 0.0
     # Bills first; coupon securities settle early only if the bills cannot keep the TGA
@@ -2861,14 +3014,14 @@ def _decide_and_settle_pending(
         if projected_tga_without_settlement + settled_cash + early >= 0.0:
             break
         for key, item in pending.items():
-            if (key[0] == 'bill') == (early_kind == 'bill') and key not in settling:
+            if (key[0] == 'bill') == (early_kind == 'bill') and key not in settling and key != _CASH_MANAGEMENT_BILL_KEY:
                 settling.append(key)
                 early += item[3]
     settled = []
     for key in settling:
         security_type, maturity_years, weekly_days, amount = pending.pop(key)
         settled.append((key, security_type, maturity_years, weekly_days, amount))
-    return settled, early, sweep
+    return settled, early
 
 
 def _schedule_issuance_leg(
@@ -3704,7 +3857,9 @@ def run_simulation(
     if cbo_operating_cash_financing_mode:
         # Only this mode decides cash needs and settles them on a calendar; the debt-path
         # modes keep their result columns unchanged.
-        for numeric_col in OPERATING_CASH_RESULT_COLUMNS:
+        for numeric_col in (
+            *OPERATING_CASH_RESULT_COLUMNS, 'FedRolloverCashSizingDifference', 'FedRolloverCashEstimateRevision',
+        ):
             results[numeric_col] = 0.0
     for status_col in [
         'CBOFedStockMode',
@@ -3871,6 +4026,7 @@ def run_simulation(
         fiscal_year_close_dates = (
             _fiscal_year_close_dates(issuance_profile, dates[0], dates[-1]) if batched_settlement else []
         )
+        close_settlement_plan = _last_settlements_before_close(settlement_schedule, fiscal_year_close_dates)
         settlement_calendar_data = copy.deepcopy(issuance_profile.get('settlement_calendar'))
         pending_issuance = {}
         current_sector_prefs = copy.deepcopy(params.get('sector_preferences', {}))
@@ -5419,7 +5575,15 @@ def run_simulation(
         else:
             primary_issuance_leg = 'ordinary_issuance'
         early_settlement_proceeds = 0.0
-        fiscal_year_close_settlement_proceeds = 0.0
+        cash_management_bill_proceeds = 0.0
+        close_books_today = False
+        rollover_prices = {}
+        rollover_stock_by_class = {}
+        estimated_rollover = {}
+        fed_rollover_cash_estimate = 0.0
+        initial_rollover_cash_estimate = 0.0
+        fed_rollover_reallocated_stock = 0.0
+        fed_only_rollover_classes = []
         if batched_settlement and cbo_fed_allocation_override_active:
             # The Fed rolls what matured today over at the day's auctions, bills into
             # bills and coupon securities into coupon securities, as far as its path needs
@@ -5432,16 +5596,17 @@ def run_simulation(
             )
             rollover_stock = min(cb_matured, max(0.0, cbo_fed_holdings_target - cb_stock))
             rolled_share = rollover_stock / cb_matured if cb_matured > TGA_FLOOR_TOLERANCE else 0.0
-            fed_rollover = _fed_rollover_allocation(
-                {
-                    'bills': cb_matured_bills * rolled_share,
-                    'coupons': (cb_matured - cb_matured_bills) * rolled_share,
-                },
-                due_events=due_events,
-                pending=pending_issuance,
-                issuance_profile=issuance_profile,
-                unit_prices=functools.partial(
-                    _settlement_unit_prices,
+            rollover_stock_by_class = {
+                'bills': cb_matured_bills * rolled_share,
+                'coupons': (cb_matured - cb_matured_bills) * rolled_share,
+            }
+            rollover_keys = sorted(
+                key for key in due_events
+                if rollover_stock_by_class['bills' if key[0] == 'bill' else 'coupons'] > TGA_FLOOR_TOLERANCE
+            )
+            if rollover_keys:
+                rollover_prices = _settlement_unit_prices(
+                    rollover_keys,
                     issuance_profile=issuance_profile,
                     due_events=due_events,
                     current_date=current_date,
@@ -5451,16 +5616,28 @@ def run_simulation(
                     bond_portfolio=bond_portfolio,
                     reference_cpi_on=lambda day: float(results.loc[pd.Timestamp(day).normalize(), 'Reference_CPI']),
                     frn_accrual_per_face=frn_accrual_per_face,
-                ),
+                )
+            # Settlement needs Fed cash before the public offer sizes exist. Pending face
+            # supplies a sizing estimate. After the public decision, its realized face
+            # determines the split. Same-day TGA cash gets the realized proceeds, including
+            # the difference from pricing a fixed amount of stock across different issues.
+            estimated_rollover, _ = _fed_rollover_allocation(
+                rollover_stock_by_class,
+                offering_face={key: pending_issuance[key][3] / rollover_prices[key][0]
+                               for key in rollover_keys if key in pending_issuance},
+                issuance_profile=issuance_profile,
+                prices=rollover_prices,
             )
-            fed_rollover_cash = sum(face * price for face, price, _stock in fed_rollover.values())
-            fed_rollover_stock = sum(face * stock for face, _price, stock in fed_rollover.values())
+            initial_rollover_cash_estimate = sum(face * price for face, price, _ in estimated_rollover.values())
+            fed_rollover_cash_estimate = initial_rollover_cash_estimate
+            fed_rollover_cash = fed_rollover_cash_estimate
+            fed_rollover_stock = sum(face * stock for face, _price, stock in estimated_rollover.values())
             fed_redeemed_face = cb_matured - fed_rollover_stock
             # The add-ons count as issued before the public decision, in debt and in bills.
             pre_issuance_position = (
                 pre_issuance_position[0] + fed_rollover_stock,
                 pre_issuance_position[1]
-                + sum(face * stock for key, (face, _price, stock) in fed_rollover.items() if key[0] == 'bill'),
+                + sum(face * stock for key, (face, _price, stock) in estimated_rollover.items() if key[0] == 'bill'),
             )
             if cbo_operating_cash_financing_mode:
                 total_issuance_target_period = max(
@@ -5472,10 +5649,9 @@ def run_simulation(
         if batched_settlement:
             if issuance_profile.get('settlement_calendar') != settlement_calendar_data:
                 raise ValueError('the settlement calendar cannot change during a run')
-            close_books_today = (
-                bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(current_date))
-                > bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(settle_window_start))
-            )
+            close_index = bisect.bisect_left(fiscal_year_close_dates, current_date)
+            close_day = fiscal_year_close_dates[close_index] if close_index < len(fiscal_year_close_dates) else None
+            close_books_today = current_date == close_day
             if not payments_open:
                 if total_issuance_target_period > TGA_FLOOR_TOLERANCE:
                     raise RuntimeError(
@@ -5483,23 +5659,9 @@ def run_simulation(
                         'a day Fedwire is closed'
                     )
                 total_issuance_target_period = 0.0
-            settlement_allocations, early_settlement_proceeds, fiscal_year_close_settlement_proceeds = _decide_and_settle_pending(
-                pending_issuance,
-                need=total_issuance_target_period,
-                issuance_profile=issuance_profile,
-                pre_issuance_position=pre_issuance_position,
-                due_keys=list(due_events),
-                projected_tga_without_settlement=projected_tga_pre_issuance + cbo_cash_residual_period + fed_rollover_cash,
-                current_date=current_date,
-                settle_all=close_books_today,
-                can_settle=market_open,
-            )
-            operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
-            off_calendar_kind = 'fiscal_year_close' if close_books_today else 'early_settlement'
-            issuance_supply_schedule = _quote_settlements(
-                settlement_allocations,
+            quote_settlements = functools.partial(
+                _quote_settlements,
                 due_events=due_events,
-                off_calendar_kind={item[0]: off_calendar_kind for item in settlement_allocations},
                 issuance_leg=primary_issuance_leg,
                 current_date=current_date,
                 pricing=issuance_pricing,
@@ -5508,6 +5670,69 @@ def run_simulation(
                 bond_portfolio=bond_portfolio,
                 reference_cpi_on=lambda day: float(results.loc[pd.Timestamp(day).normalize(), 'Reference_CPI']),
                 frn_accrual_per_face=frn_accrual_per_face,
+            )
+            net_cash_before_rollover = projected_tga_pre_issuance + cbo_cash_residual_period
+            # Re-size if the price difference would leave a cash gap over a
+            # Fedwire closure, at fiscal close, or below the TGA floor.
+            retry_possible = bool(rollover_prices)
+            next_day_closed = retry_possible and not is_fedwire_business_day(current_date + pd.Timedelta(days=1))
+            if retry_possible:
+                previous_pending = {key: item.copy() for key, item in pending_issuance.items()}
+                previous_registry = issue_registry.copy()
+            for attempt in range(16):
+                if attempt:
+                    pending_issuance.clear()
+                    pending_issuance.update({key: item.copy() for key, item in previous_pending.items()})
+                    issue_registry.clear()
+                    issue_registry.update(previous_registry)
+                    fed_rollover_cash_estimate = fed_rollover_cash
+                    total_issuance_target_period = max(
+                        0.0, cbo_operating_cash_target - net_cash_before_rollover - fed_rollover_cash_estimate
+                        - sum(item[3] for item in pending_issuance.values())
+                    )
+                settlement_allocations, early_settlement_proceeds = _decide_and_settle_pending(
+                    pending_issuance,
+                    need=total_issuance_target_period,
+                    issuance_profile=issuance_profile,
+                    pre_issuance_position=pre_issuance_position,
+                    due_keys=list(due_events),
+                    projected_tga_without_settlement=net_cash_before_rollover + fed_rollover_cash_estimate,
+                    current_date=current_date,
+                    last_settlements=close_settlement_plan.get(close_day),
+                    fiscal_close_today=close_books_today,
+                    can_settle=market_open,
+                )
+                operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
+                issuance_supply_schedule = quote_settlements(
+                    settlement_allocations,
+                    off_calendar_kind={item[0]: 'early_settlement' for item in settlement_allocations},
+                )
+                fed_rollover, fed_only_rollover_classes = _fed_rollover_allocation(
+                    rollover_stock_by_class,
+                    offering_face={item['supply_key']: item['face_amount'] for item in issuance_supply_schedule},
+                    issuance_profile=issuance_profile,
+                    prices=rollover_prices,
+                )
+                fed_rollover_cash = sum(face * price for face, price, _ in fed_rollover.values())
+                expected_tga = net_cash_before_rollover + fed_rollover_cash + operating_cash_settlement_proceeds
+                if close_books_today:
+                    on_cash_path = abs(expected_tga - cbo_operating_cash_target) <= TGA_FLOOR_TOLERANCE
+                elif next_day_closed:
+                    pending_cash = sum(item[3] for item in pending_issuance.values())
+                    on_cash_path = expected_tga + pending_cash >= cbo_operating_cash_target - TGA_FLOOR_TOLERANCE
+                else:
+                    on_cash_path = True
+                if on_cash_path and expected_tga >= -TGA_FLOOR_TOLERANCE:
+                    break
+                if not retry_possible or abs(fed_rollover_cash - fed_rollover_cash_estimate) <= TGA_FLOOR_TOLERANCE:
+                    break  # The cash checks below report a gap issuance could not close.
+            cash_management_bill_proceeds = sum(
+                item['proceeds'] for item in issuance_supply_schedule
+                if item['settlement_kind'] == CASH_MANAGEMENT_BILL_KIND
+            )
+            fed_rollover_reallocated_stock = 0.5 * sum(
+                abs(fed_rollover.get(key, (0.0,))[0] - estimated_rollover.get(key, (0.0,))[0]) * stock_per_face
+                for key, (_, stock_per_face) in rollover_prices.items()
             )
             for key, (fed_face, fed_price, _fed_stock) in fed_rollover.items():
                 item = next((item for item in issuance_supply_schedule if item['supply_key'] == key), None)
@@ -5793,6 +6018,8 @@ def run_simulation(
                         if sec_type == 'Fixed':
                             maturity_category_val = get_maturity_category(mat_yrs, issuance_profile)
                         new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'TDCPrincipalHolderType': holder, 'TDCPrincipalHolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': dated_date_val, 'OriginalDatedDate': dated_date_val, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': adjusted_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': accrued_frn_val, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
+                        if details.get('settlement_kind') == CASH_MANAGEMENT_BILL_KIND:
+                            new_tranche['IsCashManagementBill'] = True
                         new_bonds_added_list.append(new_tranche)
                         tranche_stock = adjusted_principal_val if sec_type == 'TIPS' else route_face_value
                         if is_noncash_intragovernmental_issuance:
@@ -5857,7 +6084,11 @@ def run_simulation(
                     if col not in new_bonds_df.columns:
                         dtype = PORTFOLIO_DTYPES.get(col, 'object')
                         new_bonds_df[col] = pd.NA if dtype == 'Int64' else pd.NaT if dtype == 'datetime64[ns]' else np.nan
-                new_bonds_df = new_bonds_df[BOND_PORTFOLIO_COLS]
+                runtime_columns = list(BOND_PORTFOLIO_COLS)
+                if 'IsCashManagementBill' in new_bonds_df:
+                    new_bonds_df['IsCashManagementBill'] = new_bonds_df['IsCashManagementBill'].eq(True)
+                    runtime_columns.append('IsCashManagementBill')
+                new_bonds_df = new_bonds_df[runtime_columns]
                 new_bonds_df = new_bonds_df.astype(PORTFOLIO_DTYPES, errors='ignore')
                 if bounded_handoff:
                     handoff_tables.check_portfolio_rows(
@@ -5908,12 +6139,19 @@ def run_simulation(
                 item[3] for item in pending_issuance.values()
             )
             results.loc[current_date, 'EarlySettlementProceeds'] = early_settlement_proceeds
-            results.loc[current_date, 'FiscalYearCloseSettlementProceeds'] = fiscal_year_close_settlement_proceeds
+            results.loc[current_date, 'CashManagementBillProceeds'] = cash_management_bill_proceeds
             results.loc[current_date, 'FedRolloverFace'] = fed_rollover_face_issued
             results.loc[current_date, 'FedRolloverProceeds'] = fed_rollover_proceeds
+            results.loc[current_date, 'FedRolloverCashSizingDifference'] = fed_rollover_proceeds - fed_rollover_cash_estimate
+            results.loc[current_date, 'FedRolloverCashEstimateRevision'] = (
+                fed_rollover_cash_estimate - initial_rollover_cash_estimate
+            )
+            results.loc[current_date, 'FedRolloverReallocatedStock'] = fed_rollover_reallocated_stock
+            if fed_only_rollover_classes:
+                results.loc[current_date, 'FedRolloverFedOnlyClasses'] = '|'.join(fed_only_rollover_classes)
             results.loc[current_date, 'FedRedeemedFace'] = fed_redeemed_face
             if abs(fed_rollover_proceeds - fed_rollover_cash) > target_tolerance:
-                raise RuntimeError(f'the Fed add-on cash at {current_date.date()} differs from what the cash rule counted')
+                raise RuntimeError(f'the Fed add-on cash at {current_date.date()} differs from what the allocation priced')
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
             cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))
@@ -6009,6 +6247,7 @@ def run_simulation(
                     'holder': _handoff_portfolio_stock_map(bond_portfolio),
                     'route': _handoff_portfolio_stock_map(bond_portfolio, route=True),
                 }
+                purchase_operation = {}
                 (
                     bond_portfolio,
                     fed_secondary_purchase_face,
@@ -6026,6 +6265,7 @@ def run_simulation(
                     nominal_shock=evaluated_nominal_shock,
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
+                    operation_summary=purchase_operation,
                     portfolio_row_budget=(
                         handoff_tables.portfolio_row_budget
                         if bounded_handoff
@@ -6087,6 +6327,7 @@ def run_simulation(
                 results.loc[current_date, 'CBOFedSecondaryPurchaseDepositEffect'] = fed_secondary_deposit_effect
                 results.loc[current_date, 'CBOFedSecondaryPurchaseFace'] = fed_secondary_purchase_face
                 results.loc[current_date, 'CBOFedSecondaryPurchaseCash'] = fed_secondary_purchase_cash
+                results.loc[current_date, 'CBOFedPurchaseOperation'] = json.dumps(purchase_operation, sort_keys=True)
                 results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
                     'synthetic_secondary_purchase_to_hit_cbo_stock_path'
                 )
@@ -6616,11 +6857,17 @@ def run_simulation(
                     f"TGA={current_tga:.12f}, floor={validation_floor:.12f}"
                 )
         if cbo_operating_cash_financing_mode:
+            if close_books_today and abs(current_tga - cbo_operating_cash_target) > target_tolerance:
+                raise RuntimeError(
+                    f'Fiscal close did not meet the operating-cash target at {current_date.date()}: '
+                    f'TGA={current_tga:.12f}, target={cbo_operating_cash_target:.12f}'
+                )
             # The TGA plus what is decided but not yet settled sits on the target on every
             # day with a need, and never below it; a cash flow booked after issuance would
             # break this.
             shortfall = cbo_operating_cash_target - (
                 current_tga + results.loc[current_date, 'PendingIssuanceProceeds']
+                - results.loc[current_date, 'FedRolloverCashSizingDifference']
             )
             off_target = abs(shortfall) if total_issuance_target_period > target_tolerance else max(0.0, shortfall)
             if off_target > target_tolerance:

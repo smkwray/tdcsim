@@ -311,8 +311,15 @@ def test_a_redemption_with_no_auction_is_restored_by_a_maintenance_purchase(tmp_
     ].sum())
     assert redeemed_by_banks > 1.0
     assert results.loc[day, "HolderTargetPhase"] == "hold"
-    assert results.loc[day, "HolderTargetPreTradeMaxGap"] == pytest.approx(redeemed_by_banks, rel=1e-9)
-    assert results.loc[day, "HolderTargetBoughtFace_Banks"] == pytest.approx(redeemed_by_banks, rel=1e-9)
+    # The Fed buys from banks that day. Only the change in bank sales relative
+    # to the matched baseline increases the amount the controller must restore.
+    def fed_bought_from_banks(run):
+        seller_routes = json.loads(run.loc[day, "CBOFedPurchaseOperation"])["seller_routes"]
+        return seller_routes.get("Banks", {}).get("par", 0.0)
+
+    expected_gap = redeemed_by_banks + fed_bought_from_banks(results) - fed_bought_from_banks(base_results)
+    assert results.loc[day, "HolderTargetPreTradeMaxGap"] == pytest.approx(expected_gap, abs=TOLERANCE)
+    assert results.loc[day, "HolderTargetBoughtFace_Banks"] == pytest.approx(expected_gap, abs=TOLERANCE)
     realized = _realized(closure)
     for row in rows:
         if row["date"] == day:

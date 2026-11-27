@@ -194,6 +194,13 @@ class IssuanceCalibrationError(ValueError):
     """Raised when auction data or an issuance rule cannot be used as declared."""
 
 
+# Year-end residual financing uses a separate two-week cash-management bill.
+# Move the maturity forward to the next securities business day when necessary,
+# just as on the regular bill calendar.
+CASH_MANAGEMENT_BILL_KIND = "cash_management_bill"
+CASH_MANAGEMENT_BILL_WEEKS = 2
+
+
 def bill_days(weeks: int) -> int:
     return 7 * int(weeks)
 
@@ -1097,6 +1104,26 @@ def fiscal_year_close_dates(profile: Mapping[str, Any], start: date, end: date) 
             if start <= close <= end:
                 out.append(close)
     return out
+
+
+
+def verify_fiscal_close_cash(results: pd.DataFrame, profile: Mapping[str, Any], *, tolerance: float) -> None:
+    """Check the cash and calendar identities on the recorded run dates."""
+    dates = pd.to_datetime(results["Date"]).dt.date
+    closes = set(fiscal_year_close_dates(profile, dates.iloc[0], dates.iloc[-1]))
+    cash_management = pd.to_numeric(results["CashManagementBillProceeds"], errors="raise")
+    early = pd.to_numeric(results["EarlySettlementProceeds"], errors="raise")
+    public_proceeds = pd.to_numeric(results["CashFinancingProceeds"], errors="raise")
+    if (cash_management[~dates.isin(closes)].abs() > tolerance).any():
+        raise ValueError("cash-management bill settled off its fiscal close")
+    if (early + cash_management - public_proceeds > tolerance).any():
+        raise ValueError("off-calendar proceeds exceed public settlement")
+    close_rows = results.loc[dates.isin(closes)]
+    for row in close_rows.itertuples(index=False):
+        if abs(float(row.PendingIssuanceProceeds)) > tolerance:
+            raise ValueError(f"has pending issuance at the fiscal-year end {row.Date}")
+        if abs(float(row.TGA) - float(row.CBOOperatingCashTarget)) > tolerance:
+            raise ValueError(f"TGA missed the operating-cash target at the fiscal-year end {row.Date}")
 
 
 def dated_date(rule: SecurityCalendar, nominal: date) -> date:
