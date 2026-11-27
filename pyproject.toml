@@ -57,6 +57,7 @@ py-modules = [
   "holder_mapping",
   "holder_targets",
   "issuance_calibration",
+  "mmf_eligibility",
   "quarterly_aggregation",
   "ratewall_assumption_mode_schema",
   "ratewall_contract",
