@@ -443,7 +443,8 @@ def load_nmfp_mmf_holdings(path: Path) -> tuple[pd.DataFrame, dict]:
     """Return the N-MFP money-fund Treasury holdings and the provenance its producer wrote.
 
     The provenance file must describe these exact bytes, so the book never binds to an
-    extract whose sources are unrecorded.
+    extract whose sources are unrecorded, and must declare the information date that
+    bounds every filing it selected.
     """
 
     provenance_path = path.with_suffix(".provenance.json")
@@ -452,6 +453,15 @@ def load_nmfp_mmf_holdings(path: Path) -> tuple[pd.DataFrame, dict]:
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     if provenance.get("output", {}).get("sha256") != _sha256(path) or not provenance.get("zips"):
         raise ValueError(f"{provenance_path.name} does not describe {path.name} and its source zips")
+    filed_through = provenance.get("filed_through")
+    selected = provenance.get("selected_filings")
+    if (
+        not isinstance(filed_through, str)
+        or not isinstance(selected, dict)
+        or not selected
+        or any(not rows or any(str(row[2]) > filed_through for row in rows) for rows in selected.values())
+    ):
+        raise ValueError(f"{provenance_path.name} does not list selected filings all made by a declared information date")
     frame = pd.read_csv(path, dtype={"report_date": str, "cusip": str, "security_class": str, "maturity_date": str})
     missing = [column for column in NMFP_HOLDINGS_COLUMNS if column not in frame.columns]
     if missing or frame.empty:
@@ -1521,6 +1531,7 @@ def build_initial_portfolio(
         "sha256": _sha256(nmfp_holdings_path),
         "report_date": record_date,
         "producer": nmfp_provenance.get("producer"),
+        "filed_through": nmfp_provenance["filed_through"],
         "value_basis": nmfp_provenance.get("value_basis"),
         "zips": nmfp_provenance["zips"],
     }

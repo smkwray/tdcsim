@@ -1228,6 +1228,8 @@ def _write_nmfp(path: Path, rows) -> Path:
     provenance = {
         "producer": "scripts/extract_sec_nmfp_mmf_holdings.py",
         "zips": {"fake_nmfp.zip": {"sha256": "0" * 64, "bytes": 1}},
+        "filed_through": "2026-06-22",
+        "selected_filings": {"2026-04": [["S1", "0000000000-26-000001", "2026-05-06", "fake_nmfp.zip"]]},
         "output": {"file": path.name, "sha256": rib._sha256(path)},
     }
     path.with_suffix(".provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
@@ -1579,6 +1581,15 @@ def test_opening_book_rejects_a_money_fund_mix_outside_the_filings_tolerance(tmp
 
 
 def test_opening_book_rejects_n_mfp_holdings_without_matching_provenance(tmp_path):
+    inputs = _opening_book_inputs(tmp_path)
+    path = inputs["nmfp_holdings_path"]
+    # A filing made after the declared information date was not known on it.
+    sidecar = path.with_suffix(".provenance.json")
+    provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+    provenance["selected_filings"]["2026-04"].append(["S2", "0000000000-26-000002", "2026-06-23", "fake_nmfp.zip"])
+    sidecar.write_text(json.dumps(provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="declared information date"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
     inputs = _opening_book_inputs(tmp_path)
     path = inputs["nmfp_holdings_path"]
     path.write_text(path.read_text(encoding="utf-8").replace("480.0", "481.0"), encoding="utf-8")

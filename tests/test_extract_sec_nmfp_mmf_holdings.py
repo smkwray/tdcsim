@@ -93,8 +93,17 @@ def test_extract_counts_each_fund_once_from_its_latest_complete_filing(tmp_path)
         tmp_path / "20260608-20260708_nmfp.zip",
         [("A-2", "S1", "10-JUN-2026", "N", [("912828ZZ1", TSY, "FRN", 6e9)])],
     )
+    # An amendment filed after the information date was not known on it and must not compete.
+    late = _zip(
+        tmp_path / "20260608-20260708_late_nmfp.zip",
+        [("A-3", "S1", "23-JUN-2026", "N", [("912828ZZ1", TSY, "FRN", 99e9)])],
+    )
     holdings, provenance = extract(
-        [amended, first], mspd_table_3_market=_mspd(tmp_path), first_month="2026-04", last_month="2026-04"
+        [late, amended, first],
+        mspd_table_3_market=_mspd(tmp_path),
+        first_month="2026-04",
+        last_month="2026-04",
+        filed_through="2026-06-22",
     )
     rows = holdings.set_index("cusip")
 
@@ -112,12 +121,17 @@ def test_extract_counts_each_fund_once_from_its_latest_complete_filing(tmp_path)
         "selected_without_complete_schedule": 0,
     }
     assert provenance["feeder_treasury_value_bil_dropped"] == {"2026-04": pytest.approx(7.0)}
-    assert set(provenance["zips"]) == {first.name, amended.name}
+    assert provenance["filed_through"] == "2026-06-22"
+    assert provenance["selected_filings"]["2026-04"] == [
+        ["S1", "A-2", "2026-06-10", amended.name],
+        ["S2", "B-1", "2026-05-05", first.name],
+        ["S3", "C-1", "2026-05-05", first.name],
+    ]
 
 
 def test_extract_fails_on_a_month_without_filings_or_mspd(tmp_path):
     archive = _zip(tmp_path / "20260508-20260605_nmfp.zip", [("A-1", "S1", "05-MAY-2026", "N", [("912828ZZ1", TSY, "FRN", 5e9)])])
     with pytest.raises(ValueError, match=r"no N-MFP filing for report months \['2026-03'\]"):
-        extract([archive], mspd_table_3_market=_mspd(tmp_path), first_month="2026-03", last_month="2026-04")
+        extract([archive], mspd_table_3_market=_mspd(tmp_path), first_month="2026-03", last_month="2026-04", filed_through="2026-06-22")
     with pytest.raises(ValueError, match="no record date"):
-        extract([archive], mspd_table_3_market=_mspd(tmp_path), first_month="2026-04", last_month="2026-05")
+        extract([archive], mspd_table_3_market=_mspd(tmp_path), first_month="2026-04", last_month="2026-05", filed_through="2026-06-22")
