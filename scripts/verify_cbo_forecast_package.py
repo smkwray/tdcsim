@@ -55,15 +55,13 @@ from cbo_opening_actuals import (  # noqa: E402
     build_opening_fy_splice,
     dts_fiscal_selectors,
     opening_cash_reconciliation,
+    roll_opening_marketables,
 )
-from ratewall_input_builder import load_soma_cusip_holdings  # noqa: E402
 from tdc_shared import BOND_PORTFOLIO_COLS  # noqa: E402
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import (  # noqa: E402
     CALIBRATION_FILE,
     build_issuance_calibration,
-    prestart_rollforward,
-    prestart_settlements,
     verify_fiscal_close_cash,
 )
 from sim_engine import _fiscal_year_close_dates  # noqa: E402
@@ -593,24 +591,17 @@ def _verify_opening_counts_against_source_book(
         book[column] = pd.to_datetime(book[column], errors="raise")
     if opening["record_date"] != OPENING_PORTFOLIO_RECORD_DATE:
         raise ValueError("packaged opening book record date differs from the declared May source")
-    settlements = prestart_settlements(
-        root / "sources" / "fiscaldata" / "auctions_query.csv",
-        record_date=opening["record_date"],
-        opening_close_date=OPENING_CLOSE_DATE,
-    )
     source_manifest = _read_json(root / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json")
-    soma_date, soma = load_soma_cusip_holdings(root / "sources" / SOMA_SOURCE)
-    if soma_date != SOMA_SNAPSHOT_DATE or opening.get("soma_snapshot_date") != soma_date:
+    if opening.get("soma_snapshot_date") != SOMA_SNAPSHOT_DATE:
         raise ValueError("packaged SOMA snapshot date differs from the opening roll source")
-    rolled, summary, diagnostics = prestart_rollforward(
-        book,
-        settlements,
-        opening_close_date=OPENING_CLOSE_DATE,
-        cusip_column="cusip_or_synthetic_id",
+    roll = roll_opening_marketables(
+        book, cusip_column="cusip_or_synthetic_id",
         noncb_weights=source_manifest["artifacts"]["initial_portfolio"]["noncb_weights"],
-        soma=soma,
-        soma_as_of_date=soma_date,
+        auctions_query=root / "sources" / "fiscaldata" / "auctions_query.csv",
+        soma_holdings=root / "sources" / SOMA_SOURCE,
+        tips_cpi_detail=root / "sources" / "fiscaldata" / "tips_cpi_data_detail.csv",
     )
+    rolled, summary, diagnostics = roll.book, roll.summary, roll.diagnostics
     expected = {
         "source_rows_loaded": len(book),
         "prestart_matured_rows": summary["matured_rows"],
@@ -629,10 +620,10 @@ def _verify_opening_counts_against_source_book(
             )
     for key, value in (
         ("prestart_rollforward_face_bil", summary["matured_face_bil"]),
-        ("opening_rollforward_source_debt_base_bil", summary["source_face_bil"]),
-        ("opening_rollforward_aligned_debt_base_bil", summary["opening_face_bil"]),
-        ("opening_rollforward_debt_base_delta_bil", summary["face_delta_bil"]),
-        ("opening_cb_holdings_bil", summary["soma_close_bil"]),
+        ("opening_rollforward_source_debt_base_bil", summary["source_debt_base_bil"]),
+        ("opening_rollforward_aligned_debt_base_bil", summary["opening_debt_base_bil"]),
+        ("opening_rollforward_debt_base_delta_bil", summary["opening_debt_base_bil"] - summary["source_debt_base_bil"]),
+        ("opening_cb_holdings_bil", summary["soma_close_debt_base_bil"]),
     ):
         _assert_close(key, float(opening.get(key, math.nan)), value, NUMERIC_TOLERANCE)
     return summary, diagnostics
@@ -1692,11 +1683,11 @@ def _verify_opening_cash_and_rollforward(
     portfolio = _read_csv_dicts(inputs / "tdcsim_opening_portfolio.csv")
     _assert_close(
         "opening marketable book", sum(map(_opening_debt_base, portfolio)),
-        summary["opening_face_bil"], NUMERIC_TOLERANCE,
+        summary["opening_debt_base_bil"], NUMERIC_TOLERANCE,
     )
     _assert_close(
         "opening SOMA book", sum(_opening_debt_base(row) for row in portfolio if row["HolderType"] == "CB"),
-        summary["soma_close_bil"], NUMERIC_TOLERANCE,
+        summary["soma_close_debt_base_bil"], NUMERIC_TOLERANCE,
     )
     cash_path = _read_csv_dicts(inputs / "tdcsim_operating_cash_path.csv")
     if not cash_path or any(

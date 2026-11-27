@@ -32,9 +32,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from mmf_eligibility import mmf_may_acquire
+from mmf_eligibility import mmf_eligible_mask, mmf_may_acquire
 from simulation_calendar import next_securities_business_day, previous_securities_business_day
-from tdc_shared import DAYS_PER_YEAR_ACTUAL, INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF, TGA_FLOOR_TOLERANCE
+from tdc_shared import DAYS_PER_YEAR_ACTUAL, INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF, TGA_FLOOR_TOLERANCE, TRANSFER_SCALABLE_COLUMNS
 
 ISSUANCE_RULE_MODE = "bill_share_target_v1"
 CALIBRATION_SCHEMA_VERSION = "tdcsim_issuance_calibration_v2"
@@ -1436,6 +1436,7 @@ def prestart_rollforward(
     settlements: pd.DataFrame,
     *,
     opening_close_date: str,
+    record_date: str,
     cusip_column: str,
     noncb_weights: Mapping[str, Mapping[str, float]],
     soma: pd.DataFrame,
@@ -1458,6 +1459,16 @@ def prestart_rollforward(
         or book[cusip_column].eq("").any() or not np.isfinite(ids).all() or ids.duplicated().any()
     ):
         raise IssuanceCalibrationError("opening book contains an invalid face, date, CUSIP or bond ID")
+    source_mmf = book.loc[book["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF).fillna(False)]
+    invalid = source_mmf.loc[~mmf_eligible_mask(source_mmf, record_date)]
+    if not invalid.empty:
+        raise IssuanceCalibrationError(
+            f"the opening book gives money funds ineligible {invalid[cusip_column].iloc[0]} on {record_date}"
+        )
+    mmf_acquisitions = {
+        (record_date, kind, maturity.date().isoformat())
+        for kind, maturity in source_mmf[["SecurityType", "MaturityDate"]].itertuples(index=False, name=None)
+    }
     payment_dates = {
         maturity: pd.Timestamp(next_securities_business_day(pd.Timestamp(maturity).date()))
         for maturity in book["MaturityDate"].unique()
@@ -1534,6 +1545,8 @@ def prestart_rollforward(
         for route, amount in allocations.items():
             if amount > 0:
                 new_lots.append(lot(terms, issue.cusip, route, amount, issue.issue_price_ratio))
+                if route[1] == PRIVATE_SUBBUCKET_MMF:
+                    mmf_acquisitions.add((issue.settlement_date.date().isoformat(), "Fixed", issue.maturity_date.date().isoformat()))
         if issue.soma_bil > 0:
             new_lots.append(lot(terms, issue.cusip, ("CB", ""), issue.soma_bil, issue.issue_price_ratio))
         diagnostics.append({
@@ -1563,53 +1576,69 @@ def prestart_rollforward(
         raise IssuanceCalibrationError(f"live SOMA CUSIPs are absent from the rolled marketable book: {missing_cusips}")
 
     result = []
+    scalable = [column for column in TRANSFER_SCALABLE_COLUMNS if column in rolled]
+
+    def scaled(row: dict, fraction: float) -> dict:
+        return {**row, **{column: row[column] * fraction for column in scalable if pd.notna(row[column])}}
+
     for cusip, group in rolled.groupby(cusip_column, sort=False):
         template = group.iloc[0]
-        terms = {column: template[column] for column in security_fields}
         target_fed = fed.get(cusip, 0.0)
         group_fed = group["HolderType"].eq("CB")
         group_mmf = group["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF).fillna(False)
         eligible_at_close = mmf_may_acquire(template["SecurityType"], template["MaturityDate"], close)
         if group_mmf.any() and not eligible_at_close:
-            # The governed book already holds money funds to eligible lots and the roll
-            # only adds eligible ones, so an ineligible lot here is a defect upstream.
             raise IssuanceCalibrationError(f"the opening book gives money funds ineligible {cusip} at the close")
         total = float(group["FaceValue"].sum())
         fed_gap = target_fed - float(group.loc[group_fed, "FaceValue"].sum())
-        # Reassign Fed differences against this CUSIP's non-Fed holders only.
-        public = group.loc[~group_fed]
-        public_face = float(public["FaceValue"].sum())
-        target_public = total - target_fed
-        if target_public < -1e-9:
+        if target_fed > total + 1e-9:
             raise IssuanceCalibrationError(f"SOMA holds more {cusip} than the rolled public debt")
         if abs(fed_gap) <= 1e-9:
             result.extend(group.to_dict("records"))
             continue
-        if public_face == 0 and target_public > 1e-9:
-            category = str(template["MaturityCategory"])
-            if category not in shares:
-                category = "notes"  # all nonbill categories use the same opening shares
-            weights = _eligible_route_shares(shares[category], eligible_at_close)
-            for route, weight in weights.items():
-                if weight > 0:
-                    public_lot = lot(terms, cusip, route, target_public * weight, template["IssuePriceRatio"])
-                    if template["SecurityType"] == "TIPS":
-                        public_lot["AdjustedPrincipal"] = public_lot["FaceValue"]
-                    result.append(public_lot)
-        elif target_public > 0:
-            for row in public.to_dict("records"):
-                scale = target_public / public_face
-                for column in ("FaceValue", "IssueProceeds", "OriginalPrincipal", "AdjustedPrincipal"):
-                    if pd.notna(row.get(column)):
-                        row[column] *= scale
-                result.append(row)
-        if target_fed > 0:
-            fed_lot = lot(terms, cusip, ("CB", ""), target_fed, template["IssuePriceRatio"])
-            if template["SecurityType"] == "TIPS":
-                fed_lot["AdjustedPrincipal"] = target_fed
-            result.append(fed_lot)
+        # Move shares of donor lots, carrying each tranche's original price and
+        # proceeds. A CUSIP has one contractual identity but many auction bases.
+        donor = ~group_fed if fed_gap > 0 else group_fed
+        donor_face = float(group.loc[donor, "FaceValue"].sum())
+        moved = min(1.0, abs(fed_gap) / donor_face)
+        result.extend(group.loc[~donor].to_dict("records"))
+        if fed_gap > 0:
+            buyers = {("CB", ""): 1.0}
+        else:
+            public = group.loc[~group_fed]
+            if public.empty:
+                category = str(template["MaturityCategory"])
+                buyers = _eligible_route_shares(shares.get(category, shares["notes"]), eligible_at_close)
+            else:
+                face_by_route = public.assign(HolderSubBucket=public["HolderSubBucket"].fillna("")).groupby(
+                    ["HolderType", "HolderSubBucket"]
+                )["FaceValue"].sum()
+                buyers = (face_by_route / face_by_route.sum()).to_dict()
+        for row in group.loc[donor].to_dict("records"):
+            if moved < 1.0:
+                result.append(scaled(row, 1.0 - moved))
+            for (holder, route), weight in buyers.items():
+                if weight <= 0:
+                    continue
+                transfer = scaled(row, moved * weight)
+                bond_id += 1
+                transfer.update(BondID=bond_id, HolderType=holder, HolderSubBucket=route or pd.NA)
+                for column, value in (("TDCPrincipalHolderType", holder), ("TDCPrincipalHolderSubBucket", route)):
+                    if column in transfer:
+                        transfer[column] = value
+                result.append(transfer)
+                if route == PRIVATE_SUBBUCKET_MMF:
+                    mmf_acquisitions.add((opening_close_date, row["SecurityType"], row["MaturityDate"].date().isoformat()))
 
     aligned = pd.DataFrame.from_records(result, columns=book.columns)
+    if "IssueProceeds" in rolled:
+        closing_proceeds = aligned.groupby(cusip_column)["IssueProceeds"].sum(min_count=1)
+        for cusip, original in rolled.groupby(cusip_column)["IssueProceeds"].sum(min_count=1).items():
+            closing = closing_proceeds[cusip]
+            if pd.isna(original) and pd.isna(closing):
+                continue
+            if pd.isna(original) or pd.isna(closing) or not math.isclose(original, closing, abs_tol=1e-9, rel_tol=0):
+                raise IssuanceCalibrationError(f"ownership alignment changed historical proceeds for {cusip}")
     opening_face = float(aligned["FaceValue"].sum())
     initial_face = float(face.sum())
     matured_face = float(matured["FaceValue"].sum())
@@ -1621,7 +1650,8 @@ def prestart_rollforward(
     if abs(soma_face - expected_soma) > 1e-8:
         raise IssuanceCalibrationError("opening SOMA face does not reconcile to snapshot + add-ons - redemptions")
     summary = {
-        "row_type": "summary", "opening_close_date": opening_close_date,
+        "row_type": "summary", "source_record_date": record_date, "opening_close_date": opening_close_date,
+        "mmf_acquisition_rows": len(mmf_acquisitions),
         "matured_rows": len(matured), "settlement_lot_rows": len(new_lots),
         "source_face_bil": initial_face, "matured_face_bil": matured_face, "accepted_face_bil": issued_face,
         "opening_face_bil": opening_face, "face_delta_bil": opening_face - initial_face,
@@ -1634,5 +1664,9 @@ def prestart_rollforward(
     diagnostics.extend(
         {"row_type": "replacement", "replacement_bond_id": bond_id, "replacement_cusip": cusip}
         for bond_id, cusip in lot_ids.itertuples(index=False, name=None)
+    )
+    diagnostics.extend(
+        {"row_type": "mmf_acquisition", "acquisition_date": day, "security_type": kind, "maturity_date": maturity}
+        for day, kind, maturity in sorted(mmf_acquisitions)
     )
     return aligned, summary, [summary, *diagnostics]

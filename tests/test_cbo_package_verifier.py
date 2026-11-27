@@ -21,9 +21,8 @@ from cbo_opening_actuals import (
     ACTUALS_AVAILABLE_AS_OF, DTS_CASH_SOURCE, DTS_FISCAL_LINES, DTS_FLOWS_SOURCE,
     DTS_TGA_CLOSING_ACCOUNT, DTS_TGA_OPENING_ACCOUNT, OPENING_CLOSE_DATE,
     OPENING_PORTFOLIO_CLAIM_BOUNDARY, OPENING_ROLLFORWARD_STATUS, SOMA_SNAPSHOT_DATE, SOMA_SOURCE,
-    build_opening_fy_splice, dts_fiscal_selectors, opening_cash_reconciliation,
+    build_opening_fy_splice, dts_fiscal_selectors, opening_cash_reconciliation, roll_opening_marketables,
 )
-from ratewall_input_builder import load_soma_cusip_holdings
 from tdc_shared import PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
@@ -42,7 +41,7 @@ from forecast_input_builder import (
 )
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
 from issuance_calibration import (
-    SETTLEMENT_CALENDAR, build_issuance_calibration, prestart_rollforward, prestart_settlements,
+    SETTLEMENT_CALENDAR, build_issuance_calibration,
 )
 from sim_engine import _fiscal_year_close_dates
 from simulation_calendar import build_simulation_calendar
@@ -1257,7 +1256,8 @@ def _write_source_package(package: Path) -> dict:
         ["As Of Date", "CUSIP", "Security Type", "Maturity Date", "Par Value", "Inflation Compensation"],
         [
             {"As Of Date": SOMA_SNAPSHOT_DATE, "CUSIP": cusip, "Security Type": kind, "Maturity Date": maturity,
-             "Par Value": str(amount * 1e9), "Inflation Compensation": "0"}
+             "Par Value": str(amount * (0.75 if kind == "TIPS" else 1) * 1e9),
+             "Inflation Compensation": str(amount * 0.25 * 1e9) if kind == "TIPS" else "0"}
             for cusip, (amount, kind, maturity) in fed_by_cusip.items()
         ],
     )
@@ -1271,8 +1271,12 @@ def _write_source_package(package: Path) -> dict:
     )
     _write_csv(
         package / "sources" / "fiscaldata" / "tips_cpi_data_detail.csv",
-        ["cusip", "index_date", "ref_cpi", "index_ratio"],
-        [{"cusip": "fixture", "index_date": "2026-06-21", "ref_cpi": "332.08433", "index_ratio": "1.25"}],
+        ["cusip", "original_issue_date", "index_date", "ref_cpi", "index_ratio"],
+        [
+            {"cusip": f"TIPS{index:03d}", "original_issue_date": "2026-01-01", "index_date": day,
+             "ref_cpi": "332.08433", "index_ratio": str(4 / 3)}
+            for index in range(53) for day in ("2026-05-31", OPENING_CLOSE_DATE)
+        ],
     )
     _write_csv(
         package / "sources" / "fiscaldata" / "frn_daily_indexes.csv",
@@ -1602,17 +1606,14 @@ def _roll_fixture_opening_book(package: Path) -> dict:
     source_path = sources / "opening" / "tdcsim_initial_portfolio_cohorts.csv"
     book = pd.read_csv(source_path, parse_dates=["IssueDate", "MaturityDate"])
     governed = json.loads((sources / "opening" / "tdcsim_ratewall_input_manifest.json").read_text())
-    settlements = prestart_settlements(
-        sources / "fiscaldata" / "auctions_query.csv",
-        record_date="2026-05-31", opening_close_date=OPENING_CLOSE_DATE,
-    )
-    soma_date, soma = load_soma_cusip_holdings(sources / SOMA_SOURCE)
-    rolled, summary, diagnostics = prestart_rollforward(
-        book, settlements, opening_close_date=OPENING_CLOSE_DATE, cusip_column="cusip_or_synthetic_id",
+    roll = roll_opening_marketables(
+        book, cusip_column="cusip_or_synthetic_id",
         noncb_weights=governed["artifacts"]["initial_portfolio"]["noncb_weights"],
-        soma=soma, soma_as_of_date=soma_date,
+        auctions_query=sources / "fiscaldata" / "auctions_query.csv",
+        soma_holdings=sources / SOMA_SOURCE,
+        tips_cpi_detail=sources / "fiscaldata" / "tips_cpi_data_detail.csv",
     )
-    rolled.loc[rolled["SecurityType"].eq("TIPS"), "FaceValue"] = 0.0
+    rolled, summary, diagnostics = roll.book, roll.summary, roll.diagnostics
     rolled[opening_fields].to_csv(opening_path, index=False)
 
     dts = opening_cash_reconciliation(sources / DTS_CASH_SOURCE, sources / DTS_FLOWS_SOURCE)
@@ -1648,9 +1649,9 @@ def _roll_fixture_opening_book(package: Path) -> dict:
         "prestart_rollforward_rows": summary["settlement_lot_rows"],
         "prestart_rollforward_face_bil": summary["matured_face_bil"],
         "opening_rollforward_status": OPENING_ROLLFORWARD_STATUS,
-        "opening_rollforward_source_debt_base_bil": summary["source_face_bil"],
-        "opening_rollforward_aligned_debt_base_bil": summary["opening_face_bil"],
-        "opening_rollforward_debt_base_delta_bil": summary["face_delta_bil"],
+        "opening_rollforward_source_debt_base_bil": summary["source_debt_base_bil"],
+        "opening_rollforward_aligned_debt_base_bil": summary["opening_debt_base_bil"],
+        "opening_rollforward_debt_base_delta_bil": summary["opening_debt_base_bil"] - summary["source_debt_base_bil"],
         "frn_source_boundary_note": "contract-compliant FRN opening accrual source",
         "tips_rows_enriched": 265,
         "tips_unique_cusips_enriched": 53,
