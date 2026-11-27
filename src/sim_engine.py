@@ -22,6 +22,7 @@ from tdc_shared import (
     HOLDER_TYPES,
     INTRAGOV_HOLDERS,
     MATURITY_CATEGORIES,
+    MMF_ADDED_TDC_COLUMNS,
     MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
     MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
     MMF_DEPOSIT_PASS_THROUGH_STATUS,
@@ -29,6 +30,7 @@ from tdc_shared import (
     PORTFOLIO_DTYPES,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
+    PRIVATE_SUBBUCKET_MMF_ADDED,
     PRIVATE_SUBBUCKETS,
     PRIVATE_SUBBUCKET_SHARES_KEY,
     SECURITY_TYPES,
@@ -71,7 +73,7 @@ from sim_pricing import (
     quote_issuance_from_face_target,
 )
 from sim_trading import execute_preference_trades
-from settlement_routes import TRC_RESULT_COLUMNS, TrcLedger, parse_trc_routing, trc_metadata
+from settlement_routes import MmfAddedPosition, TRC_RESULT_COLUMNS, TrcLedger, parse_trc_routing, trc_metadata
 from tdc_validation import is_coarse_frequency
 from tips_indexation import build_projected_cpi_lookup_from_macro, build_tips_daily_cpi_lookups_from_monthly_path
 from forecast_paths import (
@@ -879,6 +881,7 @@ def _handoff_append_principal(
     cash_paid,
     adjusted_principal_stock_removed=None,
     mmf_deposit_pass_through=1.0,
+    mmf_added_deposit_share=0.0,
 ):
     face_redeemed = float(face_redeemed or 0.0)
     principal_redeemed = float(principal_redeemed or 0.0)
@@ -898,11 +901,12 @@ def _handoff_append_principal(
     tdc_principal_to_du_mmf_plumbing = 0.0
     if tdc_recipient["holder_sector"] == "Private":
         route = tdc_recipient["holder_subsector"]
-        if route == PRIVATE_SUBBUCKET_MMF:
-            tdc_cash_to_du_mmf = mmf_deposit_pass_through * cash_paid
-            tdc_principal_to_du_mmf = mmf_deposit_pass_through * principal_redeemed
-            tdc_cash_to_du_mmf_plumbing = (1.0 - mmf_deposit_pass_through) * cash_paid
-            tdc_principal_to_du_mmf_plumbing = (1.0 - mmf_deposit_pass_through) * principal_redeemed
+        if route in (PRIVATE_SUBBUCKET_MMF, PRIVATE_SUBBUCKET_MMF_ADDED):
+            share = mmf_added_deposit_share if route == PRIVATE_SUBBUCKET_MMF_ADDED else mmf_deposit_pass_through
+            tdc_cash_to_du_mmf = share * cash_paid
+            tdc_principal_to_du_mmf = share * principal_redeemed
+            tdc_cash_to_du_mmf_plumbing = (1.0 - share) * cash_paid
+            tdc_principal_to_du_mmf_plumbing = (1.0 - share) * principal_redeemed
         else:
             tdc_cash_to_du_domestic_nonbank = cash_paid
             tdc_principal_to_du_domestic_nonbank = principal_redeemed
@@ -1697,6 +1701,11 @@ def _resolve_fed_secondary_sale_buyer_mix(bond_portfolio, mix_spec=None):
     active['BuyerSubBucket'] = ''
     private_mask = active['HolderType'] == 'Private'
     active.loc[private_mask, 'BuyerSubBucket'] = active.loc[private_mask].apply(_private_subbucket, axis=1)
+    # Allocate the added position's share to the other domestic nonbank route.
+    # Keep the ordinary money funds' weight and the all-holder denominator intact.
+    active.loc[active['BuyerSubBucket'].eq(PRIVATE_SUBBUCKET_MMF_ADDED), 'BuyerSubBucket'] = (
+        PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+    )
     grouped = active.groupby(['HolderType', 'BuyerSubBucket'], dropna=False)['StockQuantity'].sum()
     total = float(grouped.sum())
     if not np.isfinite(total) or total <= TGA_FLOOR_TOLERANCE:
@@ -3111,6 +3120,8 @@ def _tdc_principal_holder(row_or_mapping) -> dict[str, str]:
 def _private_subbucket_split(preferences: dict, category: str) -> dict[str, float]:
     subbucket_map = preferences.get(PRIVATE_SUBBUCKET_SHARES_KEY, {}) if isinstance(preferences, dict) else {}
     category_map = subbucket_map.get(category, {}) if isinstance(subbucket_map, dict) else {}
+    if PRIVATE_SUBBUCKET_MMF_ADDED in category_map:
+        raise ValueError('The added money-fund position cannot appear in auction holder preferences.')
     raw = {
         PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: max(
             0.0, float(category_map.get(PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, 0.0) or 0.0)
@@ -3127,12 +3138,16 @@ def _effective_private_amount(
     route_totals: dict[str, float],
     mmf_pass_through: float,
     legacy_total: float | None = None,
+    *,
+    mmf_added_deposit_share: float = 0.0,
 ) -> float:
+    added = route_totals.get(PRIVATE_SUBBUCKET_MMF_ADDED, 0.0)
     if mmf_pass_through >= 1.0 and legacy_total is not None:
-        return float(legacy_total)
+        return float(legacy_total) - (1.0 - mmf_added_deposit_share) * added
     return (
         route_totals.get(PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, 0.0)
         + mmf_pass_through * route_totals.get(PRIVATE_SUBBUCKET_MMF, 0.0)
+        + mmf_added_deposit_share * added
     )
 
 
@@ -3682,9 +3697,10 @@ def run_simulation(
         results[numeric_col] = 0.0
     results['FundingMode'] = funding_rule_mode if cbo_funding_mode else CASH_FUNDING_MODE
     holder_target_path = holder_targets.holder_target_path(params.get('holder_position_target'))
+    stock_columns = [column for group in holder_targets.STOCK_COLUMNS.values() for column in group.values()]
+    for numeric_col in [*stock_columns, *MMF_ADDED_TDC_COLUMNS.values()]:
+        results[numeric_col] = 0.0
     if holder_target_path is not None:
-        # Only a run that holds positions on a target carries these columns, so every
-        # other run's results keep their exact bytes.
         results[holder_targets.PHASE_COLUMN] = ''
         for numeric_col in holder_targets.RESULT_COLUMNS:
             results[numeric_col] = 0.0
@@ -3989,16 +4005,40 @@ def run_simulation(
         bond_portfolio = pd.DataFrame(columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES)
     t0 = dates[0]
     init_vals = params.get('initial_values', {})
+    added_position = (
+        MmfAddedPosition.from_mapping(params[PRIVATE_SUBBUCKET_MMF_ADDED])
+        if PRIVATE_SUBBUCKET_MMF_ADDED in params else None
+    )
+    if (
+        not bond_portfolio.empty
+        and bond_portfolio[['HolderSubBucket', 'TDCPrincipalHolderSubBucket']].eq(PRIVATE_SUBBUCKET_MMF_ADDED).any().any()
+    ):
+        raise ValueError('The added money-fund position must open with no securities.')
+    target_buyer = (params.get('holder_position_target') or {}).get('buyer_private_route')
+    if target_buyer == PRIVATE_SUBBUCKET_MMF_ADDED and added_position is None:
+        raise ValueError('The added money-fund buyer needs a declared settlement route.')
+    if added_position is not None and params.get('trc_routing') is None:
+        raise ValueError('The added money-fund position requires route-aware reserve accounting.')
+    mmf_added_deposit_share = added_position.deposit_share if added_position is not None else 0.0
+    opening_reserves = float(init_vals.get('reserves', 0.0))
+    if added_position is not None:
+        opening_reserves -= added_position.opening_on_rrp_bil
     results.loc[t0, 'TGA'] = init_vals.get('tga', 0.0)
-    results.loc[t0, 'Reserves'] = init_vals.get('reserves', 0.0)
+    results.loc[t0, 'Reserves'] = opening_reserves
     trc_ledger = None
     trc_rows = []
     if params.get('trc_routing') is not None:
         trc_ledger = TrcLedger(
-            parse_trc_routing(params['trc_routing'], mmf_deposit_pass_through=mmf_deposit_pass_through),
-            opening_reserves=float(init_vals.get('reserves', 0.0)),
+            parse_trc_routing(
+                params['trc_routing'],
+                mmf_deposit_pass_through=mmf_deposit_pass_through,
+                mmf_added_position=added_position,
+            ),
+            opening_reserves=opening_reserves,
         )
         trc_rows.append(trc_ledger.opening_row(t0))
+    # TDC starts from its Treasury contribution anchor. The opening deposit
+    # exchange for money-fund shares is recorded in the routing policy.
     results.loc[t0, 'TDC_Level'] = init_vals.get('tdc_level', init_vals.get('deposits', 0.0))
     results.loc[t0, 'CB_DeferredAsset'] = 0.0
     results.loc[t0, 'CPI_Level'] = cpi_start
@@ -4007,6 +4047,14 @@ def run_simulation(
         reference_cpi_start,
     )
     results.loc[t0, 'CBOFundingModeActive'] = 1.0 if cbo_funding_mode else 0.0
+    opening_stocks = holder_targets.closing_stocks(bond_portfolio)
+    for column, value in holder_targets.stock_result_values(opening_stocks).items():
+        results.loc[t0, column] = value
+    if holder_target_path is not None and holder_target_path.bill_change_weights is not None:
+        opening_bills = opening_stocks[holder_target_path.stock_column_stem]
+        _, opening_targets = holder_target_path.for_date(t0, opening_bills)
+        if max(abs(opening_bills[p] - opening_targets[p]) for p in holder_targets.PARTICIPANTS) > holder_target_path.tolerance_bil:
+            raise holder_targets.HolderTargetError('Opening bill holdings differ from the matched baseline.')
     results.loc[t0, ['CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOFiscalIncidencePolicyPresent', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBONetInterestBridgeRows']] = 0.0
     if bounded_handoff:
         handoff_tables.capture_portfolio_snapshot(
@@ -4672,6 +4720,7 @@ def run_simulation(
                         else None
                     ),
                     mmf_deposit_pass_through=mmf_deposit_pass_through,
+                    mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 if bill_discount_interest_payment > TGA_FLOOR_TOLERANCE:
                     _handoff_append_payment(
@@ -4931,6 +4980,7 @@ def run_simulation(
             },
             mmf_deposit_pass_through,
             legacy_total=principal_paid_by_holder.get('Private', 0.0) + interest_paid_by_holder.get('Private', 0.0),
+            mmf_added_deposit_share=mmf_added_deposit_share,
         )
         reserve_change_period += debt_service_reserve_change
         if trc_ledger is not None:
@@ -5109,6 +5159,7 @@ def run_simulation(
                             else None
                         ),
                         mmf_deposit_pass_through=mmf_deposit_pass_through,
+                        mmf_added_deposit_share=mmf_added_deposit_share,
                     )
                 total_principal_paid_period += retired_amount
                 buyback_reserve_change = sum(
@@ -5126,6 +5177,7 @@ def run_simulation(
                     retired_by_private_route,
                     mmf_deposit_pass_through,
                     legacy_total=retired_by_holder.get('Private', 0.0),
+                    mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 debt_service_deposit_change += buyback_deposit_change
                 deposit_change_period += buyback_deposit_change
@@ -5952,6 +6004,7 @@ def run_simulation(
                     fed_secondary_private_routes,
                     mmf_deposit_pass_through,
                     legacy_total=fed_secondary_sellers.get('Private', 0.0),
+                    mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 for route in PRIVATE_SUBBUCKETS:
                     fed_secondary_private_route_effects[route] += fed_secondary_private_routes[route]
@@ -6041,6 +6094,7 @@ def run_simulation(
                     fed_secondary_buyer_private_routes,
                     mmf_deposit_pass_through,
                     legacy_total=fed_secondary_buyers.get('Private', 0.0),
+                    mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 for route in PRIVATE_SUBBUCKETS:
                     fed_secondary_private_route_effects[route] -= fed_secondary_buyer_private_routes[route]
@@ -6076,22 +6130,32 @@ def run_simulation(
                 results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
                     'synthetic_secondary_sale_to_hit_cbo_stock_path'
                 )
+        closing_holder_stocks = None
         if holder_target_path is not None:
             if current_enable_trading:
                 raise RuntimeError(
                     'Holder position targets close after the Federal Reserve operation and '
                     'cannot run with preference trading, which would move positions afterward.'
                 )
-            holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date)
+            closing_holder_stocks = holder_targets.closing_stocks(bond_portfolio)
+            stock_stem = holder_target_path.stock_column_stem
+            holder_target_stocks = closing_holder_stocks[stock_stem]
+            holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date, holder_target_stocks)
             holder_target_tolerance = holder_target_path.tolerance_bil
             holder_target_gaps = holder_targets.target_gaps(
-                holder_targets.holder_stocks(bond_portfolio),
+                holder_target_stocks,
                 holder_target_vector,
                 tolerance=holder_target_tolerance,
                 current_date=current_date,
             )
             holder_target_pre_gap = max(abs(value) for value in holder_target_gaps.values())
             holder_target_report = holder_targets.RebalanceReport()
+            for route in holder_target_path.frozen_routes:
+                if abs(holder_target_gaps[route]) > holder_target_tolerance:
+                    raise holder_targets.HolderTargetError(
+                        f"Untraded route {route} differs from the baseline at the {current_date.date()} close."
+                    )
+                holder_target_gaps[route] = 0.0
             if holder_target_pre_gap > holder_target_tolerance:
                 if not market_open:
                     raise holder_targets.HolderTargetError(
@@ -6151,9 +6215,10 @@ def run_simulation(
                             seller_private_route=seller[1] or None,
                             amount=cash,
                         )
-                holder_target_deposit_effect = (
-                    holder_target_private_route_effects[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK]
-                    + mmf_deposit_pass_through * holder_target_private_route_effects[PRIVATE_SUBBUCKET_MMF]
+                holder_target_deposit_effect = _effective_private_amount(
+                    holder_target_private_route_effects,
+                    mmf_deposit_pass_through,
+                    mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 deposit_change_period += holder_target_deposit_effect
                 _handoff_append_journal(
@@ -6171,11 +6236,11 @@ def run_simulation(
                     deposit_change=holder_target_deposit_effect,
                     settlement_scope=holder_target_scope,
                 )
-            holder_target_closing = holder_targets.holder_stocks(bond_portfolio)
+                closing_holder_stocks = holder_targets.closing_stocks(bond_portfolio)
             holder_target_values = holder_targets.result_values(
                 phase=holder_target_phase,
                 targets=holder_target_vector,
-                stocks=holder_target_closing,
+                stocks=closing_holder_stocks[stock_stem],
                 pre_trade_gap=holder_target_pre_gap,
                 report=holder_target_report,
                 deposit_effect=holder_target_deposit_effect,
@@ -6419,6 +6484,10 @@ def run_simulation(
         results.loc[current_date, 'WAM'] = current_wam
         new_issuance_metrics = _handoff_weighted_metrics(new_bonds_added_list)
         outstanding_metrics = _handoff_outstanding_metrics(active_bonds_final, current_date)
+        if closing_holder_stocks is None:
+            closing_holder_stocks = holder_targets.closing_stocks(active_bonds_final)
+        for column, value in holder_targets.stock_result_values(closing_holder_stocks).items():
+            results.loc[current_date, column] = value
         results.loc[current_date, 'NewIssuanceWAM'] = new_issuance_metrics['wam_years']
         results.loc[current_date, 'NewIssuanceBillShare'] = new_issuance_metrics['bill_share']
         results.loc[current_date, 'NewIssuanceShortMaturityShare'] = new_issuance_metrics['short_maturity_share']
@@ -6551,21 +6620,30 @@ def run_simulation(
             principal_component_paid_by_private_route,
             PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
         )
-        results.loc[current_date, 'TDC_PrincipalToDU_MMF'] = mmf_deposit_pass_through * _private_route_value(
-            principal_component_paid_by_private_route,
-            PRIVATE_SUBBUCKET_MMF,
+        added_principal = principal_component_paid_by_private_route[PRIVATE_SUBBUCKET_MMF_ADDED]
+        added_principal_tdc = mmf_added_deposit_share * added_principal
+        results.loc[current_date, MMF_ADDED_TDC_COLUMNS['TDC_PrincipalToDU']] = added_principal_tdc
+        results.loc[current_date, 'TDC_PrincipalToDU_MMF'] = (
+            added_principal_tdc
+            + mmf_deposit_pass_through * _private_route_value(
+                principal_component_paid_by_private_route, PRIVATE_SUBBUCKET_MMF,
+            )
         )
         results.loc[current_date, 'TDC_PrincipalToDU_MMFPlumbing'] = (
             (1.0 - mmf_deposit_pass_through)
             * _private_route_value(principal_component_paid_by_private_route, PRIVATE_SUBBUCKET_MMF)
+            + (1.0 - mmf_added_deposit_share) * added_principal
         )
         results.loc[current_date, 'TDC_BillDiscountInterestToDU_DomesticNonbank'] = _private_route_value(
             bill_discount_interest_paid_by_private_route,
             PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
         )
-        results.loc[current_date, 'TDC_BillDiscountInterestToDU_MMF'] = mmf_deposit_pass_through * _private_route_value(
-            bill_discount_interest_paid_by_private_route,
-            PRIVATE_SUBBUCKET_MMF,
+        added_discount = bill_discount_interest_paid_by_private_route[PRIVATE_SUBBUCKET_MMF_ADDED]
+        added_discount_tdc = mmf_added_deposit_share * added_discount
+        results.loc[current_date, MMF_ADDED_TDC_COLUMNS['TDC_BillDiscountInterestToDU']] = added_discount_tdc
+        results.loc[current_date, 'TDC_BillDiscountInterestToDU_MMF'] = (
+            added_discount_tdc
+            + mmf_deposit_pass_through * _private_route_value(bill_discount_interest_paid_by_private_route, PRIVATE_SUBBUCKET_MMF)
         )
         results.loc[current_date, 'TDC_CouponInterestToDU_DomesticNonbank'] = _private_route_value(
             coupon_interest_paid_by_private_route,
@@ -6608,6 +6686,10 @@ def run_simulation(
                 },
                 PRIVATE_SUBBUCKET_MMF,
             )
+            + (1.0 - mmf_added_deposit_share) * (
+                principal_paid_by_private_route[PRIVATE_SUBBUCKET_MMF_ADDED]
+                + interest_paid_by_private_route[PRIVATE_SUBBUCKET_MMF_ADDED]
+            )
         )
         results.loc[current_date, 'TDC_PrincipalToDU'] = (
             results.loc[current_date, 'TDC_PrincipalToDU_DomesticNonbank']
@@ -6617,13 +6699,15 @@ def run_simulation(
             principal_paid_by_private_route,
             PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
         )
-        results.loc[current_date, 'TDC_PrincipalCashToDU_MMF'] = mmf_deposit_pass_through * _private_route_value(
-            principal_paid_by_private_route,
-            PRIVATE_SUBBUCKET_MMF,
+        added_principal_cash = principal_paid_by_private_route[PRIVATE_SUBBUCKET_MMF_ADDED]
+        results.loc[current_date, 'TDC_PrincipalCashToDU_MMF'] = (
+            mmf_added_deposit_share * added_principal_cash
+            + mmf_deposit_pass_through * _private_route_value(principal_paid_by_private_route, PRIVATE_SUBBUCKET_MMF)
         )
         results.loc[current_date, 'TDC_PrincipalCashToDU_MMFPlumbing'] = (
             (1.0 - mmf_deposit_pass_through)
             * _private_route_value(principal_paid_by_private_route, PRIVATE_SUBBUCKET_MMF)
+            + (1.0 - mmf_added_deposit_share) * added_principal_cash
         )
         results.loc[current_date, 'TDC_PrincipalCashToDU'] = (
             results.loc[current_date, 'TDC_PrincipalCashToDU_DomesticNonbank']
@@ -6692,8 +6776,14 @@ def run_simulation(
             fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_MMF]
             + holder_target_private_route_effects[PRIVATE_SUBBUCKET_MMF]
         )
+        added_secondary_cash = (
+            fed_secondary_private_route_effects[PRIVATE_SUBBUCKET_MMF_ADDED]
+            + holder_target_private_route_effects[PRIVATE_SUBBUCKET_MMF_ADDED]
+        )
+        added_secondary_tdc = mmf_added_deposit_share * added_secondary_cash
+        results.loc[current_date, MMF_ADDED_TDC_COLUMNS['TDC_SecondaryTrades']] = added_secondary_tdc
         results.loc[current_date, 'TDC_SecondaryTrades_MMF'] = (
-            mmf_deposit_pass_through
+            added_secondary_tdc + mmf_deposit_pass_through
             * (
                 pref_trade_monetary_impact.get('deposit_change_private_mmf', 0.0)
                 + fed_secondary_mmf_gross
@@ -6702,6 +6792,7 @@ def run_simulation(
         results.loc[current_date, 'TDC_SecondaryTrades_MMFPlumbing'] = (
             pref_trade_monetary_impact.get('deposit_change_private_mmf_plumbing', 0.0)
             + (1.0 - mmf_deposit_pass_through) * fed_secondary_mmf_gross
+            + (1.0 - mmf_added_deposit_share) * added_secondary_cash
         )
         results.loc[current_date, 'TDC_SecondaryDUToRU'] = max(0.0, private_secondary_change)
         results.loc[current_date, 'TDC_SecondaryRUToDU'] = max(0.0, -private_secondary_change)

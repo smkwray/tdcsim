@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 import holder_targets
+from tdc_shared import MMF_ADDED_TDC_COLUMNS, PRIVATE_SUBBUCKET_MMF, PRIVATE_SUBBUCKET_MMF_ADDED
 
 from ._json import sha256_file, write_json
 
@@ -131,7 +132,9 @@ BOUNDED_SUMMARY_COLUMNS = [
     "TDC_SecondaryTrades_MMFPlumbing",
     "CBOBuybackFaceRetired",
     "CBOBuybackCashPaid",
-    # Present only in runs that hold positions on a target.
+    *(column for group in holder_targets.STOCK_COLUMNS.values() for column in group.values()),
+    *MMF_ADDED_TDC_COLUMNS.values(),
+    # Controller results are present only in runs with a target.
     holder_targets.PHASE_COLUMN,
     *holder_targets.RESULT_COLUMNS,
 ]
@@ -679,6 +682,27 @@ TDC_COMPONENT_SPECS = [
     },
 ]
 
+_added_components = {
+    f"{stem}_MMF": column for stem, column in MMF_ADDED_TDC_COLUMNS.items()
+}
+for spec in tuple(TDC_COMPONENT_SPECS):
+    component_column = _added_components.get(spec["column"])
+    if spec["holder_subsector"] == PRIVATE_SUBBUCKET_MMF and component_column is not None:
+        spec["subtract_column"] = component_column
+        TDC_COMPONENT_SPECS.append({
+            **{key: value for key, value in spec.items() if key != "subtract_column"},
+            "column": component_column,
+            "component_key": f"{spec['component_key']}_added_position",
+            "holder_subsector": PRIVATE_SUBBUCKET_MMF_ADDED,
+        })
+
+
+def tdc_component_amount(row: Mapping[str, Any] | pd.Series, spec: Mapping[str, Any]) -> float:
+    amount = _number(row, spec["column"])
+    if "subtract_column" in spec:
+        amount -= _number(row, spec["subtract_column"])
+    return amount
+
 
 def _write_trc_outputs(
     results: pd.DataFrame,
@@ -955,7 +979,7 @@ def _tdc_handoff_tables(results: pd.DataFrame) -> dict[str, list[dict[str, Any]]
             }
         )
         for spec in TDC_COMPONENT_SPECS:
-            amount = _number(row, spec["column"])
+            amount = tdc_component_amount(row, spec)
             if abs(amount) <= 1e-12:
                 continue
             component_key = str(spec["component_key"])
@@ -990,6 +1014,7 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
         return {"tdcsim_tdc_principal_route_stock_closure": []}
     issuance = pd.DataFrame(raw.get("tdcsim_period_issuance_flows", []))
     principal = pd.DataFrame(raw.get("tdcsim_period_principal_flows", []))
+    has_journal = "tdcsim_accounting_journal" in raw
     journal = pd.DataFrame(raw.get("tdcsim_accounting_journal", []))
     rows: list[dict[str, Any]] = []
     stocks = stocks.copy()
@@ -1019,7 +1044,6 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
             period_start=period_start,
             period_end=period_end,
         )
-        journal_mode = bool(journal_face or journal_adjusted or journal_debt)
         keys = (
             set(opening)
             | set(closing)
@@ -1034,14 +1058,10 @@ def _route_stock_closure_handoff_tables(raw: Mapping[str, Any]) -> dict[str, lis
             issued_value = issued.get(key, 0.0)
             redeemed_value = redeemed.get(key, 0.0)
             close_value = closing.get(key, 0.0)
-            if journal_mode:
-                identity_error = (
-                    close_value - open_value - journal_debt.get(key, 0.0)
-                )
-            else:
-                identity_error = (
-                    close_value - open_value - issued_value + redeemed_value
-                )
+            # Stock legs can net to zero when same-day maintenance trades offset a
+            # redemption and auction. The journal still describes the complete change.
+            change = journal_debt.get(key, 0.0) if has_journal else issued_value - redeemed_value
+            identity_error = close_value - open_value - change
             route_holder, route_subbucket, instrument_type, maturity_bucket, debt_scope = key
             rows.append(
                 {
@@ -1424,8 +1444,8 @@ def _flow_amount_map(frame: pd.DataFrame, amount_column: str) -> dict[tuple[str,
     return {tuple(key): float(value) for key, value in grouped.items()}
 
 
-def _number(row: pd.Series, column: str) -> float:
-    if column not in row.index:
+def _number(row: Mapping[str, Any] | pd.Series, column: str) -> float:
+    if column not in row:
         return 0.0
     value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
     if pd.isna(value):

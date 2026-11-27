@@ -1,13 +1,14 @@
 {
   "schema_version": "tdcsim_scenario_family_spec_v1",
-  "family_id": "buyer_shift_v1",
+  "family_id": "buyer_shift_v2",
   "as_of_date": "2026-11-21",
   "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
+  "opening_mmf_added_on_rrp_bil": 500.0,
   "simulation": {
     "start_date": "2026-06-21",
     "end_date": "2031-09-30"
   },
-  "description": "Buyer shifts at unchanged Treasury financing. Banks, foreign accounts settling through US banks, or money funds paying from deposits acquire $500 billion of Treasury holdings in the secondary market during fiscal year 2027 and keep exactly that much more than the family baseline at every close through September 2031. Other holders' holdings fall in fixed proportions to their bill holdings at the 2026-09-30 close. Money-fund deposit pass-through is 1.0 in every run of the family.",
+  "description": "Buyer shifts at unchanged Treasury financing. Banks, foreign accounts or a separately routed money-fund position acquire $500 billion of Treasury holdings in fiscal year 2027 and maintain the added position through September 2031. All cases share one baseline. Ordinary money funds use covered deposits.",
   "boundaries": [
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "The $500 billion size is a stated assumption, equal across buyers so their effects can be compared, not an estimated demand response",
@@ -15,25 +16,26 @@
     "Positions are exact at each daily period close, after the Federal Reserve's operation; this is a model clock, not literal market execution on every calendar day",
     "The added position is total controlled public marketable Treasury holdings at par (adjusted principal for TIPS), acquired and maintained through nominal bills; it is not exactly $500 billion more bills",
     "Every scenario puts the TGA on the operating-cash path at each fiscal-year end, so financing-cost differences change the debt rather than the TGA",
-    "Banks pay with reserves; foreign holders settle through US banks outside covered deposits; money funds and other domestic nonbanks pay from covered deposits (money-fund pass-through 1.0)",
-    "Compare each run with this family's baseline"
+    "Banks settle with reserves and foreign holders settle through US banks outside covered deposits.",
+    "Ordinary money funds use covered deposits. The added position uses covered deposits or money-fund ON RRP.",
+    "At opening households hold $500 billion more money-fund shares and $500 billion fewer deposits. Reserves are $500 billion lower and money-fund ON RRP is $500 billion higher in every role. The opening exchange is outside the Treasury flow measures."
   ],
   "calibration": {
     "size": "$500 billion, about 1.6 percent of marketable debt at the opening, for every buyer.",
     "timing": "Zero at the 2026-09-30 close, rising linearly to $500 billion at the 2027-09-30 close, held at $500 billion through 2031-09-30.",
-    "displacement": "Every other public holder route gives up the position in proportion to its realized non-Fed bill holdings in the family baseline at the 2026-09-30 close; Private's two routes count separately. In the money-fund case banks, foreign holders and other domestic nonbanks sell, and other domestic nonbanks are paid into covered deposits.",
+    "displacement": "Banks and foreign buyers displace the other ordinary holder routes. For either money-fund case, banks, foreign holders and other domestic nonbanks give up the position. Donor weights use their realized bill holdings in the baseline at the 2026-09-30 close. Ordinary money funds follow their baseline path in both money-fund cases, and the added route acquires securities only in controller trades.",
     "trading": "After the Federal Reserve's operation each day, holders above their target sell nominal bills to holders below it at model dirty prices; each sale is spread across remaining-maturity buckets in proportion to the seller's bills."
   },
   "scenarios": [
     {
       "role": "baseline",
-      "scenario_id": "tdcsim_buyer_shift_v1_baseline",
+      "scenario_id": "tdcsim_buyer_shift_v2_baseline",
       "label": "Buyer-shift family baseline",
       "mmf_deposit_pass_through": 1.0
     },
     {
       "role": "banks",
-      "scenario_id": "tdcsim_buyer_shift_v1_banks",
+      "scenario_id": "tdcsim_buyer_shift_v2_banks",
       "label": "Banks hold $500 billion more Treasury securities, paid with reserves",
       "mmf_deposit_pass_through": 1.0,
       "holder_position_target": {
@@ -56,12 +58,17 @@
             "mmf_cash_fund_route"
           ]
         ],
-        "unchanged_routes": []
+        "unchanged_routes": [
+          [
+            "Private",
+            "mmf_added_position"
+          ]
+        ]
       }
     },
     {
       "role": "foreign",
-      "scenario_id": "tdcsim_buyer_shift_v1_foreign",
+      "scenario_id": "tdcsim_buyer_shift_v2_foreign",
       "label": "Foreign accounts hold $500 billion more Treasury securities, settled through US banks",
       "mmf_deposit_pass_through": 1.0,
       "holder_position_target": {
@@ -84,17 +91,22 @@
             "mmf_cash_fund_route"
           ]
         ],
-        "unchanged_routes": []
+        "unchanged_routes": [
+          [
+            "Private",
+            "mmf_added_position"
+          ]
+        ]
       }
     },
     {
       "role": "mmf_deposits",
-      "scenario_id": "tdcsim_buyer_shift_v1_mmf_deposits",
+      "scenario_id": "tdcsim_buyer_shift_v2_mmf_deposits",
       "label": "Money funds hold $500 billion more Treasury securities, paid from deposits",
       "mmf_deposit_pass_through": 1.0,
       "holder_position_target": {
         "buyer_holder": "Private",
-        "buyer_private_route": "mmf_cash_fund_route",
+        "buyer_private_route": "mmf_added_position",
         "size_bil": 500.0,
         "origin": "2026-09-30",
         "build_end": "2027-09-30",
@@ -112,8 +124,47 @@
             "domestic_nonbank_deposit_funded"
           ]
         ],
-        "unchanged_routes": []
+        "unchanged_routes": [
+          [
+            "Private",
+            "mmf_cash_fund_route"
+          ]
+        ]
       }
+    },
+    {
+      "role": "mmf_onrrp",
+      "scenario_id": "tdcsim_buyer_shift_v2_mmf_onrrp",
+      "label": "Money funds hold $500 billion more Treasury securities, paid from ON RRP",
+      "mmf_deposit_pass_through": 1.0,
+      "holder_position_target": {
+        "buyer_holder": "Private",
+        "buyer_private_route": "mmf_added_position",
+        "size_bil": 500.0,
+        "origin": "2026-09-30",
+        "build_end": "2027-09-30",
+        "donors": [
+          [
+            "Banks",
+            ""
+          ],
+          [
+            "Foreign",
+            ""
+          ],
+          [
+            "Private",
+            "domestic_nonbank_deposit_funded"
+          ]
+        ],
+        "unchanged_routes": [
+          [
+            "Private",
+            "mmf_cash_fund_route"
+          ]
+        ]
+      },
+      "mmf_added_position_settlement": "on_rrp_mmf"
     }
   ]
 }

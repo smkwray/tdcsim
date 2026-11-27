@@ -13,7 +13,7 @@ from tdc_shared import (
     HOLDER_TYPES,
     MARKETABLE_PREFERENCE_CATEGORIES,
     PRIVATE_SUBBUCKET_SHARES_KEY,
-    PRIVATE_SUBBUCKETS,
+    PRIVATE_AUCTION_SUBBUCKETS,
 )
 
 MARKETABLE_SECURITY_TYPES = MARKETABLE_PREFERENCE_CATEGORIES
@@ -277,12 +277,12 @@ def compile_holder_preference_events(
 def _private_routes(raw: Any, *, private_share: float, label: tuple[str, str]) -> dict[str, float]:
     """Validate a row's split of the Private share across the registered private routes."""
 
-    if not isinstance(raw, Mapping) or set(raw) != set(PRIVATE_SUBBUCKETS):
-        raise PortfolioTransformError(f"private_routes for {label} must have exactly {list(PRIVATE_SUBBUCKETS)}")
+    if not isinstance(raw, Mapping) or set(raw) != set(PRIVATE_AUCTION_SUBBUCKETS):
+        raise PortfolioTransformError(f"private_routes for {label} must have exactly {list(PRIVATE_AUCTION_SUBBUCKETS)}")
     if private_share <= 0.0:
         raise PortfolioTransformError(f"private_routes for {label} requires a positive Private share")
     routes = {}
-    for route in PRIVATE_SUBBUCKETS:
+    for route in PRIVATE_AUCTION_SUBBUCKETS:
         value = raw[route]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
             raise PortfolioTransformError(f"private_routes.{route} for {label} must be a number in [0, 1]")

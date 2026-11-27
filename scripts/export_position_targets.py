@@ -111,9 +111,14 @@ def _check_hierarchy(role: str, day: str, rows: list[tuple[str, str, str, str, s
 
 
 def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], ht: Any) -> dict[str, Any]:
+    from settlement_routes import MmfAddedPosition
+    from tdc_shared import MMF_ADDED_TDC_COLUMNS, PRIVATE_SUBBUCKET_MMF_ADDED
+
     run_dir = root / role / "run"
     scenario = json.loads((run_dir / "scenario.json").read_text(encoding="utf-8"))
     target = scenario["overrides"]["holder_position_target"]
+    added_buyer = target["buyer_private_route"] == PRIVATE_SUBBUCKET_MMF_ADDED
+    added_position = MmfAddedPosition.from_mapping(scenario["overrides"][PRIVATE_SUBBUCKET_MMF_ADDED]) if added_buyer else None
     reference = target["baseline_reference"]
     base_dir = root / "baseline" / "run"
     if (reference["run_manifest_sha256"] != sha256(base_dir / RUN_MANIFEST)
@@ -254,6 +259,24 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
             ("trc", "settlement_account", "additive", "trc_change", "minus_route_held_balance_change", -states),
             ("trc", "settlement_account", "additive", "trc_change", "reconciliation_residual", trc_residual),
         ]
+        if added_position is not None:
+            label = ht.PARTICIPANT_LABELS[("Private", PRIVATE_SUBBUCKET_MMF_ADDED)]
+            added_trade = added_position.deposit_share * (
+                _since(results, f"HolderTargetSoldCash_{label}", origin, day)
+                - _since(results, f"HolderTargetBoughtCash_{label}", origin, day)
+            )
+            added_secondary = diff(results, base_results, MMF_ADDED_TDC_COLUMNS["TDC_SecondaryTrades"])
+            for name, total, added in (
+                ("principal_to_deposit_users", principal, diff(results, base_results, MMF_ADDED_TDC_COLUMNS["TDC_PrincipalToDU"])),
+                ("treasury_interest_to_deposit_users_bill_discount", parts["bill_discount"],
+                 diff(results, base_results, MMF_ADDED_TDC_COLUMNS["TDC_BillDiscountInterestToDU"])),
+                ("secondary_settlements_target_trades", target_trades, added_trade),
+                ("secondary_settlements_federal_reserve", fed, added_secondary - added_trade),
+            ):
+                rows_out.extend([
+                    ("tdc", "settlement_type", "of_which", name, f"{name}_added_mmf_position", added),
+                    ("tdc", "settlement_type", "of_which", name, f"{name}_other_routes", total - added),
+                ])
         _check_hierarchy(role, day, rows_out)
         components.extend({"family_id": family["family_id"], "role": role, "date": day, "object": obj,
                            "decomposition": decomposition, "row_kind": kind, "parent_component": parent,
@@ -338,7 +361,10 @@ def main(argv: list[str] | None = None) -> int:
             "mmf_deposit_pass_through": base_scenario["overrides"]["mmf_deposit_pass_through"]["value"],
             "simulation": base_scenario["simulation"],
             "baseline": {"scenario_id": base_scenario["scenario_id"], "verification": _verified(root, "baseline").get("status"),
-                         "run_manifest_sha256": sha256(root / "baseline" / "run" / RUN_MANIFEST)},
+                         "run_manifest_sha256": sha256(root / "baseline" / "run" / RUN_MANIFEST),
+                         **({"routing": json.loads((root / "baseline" / "run" / "outputs" / "tdcsim_trc_metadata.json")
+                                                    .read_text(encoding="utf-8"))["routing"]}
+                            if "mmf_added_position" in base_scenario["overrides"] else {})},
             "cases": cases,
         })
     args.out_dir.mkdir(parents=True)
@@ -383,9 +409,8 @@ def main(argv: list[str] | None = None) -> int:
         "allocation_conventions": (
             "Each seller's sale is spread across remaining-maturity buckets (0-30, 31-91, 92-182 and over 182 days) in "
             "proportion to its eligible bills, whole lots first in order of maturity, holder route and terms; a seller's "
-            "selected lots are then divided among buyers in the fixed order Banks, Foreign, other domestic nonbanks, money "
-            "funds. The Federal Reserve buys Private first, then Banks, then Foreign, earliest maturity first, with equal "
-            "maturities taken in the same order of holder route and terms."
+            "selected lots are then divided among buyers in the fixed order Banks, Foreign, other domestic nonbanks, ordinary "
+            "money funds, and the added money-fund position."
         ),
         "families": families,
         "outputs": {name: sha256(args.out_dir / name) for name in names.values()},

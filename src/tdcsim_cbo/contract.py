@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import holder_targets
+from settlement_routes import MmfAddedPosition
+from tdc_shared import PRIVATE_SUBBUCKET_MMF_ADDED
 from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     OPEN04_OUTPUT_CONTRACT,
@@ -187,10 +189,20 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
                 },
             )
     _validate_open04_evaluated_nominal_contract(data, overrides)
+    added_position = overrides.get(PRIVATE_SUBBUCKET_MMF_ADDED)
+    policy = MmfAddedPosition.from_mapping(added_position) if added_position is not None else None
+    target = overrides.get("holder_position_target", {})
+    if target.get("buyer_private_route") == PRIVATE_SUBBUCKET_MMF_ADDED:
+        size = float(target["target_path"][-1]["increment_bil"])
+        if policy is None or policy.opening_on_rrp_bil != size:
+            raise ValueError("the added money-fund target size must equal its declared opening ON RRP balance")
 
 
 def _validate_holder_position_target(data: Mapping[str, Any], override: Mapping[str, Any]) -> None:
     try:
+        if override.get("mode") == holder_targets.BILL_TARGET_MODE:
+            holder_targets.bill_change_weights(override["bill_change_weights"])
+            return
         path = holder_targets.BuildAndHoldPath.from_points(list(override.get("target_path") or []))
         holder_targets.declared_weights(override)
     except (holder_targets.HolderTargetError, KeyError, TypeError, ValueError) as exc:

@@ -33,6 +33,7 @@ from tdc_shared import (
     INTRAGOV_HOLDERS,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
+    PRIVATE_SUBBUCKET_MMF_ADDED,
     PRIVATE_SUBBUCKETS,
 )
 
@@ -246,6 +247,28 @@ def _finite_share(value: Any, label: str) -> float:
 
 
 @dataclass(frozen=True)
+class MmfAddedPosition:
+    settlement_route: str
+    opening_on_rrp_bil: float
+
+    @property
+    def deposit_share(self) -> float:
+        return SETTLEMENT_ROUTES[self.settlement_route].covered_deposit_member
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> MmfAddedPosition:
+        if not isinstance(config, Mapping) or set(config) != {"settlement_route", "opening_on_rrp_bil"}:
+            raise TrcRoutingError("the added money-fund position requires a settlement route and opening ON RRP")
+        route = config["settlement_route"]
+        amount = float(config["opening_on_rrp_bil"])
+        if route not in ("covered_deposit_settled", "on_rrp_mmf"):
+            raise TrcRoutingError("the added money-fund position must settle through covered deposits or money-fund ON RRP")
+        if not math.isfinite(amount) or amount <= 0.0:
+            raise TrcRoutingError("the added money-fund opening ON RRP balance must be finite and positive")
+        return cls(route, amount)
+
+
+@dataclass(frozen=True)
 class TrcRoutingPolicy:
     """Holder-to-route shares and opening Fed nonreserve balances.
 
@@ -264,6 +287,7 @@ class TrcRoutingPolicy:
     mmf_deposit_pass_through: float
     assumption_status: str
     description: str
+    mmf_added_position: MmfAddedPosition | None = None
 
     def routes_for(self, holder: str, private_route: str | None = None) -> tuple[tuple[str, float], ...]:
         if holder in _FIXED_HOLDER_ROUTES:
@@ -275,6 +299,10 @@ class TrcRoutingPolicy:
                 if share > 0.0
             )
         if holder == "Private":
+            if private_route == PRIVATE_SUBBUCKET_MMF_ADDED:
+                if self.mmf_added_position is None:
+                    raise TrcRoutingError("added money-fund holdings require a declared settlement route")
+                return ((self.mmf_added_position.settlement_route, 1.0),)
             if private_route == PRIVATE_SUBBUCKET_MMF:
                 bank_settled = 1.0 - self.mmf_deposit_pass_through - self.mmf_on_rrp_share
                 routes = (
@@ -301,7 +329,7 @@ class TrcRoutingPolicy:
         )
 
     def as_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "schema_version": TRC_ROUTING_SCHEMA_VERSION,
             "foreign_settlement_mix": dict(self.foreign_mix),
             "mmf_cash_fund_route": {
@@ -318,9 +346,22 @@ class TrcRoutingPolicy:
                 for holder, routes in _FIXED_HOLDER_ROUTES.items()
             },
         }
+        if self.mmf_added_position is not None:
+            amount = self.mmf_added_position.opening_on_rrp_bil
+            record[PRIVATE_SUBBUCKET_MMF_ADDED] = {
+                "settlement_route": self.mmf_added_position.settlement_route,
+                "opening_on_rrp_bil": amount,
+                "opening_deposits_offset_bil": -amount,
+                "opening_reserves_offset_bil": -amount,
+                "basis": "Households exchange deposits for money-fund shares at opening. "
+                "The fund places the cash at ON RRP. The opening exchange is outside Treasury flows.",
+            }
+        return record
 
 
-def parse_trc_routing(config: Mapping[str, Any], *, mmf_deposit_pass_through: float) -> TrcRoutingPolicy:
+def parse_trc_routing(
+    config: Mapping[str, Any], *, mmf_deposit_pass_through: float, mmf_added_position: MmfAddedPosition | None = None,
+) -> TrcRoutingPolicy:
     """Validate a ``trc_routing`` block; every share and opening balance is explicit."""
 
     if not isinstance(config, Mapping):
@@ -359,6 +400,8 @@ def parse_trc_routing(config: Mapping[str, Any], *, mmf_deposit_pass_through: fl
         raise TrcRoutingError(
             "mmf_cash_fund_route.on_rrp_share cannot exceed the non-deposit share one minus the pass-through"
         )
+    if mmf_added_position is not None and (pass_through != 1.0 or mmf_on_rrp_share != 0.0):
+        raise TrcRoutingError("the added money-fund position requires ordinary money funds to settle through deposits")
 
     balances_raw = config["opening_fed_nonreserve_balances_bil"]
     sources_raw = config["opening_balance_sources"]
@@ -382,6 +425,8 @@ def parse_trc_routing(config: Mapping[str, Any], *, mmf_deposit_pass_through: fl
         if not source:
             raise TrcRoutingError(f"opening balance {state} requires a named source")
         balances[state] = value
+    if mmf_added_position is not None:
+        balances["ONRRP_MMF"] += mmf_added_position.opening_on_rrp_bil
 
     return TrcRoutingPolicy(
         foreign_mix=MappingProxyType(foreign_mix),
@@ -392,6 +437,7 @@ def parse_trc_routing(config: Mapping[str, Any], *, mmf_deposit_pass_through: fl
         mmf_deposit_pass_through=pass_through,
         assumption_status=str(config.get("assumption_status") or "scenario_assumption"),
         description=str(config.get("description") or ""),
+        mmf_added_position=mmf_added_position,
     )
 
 
@@ -509,10 +555,15 @@ class TrcLedger:
             )
         for state in TRC_ROUTE_STATES:
             self.balances[state] += self._state_delta[state]
-            if self.balances[state] < -TRC_STATE_TOLERANCE_BIL:
+            available = self.balances[state]
+            if state == "ONRRP_MMF" and self.policy.mmf_added_position is not None:
+                # Only the added position can draw on ON RRP. The observed
+                # balance belongs to other activity and remains in the account.
+                available -= self.policy.opening_balances[state] - self.policy.mmf_added_position.opening_on_rrp_bil
+            if available < -TRC_STATE_TOLERANCE_BIL:
                 raise TrcRoutingError(
                     f"Fed nonreserve route balance {state} is negative at the {date} close: "
-                    f"{self.balances[state]!r}; the routed settlement exceeds available capacity"
+                    f"{available!r}; the routed settlement exceeds available capacity"
                 )
         self.cumulative += trc_change
         self.legacy_cumulative += legacy

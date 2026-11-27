@@ -42,12 +42,18 @@ MARKETABLE_PREFERENCE_CATEGORIES = ('bills', 'notes', 'bonds', 'tips', 'frn')
 PREFERENCE_CATEGORIES = [*MARKETABLE_PREFERENCE_CATEGORIES, 'nonmarketable']
 PRIVATE_SUBBUCKET_DOMESTIC_NONBANK = 'domestic_nonbank_deposit_funded'
 PRIVATE_SUBBUCKET_MMF = 'mmf_cash_fund_route'
+PRIVATE_SUBBUCKET_MMF_ADDED = 'mmf_added_position'
 # Key under which holder-preference blocks carry the private route split of each category.
 PRIVATE_SUBBUCKET_SHARES_KEY = '__private_subbucket_shares__'
-PRIVATE_SUBBUCKETS = [
+PRIVATE_AUCTION_SUBBUCKETS = (
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
-]
+)
+PRIVATE_SUBBUCKETS = [*PRIVATE_AUCTION_SUBBUCKETS, PRIVATE_SUBBUCKET_MMF_ADDED]
+MMF_ADDED_TDC_COLUMNS = {
+    name: f"{name}_MMFAdded"
+    for name in ("TDC_PrincipalToDU", "TDC_BillDiscountInterestToDU", "TDC_SecondaryTrades")
+}
 MMF_DEPOSIT_PASS_THROUGH_DEFAULT = 0.97
 MMF_DEPOSIT_PASS_THROUGH_STATUS = (
     'source_backed_measurement_regime_aware_static_0_97_tdcest_rrp_runoff_anchor'

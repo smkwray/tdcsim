@@ -48,7 +48,9 @@ import holder_targets as ht  # noqa: E402
 from simulation_calendar import previous_securities_business_day  # noqa: E402
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
-from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS  # noqa: E402
+from tdc_shared import (  # noqa: E402
+    HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_AUCTION_SUBBUCKETS, PRIVATE_SUBBUCKET_MMF_ADDED,
+)
 from issuance_calibration import CALIBRATION_FILE, ISSUANCE_RULE_MODE, load_calibration, target_for_date  # noqa: E402
 from write_cbo_example_scenarios import _baseline_coupling, _scenario  # noqa: E402
 
@@ -59,7 +61,7 @@ DEBT_STOCK_FILE = "tdcsim_debt_stock_path.csv"
 ITEM_KEYS = frozenset({
     "role", "scenario_id", "label", "notes", "holder_shift", "bill_share_change", "bill_holder_shift",
     "bill_buyer_shift", "fed_holdings_change", "key_rate_shocks_bp", "rate_path", "mmf_deposit_pass_through",
-    "holder_position_target",
+    "holder_position_target", "mmf_added_position_settlement",
 })
 SUBKEYS = {
     "bill_holder_shift": frozenset({"absorbers"}),
@@ -176,14 +178,14 @@ def bill_holder_rows(
     target_path: list[dict[str, Any]],
     absorbers: list[str],
 ) -> list[dict[str, Any]]:
-    """Dated bill shares under which only ``absorbers`` take up the change in the bill stock.
+    """First-pass auction shares for a bill-stock change assigned to ``absorbers``.
 
     Auction shares apply to all bills sold, and bills roll within a year, so a holder's
     share of bill auctions is close to its share of the bill stock. With baseline shares
     s, opening bill share b and target t, every other holder keeps its baseline bill
-    holdings in dollars (share s * b / t), and the absorbers split the change t - b in
-    proportion to their baseline shares. Rows are written monthly from the first to the
-    last target date so the shares follow the target path.
+    holdings in dollars (share s * b / t) under that approximation, and the absorbers split
+    the change t - b in proportion to their baseline shares. The position controller
+    reconciles actual closing stocks. Rows are written monthly across the target path.
     """
 
     unknown = set(absorbers) - set(HOLDER_TYPES)
@@ -281,11 +283,11 @@ def bill_buyer_rows(
     if others <= 0.0:
         raise ValueError(f"{holder} already takes every bill")
     if private_route is not None:
-        if holder != "Private" or private_route not in PRIVATE_SUBBUCKETS:
-            raise ValueError(f"a private route needs holder Private and one of {list(PRIVATE_SUBBUCKETS)}")
+        if holder != "Private" or private_route not in PRIVATE_AUCTION_SUBBUCKETS:
+            raise ValueError(f"a private route needs holder Private and one of {list(PRIVATE_AUCTION_SUBBUCKETS)}")
         if baseline_route_share is None or not 0.0 <= baseline_route_share <= 1.0:
             raise ValueError("a private route needs its baseline bill route share in [0, 1]")
-        (other_route,) = [route for route in PRIVATE_SUBBUCKETS if route != private_route]
+        (other_route,) = [route for route in PRIVATE_AUCTION_SUBBUCKETS if route != private_route]
     stocks = sorted(bill_stock_by_date)
     start = pd.Timestamp(build[0]).normalize()
     dates = sorted({start, pd.Timestamp(build[1]).normalize()} | set(pd.date_range(start, stocks[-1][0], freq="ME")))
@@ -477,9 +479,49 @@ def _route(value: Any) -> tuple[str, str]:
 
 
 def _item_phase(item: dict[str, Any]) -> str:
-    if item.get("holder_position_target"):
+    if item.get("holder_position_target") or item.get("bill_holder_shift"):
         return "positions"
     return "rates" if item.get("rate_path") else "quantity"
+
+
+def _write_bill_target(
+    item: dict[str, Any], bill_shares: dict[str, float], runs_root: Path, output_dir: Path,
+) -> dict[str, Any]:
+    run = runs_root / "baseline" / "run"
+    results = pd.read_csv(run / RESULTS, float_precision="round_trip")
+    absorbers = item["bill_holder_shift"]["absorbers"]
+    routes = [(holder, "") for holder in absorbers]
+    total = sum(bill_shares[holder] for holder in absorbers)
+    weights = [
+        {"holder_type": holder, "holder_subbucket": subbucket, "weight": bill_shares[holder] / total}
+        for holder, subbucket in routes
+    ]
+    ht.bill_change_weights(weights)
+    columns = ht.STOCK_COLUMNS["HolderBillStock"]
+    rows = [
+        {"date": pd.Timestamp(row["Date"]).date().isoformat(), "holder_type": holder, "holder_subbucket": subbucket,
+         "baseline_stock_bil": row[column]}
+        for row in results[["Date", *columns.values()]].to_dict("records")
+        for (holder, subbucket), column in columns.items()
+    ]
+    name = f"{item['role']}_holder_position_target.csv"
+    with (output_dir / name).open("x", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ht.BILL_TARGET_FILE_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    baseline_scenario = json.loads((run / "scenario.json").read_text(encoding="utf-8"))
+    return {
+        "mode": ht.BILL_TARGET_MODE,
+        "bill_change_weights": weights,
+        "baseline_reference": {
+            "scenario_id": str(baseline_scenario["scenario_id"]),
+            "scenario_sha256": canonical_json_sha256(baseline_scenario),
+            "run_manifest_sha256": sha256_file(run / RUN_MANIFEST),
+            "results_sha256": sha256_file(run / RESULTS),
+        },
+        "target_tolerance_bil": HOLDER_TARGET_TOLERANCE_BIL,
+        "file": {"relative_path": name, "sha256": sha256_file(output_dir / name), "media_type": "text/csv"},
+    }
 
 
 def _write_holder_target(
@@ -587,6 +629,8 @@ def family_scenarios(
             if item.get("bill_holder_shift"):
                 if shift:
                     raise ValueError(f"{item['role']}: declare a holder shift or a bill holder shift, not both")
+                if runs_root is None or output_dir is None:
+                    raise ValueError(f"{item['role']}: a bill holder shift needs the baseline run and an output directory")
                 overrides["holder_preferences"] = {
                     "mode": "dated_static_shares",
                     "rows": bill_holder_rows(
@@ -596,6 +640,7 @@ def family_scenarios(
                         absorbers=[str(h) for h in item["bill_holder_shift"]["absorbers"]],
                     ),
                 }
+                overrides["holder_position_target"] = _write_bill_target(item, base["bills"], runs_root, output_dir)
         if item.get("bill_buyer_shift"):
             if item.get("bill_share_change"):
                 raise ValueError(f"{item['role']}: a bill-buyer shift is sized on the opening bill share and cannot be combined with a bill_share_change")
@@ -627,6 +672,13 @@ def family_scenarios(
                 "mode": "fixed_fraction",
                 "value": float(item["mmf_deposit_pass_through"]),
             }
+        if "opening_mmf_added_on_rrp_bil" in family:
+            overrides[PRIVATE_SUBBUCKET_MMF_ADDED] = {
+                "settlement_route": item.get("mmf_added_position_settlement", "covered_deposit_settled"),
+                "opening_on_rrp_bil": float(family["opening_mmf_added_on_rrp_bil"]),
+            }
+        elif "mmf_added_position_settlement" in item:
+            raise ValueError(f"{item['role']}: added money-fund settlement needs a common opening ON RRP balance")
         if item.get("holder_position_target"):
             if shift or "holder_preferences" in overrides or item.get("fed_holdings_change"):
                 raise ValueError(f"{item['role']}: a holder position target is the scenario's only holdings change")

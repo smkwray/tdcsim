@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -131,6 +132,7 @@ def test_family_runs_verify_and_export(tmp_path: Path, monkeypatch) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
     simulation = json.loads(Path(scenarios["noop"]).read_text()).get("simulation")
     family = _family(25.0)
+    family["export_holder_stocks"] = True
     # The fixture's auctions go entirely to private holders, so the derived path shifts them.
     private_shift = {"holder": "Private", "multiplier": 0.5, "absorbers": {"Banks": 1.0}}
     family["scenarios"] += [
@@ -214,6 +216,13 @@ def test_family_runs_verify_and_export(tmp_path: Path, monkeypatch) -> None:
     assert max(rate_shifts) > 0.0
     assert {round(100.0 * s, 9) for s in rate_shifts} <= {round(item["shift_10y_bp"], 9) for item in shift_path}
     assert all(receipt["roles"][role]["verification_status"] == "pass" for role in runs)
+    holder_output = receipt["holder_stock_output"]
+    with (tmp_path / "export" / holder_output["path"]).open(newline="") as handle:
+        holder_rows = list(csv.DictReader(handle))
+    assert {r["scenario_role"] for r in holder_rows} == set(runs)
+    assert all(float(r["controller_bought_cash_bil"]) == 0.0 for r in holder_rows)
+    assert all(float(r["closing_bill_stock_bil"]) <= float(r["closing_controlled_treasury_stock_bil"])
+               for r in holder_rows)
 
     runs["retreat"]["verification"] = {"status": "fail"}
     with pytest.raises(ScenarioFamilyExportError, match="verification"):
@@ -340,6 +349,46 @@ def test_only_the_named_holders_take_up_a_change_in_the_bill_stock(change) -> No
     assert sum(absorbed.values()) == pytest.approx(change)
     # Absorbers split the change in proportion to their baseline bill shares.
     assert absorbed["Banks"] / absorbed["Foreign"] == pytest.approx(0.2 / 0.3)
+
+
+def test_cost_family_writes_closing_bill_targets_only_for_banks_foreign(tmp_path, monkeypatch) -> None:
+    import holder_targets as ht
+    import write_scenario_family as writer
+    from test_tdcsim_cbo_closeout_interface import _runner_baseline_and_scenarios
+
+    baseline, _ = _runner_baseline_and_scenarios(tmp_path)
+    monkeypatch.setattr(writer, "baseline_holder_shares", lambda _: BASE)
+    monkeypatch.setattr(writer, "baseline_bill_share", lambda _: 0.225)
+    family = json.loads((PROJECT_ROOT / "scenarios" / "cost_tdc_v1.json").read_text())
+    quantity = family_scenarios(baseline, family)
+    assert list(quantity) == ["00_baseline.json", "01_shorter_mix_only.json", "02_shorter_proportional.json",
+                              "04_longer_mix_only.json", "05_longer_proportional.json"]
+    for scenario in quantity.values():
+        assert "holder_preferences" not in scenario["overrides"]
+        assert "holder_position_target" not in scenario["overrides"]
+
+    runs = tmp_path / "runs"
+    run = runs / "baseline" / "run"
+    (run / "outputs").mkdir(parents=True)
+    (run / "scenario.json").write_text(json.dumps(quantity["00_baseline.json"]))
+    (run / writer.RUN_MANIFEST).write_text("{}")
+    columns = ht.STOCK_COLUMNS["HolderBillStock"]
+    with gzip.open(run / writer.RESULTS, "wt", newline="") as stream:
+        csv_writer = csv.DictWriter(stream, fieldnames=["Date", *columns.values()])
+        csv_writer.writeheader()
+        csv_writer.writerow({"Date": "2026-06-21", **dict.fromkeys(columns.values(), 20.0)})
+    out = tmp_path / "positions"
+    out.mkdir()
+    positions = family_scenarios(baseline, family, phase="positions", runs_root=runs, output_dir=out)
+    assert list(positions) == ["03_shorter_banks_foreign.json", "06_longer_banks_foreign.json"]
+    for scenario in positions.values():
+        overrides = scenario["overrides"]
+        assert overrides["holder_preferences"]["mode"] == "dated_static_shares"
+        target = overrides["holder_position_target"]
+        assert target["mode"] == ht.BILL_TARGET_MODE
+        assert [row["weight"] for row in target["bill_change_weights"]] == pytest.approx([0.4, 0.6])
+        with (out / target["file"]["relative_path"]).open(newline="") as handle:
+            assert len(list(csv.DictReader(handle))) == len(ht.PARTICIPANTS)
 
 
 def test_bill_holder_shift_rejects_a_cut_larger_than_the_absorbers_hold() -> None:
