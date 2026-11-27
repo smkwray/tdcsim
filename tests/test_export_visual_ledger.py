@@ -255,3 +255,18 @@ def test_opening_tips_export_values_par_at_simulation_start(tmp_path) -> None:
     opening = ledger.build_opening(tmp_path)
     assert opening["face_total"].item() == pytest.approx(100.0)
     assert opening["debt_basis_total"].item() == pytest.approx(111.0)
+
+
+def test_the_readme_states_the_fed_interest_clock_and_the_fmu_transfer_it_assumes():
+    """Consumers read Fed reserve balances off the export. The model posts IORB daily rather than
+    per maintenance period, and books FMU interest into bank reserves; both are assumptions the
+    README must state, with every Treasury income line it says sums to the total."""
+
+    import export_visual_ledger as ledger
+    from fed_income import FED_INCOME_EXPORT_FLOWS, TREASURY_INCOME_TERMS
+
+    text = " ".join(ledger.README.split())
+    assert "once per 14-day maintenance period" in text
+    assert "the model assumes the FMUs pass it on to banks" in text
+    for column in TREASURY_INCOME_TERMS:
+        assert f"`{FED_INCOME_EXPORT_FLOWS[column]}`" in text, column

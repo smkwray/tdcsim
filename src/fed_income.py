@@ -19,10 +19,12 @@ Earnings are accrual basis on the Fed's own acquisition basis:
 
 Expenses accrue on each day's closing balances: IORB on reserves and on designated
 financial market utilities' balances, the ON RRP rate on domestic ON RRP and on the foreign
-official repo pool. Interest is posted on the next Fedwire business day: IORB and domestic
-ON RRP interest credit reserves (FMU interest credits FMU accounts, which the exogenous
-other-deposit path already contains, so it also adds to reserves against that path); foreign
-repo pool interest is reinvested in the pool and grows that liability, not reserves.
+official repo pool. Interest is posted on the next Fedwire business day, a simplified clock:
+the Reserve Banks pay interest on reserve balances once per 14-day maintenance period, after
+it ends. IORB and domestic ON RRP interest credit reserves. FMU interest credits FMU accounts,
+whose balance follows the exogenous other-deposit path, so the FMUs are assumed to pass it on
+to banks and it adds to reserves. Foreign repo pool interest is reinvested in the pool and
+grows that liability, not reserves.
 
 The pooled H.4.1 line "Earnings remittances due to the U.S. Treasury" is one signed balance:
 net income after dividends adds to it, a debit is the deferred asset. The Reserve Banks remit

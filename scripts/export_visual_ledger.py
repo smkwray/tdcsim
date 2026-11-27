@@ -519,8 +519,13 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   on each day's closing balances at that day's rates: `fed_iorb_on_reserves_expense_bil`,
   `fed_iorb_on_fmu_balances_expense_bil` (designated financial market utilities' balances, a fixed share
   of other deposits), `fed_domestic_on_rrp_expense_bil` and `fed_foreign_repo_pool_expense_bil` (both at
-  the ON RRP offering rate). Interest posts on the next business day; foreign repo pool interest is
-  reinvested in the pool. `fed_mbs_income_bil` (coupon less premium amortization on the agency MBS
+  the ON RRP offering rate). The model posts each day's interest on reserves, FMU balances and domestic
+  ON RRP on the next Fedwire business day. That is a simplified clock: the Reserve Banks pay interest on
+  reserve balances once per 14-day maintenance period, after it ends, so posting earlier slightly raises
+  the balance on which later IORB accrues. Interest credited to FMU accounts leaves
+  `fed_fmu_balances_bil` on its other-deposits path: the model assumes the FMUs pass it on to banks, so
+  it raises `fed_reserve_balances_bil` by the same amount. Foreign repo pool interest is reinvested in
+  the pool. `fed_mbs_income_bil` (coupon less premium amortization on the agency MBS
   runoff path), `fed_other_income_bil`, `fed_operating_expenses_bil` and `fed_dividends_bil` are
   smoothed daily proxies with no payment clock: they accrue every calendar day, and the MBS runoff,
   coupon and the other lines (including net government-agency reimbursements) settle through bank
