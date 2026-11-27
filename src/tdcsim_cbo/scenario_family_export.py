@@ -100,6 +100,12 @@ def _fed_interest_remittance_rows(
             "treasury_interest_less_fed_remittances_bil": interest - remitted,
         }
         row.update({name: float(series[column][window].sum()) for column, name in flows.items() if name not in row})
+        # Two scopes: Treasury's interest payments to the Fed (cash, bill discount at maturity on
+        # the issue basis, no TIPS principal indexation) and the Fed's accrued Treasury income on
+        # its acquisition basis (indexation, amortization and realized gains included).
+        row["fed_treasury_income_accrued_less_treasury_interest_paid_bil"] = (
+            row["fed_treasury_income_accrued_bil"] - interest
+        )
         at_end = result_dates == end
         if at_end.sum() != 1:
             raise ScenarioFamilyExportError(f"results lack a unique {end.date()} period end")

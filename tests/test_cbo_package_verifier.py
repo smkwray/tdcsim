@@ -31,18 +31,13 @@ from forecast_bundle_builders import (
     FED_INCOME_SOURCE_FILE,
     build_fed_income_path_rows,
     build_fed_remittance_path_rows,
+    build_policy_rate_path_rows,
     build_primary_deficit_path_rows,
     cbo_remittance_source_fixture,
     fed_income_source_fixture,
     read_dts_fed_earnings,
 )
-from fed_income import (
-    FED_INCOME_RESULT_COLUMNS,
-    INTEREST_EXPENSE_DAY_COUNT,
-    non_treasury_reserve_effect,
-    remittance_week,
-    settle_remittances,
-)
+from fed_income import ACCRUAL_TYPES, FED_INCOME_RESULT_COLUMNS, FedBook, FedOpening
 from forecast_paths import (
     CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
     CBO_FED_REMITTANCE_OPENING_STATUS,
@@ -50,8 +45,10 @@ from forecast_paths import (
     CBO_FED_REMITTANCE_STATUS,
     FED_INCOME_PATH_FILE,
     FED_REMITTANCE_PATH_FILE,
+    POLICY_RATE_PATH_FILE,
+    load_policy_rate_path,
 )
-from simulation_calendar import is_fedwire_business_day
+from sim_engine import _fed_rates
 from forecast_input_builder import (
     build_cbo_fiscal_baseline_rows,
     build_cbo_macro_forecast_path_rows,
@@ -770,7 +767,7 @@ def _write_valid_package(package: Path) -> Path:
         rows = _result_rows(debt_rows, opening_cb_holdings=opening_cb_holdings)
         for row in rows:
             row["CBOTable43RemittanceInFiscalFlow"] = remittance_by_end.get(row["Date"], 0.0)
-        _apply_fed_income(rows, fed_income)
+        _apply_fed_income(rows, fed_income, package)
         run_rows[run_id] = rows
         _write_csv(package / run_dir / "results_compact.csv", RESULT_COLUMNS, rows)
         summary = _summary(rows)
@@ -1036,60 +1033,60 @@ def _write_fed_income_path(package: Path) -> list[dict]:
     rows = build_fed_income_path_rows(
         scenario_id="cbo_full_horizon_local_smoke_3m",
         periods=build_simulation_calendar("2026-06-21", "2036-09-30", "daily"),
-        yield_rows=_read_csv(package / "forecast_inputs" / "tdcsim_yield_curve_surface.csv"),
     )
     _write_csv(package / "forecast_inputs" / FED_INCOME_PATH_FILE, list(rows[0]), rows)
+    policy = build_policy_rate_path_rows(
+        scenario_id="cbo_full_horizon_local_smoke_3m", simulation_start="2026-06-21",
+        simulation_end="2036-09-30", economic_workbook=ECONOMIC_WORKBOOK,
+    )
+    _write_csv(package / "forecast_inputs" / POLICY_RATE_PATH_FILE, list(policy[0]), policy)
     return rows
 
 
-def _apply_fed_income(rows: list[dict], path: list[dict]) -> None:
-    """Fill the Fed columns the way the engine books them, for a Fed with no Treasury income."""
+def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None:
+    """Book the fixture's Fed with the production Fed book, as the engine would.
 
-    first = path[0]
-    reserves = first["h41_reserve_balances_bil"] - (float(rows[0]["TGA"]) - first["h41_tga_bil"]) + (
-        first["soma_mbs_start_bil"] - first["h41_soma_mbs_bil"]
-    ) - (first["currency_start_bil"] - first["h41_currency_bil"])
-    on_rrp = first["h41_on_rrp_bil"]
-    due = first["h41_earnings_remittances_due_bil"]
-    week = remittance_week(rows[0]["Date"])
-    short = 3.35
-    for index, row in enumerate(rows):
-        row.update({column: 0.0 for column in FED_INCOME_RESULT_COLUMNS if column != "CBOTable43RemittanceInFiscalFlow"})
-        row.update({"Reserves": 3_000.0, "CB_ShortRatePct": short, "CB_IORBRatePct": short + first["iorb_spread_pct"],
-                    "CB_ONRRPRatePct": short + first["on_rrp_spread_pct"], "CB_ONRRPBalances": on_rrp})
-        line = path[max(0, index - 1)]
-        if index == 0:
-            row.update({"CB_MBSHoldings": line["soma_mbs_start_bil"], "CB_Currency": line["currency_start_bil"],
-                        "CB_NetIncome": 0.0, "CB_Remittance": 0.0})
-        else:
-            accrual = 1.0 / INTEREST_EXPENSE_DAY_COUNT
-            iorb = row["CB_IORBRatePct"] / 100.0 * reserves * accrual
-            rrp = row["CB_ONRRPRatePct"] / 100.0 * on_rrp * accrual
-            net = line["soma_mbs_interest_bil"] + line["other_income_bil"] - iorb - rrp - line[
-                "operating_expenses_bil"] - line["dividends_bil"]
-            pay_day = is_fedwire_business_day(date.fromisoformat(row["Date"])) and remittance_week(row["Date"]) > week
-            if pay_day:
-                week = remittance_week(row["Date"])
-            due, paid = settle_remittances(due, net, pay_day)
-            reserves += non_treasury_reserve_effect(
-                mbs_start=line["soma_mbs_start_bil"], mbs_end=line["soma_mbs_end_bil"],
-                currency_start=line["currency_start_bil"], currency_end=line["currency_end_bil"],
-                mbs_income=line["soma_mbs_interest_bil"], other_income=line["other_income_bil"],
-                iorb_expense=iorb, on_rrp_expense=rrp, operating_expenses=line["operating_expenses_bil"],
-                dividends=line["dividends_bil"],
-            )
-            row.update({
-                "CB_MBSIncome": line["soma_mbs_interest_bil"], "CB_OtherIncome": line["other_income_bil"],
-                "CB_OperatingExpenses": line["operating_expenses_bil"], "CB_Dividends": line["dividends_bil"],
-                "CB_IORBExpense": iorb, "CB_ONRRPExpense": rrp, "CB_NetIncome": net, "CB_Remittance": paid,
-                "CB_MBSHoldings": line["soma_mbs_end_bil"], "CB_Currency": line["currency_end_bil"],
-            })
-        row.update({
-            "CB_ReserveBalances": reserves, "CB_EarningsRemittancesDue": due, "CB_DeferredAsset": max(0.0, -due),
-            "CB_OtherLiabilitiesAndCapital": first["h41_other_liabilities_and_capital_bil"] + due
-            - first["h41_earnings_remittances_due_bil"],
-            "CBORemittanceCashEffect": row["CB_Remittance"],
-        })
+    The fixture Fed buys one unit of stock a day at 0.99 in the secondary market, so its lots
+    carry a 0.01 discount; the Treasury's other cash flows settle through reserves.
+    """
+
+    policy = load_policy_rate_path(package / "forecast_inputs" / POLICY_RATE_PATH_FILE)
+    opening_day = rows[0]["Date"]
+    book = FedBook(
+        FedOpening.from_row(path[0]),
+        opening_day=opening_day,
+        tga=float(rows[0]["TGA"]),
+        treasury_book={"premiums": {}, "accrued": dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                       "stock": float(rows[0]["DebtHeld_CentralBank"])},
+        path_row=path[0],
+        route_balances=None,
+    )
+    zeros = dict.fromkeys(FED_INCOME_RESULT_COLUMNS, 0.0)
+    rates = _fed_rates(policy, opening_day, opening_day)
+    rows[0].update({**zeros, **book.opening_row(), "CB_PolicyRatePct": rates["policy"], "CB_IORBRatePct": rates["iorb"],
+                    "CB_ONRRPRatePct": rates["on_rrp"], "CB_NetIncome": 0.0, "CB_Remittance": 0.0,
+                    "CBORemittanceCashEffect": 0.0, "CBOTable43RemittanceInFiscalFlow": 0.0, "Reserves": 3_000.0})
+    legacy = 3_000.0
+    for index in range(1, len(rows)):
+        row, prev = rows[index], rows[index - 1]
+        paid = book.remittance(row["Date"])
+        face, cash = float(row["CBOFedSecondaryPurchaseFace"]), float(row["CBOFedSecondaryPurchaseCash"])
+        if face > 0.0:
+            book.lots.add(index, "2040-01-02", cash - face, False, row["Date"])
+        effect = cash - (float(row["TGA"]) - float(prev["TGA"]) - paid)
+        legacy += effect
+        values = book.close_day(
+            prev["Date"], row["Date"], tga=float(row["TGA"]), remitted=paid, treasury_reserve_effect=effect,
+            treasury={
+                "cash": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_end": dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                "accrued_purchased": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_sold": dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                "tips_indexation": 0.0, "floor_topup": 0.0, "realized_gains": 0.0,
+                "premium_acquired": cash - face, "premium_sold": 0.0, "stock": float(row["DebtHeld_CentralBank"]),
+            },
+            path_row=path[index - 1], rates=_fed_rates(policy, row["Date"], opening_day), route_balances=None,
+        )
+        row.update({**zeros, **values, "CBOTable43RemittanceInFiscalFlow": row["CBOTable43RemittanceInFiscalFlow"],
+                    "CBORemittanceCashEffect": paid, "Reserves": legacy})
 
 
 def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:

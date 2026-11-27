@@ -414,3 +414,24 @@ def test_fed_income_transcription_matches_the_source_documents():
     for value in banks["other_income"].values():
         if value not in {"216", "-14"}:  # sums of two published lines
             assert published(value).lstrip("-") in statements, value
+    import json
+
+    effr = json.loads((root / Path(source["documents"]["nyfed_effr"]["file"]).name).read_text())
+    opening_effr = [row for row in effr["refRates"] if row["effectiveDate"] == "2026-06-18"]
+    assert [str(row["percentRate"]) for row in opening_effr] == [rates["effective_federal_funds_rate_2026_06_18"]]
+    operations = json.loads((root / Path(source["documents"]["nyfed_reverse_repo_operations"]["file"]).name).read_text())
+    june_18 = [op for op in operations["repo"]["operations"] if op["operationDate"] == "2026-06-18"]
+    assert [op["totalAmtAccepted"] / 1e9 for op in june_18] == [float(source["opening_domestic_on_rrp"]["total_accepted_bil"])]
+    accounts = texts["financial_accounts_ccp_table"]
+    ccp = source["financial_accounts_ccp_federal_reserve_deposits_bil"]
+    assert ccp["series"] in accounts and "Federal Reserve deposits" in accounts and ccp["2026Q1"] in accounts
+    quarterly = texts["reserve_banks_quarterly_report"]
+    for key, value in source["reserve_banks_2026q1_mil"].items():
+        if key.endswith("_pct"):
+            assert f"{value}%" in quarterly, key
+        elif key == "amortization_notes_and_bonds_q1":  # notes (1,262) plus bonds (2,686)
+            assert "(1,262)" in quarterly and "(2,686)" in quarterly and value == "-3948"
+        elif key != "tables":
+            assert published(value).lstrip("-") in quarterly, key
+    manual = texts["financial_accounting_manual_chapter_6"]
+    assert "lower of the liability (credit) balance" in manual and "Special procedures exist for the first remittance" in manual

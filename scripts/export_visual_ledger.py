@@ -501,22 +501,33 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   The Table 4-3 remittance is never paid into the TGA; the TGA receives the modeled remittance in
   `fed_remittances.csv`.
 - `fed_remittances.csv`: one row per day. `fed_to_tga_bil` is the remittance the run models and
-  pays from the Fed to the TGA: the Reserve Banks' net income, paid weekly on the first Fedwire
-  business day from each Wednesday once the deferred asset is repaid. It changes the TGA but has
-  zero direct deposit and reserve effect. The income lines are daily, cash basis:
-  `fed_treasury_interest_income_bil` (the sum of bill discount at maturity, coupons, floating-rate
-  interest, TIPS coupons and TIPS inflation compensation at maturity, as the run pays them),
-  `fed_mbs_income_bil` (coupon on the agency MBS runoff path), `fed_other_income_bil`, less
-  `fed_iorb_expense_bil` (IORB on reserve balances), `fed_on_rrp_expense_bil` (the ON RRP rate on all
-  reverse repos, foreign official included), `fed_operating_expenses_bil` and `fed_dividends_bil`;
-  they sum to `fed_net_income_bil`. Net income adds to `fed_earnings_remittances_due_bil`, the H.4.1
-  line of that name: negative values are the deferred asset (`fed_deferred_asset_bil`), positive
-  values are owed and paid on the next remittance day. The levels are end of day:
-  `fed_reserve_balances_bil` is the H.4.1 opening moved by the run's Treasury reserve effect,
-  currency growth, MBS runoff and the non-Treasury income lines; `fed_on_rrp_balances_bil`,
-  `fed_currency_bil`, `fed_mbs_holdings_bil` and `fed_other_liabilities_and_capital_bil` are the
-  other balance-sheet lines; `iorb_rate_pct` and `on_rrp_rate_pct` are the run's 3-month rate plus
-  their opening spreads.
+  pays from the Fed to the TGA. It changes the TGA but has zero direct deposit and reserve effect.
+  The Reserve Banks are one pooled account (a model assumption: no Bank remits while the combined
+  balance is a debit). Net income adds to `fed_earnings_remittances_due_bil`, the H.4.1 line of that
+  name; a debit is the deferred asset (`fed_deferred_asset_bil`). Each Wednesday, or the next business
+  day after a Wednesday holiday, the Banks pay the lower of the credit balances at the previous
+  Wednesday and on the day before, and nothing if either is a debit; the year's first payment uses the
+  December 31 balance.
+  Treasury income is accrued on the Fed's own acquisition basis: `fed_coupon_accrual_bil`,
+  `fed_tips_coupon_accrual_bil` and `fed_frn_accrual_bil` are interest earned (cash received plus the
+  change in the accrued-interest receivable, so purchased accrued interest is not income),
+  `fed_tips_indexation_bil` is indexation on held TIPS, `fed_bill_discount_accretion_bil` and
+  `fed_coupon_premium_amortization_bil` amortize each lot's purchase discount or premium straight line,
+  and `fed_realized_gains_bil` books sales; they sum to `fed_treasury_income_accrued_bil`. Expenses accrue
+  on each day's closing balances at that day's rates: `fed_iorb_on_reserves_expense_bil`,
+  `fed_iorb_on_fmu_balances_expense_bil` (designated financial market utilities' balances, a fixed share
+  of other deposits), `fed_domestic_on_rrp_expense_bil` and `fed_foreign_repo_pool_expense_bil` (both at
+  the ON RRP offering rate). Interest posts on the next business day; foreign repo pool interest is
+  reinvested in the pool. `fed_mbs_income_bil` (coupon less premium amortization on the agency MBS
+  runoff path), `fed_other_income_bil`, `fed_operating_expenses_bil` and `fed_dividends_bil` are
+  smoothed daily proxies with no payment clock: they accrue every calendar day, and the MBS runoff,
+  coupon and the other lines (including net government-agency reimbursements) settle through bank
+  reserves on the day they accrue. All lines sum to `fed_net_income_bil`. Levels are end of day:
+  `fed_reserve_balances_bil` is the June 17 H.4.1 level moved by the run's Treasury reserve effect,
+  currency, other deposits, other liabilities and capital, MBS runoff and the Fed's non-Treasury cash
+  flows, and always equals Fed assets less every other liability and capital. `policy_rate_pct` is the
+  observed fed funds rate spliced to CBO's quarterly path; `iorb_rate_pct` and `on_rrp_rate_pct` keep
+  their opening spreads to it.
 - `daily.csv`: one row per calendar day. `fedwire_open` marks the days cash can move: on the
   others nothing is paid, issued or settled, and fiscal flows are zero; a payment due then is
   made on the next open day at its contractual amount. Securities do not settle on Good

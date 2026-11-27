@@ -691,7 +691,6 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
     calendar = _read_json(root / "forecast_inputs" / CALIBRATION_FILE)["settlement_calendar"]
     for run_id, run_dir in RUN_DIRS.items():
         results = _read_csv_dicts(root / run_dir / "results_compact.csv")
-        verify_fed_remittances(pd.read_csv(root / run_dir / "results_compact.csv"), root / "forecast_inputs")
         summary = _read_json(root / run_dir / "summary.json")
         if not isinstance(summary, Mapping):
             raise ValueError(f"{run_id} summary must be a JSON object")
@@ -709,6 +708,8 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
         if not isinstance(manifest_summary, Mapping):
             raise ValueError(f"manifest missing run summary: {run_id}")
         _verify_run_summary(f"manifest {run_id}", manifest_summary, metrics)
+        # The Fed's books close last: they rest on the Treasury cash and Fed stock checked above.
+        verify_fed_remittances(pd.read_csv(root / run_dir / "results_compact.csv"), root / "forecast_inputs")
         run_metrics[run_id] = metrics
 
     _verify_partial_interest_financing_diagnostic(root, run_metrics["baseline"])
