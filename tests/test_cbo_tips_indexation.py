@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +14,24 @@ from tips_indexation import (
     build_tips_real_yield_path_rows,
     enrich_opening_tips_from_cpi_detail,
     opening_tips_to_par,
+    value_opening_tips,
 )
+
+
+@pytest.mark.parametrize("modeled", [False, True])
+def test_declared_prevalued_tips_book_needs_no_carry(tmp_path: Path, modeled: bool) -> None:
+    start = "2028-01-01" if modeled else "2026-06-21"
+    source_contract = {
+        "date_range": {"opening_state_date": start},
+        "opening_portfolio_construction": {"tips_cpi_detail_index_date": "2026-06-21"},
+    }
+    if modeled:
+        source_contract["derived_forecast_state"] = {"opening_state_date": start}
+        source_contract["opening_portfolio_construction"]["simulation_start_tips_adjusted_principal_bil"] = 110.0
+    (tmp_path / "source_contract_smoke.json").write_text(json.dumps(source_contract))
+    book = pd.DataFrame({"SecurityType": ["TIPS"], "AdjustedPrincipal": [120.0]})
+
+    pd.testing.assert_frame_equal(value_opening_tips(book, tmp_path, simulation_start_date=start), book)
 
 
 def test_enrich_opening_tips_values_original_par_at_the_close(tmp_path: Path) -> None:

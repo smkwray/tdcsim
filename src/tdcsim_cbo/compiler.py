@@ -32,7 +32,7 @@ from issuance_calibration import (
     load_calibration,
 )
 from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT, MMF_DEPOSIT_PASS_THROUGH_STATUS
-from tips_indexation import load_opening_tips_observation, opening_tips_at_simulation_start
+from tips_indexation import value_opening_tips
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
@@ -1217,7 +1217,7 @@ def _ensure_opening_fed_target_identity(
         raise CompilerError(
             "opening Fed target identity requires tdcsim_opening_portfolio.csv"
         )
-    opening_cb_stock = _opening_cb_stock(portfolio_path)
+    opening_cb_stock = _opening_cb_stock(portfolio_path, opening_state_date=opening_state_date)
     if opening_rows:
         try:
             opening_target = float(
@@ -1295,13 +1295,13 @@ def _ensure_opening_fed_target_identity(
     return True
 
 
-def _opening_cb_stock(path: Path) -> float:
-    rows, _ = _read_csv(path)
-    observation = load_opening_tips_observation(path.parent)
-    if observation:
-        rows = opening_tips_at_simulation_start(pd.read_csv(path), observation).to_dict("records")
+def _opening_cb_stock(path: Path, *, opening_state_date: str) -> float:
+    try:
+        book = value_opening_tips(pd.read_csv(path, low_memory=False), path.parent, simulation_start_date=opening_state_date)
+    except ValueError as exc:
+        raise CompilerError(str(exc)) from exc
     total = 0.0
-    for row in rows:
+    for row in book.to_dict("records"):
         if str(row.get("Status") or "") != "Active":
             continue
         if str(row.get("HolderType") or "") != "CB":

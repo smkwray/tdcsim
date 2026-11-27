@@ -40,7 +40,7 @@ from issuance_calibration import (  # noqa: E402
 )
 from run_open04_reproduction import _assert_installed_distribution_import  # noqa: E402
 from simulation_calendar import is_fedwire_business_day, next_fedwire_business_day  # noqa: E402
-from tips_indexation import load_opening_tips_observation, opening_tips_at_simulation_start  # noqa: E402
+from tips_indexation import value_opening_tips  # noqa: E402
 
 SCHEMA_VERSION = "tdcsim_visual_ledger_v2"
 HOLDER_COLUMNS = ("fed", "banks", "foreign", "mmf", "other_domestic")
@@ -245,11 +245,12 @@ def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame
     return out
 
 
-def build_opening(run_dir: Path) -> pd.DataFrame:
+def build_opening(run_dir: Path, *, simulation_start_date: str | None = None) -> pd.DataFrame:
     book = pd.read_csv(run_dir / OPENING_PORTFOLIO, low_memory=False)
-    observation = load_opening_tips_observation((run_dir / OPENING_PORTFOLIO).parent)
-    if observation and "IssueID" not in book:
-        raise SystemExit("opening portfolio requires complete issue IDs")
+    try:
+        book = value_opening_tips(book, (run_dir / OPENING_PORTFOLIO).parent, simulation_start_date=simulation_start_date)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     source = pd.read_csv(run_dir / OPENING_SOURCE, low_memory=False)[["BondID", "cusip_or_synthetic_id", "MaturityDate"]]
     book = book.merge(source, on="BondID", how="left", suffixes=("", "_source"))
     joined = book["cusip_or_synthetic_id"].notna()
@@ -274,7 +275,6 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
         book["security_id"] = book["cusip_or_synthetic_id"].fillna(book["BondID"].map(added))
     if book["security_id"].isna().any():
         raise SystemExit("an opening row is neither in the source book nor a pre-start rollforward replacement")
-    book = opening_tips_at_simulation_start(book, observation)
     book["holder"] = [holder_column(h, s) for h, s in zip(book["HolderType"], book["HolderSubBucket"])]
     book["debt_basis"] = book["AdjustedPrincipal"].where(book["SecurityType"].eq("TIPS"), book["FaceValue"])
     keys = ["security_id", "kind", "IssueDate", "MaturityDate", "CouponRate"]
@@ -539,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
 
     check_issues_against_calendar(issues, results, _issuance_profile(run_dir / OPENING_PORTFOLIO.parent))
     maturities_checked = check_maturities(run_dir, issues)
-    opening = build_opening(run_dir)
+    opening = build_opening(run_dir, simulation_start_date=results.index[0].date().isoformat())
     issues = name_reopened_opening_securities(issues, opening)
     if issues.duplicated(["security_id", "settlement_date"]).any():
         raise SystemExit("a security settles twice on one day")

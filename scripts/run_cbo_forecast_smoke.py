@@ -541,6 +541,7 @@ def build_forecast_bundle(
     opening_portfolio_metadata["source_manifest_portable_sha256"] = manifest_entry.get("sha256")
     runtime_portfolio = opening_tips_at_simulation_start(
         initial_portfolio, opening_portfolio_metadata["simulation_start_tips_observation"],
+        simulation_start_date=SIMULATION_START_DATE,
     )
     opening_cb_holdings_bil = _portfolio_total_debt_base(
         runtime_portfolio[runtime_portfolio["HolderType"].eq("CB")]

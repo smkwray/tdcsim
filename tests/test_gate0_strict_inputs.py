@@ -91,6 +91,29 @@ def test_runtime_rejects_partial_explicit_opening_state(tmp_path: Path) -> None:
         build_runtime_params(inputs)
 
 
+@pytest.mark.parametrize(("evidence", "message"), [
+    (None, "requires readable tdcsim_opening_portfolio_metadata.json"),
+    ({}, "requires simulation_start_tips_observation"),
+    ({"simulation_start_tips_observation": {}}, r"index_date must equal 2026-09-20"),
+    ({"simulation_start_tips_observation": {"index_date": "2026-09-18"}}, r"index_date must equal 2026-09-20"),
+])
+def test_runtime_requires_dated_tips_carry_for_declared_valuation(tmp_path: Path, evidence, message: str) -> None:
+    inputs = _materialized_inputs(tmp_path)
+    contract_path = inputs / "source_contract_smoke.json"
+    contract = read_json(contract_path)
+    contract["date_range"] = {"opening_state_date": "2026-09-20"}
+    contract["opening_portfolio_construction"] = {"simulation_start_tips_adjusted_principal_bil": 110.0}
+    write_json(contract_path, contract)
+    metadata_path = inputs / "tdcsim_opening_portfolio_metadata.json"
+    if evidence is None:
+        metadata_path.unlink()
+    else:
+        write_json(metadata_path, evidence)
+
+    with pytest.raises(RunnerError, match=message):
+        build_runtime_params(inputs)
+
+
 @pytest.mark.parametrize("case", ["missing", "malformed"])
 def test_runtime_rejects_frn_without_finite_fixed_spread(
     tmp_path: Path,

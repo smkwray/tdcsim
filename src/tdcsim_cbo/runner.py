@@ -56,7 +56,7 @@ from tdc_shared import (
     SECURITY_TYPES,
 )
 from tdc_validation import validate_events
-from tips_indexation import load_opening_tips_observation, opening_tips_at_simulation_start
+from tips_indexation import value_opening_tips
 
 from ._json import read_json, sha256_file, write_json
 from ._schema import validate_schema
@@ -824,10 +824,11 @@ def build_runtime_params(
     """Build simulator params from compiled forecast inputs and scenario config."""
 
     inputs = Path(inputs_dir)
-    initial_portfolio = opening_tips_at_simulation_start(
-        _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv"),
-        load_opening_tips_observation(inputs),
-    )
+    initial_portfolio = _load_opening_portfolio(inputs / "tdcsim_opening_portfolio.csv")
+    try:
+        initial_portfolio = value_opening_tips(initial_portfolio, inputs, simulation_start_date=simulation_start_date)
+    except ValueError as exc:
+        raise RunnerError(str(exc)) from exc
     base_tga = _opening_operating_cash_target(inputs / "tdcsim_operating_cash_path.csv")
     initial_values = _opening_runtime_initial_values(inputs, base_tga=base_tga)
     holder_preferences = _holder_preferences(inputs / "tdcsim_holder_profile_assumptions.csv")

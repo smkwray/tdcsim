@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_HALF_UP
 import json
+from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -53,27 +54,75 @@ def observed_tips_cpi_months(
 
 
 def opening_tips_at_simulation_start(
-    portfolio: pd.DataFrame, observation: Mapping[str, Any],
+    portfolio: pd.DataFrame, observation: Mapping[str, Any], *, simulation_start_date: str,
 ) -> pd.DataFrame:
     """Carry the observed close to the start using published TIPS index ratios."""
-    if not observation:
-        return portfolio
+    if observation.get("index_date") != simulation_start_date:
+        raise ValueError(f"simulation_start_tips_observation.index_date must equal {simulation_start_date}")
+    ratios_by_issue = observation.get("index_ratios")
+    if not isinstance(ratios_by_issue, Mapping) or "IssueID" not in portfolio:
+        raise ValueError("opening TIPS require published simulation-start index ratios by issue ID")
+    try:
+        reference_cpi = float(observation["reference_cpi"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("simulation-start reference CPI must be finite and positive") from exc
+    if not np.isfinite(reference_cpi) or reference_cpi <= 0:
+        raise ValueError("simulation-start reference CPI must be finite and positive")
     result = portfolio.copy()
     tips = result["SecurityType"].eq("TIPS")
-    ratios = result.loc[tips, "IssueID"].map(observation["index_ratios"]).astype(float)
+    ratios = pd.to_numeric(result.loc[tips, "IssueID"].map(ratios_by_issue), errors="raise")
     if not np.isfinite(ratios).all() or (ratios <= 0).any():
         raise ValueError("opening TIPS require a published simulation-start index ratio for every issue")
     result.loc[tips, "IndexRatio"] = ratios
     result.loc[tips, "AdjustedPrincipal"] = result.loc[tips, "OriginalPrincipal"] * ratios
-    result.loc[tips, "ReferenceCPI_Issue"] = float(observation["reference_cpi"]) / ratios
+    result.loc[tips, "ReferenceCPI_Issue"] = reference_cpi / ratios
     return result
 
 
-def load_opening_tips_observation(inputs: Path) -> dict[str, Any]:
-    path = inputs / "tdcsim_opening_portfolio_metadata.json"
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8")).get("simulation_start_tips_observation", {})
+def value_opening_tips(
+    portfolio: pd.DataFrame, inputs: Path, *, simulation_start_date: str | None = None,
+) -> pd.DataFrame:
+    """Select the opening TIPS valuation basis from the package source contract."""
+    contract = _opening_json(inputs / "source_contract_smoke.json")
+    dates = contract.get("date_range", {})
+    modeled = contract.get("derived_forecast_state")
+    construction = contract.get("opening_portfolio_construction", {})
+    if not isinstance(dates, Mapping) or not isinstance(construction, Mapping):
+        raise ValueError("opening TIPS valuation requires valid date_range and opening_portfolio_construction")
+    declared_start = dates.get("opening_state_date") or dates.get("simulation_start_date")
+    if declared_start and simulation_start_date and declared_start != simulation_start_date:
+        raise ValueError("opening TIPS valuation date does not match the simulation start")
+    start = simulation_start_date or declared_start
+    if modeled is not None:
+        if not isinstance(modeled, Mapping) or not start or modeled.get("opening_state_date") != start:
+            raise ValueError("modeled TIPS valuation date does not match the simulation start")
+        return portfolio
+
+    index_date = construction.get("tips_cpi_detail_index_date")
+    carry_declared = "simulation_start_tips_adjusted_principal_bil" in construction
+    if carry_declared or (isinstance(index_date, str) and isinstance(start, str) and index_date < start):
+        if not isinstance(start, str) or date.fromisoformat(start).isoformat() != start:
+            raise ValueError("source TIPS carry requires a declared simulation start date")
+        metadata = _opening_json(inputs / "tdcsim_opening_portfolio_metadata.json")
+        observation = metadata.get("simulation_start_tips_observation")
+        if not isinstance(observation, Mapping):
+            raise ValueError("opening portfolio metadata requires simulation_start_tips_observation")
+        return opening_tips_at_simulation_start(portfolio, observation, simulation_start_date=start)
+
+    # Older source packages explicitly publish the opening book's index date.
+    if portfolio["SecurityType"].eq("TIPS").any() and (not start or index_date != start):
+        raise ValueError("source opening TIPS require an index date or declared simulation-start carry")
+    return portfolio
+
+
+def _opening_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"opening TIPS valuation requires readable {path.name}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"opening TIPS valuation requires a JSON object in {path.name}")
+    return payload
 
 
 def opening_tips_to_par(

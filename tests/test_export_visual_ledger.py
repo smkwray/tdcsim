@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -151,6 +152,7 @@ def test_opening_book_lists_pre_start_replacements_under_their_own_cusips(tmp_pa
 
     for path in (ledger.OPENING_PORTFOLIO, ledger.OPENING_SOURCE, ledger.ROLLFORWARD):
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / ledger.OPENING_PORTFOLIO.parent / "source_contract_smoke.json").write_text("{}")
     pd.DataFrame([
         row(1, "2026-03-03", "2026-06-30", 10.0),
         row(9, "2026-03-03", "2026-06-30", 4.0, "Foreign"),  # reinvestment in the book's CUSIP
@@ -184,6 +186,7 @@ def test_reopening_uses_opening_cusip_for_a_ten_year_note(tmp_path) -> None:
     maturity = "2036-05-15"
     for path in (ledger.OPENING_PORTFOLIO, ledger.OPENING_SOURCE, ledger.ROLLFORWARD):
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / ledger.OPENING_PORTFOLIO.parent / "source_contract_smoke.json").write_text("{}")
     elapsed_years = (pd.Timestamp(maturity) - pd.Timestamp(dated)).days / 365.25
     assert elapsed_years > 10.0
     pd.DataFrame([{
@@ -222,11 +225,14 @@ def test_reopening_uses_opening_cusip_for_a_ten_year_note(tmp_path) -> None:
 
 
 def test_opening_tips_export_values_par_at_simulation_start(tmp_path) -> None:
-    import json
     import export_visual_ledger as ledger
 
     (tmp_path / ledger.OPENING_PORTFOLIO).parent.mkdir(parents=True)
     (tmp_path / ledger.OPENING_SOURCE).parent.mkdir(parents=True)
+    (tmp_path / ledger.OPENING_PORTFOLIO.parent / "source_contract_smoke.json").write_text(json.dumps({
+        "date_range": {"opening_state_date": "2026-06-21"},
+        "opening_portfolio_construction": {"simulation_start_tips_adjusted_principal_bil": 111.0},
+    }))
     pd.DataFrame([{
         "BondID": 1, "IssueID": "TIPS-A", "SecurityType": "TIPS", "IssueDate": "2025-04-15",
         "MaturityDate": "2030-04-15", "MaturityCategory": "notes", "CouponRate": 0.01,
