@@ -889,14 +889,22 @@ def _apply_overrides(
         override = _override_mapping(overrides["holder_position_target"])
         source = _resolve_scenario_file(spec, override.get("file"))
         rows, header = _read_csv(source)
-        if tuple(header) != holder_targets.TARGET_FILE_COLUMNS:
-            raise CompilerError(f"holder position target file columns must be {list(holder_targets.TARGET_FILE_COLUMNS)}")
+        bill_mode = override["mode"] == holder_targets.BILL_TARGET_MODE
+        columns = holder_targets.BILL_TARGET_FILE_COLUMNS if bill_mode else holder_targets.TARGET_FILE_COLUMNS
+        if tuple(header) != columns:
+            raise CompilerError(f"holder position target file columns must be {list(columns)}")
         try:
-            holder_targets.check_target_rows(
-                rows,
-                path=holder_targets.BuildAndHoldPath.from_points(list(override["target_path"])),
-                weights=holder_targets.declared_weights(override),
-            )
+            if bill_mode:
+                holder_targets.holder_target_path({
+                    "mode": override["mode"], "bill_change_weights": override["bill_change_weights"],
+                    "tolerance_bil": override["target_tolerance_bil"], "rows": rows,
+                })
+            else:
+                holder_targets.check_target_rows(
+                    rows,
+                    path=holder_targets.BuildAndHoldPath.from_points(list(override["target_path"])),
+                    weights=holder_targets.declared_weights(override),
+                )
         except holder_targets.HolderTargetError as exc:
             raise CompilerError(f"holder position target file: {exc}") from exc
         shutil.copyfile(source, forecast_inputs_dir / HOLDER_TARGET_FILE)
@@ -1342,6 +1350,7 @@ def _is_file_mode(mode: str) -> bool:
         "explicit_path_file",
         "comparison_path_file",
         holder_targets.HOLDER_TARGET_MODE,
+        holder_targets.BILL_TARGET_MODE,
     }
 
 

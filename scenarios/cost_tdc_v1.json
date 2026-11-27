@@ -3,6 +3,7 @@
   "family_id": "cost_tdc_v1",
   "as_of_date": "2026-11-15",
   "funding_closure_mode": "cbo_operating_cash_target_financing_v1",
+  "export_holder_stocks": true,
   "description": "Illustrative issuance-maturity scenarios over the CBO baseline horizon. Treasury moves the bill share of marketable debt up or down by 5 percentage points over the first year. Each issuance change runs three times: without a yield change, to isolate the issuance mix; with the yield change and the change in the bill stock spread across holders in proportion to their bill holdings; and with the yield change and banks and foreign accounts taking up the whole change. Financing cost depends on the issuance mix and the yield; the deposit effect depends on who buys or gives up the bills.",
   "boundaries": [
     "Illustrative scenario accounting, not a forecast or causal estimate",

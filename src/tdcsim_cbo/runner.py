@@ -940,11 +940,14 @@ def _holder_position_target(inputs: Path) -> dict[str, Any] | None:
         raise RunnerError("compiled holder position target declaration is malformed")
     with target_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    return {
+    config = {
         "mode": declaration["mode"],
         "tolerance_bil": float(declaration["target_tolerance_bil"]),
         "rows": rows,
     }
+    if "bill_change_weights" in declaration:
+        config["bill_change_weights"] = declaration["bill_change_weights"]
+    return config
 
 
 def _assert_explicit_frn_path(

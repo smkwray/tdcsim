@@ -21,6 +21,8 @@ from typing import Any
 
 import pandas as pd
 
+from holder_targets import PARTICIPANT_LABELS, STOCK_COLUMNS
+
 from .open04_campaign import OPEN04_AGGREGATION_CLOCK_ID
 from .trc_fy import read_output_csv, sha256_path, trc_fiscal_year_rows
 
@@ -58,7 +60,9 @@ def _nominal_10y(run_dir: Path) -> pd.Series:
     return ten.set_index("curve_date")["nominal_rate"].astype(float).sort_index()
 
 
-def _role_rows(run_dir: Path, *, family_id: str, role: str, scenario_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _role_rows(
+    run_dir: Path, *, family_id: str, role: str, scenario_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], pd.DataFrame]:
     manifest_path = run_dir / RUN_MANIFEST_FILE
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("status") != "complete":
@@ -110,7 +114,44 @@ def _role_rows(run_dir: Path, *, family_id: str, role: str, scenario_id: str) ->
             "compiled_curve_sha256": sha256_path(run_dir / CURVE_SURFACE),
         }
     )
-    return rows, evidence
+    return rows, evidence, results
+
+
+def _holder_stock_rows(fy_rows: list[dict[str, Any]], results: pd.DataFrame, *, controlled: bool) -> list[dict[str, Any]]:
+    trade_columns = ("BoughtFace", "SoldFace", "BoughtCash", "SoldCash")
+    rows = []
+    for fy in fy_rows:
+        start, end = (fy[key] for key in ("coverage_start_exclusive", "coverage_end_inclusive"))
+        window = results.loc[(results.index > start) & (results.index <= end)]
+        for route, label in PARTICIPANT_LABELS.items():
+            rows.append({
+                **{key: fy[key] for key in (
+                    "family_id", "scenario_role", "scenario_id", "period_label", "period_status",
+                    "coverage_start_exclusive", "coverage_end_inclusive",
+                )},
+                "holder_type": route[0],
+                "holder_subbucket": route[1],
+                "closing_bill_stock_bil": float(results.loc[end, STOCK_COLUMNS["HolderBillStock"][route]]),
+                "closing_controlled_treasury_stock_bil": float(results.loc[end, STOCK_COLUMNS["HolderStock"][route]]),
+                **{
+                    f"controller_{name}_bil": float(window[f"HolderTarget{stem}_{label}"].sum(skipna=False))
+                    if controlled else 0.0
+                    for name, stem in zip(("bought_face", "sold_face", "bought_cash", "sold_cash"), trade_columns)
+                },
+            })
+    return rows
+
+
+def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    for row in rows:
+        for key, value in row.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ScenarioFamilyExportError(f"nonfinite export value {key}")
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8")
 
 
 def export_scenario_family(
@@ -131,15 +172,20 @@ def export_scenario_family(
     if list(runs) != expected_roles:
         raise ScenarioFamilyExportError(f"runs {list(runs)} differ from the family roles {expected_roles}")
     rows: list[dict[str, Any]] = []
+    stock_rows: list[dict[str, Any]] = []
     roles: dict[str, Any] = {}
     for role, record in runs.items():
         verification = record.get("verification")
         if not isinstance(verification, Mapping) or verification.get("status") != "pass":
             raise ScenarioFamilyExportError(f"{role}: bounded replay verification did not pass")
-        role_rows, evidence = _role_rows(
+        role_rows, evidence, results = _role_rows(
             Path(record["run_dir"]), family_id=family_id, role=role, scenario_id=str(record["scenario_id"])
         )
         rows.extend(role_rows)
+        if family_spec.get("export_holder_stocks"):
+            stock_rows.extend(_holder_stock_rows(
+                role_rows, results, controlled="HolderTargetPhase" in results.columns,
+            ))
         roles[role] = {
             "scenario_id": record["scenario_id"],
             "scenario_sha256": record["scenario_sha256"],
@@ -147,15 +193,8 @@ def export_scenario_family(
             "verification_grade": verification.get("verification_grade"),
             **evidence,
         }
-    for row in rows:
-        for key, value in row.items():
-            if isinstance(value, float) and not math.isfinite(value):
-                raise ScenarioFamilyExportError(f"nonfinite export value {key}")
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]), lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-    table_bytes = buffer.getvalue().encode("utf-8")
+    table_bytes = _csv_bytes(rows)
+    stock_bytes = _csv_bytes(stock_rows) if stock_rows else None
     output_dir.mkdir(parents=True)
     table_path = output_dir / "scenario_family_fy.csv"
     table_path.write_bytes(table_bytes)
@@ -169,6 +208,12 @@ def export_scenario_family(
         "roles": roles,
         "boundaries": list(family_spec.get("boundaries", [])),
     }
+    if stock_bytes is not None:
+        stock_path = output_dir / "scenario_family_holder_stocks_fy.csv"
+        stock_path.write_bytes(stock_bytes)
+        receipt["holder_stock_output"] = {
+            "path": stock_path.name, "sha256": hashlib.sha256(stock_bytes).hexdigest(), "rows": len(stock_rows),
+        }
     (output_dir / "scenario_family_receipt.json").write_text(
         json.dumps(receipt, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )

@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import pandas as pd
 
+from issuance_calibration import bill_mask
 from simulation_calendar import previous_securities_business_day
 from tdc_shared import (
     INTRAGOV_HOLDERS,
@@ -39,6 +40,7 @@ from tdc_shared import (
 )
 
 HOLDER_TARGET_MODE = "baseline_relative_stock_v1"
+BILL_TARGET_MODE = "baseline_relative_bill_stock_v1"
 # Every public holder of controlled marketable debt other than the Federal Reserve, whose
 # stock follows its own path. Order fixes the buyer order when a seller's lots are divided.
 PARTICIPANTS = (
@@ -77,7 +79,6 @@ SUMMARY_COLUMNS = (
 )
 PARTICIPANT_COLUMN_STEMS = (
     "HolderTarget",
-    "HolderStock",
     "HolderTargetBoughtFace",
     "HolderTargetSoldFace",
     "HolderTargetBoughtCash",
@@ -87,6 +88,11 @@ RESULT_COLUMNS = (
     *SUMMARY_COLUMNS,
     *(f"{stem}_{PARTICIPANT_LABELS[p]}" for stem in PARTICIPANT_COLUMN_STEMS for p in PARTICIPANTS),
 )
+STOCK_COLUMNS = {
+    stem: {p: f"{stem}_{PARTICIPANT_LABELS[p]}" for p in PARTICIPANTS}
+    for stem in ("HolderStock", "HolderBillStock")
+}
+BILL_TARGET_FILE_COLUMNS = ("date", "holder_type", "holder_subbucket", "baseline_stock_bil")
 
 
 class HolderTargetError(RuntimeError):
@@ -99,13 +105,42 @@ class HolderTargetPath:
 
     tolerance_bil: float
     rows: Mapping[pd.Timestamp, tuple[str, dict[tuple[str, str], float]]]
+    bill_change_weights: Mapping[tuple[str, str], float] | None = None
 
-    def for_date(self, day: Any) -> tuple[str, dict[tuple[str, str], float]]:
+    @property
+    def stock_column_stem(self) -> str:
+        return "HolderBillStock" if self.bill_change_weights is not None else "HolderStock"
+
+    def for_date(
+        self, day: Any, stocks: Mapping[tuple[str, str], float]
+    ) -> tuple[str, dict[tuple[str, str], float]]:
         key = pd.Timestamp(day).normalize()
         try:
-            return self.rows[key]
+            phase, reference = self.rows[key]
         except KeyError:
             raise HolderTargetError(f"no holder position target for the {key.date()} close") from None
+        if self.bill_change_weights is None:
+            return phase, reference
+        delta = math.fsum(stocks.values()) - math.fsum(reference.values())
+        targets = {p: reference[p] + delta * self.bill_change_weights.get(p, 0.0) for p in PARTICIPANTS}
+        for p, target in targets.items():
+            if target < 0.0:
+                raise HolderTargetError(f"{PARTICIPANT_LABELS[p]} bill target on {key.date()} is negative: {target}")
+        return phase, targets
+
+
+def bill_change_weights(rows: list[Mapping[str, Any]]) -> dict[tuple[str, str], float]:
+    """Positive shares of the change in non-Fed bills. Unnamed routes keep their baseline bill stock."""
+    weights = {}
+    for row in rows:
+        route = (str(row["holder_type"]), str(row["holder_subbucket"]))
+        weight = float(row["weight"])
+        if route not in PARTICIPANTS or route in weights or not math.isfinite(weight) or weight <= 0.0:
+            raise HolderTargetError(f"invalid or repeated bill change weight for {route}")
+        weights[route] = weight
+    if not math.isclose(math.fsum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise HolderTargetError("bill change weights must sum to one")
+    return weights
 
 
 def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | None:
@@ -113,21 +148,24 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
 
     if config is None:
         return None
-    if config.get("mode") != HOLDER_TARGET_MODE:
-        raise HolderTargetError(f"holder position target mode must be {HOLDER_TARGET_MODE}")
+    mode = config.get("mode")
+    if mode not in (HOLDER_TARGET_MODE, BILL_TARGET_MODE):
+        raise HolderTargetError(f"unknown holder position target mode {mode!r}")
+    bills = mode == BILL_TARGET_MODE
+    weights = bill_change_weights(config["bill_change_weights"]) if bills else None
     tolerance = float(config.get("tolerance_bil", float("nan")))
     if not math.isfinite(tolerance) or tolerance <= 0.0:
         raise HolderTargetError("holder position target tolerance must be positive")
     dated: dict[pd.Timestamp, tuple[str, dict[tuple[str, str], float]]] = {}
     for row in config.get("rows") or ():
         day = pd.Timestamp(row["date"]).normalize()
-        phase = str(row["phase"])
+        phase = "hold" if bills else str(row["phase"])
         holder = (str(row["holder_type"]), str(row.get("holder_subbucket") or ""))
         if phase not in PHASES:
             raise HolderTargetError(f"unknown holder target phase {phase!r} on {day.date()}")
         if holder not in PARTICIPANTS:
             raise HolderTargetError(f"holder target names {holder}, which is not a public holder route")
-        target = float(row["target_stock_bil"])
+        target = float(row["baseline_stock_bil" if bills else "target_stock_bil"])
         if not math.isfinite(target) or target < 0.0:
             raise HolderTargetError(f"holder target for {holder} on {day.date()} must be finite and nonnegative")
         existing_phase, targets = dated.setdefault(day, (phase, {}))
@@ -141,15 +179,17 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
     for day, (_, targets) in dated.items():
         if set(targets) != set(PARTICIPANTS):
             raise HolderTargetError(f"holder targets on {day.date()} must name every public holder route")
-    return HolderTargetPath(tolerance_bil=tolerance, rows=dated)
+    return HolderTargetPath(tolerance_bil=tolerance, rows=dated, bill_change_weights=weights)
 
 
-def holder_stocks(portfolio: pd.DataFrame) -> dict[tuple[str, str], float]:
-    """Controlled public marketable stock of each participant: par, adjusted principal for TIPS."""
+def closing_stocks(portfolio: pd.DataFrame) -> dict[str, dict[tuple[str, str], float]]:
+    """Controlled public marketable stock and nominal bill face by participant."""
 
     stocks = {participant: 0.0 for participant in PARTICIPANTS}
+    bills = stocks.copy()
+    result = {"HolderStock": stocks, "HolderBillStock": bills}
     if portfolio is None or portfolio.empty:
-        return stocks
+        return result
     holder = portfolio["HolderType"].fillna("").astype(str)
     security = portfolio["SecurityType"].fillna("").astype(str)
     mask = (
@@ -158,7 +198,7 @@ def holder_stocks(portfolio: pd.DataFrame) -> dict[tuple[str, str], float]:
         & ~holder.isin(INTRAGOV_HOLDERS | {"CB"})
     )
     if not mask.any():
-        return stocks
+        return result
     rows = portfolio.loc[mask]
     face = pd.to_numeric(rows["FaceValue"], errors="coerce")
     adjusted = pd.to_numeric(rows["AdjustedPrincipal"], errors="coerce").fillna(face)
@@ -171,13 +211,24 @@ def holder_stocks(portfolio: pd.DataFrame) -> dict[tuple[str, str], float]:
         raise HolderTargetError("a Private holding has no money-fund or deposit-funded route")
     if (~private & subbucket.ne("")).any():
         raise HolderTargetError("a non-Private public holding names a private route")
-    grouped = base.groupby([holder[mask], subbucket]).sum()
-    for (name, route), value in grouped.items():
+    bill = bill_mask(rows)
+    grouped = pd.DataFrame({"stock": base, "bill": face.where(bill, 0.0)}).groupby([holder[mask], subbucket]).sum()
+    for (name, route), (stock, bill_face) in grouped.iterrows():
         key = (str(name), str(route))
         if key not in stocks:
             raise HolderTargetError(f"public holder {key} is not a holder target route")
-        stocks[key] = float(value)
-    return stocks
+        stocks[key] = float(stock)
+        bills[key] = float(bill_face)
+    return result
+
+
+def holder_stocks(portfolio: pd.DataFrame) -> dict[tuple[str, str], float]:
+    """Controlled public marketable stock: par, adjusted principal for TIPS."""
+    return closing_stocks(portfolio)["HolderStock"]
+
+
+def stock_result_values(stocks: Mapping[str, Mapping[tuple[str, str], float]]) -> dict[str, float]:
+    return {column: stocks[stem][p] for stem, columns in STOCK_COLUMNS.items() for p, column in columns.items()}
 
 
 def target_gaps(
@@ -255,17 +306,12 @@ def economic_lot_order(lots: pd.DataFrame) -> list[Any]:
 
 def _bill_lots(portfolio: pd.DataFrame, seller: tuple[str, str], current_date: pd.Timestamp) -> pd.DataFrame:
     holder, route = seller
-    security = portfolio["SecurityType"].fillna("").astype(str)
     owned = portfolio["Status"].astype(str).eq("Active") & portfolio["HolderType"].fillna("").astype(str).eq(holder)
     if holder == "Private":
         owned &= portfolio["HolderSubBucket"].fillna("").astype(str).eq(route)
-    fixed = owned & security.eq("Fixed")
-    category = portfolio["MaturityCategory"].fillna("").astype(str)
-    if (fixed & category.eq("")).any():
-        raise HolderTargetError(f"{PARTICIPANT_LABELS[seller]} holds a fixed-rate security with no maturity category")
     face = pd.to_numeric(portfolio["FaceValue"], errors="coerce")
     maturity = pd.to_datetime(portfolio["MaturityDate"], errors="coerce")
-    eligible = fixed & category.eq("bills") & (maturity > current_date) & (face > DUST_BIL)
+    eligible = owned & bill_mask(portfolio) & (maturity > current_date) & (face > DUST_BIL)
     # The economic order starts with maturity, so it also orders the buckets.
     lots = portfolio.loc[economic_lot_order(portfolio.loc[eligible]), ["MaturityDate", "FaceValue"]].copy()
     lots["FaceValue"] = face[lots.index]
@@ -616,7 +662,6 @@ def result_values(
     for participant in PARTICIPANTS:
         label = PARTICIPANT_LABELS[participant]
         values[f"HolderTarget_{label}"] = float(targets[participant])
-        values[f"HolderStock_{label}"] = float(stocks[participant])
         values[f"HolderTargetBoughtFace_{label}"] = report.bought_face[participant]
         values[f"HolderTargetSoldFace_{label}"] = report.sold_face[participant]
         values[f"HolderTargetBoughtCash_{label}"] = report.bought_cash[participant]

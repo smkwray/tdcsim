@@ -191,6 +191,9 @@ def _validate_mode_specific_overrides(data: Mapping[str, Any]) -> None:
 
 def _validate_holder_position_target(data: Mapping[str, Any], override: Mapping[str, Any]) -> None:
     try:
+        if override.get("mode") == holder_targets.BILL_TARGET_MODE:
+            holder_targets.bill_change_weights(override["bill_change_weights"])
+            return
         path = holder_targets.BuildAndHoldPath.from_points(list(override.get("target_path") or []))
         holder_targets.declared_weights(override)
     except (holder_targets.HolderTargetError, KeyError, TypeError, ValueError) as exc:

@@ -501,6 +501,44 @@ def test_a_seller_without_enough_bills_raises_with_route_date_and_shortfall() ->
         ht.rebalance_holder_positions(_book(), gaps, current_date="2026-09-25", price=_price)
 
 
+def test_bill_stock_control_assigns_the_realized_change_and_settles_at_dirty_prices(tmp_path) -> None:
+    params = _params(tmp_path / "inputs", fed=False)
+    treatment = copy.deepcopy(params)
+    params["treasury_issuance_profile"]["bills"]["target_percentage_of_remainder"] = 0.60
+    params["treasury_issuance_profile"]["notes"]["target_percentage_of_remainder"] = 0.40
+    params["treasury_issuance_profile"]["remainder_maturity_years"] = 2.0
+    base, _, _ = _run(params, tmp_path / "base")
+    bills = ht.STOCK_COLUMNS["HolderBillStock"]
+    weights = {BANKS: 0.30, FOREIGN: 0.70}
+    treatment["holder_position_target"] = {
+        "mode": ht.BILL_TARGET_MODE,
+        "tolerance_bil": TOLERANCE,
+        "bill_change_weights": [
+            {"holder_type": holder, "holder_subbucket": route, "weight": weight}
+            for (holder, route), weight in weights.items()
+        ],
+        "rows": [
+            {"date": day, "holder_type": holder, "holder_subbucket": route, "baseline_stock_bil": row[column]}
+            for day, row in base.iterrows()
+            for (holder, route), column in bills.items()
+        ],
+    }
+    result, _, _ = _run(treatment, tmp_path / "treatment")
+    difference = result[list(bills.values())] - base[list(bills.values())]
+    total = difference.sum(axis=1)
+    assert total.abs().max() >= 10.0
+    for participant, column in bills.items():
+        assert difference[column].to_numpy() == pytest.approx(total.to_numpy() * weights.get(participant, 0), abs=TOLERANCE)
+    traded = result[result["HolderTargetTradeFace"] > 0]
+    assert not traded.empty
+    assert (traded["HolderTargetTradeCash"] < traded["HolderTargetTradeFace"]).all()
+    deposit_cash = sum(
+        traded[f"HolderTargetSoldCash_{label}"] - traded[f"HolderTargetBoughtCash_{label}"]
+        for label in ("PrivateDomesticNonbank", "PrivateMMF")
+    )
+    assert traded["HolderTargetDepositEffect"].to_numpy() == pytest.approx(deposit_cash.to_numpy())
+
+
 def test_targets_that_do_not_sum_to_the_public_stock_raise() -> None:
     stocks = ht.holder_stocks(_book())
     targets = {participant: value for participant, value in stocks.items()}

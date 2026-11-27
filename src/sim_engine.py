@@ -3682,9 +3682,10 @@ def run_simulation(
         results[numeric_col] = 0.0
     results['FundingMode'] = funding_rule_mode if cbo_funding_mode else CASH_FUNDING_MODE
     holder_target_path = holder_targets.holder_target_path(params.get('holder_position_target'))
+    stock_columns = [column for group in holder_targets.STOCK_COLUMNS.values() for column in group.values()]
+    for numeric_col in stock_columns:
+        results[numeric_col] = 0.0
     if holder_target_path is not None:
-        # Only a run that holds positions on a target carries these columns, so every
-        # other run's results keep their exact bytes.
         results[holder_targets.PHASE_COLUMN] = ''
         for numeric_col in holder_targets.RESULT_COLUMNS:
             results[numeric_col] = 0.0
@@ -4007,6 +4008,14 @@ def run_simulation(
         reference_cpi_start,
     )
     results.loc[t0, 'CBOFundingModeActive'] = 1.0 if cbo_funding_mode else 0.0
+    opening_stocks = holder_targets.closing_stocks(bond_portfolio)
+    for column, value in holder_targets.stock_result_values(opening_stocks).items():
+        results.loc[t0, column] = value
+    if holder_target_path is not None and holder_target_path.bill_change_weights is not None:
+        opening_bills = opening_stocks[holder_target_path.stock_column_stem]
+        _, opening_targets = holder_target_path.for_date(t0, opening_bills)
+        if max(abs(opening_bills[p] - opening_targets[p]) for p in holder_targets.PARTICIPANTS) > holder_target_path.tolerance_bil:
+            raise holder_targets.HolderTargetError('Opening bill holdings differ from the matched baseline.')
     results.loc[t0, ['CBOControlledDebtTarget', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOFiscalIncidencePolicyPresent', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBONetInterestBridgeRows']] = 0.0
     if bounded_handoff:
         handoff_tables.capture_portfolio_snapshot(
@@ -6076,16 +6085,20 @@ def run_simulation(
                 results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
                     'synthetic_secondary_sale_to_hit_cbo_stock_path'
                 )
+        closing_holder_stocks = None
         if holder_target_path is not None:
             if current_enable_trading:
                 raise RuntimeError(
                     'Holder position targets close after the Federal Reserve operation and '
                     'cannot run with preference trading, which would move positions afterward.'
                 )
-            holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date)
+            closing_holder_stocks = holder_targets.closing_stocks(bond_portfolio)
+            stock_stem = holder_target_path.stock_column_stem
+            holder_target_stocks = closing_holder_stocks[stock_stem]
+            holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date, holder_target_stocks)
             holder_target_tolerance = holder_target_path.tolerance_bil
             holder_target_gaps = holder_targets.target_gaps(
-                holder_targets.holder_stocks(bond_portfolio),
+                holder_target_stocks,
                 holder_target_vector,
                 tolerance=holder_target_tolerance,
                 current_date=current_date,
@@ -6171,11 +6184,11 @@ def run_simulation(
                     deposit_change=holder_target_deposit_effect,
                     settlement_scope=holder_target_scope,
                 )
-            holder_target_closing = holder_targets.holder_stocks(bond_portfolio)
+                closing_holder_stocks = holder_targets.closing_stocks(bond_portfolio)
             holder_target_values = holder_targets.result_values(
                 phase=holder_target_phase,
                 targets=holder_target_vector,
-                stocks=holder_target_closing,
+                stocks=closing_holder_stocks[stock_stem],
                 pre_trade_gap=holder_target_pre_gap,
                 report=holder_target_report,
                 deposit_effect=holder_target_deposit_effect,
@@ -6419,6 +6432,10 @@ def run_simulation(
         results.loc[current_date, 'WAM'] = current_wam
         new_issuance_metrics = _handoff_weighted_metrics(new_bonds_added_list)
         outstanding_metrics = _handoff_outstanding_metrics(active_bonds_final, current_date)
+        if closing_holder_stocks is None:
+            closing_holder_stocks = holder_targets.closing_stocks(active_bonds_final)
+        for column, value in holder_targets.stock_result_values(closing_holder_stocks).items():
+            results.loc[current_date, column] = value
         results.loc[current_date, 'NewIssuanceWAM'] = new_issuance_metrics['wam_years']
         results.loc[current_date, 'NewIssuanceBillShare'] = new_issuance_metrics['bill_share']
         results.loc[current_date, 'NewIssuanceShortMaturityShare'] = new_issuance_metrics['short_maturity_share']

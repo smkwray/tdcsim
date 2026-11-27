@@ -131,7 +131,8 @@ BOUNDED_SUMMARY_COLUMNS = [
     "TDC_SecondaryTrades_MMFPlumbing",
     "CBOBuybackFaceRetired",
     "CBOBuybackCashPaid",
-    # Present only in runs that hold positions on a target.
+    *(column for group in holder_targets.STOCK_COLUMNS.values() for column in group.values()),
+    # Controller results are present only in runs with a target.
     holder_targets.PHASE_COLUMN,
     *holder_targets.RESULT_COLUMNS,
 ]
