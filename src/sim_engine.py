@@ -4571,14 +4571,14 @@ def run_simulation(
                 )
                 frn_yield = 0.0 if pd.isna(frn_yield) else frn_yield
             lockout_business_days = _frn_lockout_business_days(frn_path_row)
+            frn_indices = bond_portfolio.index[frn_mask]
+            last_accrued = pd.to_datetime(bond_portfolio.loc[frn_indices, 'LastAccrualDate']).dt.normalize()
+            last_accrued = last_accrued.fillna(pd.Timestamp(window_start).normalize())
             accrual_dates = pd.date_range(
-                pd.Timestamp(window_start).normalize() + pd.Timedelta(days=1),
-                pd.Timestamp(current_date).normalize(),
-                freq='D',
+                last_accrued.min() + pd.Timedelta(days=1), pd.Timestamp(current_date).normalize(), freq='D',
             )
-            if len(accrual_dates) == 1:
+            if len(accrual_dates) == 1 and last_accrued.lt(current_date).all():
                 accrual_day = pd.Timestamp(accrual_dates[0]).normalize()
-                frn_indices = bond_portfolio.index[frn_mask]
                 benchmark_rates = pd.Series(float(frn_yield), index=frn_indices, dtype=float)
                 day_count_bases = pd.Series(float(day_count_basis), index=frn_indices, dtype=float)
                 if (
@@ -4632,19 +4632,26 @@ def run_simulation(
                     accrued_balance = 0.0 if pd.isna(accrued_balance) else float(accrued_balance)
                     coupon_dates = {
                         pd.Timestamp(value).normalize()
-                        for value in _frn_coupon_dates_for_period(bond, window_start, current_date)
+                        for value in _frn_coupon_dates_for_period(bond, last_accrued.at[idx], current_date)
                     }
                     maturity_date = pd.Timestamp(bond.get('MaturityDate')).normalize()
-                    last_benchmark_rate = float(frn_yield)
+                    last_benchmark_rate = bond.get("BenchmarkRate_FRN")
                     last_accrual_date = pd.NaT
                     for accrual_day in accrual_dates:
+                        if accrual_day <= last_accrued.at[idx]:
+                            continue
                         if pd.notna(maturity_date) and accrual_day > maturity_date:
                             break
                         rate_date = _frn_rate_date_for_accrual_day(bond, accrual_day, lockout_business_days)
                         rate_row = None
                         benchmark_rate = float(frn_yield)
                         rate_day_count = day_count_basis
-                        if isinstance(frn_path_frame, pd.DataFrame) and not frn_path_frame.empty:
+                        if accrual_day <= t0 and pd.notna(bond.get("BenchmarkRate_FRN")):
+                            # The observed opening reset carries across the
+                            # pre-simulation days before the forecast rates apply.
+                            benchmark_rate = float(bond["BenchmarkRate_FRN"])
+                            rate_day_count = FRN_DAY_COUNT_BASIS
+                        elif isinstance(frn_path_frame, pd.DataFrame) and not frn_path_frame.empty:
                             rate_row = _frn_rate_path_row_for_date(
                                 frn_path_frame,
                                 cbo_scenario_id,

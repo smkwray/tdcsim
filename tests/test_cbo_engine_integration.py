@@ -180,6 +180,7 @@ def _opening_frn_portfolio(
     accrued_interest: float = 1.0,
     first_interest_payment_date: str = "2026-09-30",
     maturity_date: str = "2027-09-30",
+    last_accrued: str = "2026-09-20",
 ) -> pd.DataFrame:
     row = {column: pd.NA for column in BOND_PORTFOLIO_COLS}
     row.update(
@@ -206,7 +207,7 @@ def _opening_frn_portfolio(
             "FixedSpread": 0.001,
             "AccruedInterest_FRN": accrued_interest,
             "BenchmarkRate_FRN": 0.04,
-            "LastAccrualDate": pd.Timestamp("2026-09-20"),
+            "LastAccrualDate": pd.Timestamp(last_accrued),
             "IssuePriceRatio": 1.0,
             "IssueProceeds": face_value,
             "IssueYieldAtIssue": 0.04,
@@ -1029,6 +1030,7 @@ def test_cbo_frn_lockout_counts_federal_reserve_business_days_over_a_holiday_wee
         accrued_interest=0.0,
         first_interest_payment_date="2026-07-07",
         maturity_date="2027-07-07",
+        last_accrued="2026-07-01",
     )
 
     results, final_portfolio = run_simulation(
@@ -2067,3 +2069,20 @@ def test_fed_sale_buyer_mix_rejects_an_unsupported_stock_basis():
             pd.DataFrame(),
             {"type": "private_domestic_nonbank", "basis": "market_value"},
         )
+
+def test_opening_frn_accrues_continuously_from_june_18_to_first_period_end(tmp_path: Path) -> None:
+    start, end = "2026-06-21", "2026-06-22"
+    periods = build_simulation_calendar(start, end, "daily")
+    paths = _build_temp_forecast_inputs(tmp_path, periods=periods, period_start=start, period_end=end)
+    paths["frn_rate_path_file"] = _write_frn_rate_path(tmp_path, rows=[
+        _frn_rate_path_row(period_start=start, period_end=end, rate_decimal=0.06),
+    ])
+    params = _minimal_engine_params(paths)
+    opening = _opening_frn_portfolio(last_accrued="2026-06-18")
+    opening.loc[0, ["IssueDate", "DatedDate", "OriginalDatedDate"]] = pd.Timestamp("2026-03-31")
+    params["initial_bonds_df"] = opening
+    _, final = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+    lot = final.loc[final["BondID"].eq(1)].iloc[0]
+    daily_rates = [0.04, 0.04, 0.04, 0.06]
+    assert lot["AccruedInterest_FRN"] == pytest.approx(1 + sum((rate + 0.001) * 1000 / 360 for rate in daily_rates))
+    assert lot["LastAccrualDate"] == pd.Timestamp(end)
