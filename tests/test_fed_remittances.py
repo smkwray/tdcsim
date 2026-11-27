@@ -597,6 +597,34 @@ def test_verifier_rebuilds_the_fed_receivable_at_every_fiscal_year_end(tmp_path)
         _verify(moved, paths)
 
 
+def test_the_fed_year_end_lots_are_each_recorded_once_and_sum_to_its_stock(tmp_path):
+    """The audit's probe: a second copy of a lot, its face sized to accrue the 0.1 moved across
+    the fiscal-year boundary, hid the shift because only the set of lot IDs was compared. Each
+    lot may appear once on a day, and the lots recorded must add up to the Fed's reported stock."""
+
+    results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=-100.0)
+    lots = results.attrs["fed_year_end_lots"]
+    shifted = results.copy()
+    for column in ("CB_CouponAccrual", "CB_TreasuryInterestIncome", "CB_NetIncome"):
+        shifted.loc["2026-09-30", column] += 0.1
+        shifted.loc["2026-10-01", column] -= 0.1
+    for column in ("CB_TreasuryAccruedInterest", "CB_EarningsRemittancesDue"):
+        shifted.loc["2026-09-30", column] += 0.1
+    shifted.loc["2026-09-30", "CB_DeferredAsset"] = max(0.0, -shifted.loc["2026-09-30", "CB_EarningsRemittancesDue"])
+    copy_lot = lots.iloc[[0]].copy()
+    copy_lot["FaceValue"] = copy_lot["AdjustedPrincipal"] = 0.1 / (0.04 / 2 * 1 / 183)  # one day's coupon is 0.1
+    copy_lot["CouponRate"] = 0.04
+    copy_lot["MaturityDate"] = pd.Timestamp("2027-03-31")  # its last coupon was the day before
+    shifted.attrs["fed_year_end_lots"] = pd.concat([lots, copy_lot], ignore_index=True)
+    with pytest.raises(ValueError, match="record a lot twice on one day"):
+        _verify(shifted, paths)
+    inflated = results.copy()  # one copy, but a face the Fed's reported stock does not hold
+    inflated.attrs["fed_year_end_lots"] = lots.assign(FaceValue=lots["FaceValue"] * 1.01,
+                                                      AdjustedPrincipal=lots["AdjustedPrincipal"] * 1.01)
+    with pytest.raises(ValueError, match="against its reported Treasury stock"):
+        _verify(inflated, paths)
+
+
 def test_replay_is_bound_to_the_results_file_delivered(tmp_path):
     """The audit's refresh left the output manifest's own record of the results stale, so the
     replay matched the original bytes while the consumer received others."""

@@ -1129,6 +1129,14 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
         day = pd.Timestamp(row["Date"])
         if day.month == 9 and day.day == 30:
             held = held_at(day)
+            # The fixture's stock path rolls maturing lots over without booking new ones, so a
+            # zero-coupon purchase carries the difference: the lots add up to the reported stock
+            # and their receivable is unchanged.
+            from fed_income import stock as lot_stock
+
+            gap = float(row["DebtHeld_CentralBank"]) - float(lot_stock(held).sum())
+            last = held.index[held["BondID"].astype(int).ge(10**6)][-1]
+            held.loc[last, ["FaceValue", "AdjustedPrincipal"]] = held.loc[last, "FaceValue"] + gap
             year_end_lots.append(held.assign(date=day.date().isoformat()))
             year_end_receivable[row["Date"]] = {
                 **dict.fromkeys(ACCRUAL_TYPES, 0.0),

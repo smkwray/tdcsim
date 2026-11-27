@@ -1401,12 +1401,18 @@ def verify_fed_remittances(
     recorded = pd.to_datetime(year_end_lots["date"]).dt.normalize()
     if not set(recorded) <= set(year_ends):
         raise ValueError("the Fed's year-end lots name a day that is not one of the run's fiscal-year ends")
+    if pd.DataFrame({"date": recorded, "bond": pd.to_numeric(year_end_lots["BondID"], errors="raise")}).duplicated().any():
+        raise ValueError("the Fed's year-end lots record a lot twice on one day")
+    from fed_income import stock as lot_stock
+
     position = {day: i for i, day in enumerate(dates)}
     for day in year_ends:
         held = year_end_lots.loc[recorded.eq(day)]
         alive = held.loc[pd.to_datetime(held["MaturityDate"]).dt.normalize() > day, "BondID"]
         if set(pd.to_numeric(alive, errors="raise").astype(int)) != rebuilt["live_at"][str(day.date())]:
             raise ValueError(f"the Fed's lots at {day.date()} are not the lots its journal leaves open")
+        _close([float(lot_stock(held).sum()) if not held.empty else 0.0], [out["DebtHeld_CentralBank"][position[day]]],
+               f"the Fed's lots at {day.date()} against its reported Treasury stock")
         _close([out["CB_TreasuryAccruedInterest"][position[day]]],
                [_rebuild_fed_receivable(held, day, opening_day=dates.iloc[0], inputs=inputs)],
                f"Fed accrued-interest receivable at {day.date()} against its lots' terms")
