@@ -478,6 +478,49 @@ def test_added_mmf_position_routes_purchases_redemptions_and_reinvestment(tmp_pa
         _run(params, tmp_path / "overdrawn")
 
 
+def test_added_mmf_funding_preserves_ordinary_holdings_when_the_fed_buys(tmp_path) -> None:
+    # Exercise the production Fed purchase rule and controller in the same run.
+    size = 60.0
+    params = _params(tmp_path / "inputs", fed=True)
+    position = {"settlement_route": "covered_deposit_settled", "opening_on_rrp_bil": size}
+    params[PRIVATE_SUBBUCKET_MMF_ADDED] = position
+    base, _, closure = _run(params, tmp_path / "baseline")
+    assert base["CBOFedSecondaryPurchaseFace"].sum() > 0.0
+    rows, _ = _targets(closure, buyer=PRIVATE_MMF_ADDED, donors=MMF_DONORS, size=size)
+    target = pd.Series({
+        pd.Timestamp(row["date"]): row["target_stock_bil"]
+        for row in rows if (row["holder_type"], row["holder_subbucket"]) == PRIVATE_MMF_ADDED
+    })
+    params["holder_position_target"] = {
+        "mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows,
+        "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED,
+    }
+    deposits, deposit_book, _ = _run(params, tmp_path / "deposits")
+    params[PRIVATE_SUBBUCKET_MMF_ADDED] = {**position, "settlement_route": "on_rrp_mmf"}
+    onrrp, onrrp_book, _ = _run(params, tmp_path / "onrrp")
+
+    for results in (deposits, onrrp):
+        purchases = results.loc[results["CBOFedSecondaryPurchaseFace"] > 0, "CBOFedPurchaseOperation"]
+        sellers = [json.loads(operation)["seller_routes"] for operation in purchases]
+        assert any(sale.get(MMF, {}).get("par", 0.0) > 0.0 for sale in sellers)
+        assert any(sale.get(PRIVATE_SUBBUCKET_MMF_ADDED, {}).get("par", 0.0) > 0.0 for sale in sellers)
+        pd.testing.assert_series_equal(results["HolderStock_PrivateMMF"], base["HolderStock_PrivateMMF"],
+                                       check_exact=False, rtol=0.0, atol=1e-10)
+        assert (results[["HolderTargetBoughtFace_PrivateMMF", "HolderTargetSoldFace_PrivateMMF"]] == 0.0).all().all()
+        pd.testing.assert_series_equal(results["TGA"], base["TGA"], check_exact=False, rtol=0.0, atol=1e-9)
+        added = results["HolderStock_PrivateMMFAdded"]
+        assert added.iloc[0] == 0.0
+        pd.testing.assert_series_equal(added.iloc[1:], target, check_names=False, check_freq=False,
+                                       check_exact=False, rtol=0.0, atol=TOLERANCE)
+        assert added.iloc[-1] == pytest.approx(size, abs=TOLERANCE)
+
+    donors = [ht.PARTICIPANT_LABELS[route] for route in MMF_DONORS]
+    sales = [f"HolderTargetSold{basis}_{donor}" for basis in ("Face", "Cash") for donor in donors]
+    assert (deposits[sales].sum() > 0.0).all()
+    pd.testing.assert_frame_equal(deposits[sales], onrrp[sales], check_exact=True)
+    pd.testing.assert_frame_equal(deposit_book, onrrp_book, check_exact=True)
+
+
 # --- The controller on a hand-built book ---
 
 
