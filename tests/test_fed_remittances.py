@@ -319,6 +319,37 @@ def test_the_fed_meets_cbos_published_stock_on_a_closed_fiscal_year_end(tmp_path
     assert friday.loc["2028-09-29", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
 
 
+def test_the_year_end_trade_allows_for_the_tips_it_buys_or_sells():
+    """The audit's case: on positioning Friday 2028-09-29 the only security the Fed can buy is a
+    TIPS, and the reference CPI moves from 340 to 340.02 by Sunday's fiscal-year end. Sized on
+    the book before the trade, buying 0.1 would leave the year end 5.9e-6 above CBO's stock; the
+    trade must allow for its own TIPS so the year-end stop fires only on a real miss."""
+
+    from sim_engine import _fed_stock_at, _fed_year_end_trade, _purchase_issue_allocations, _purchase_issues
+    from test_issuance_rule import _portfolio, _portfolio_row
+
+    friday, year_end = pd.Timestamp("2028-09-29"), pd.Timestamp("2028-09-30")
+
+    def tips(bond_id, holder, face):
+        row = _portfolio_row(bond_id, security_type="TIPS", years=5.0, maturity="2029-04-15", face=face, holder=holder)
+        row.update(IssueID="TIPS-2029-04", ReferenceCPI_Issue=300.0, OriginalPrincipal=face,
+                   AdjustedPrincipal=face * 340.0 / 300.0, IndexRatio=340.0 / 300.0, CouponRate=0.00125)
+        return row
+
+    book = _portfolio([tips(1, "Private", 50.0), tips(2, "CB", 10.0)])
+    base = _fed_stock_at(book, year_end, 340.02)
+    for wanted in (base + 0.1, base - 0.1):  # a purchase and a sale of TIPS
+        trade = _fed_year_end_trade(book, friday, year_end, wanted, 340.02, 340.0)
+        naive = wanted - base
+        assert abs(naive * 340.02 / 340.0 - naive) == pytest.approx(0.1 * 0.02 / 340.0, rel=1e-6)  # the audit's 5.9e-6
+        if trade > 0:
+            allocations, _ = _purchase_issue_allocations(_purchase_issues(book, friday), trade)
+            assert sum(allocations.values()) == pytest.approx(trade)
+        assert base + trade * 340.02 / 340.0 == pytest.approx(wanted, abs=1e-10)
+
+
+
+
 def test_the_opening_lot_check_reads_each_lot_by_its_id_not_its_row():
     """The opening portfolio lists the Fed's lots in no particular order; the verifier must
     rebuild each lot's opening premium from that lot's own terms and issue proceeds."""

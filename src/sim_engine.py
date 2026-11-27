@@ -664,6 +664,49 @@ def _fed_stock_at(bond_portfolio, anchor, reference_cpi):
     return float(face.where(~tips, adjusted)[~paid].sum())
 
 
+def _fed_year_end_trade(bond_portfolio, current, anchor, anchor_stock, anchor_cpi, current_cpi):
+    """The stock the Fed buys (positive) or sells (negative) today so that its stock at the close of
+    ``anchor``, with no trades between, is ``anchor_stock``.
+
+    Every TIPS lot's indexed principal grows by the same factor through the anchor, so the TIPS
+    the trade itself buys or sells move the result: the trade is solved against the allocation the
+    purchase rule makes, or the lots the sale rule takes, for that amount.
+    """
+
+    growth = float(anchor_cpi) / float(current_cpi)
+    base = _fed_stock_at(bond_portfolio, anchor, anchor_cpi)
+    issues = _purchase_issues(bond_portfolio, current)
+    fed = bond_portfolio[
+        bond_portfolio['Status'].eq('Active') & bond_portfolio['HolderType'].eq('CB')
+        & bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS', 'FRN'])
+    ]
+    fed = fed[fed.apply(_bond_debt_base, axis=1) > TGA_FLOOR_TOLERANCE]
+    sale_order = holder_targets.economic_lot_order(fed) if not fed.empty else []
+
+    def at_anchor(trade):
+        if trade > TGA_FLOOR_TOLERANCE:
+            allocations, _ = _purchase_issue_allocations(issues, trade)
+            return sum(quantity * (growth if issues[key]['security_type'] == 'TIPS' else 1.0)
+                       for key, quantity in allocations.items())
+        moved, remaining = 0.0, -trade
+        for index in sale_order:
+            if remaining <= TGA_FLOOR_TOLERANCE:
+                break
+            lot = bond_portfolio.loc[index]
+            sold = min(remaining, _bond_debt_base(lot))
+            moved -= sold * (growth if lot['SecurityType'] == 'TIPS' else 1.0)
+            remaining -= sold
+        return moved
+
+    trade = anchor_stock - base
+    for _ in range(8):
+        miss = anchor_stock - (base + at_anchor(trade))
+        if abs(miss) <= 1e-10:
+            return trade
+        trade += miss
+    raise RuntimeError(f'the Fed cannot size its trade for the fiscal-year end {anchor.date()}: miss {miss!r}')
+
+
 def _new_fed_basis(lots):
     return {
         'lots': lots,
@@ -6555,13 +6598,14 @@ def run_simulation(
                 else None
             )
             if fed_year_end_row is not None:
-                # The market is closed from tomorrow through a fiscal-year end: buy or sell today to
-                # CBO's published stock for that date, less what the book does without trading
-                # (TIPS indexation, maturities paid) before it closes.
-                fed_year_end_drift = _fed_stock_at(
-                    bond_portfolio, fed_year_end, cbo_reference_cpi_lookup.get(fed_year_end, current_ref_cpi),
-                ) - current_cb_after_issuance
-                cbo_fed_holdings_target = float(fed_year_end_row['cbo_fed_holdings_target_bil']) - fed_year_end_drift
+                # The market is closed from tomorrow through a fiscal-year end: trade today so that
+                # the stock reaches CBO's published stock for that date, allowing for what the book,
+                # including what it trades today, does without trading (TIPS indexation, maturities
+                # paid) before it closes.
+                cbo_fed_holdings_target = current_cb_after_issuance + _fed_year_end_trade(
+                    bond_portfolio, current_date, fed_year_end, float(fed_year_end_row['cbo_fed_holdings_target_bil']),
+                    cbo_reference_cpi_lookup.get(fed_year_end, current_ref_cpi), current_ref_cpi,
+                )
                 results.loc[current_date, 'CBOFedHoldingsTarget'] = cbo_fed_holdings_target
             fed_purchase_shortfall = cbo_fed_holdings_target - current_cb_after_issuance
             fed_target_tolerance = float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001)
