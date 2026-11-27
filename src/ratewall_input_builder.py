@@ -99,8 +99,8 @@ FRN_OVERRIDE_CLAIM = (
 NMFP_MIX_TOLERANCE = 0.05
 NMFP_MIX_BUCKETS = ("total", "bills", "frn", "coupon_le397")
 # FRN auction tranches, by settlement date, that calibrate the money-fund share of new FRN
-# supply: four two-year FRNs, each a new issue and two reopenings, measured on N-MFP
-# month-ends through April 2026.
+# supply: four whole calendar quarters, each with one two-year FRN new issue and its two
+# reopenings, measured on N-MFP month-ends through April 2026.
 FRN_AUCTION_SHARE_WINDOW = ("2025-04-01", "2026-03-31")
 # Each two-year FRN is a new issue and two monthly reopenings, in this order.
 FRN_TRANCHE_REOPENING_FLAGS = ("No", "Yes", "Yes")
@@ -523,6 +523,17 @@ def calibrate_mmf_frn_auction_share(holdings: pd.DataFrame, auctions_path: Path)
     in_window = sorted(set(frns.loc[frns["issue"].between(start, end), "cusip"]))
     if not in_window:
         raise ValueError(f"{auctions_path.name} has no FRN auction settling in {FRN_AUCTION_SHARE_WINDOW}")
+    # Treasury issues one new two-year FRN a quarter. Coverage is checked against the window's
+    # calendar quarters, not the CUSIPs the source happens to list, so a source missing a whole
+    # FRN fails instead of calibrating on the rest.
+    quarters = pd.period_range(start, end, freq="Q")
+    if quarters[0].start_time != start or quarters[-1].end_time.normalize() != end:
+        raise ValueError(f"the FRN calibration window {FRN_AUCTION_SHARE_WINDOW} is not whole calendar quarters")
+    new_issues = frns.loc[frns["issue"].between(start, end) & frns["reopening"].eq("No")]
+    per_quarter = new_issues["issue"].dt.to_period("Q").value_counts()
+    uncovered = [str(quarter) for quarter in quarters if per_quarter.get(quarter, 0) != 1]
+    if uncovered:
+        raise ValueError(f"{auctions_path.name} does not show exactly one FRN new issue settling in quarters {uncovered}")
     filed = holdings.loc[holdings["security_class"].eq("frn")].set_index(["report_date", "cusip"])["value_bil"]
     report_dates = set(holdings["report_date"])
     observations = []
@@ -757,6 +768,7 @@ def verify_opening_book_against_nmfp(
         for key in ("model_par_bil", "filed_value_bil"):
             if abs(values[key] - float(recorded_mix[bucket][key])) > 1e-6:
                 raise ValueError(f"the manifest's N-MFP mix check {bucket} {key} does not rebuild from the book and extract")
+    _check_frn_donors(book, initial)
     calibration = calibrate_mmf_frn_auction_share(holdings, auctions_path)
     recorded_calibration = initial["frn_mmf_auction_share_calibration"]
     share = initial["noncb_weights"][FRN_MMF_AUCTION_SHARE_KEY]
@@ -777,6 +789,48 @@ def verify_opening_book_against_nmfp(
     ):
         raise ValueError("the manifest's money-fund FRN auction share does not rebuild from the extract and auctions")
     return {"frn_cusips": len(book_frns), "mix_check": mix, "frn_mmf_auction_share": calibration["share"]}
+
+
+def _check_frn_donors(book: pd.DataFrame, initial: dict) -> None:
+    """Rederive each sector's FRNs given to money funds and bills taken back, from the book.
+
+    Before the override each sector held the uniform nonbill share of the FRNs' non-Fed par,
+    and its bill-group par, as the manifest records them upstream of the override, with the
+    eligibility swap's FRNs and bills moved from domestic nonbanks to money funds. What a
+    sector holds in the book now, against that, is what it gave and took; both must equal
+    the amounts the manifest reports.
+    """
+
+    allocation = initial["opening_allocation"]
+    weights = allocation["groups"]["nonbills"]["route_weights"]
+    bills_par = allocation["groups"]["bills"]["par_bil"]
+    swapped = allocation["money_fund_eligibility_swap"]["face_bil_by_class"]["to_mmf"]
+    swapped_frns = float(swapped.get("Floating Rate Notes", 0.0))
+    swapped_bills = float(swapped.get("Bills", 0.0))
+    noncb = book.loc[book["HolderType"].ne("CB")]
+    route = noncb["HolderType"] + "/" + noncb["HolderSubBucket"].fillna("").astype(str)
+    route = route.str.rstrip("/")
+    is_frn = noncb["SecurityType"].eq("FRN")
+    is_bill = noncb["MaturityCategory"].eq("bills") & ~is_frn
+    frn_par = float(noncb.loc[is_frn, "FaceValue"].sum())
+    frns_now = noncb.loc[is_frn].groupby(route[is_frn])["FaceValue"].sum()
+    bills_now = noncb.loc[is_bill].groupby(route[is_bill])["FaceValue"].sum()
+    residual, mmf = _route_key(NONCB_RESIDUAL_ROUTE), _route_key(MMF_OPENING_ROUTE)
+    shift = {residual: -1.0, mmf: 1.0}
+    override = allocation["money_fund_frn_holdings_override"]
+    for key in (_route_key(route_key) for tier in FRN_OVERRIDE_GIVER_TIERS for route_key in tier):
+        frns_before = float(weights[key]) * frn_par + shift.get(key, 0.0) * swapped_frns
+        bills_before = float(bills_par[key]) + shift.get(key, 0.0) * swapped_bills
+        given = frns_before - float(frns_now.get(key, 0.0))
+        taken = float(bills_now.get(key, 0.0)) - bills_before
+        recorded_given = float(override["frn_to_mmf_bil_by_sector"][key])
+        recorded_taken = float(override["bills_from_mmf_bil_by_sector"][key])
+        recorded_by_cusip = sum(float(row["from_bil"][key]) for row in override["by_cusip"].values())
+        if max(abs(given - recorded_given), abs(taken - recorded_taken), abs(recorded_by_cusip - recorded_given)) > 1e-6:
+            raise ValueError(
+                f"{key} gave {given:.6f} bn of FRNs and took {taken:.6f} bn of bills against the pre-override allocation, "
+                f"but the manifest reports {recorded_given:.6f} and {recorded_taken:.6f}"
+            )
 
 
 def load_soma_auction_add_ons(path: Path, *, after: str, through: str) -> tuple[int, dict[str, float]]:
