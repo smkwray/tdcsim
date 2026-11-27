@@ -1158,15 +1158,15 @@ def _write_yield_and_frn_rate_paths(package: Path) -> None:
         observed_cpi_by_month=FIXTURE_OBSERVED_CPI,
         reference_lag_months=3,
         pricing_horizon_end_date="2046-10-01",
-        observation_date="2026-02-11",
-        available_date="2026-02-11",
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     real_yield_rows = build_tips_real_yield_path_rows(
         scenario_id="cbo_full_horizon_local_smoke_3m",
         yield_surface_rows=yield_rows,
         tips_cpi_path_rows=tips_cpi_rows,
-        observation_date="2026-02-11",
-        available_date="2026-02-11",
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     _write_csv(package / "forecast_inputs" / "tdcsim_yield_curve_surface.csv", list(yield_rows[0]), yield_rows)
     _write_csv(package / "forecast_inputs" / "tdcsim_frn_rate_path.csv", list(frn_rows[0]), frn_rows)

@@ -593,15 +593,15 @@ def build_forecast_bundle(
         observed_cpi_by_month=opening_portfolio_metadata["observed_tips_cpi_by_month"],
         reference_lag_months=3,
         pricing_horizon_end_date=_tips_pricing_horizon_end_date(yield_rows),
-        observation_date=FORECAST_PUBLICATION_DATE,
-        available_date=FORECAST_PUBLICATION_DATE,
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     tips_real_yield_rows = build_tips_real_yield_path_rows(
         scenario_id=SCENARIO_ID,
         yield_surface_rows=yield_rows,
         tips_cpi_path_rows=tips_cpi_rows,
-        observation_date=FORECAST_PUBLICATION_DATE,
-        available_date=FORECAST_PUBLICATION_DATE,
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     write_forecast_rows_csv(inputs / "tdcsim_tips_cpi_path.csv", tips_cpi_rows)
     write_forecast_rows_csv(inputs / "tdcsim_tips_real_yield_path.csv", tips_real_yield_rows)
@@ -1006,7 +1006,7 @@ def build_manifest(
             "cpi_file": "forecast_inputs/tdcsim_tips_cpi_path.csv",
             "real_yield_file": "forecast_inputs/tdcsim_tips_real_yield_path.csv",
             "cpi_mode": (
-                "monthly_cbo_cpi_u_interpolation_through_cbo_horizon_then_tdcsim_terminal_extrapolation"
+                "observed_treasury_reference_cpi_then_interpolated_cbo_cpi_u_and_tdcsim_terminal_extrapolation"
             ),
             "reference_cpi_lag_months": 3,
             **_tips_terminal_cpi_manifest(tips_cpi_rows, tips_real_yield_rows),

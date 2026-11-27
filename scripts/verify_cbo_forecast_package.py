@@ -1624,8 +1624,8 @@ def _verify_tips_forward_paths(root: Path, manifest: Mapping[str, Any]) -> None:
                 _max_expected_inflation_horizon_date(yield_rows),
             )
         ),
-        observation_date=str(cpi_rows[0]["observation_date"]),
-        available_date=str(cpi_rows[0]["available_date"]),
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     _verify_csv_rows_match_expected("tdcsim_tips_cpi_path.csv", cpi_rows, expected_cpi_rows)
     _verify_tips_start_valuation(root, manifest, detail, cpi_rows)
@@ -1661,8 +1661,8 @@ def _verify_tips_forward_paths(root: Path, manifest: Mapping[str, Any]) -> None:
         scenario_id=str(manifest.get("scenario_id")),
         yield_surface_rows=yield_rows,
         tips_cpi_path_rows=expected_cpi_rows,
-        observation_date=str(real_rows[0]["observation_date"]),
-        available_date=str(real_rows[0]["available_date"]),
+        observation_date=OPENING_CLOSE_DATE,
+        available_date=ACTUALS_AVAILABLE_AS_OF,
     )
     _verify_csv_rows_match_expected("tdcsim_tips_real_yield_path.csv", real_rows, expected_real_rows)
 
