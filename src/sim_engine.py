@@ -134,6 +134,7 @@ from simulation_calendar import (
     add_fedwire_business_days,
     is_fedwire_business_day,
     is_securities_business_day,
+    next_fedwire_business_day,
     previous_fedwire_business_day,
 )
 from yield_curve_path import curve_for_date, load_yield_curve_surface
@@ -627,6 +628,40 @@ def _register_new_fed_lots(bond_portfolio, fed_basis, day):
             'auction', lot['BondID'], lot['MaturityDate'], bool(new_bills.at[idx]), day,
             stock=float(new_stock.at[idx]), cash=float(proceeds.at[idx]), accrued=float(new_accrued.loc[idx].sum()),
         )
+
+
+def _fed_closed_fiscal_year_end(day, last_day):
+    """The September 30 after ``day`` when the securities market is closed from ``day`` through it.
+
+    The Fed cannot trade on the fiscal-year end itself then, so ``day`` is its last chance to
+    position for CBO's published stock at that date.
+    """
+
+    day = pd.Timestamp(day).normalize()
+    fiscal_year_end = pd.Timestamp(year=day.year, month=9, day=30)
+    if not day < fiscal_year_end <= pd.Timestamp(last_day).normalize():
+        return None
+    between = pd.date_range(day + pd.Timedelta(days=1), fiscal_year_end, freq='D')
+    if any(is_securities_business_day(other.date()) for other in between):
+        return None
+    return fiscal_year_end
+
+
+def _fed_stock_at(bond_portfolio, anchor, reference_cpi):
+    """The Fed's stock at the close of ``anchor`` if it trades no more before then: TIPS at the
+    anchor's index ratio, and lots whose maturity is paid by then gone."""
+
+    fed = bond_portfolio[bond_portfolio['Status'].eq('Active') & bond_portfolio['HolderType'].eq('CB')]
+    maturity = pd.to_datetime(fed['MaturityDate']).dt.normalize()
+    paid = maturity.le(anchor) & maturity.map(
+        lambda value: pd.Timestamp(next_fedwire_business_day(value.date())) <= anchor
+    )
+    face = pd.to_numeric(fed['FaceValue'], errors='raise')
+    tips = fed['SecurityType'].astype(str).eq('TIPS')
+    reference = pd.to_numeric(fed['ReferenceCPI_Issue'], errors='coerce')
+    indexed = pd.to_numeric(fed['OriginalPrincipal'], errors='coerce') * float(reference_cpi) / reference
+    adjusted = indexed.where(reference.gt(TGA_FLOOR_TOLERANCE), fed['AdjustedPrincipal'])
+    return float(face.where(~tips, adjusted)[~paid].sum())
 
 
 def _new_fed_basis(lots):
@@ -6509,6 +6544,23 @@ def run_simulation(
                 ].sum()
             else:
                 current_cb_after_issuance = 0.0
+            fed_year_end = _fed_closed_fiscal_year_end(current_date, dates[-1]) if market_open else None
+            fed_year_end_row = (
+                _cbo_optional_exact_date_row(
+                    cbo_inputs.get('fed_holdings'), cbo_scenario_id, fed_year_end, 'period_end', 'CBO Fed holdings path',
+                )
+                if fed_year_end is not None
+                else None
+            )
+            if fed_year_end_row is not None:
+                # The market is closed from tomorrow through a fiscal-year end: buy or sell today to
+                # CBO's published stock for that date, less what the book does without trading
+                # (TIPS indexation, maturities paid) before it closes.
+                fed_year_end_drift = _fed_stock_at(
+                    bond_portfolio, fed_year_end, cbo_reference_cpi_lookup.get(fed_year_end, current_ref_cpi),
+                ) - current_cb_after_issuance
+                cbo_fed_holdings_target = float(fed_year_end_row['cbo_fed_holdings_target_bil']) - fed_year_end_drift
+                results.loc[current_date, 'CBOFedHoldingsTarget'] = cbo_fed_holdings_target
             fed_purchase_shortfall = cbo_fed_holdings_target - current_cb_after_issuance
             fed_target_tolerance = float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001)
             if cbo_funding_mode and abs(fed_purchase_shortfall) > TGA_FLOOR_TOLERANCE:
@@ -7020,6 +7072,19 @@ def run_simulation(
                     f"post={results.loc[current_date, 'DebtHeld_CB']:.12f}, "
                     f"error={results.loc[current_date, 'CBOFedHoldingsTargetError']:.12f}"
                 )
+            if not market_open and current_date.month == 9 and current_date.day == 30:
+                # CBO publishes the Fed's stock at each fiscal-year end; a closed one is reached by
+                # positioning on the last market day before it.
+                year_end_row = _cbo_optional_exact_date_row(
+                    cbo_inputs.get('fed_holdings'), cbo_scenario_id, current_date, 'period_end', 'CBO Fed holdings path',
+                )
+                year_end_miss = float(results.loc[current_date, 'DebtHeld_CB']) - float(
+                    year_end_row['cbo_fed_holdings_target_bil']
+                )
+                if abs(year_end_miss) > fed_target_tolerance:
+                    raise RuntimeError(
+                        f"the Fed misses CBO's fiscal-year-end holdings at {current_date.date()} by {year_end_miss:.12f}"
+                    )
             cbo_fed_end_stock = float(results.loc[current_date, 'DebtHeld_CB'])
             cbo_fed_maturities = cb_stock_matured
             # Stock added at auction: adjusted principal for TIPS, as in the Fed bridge.

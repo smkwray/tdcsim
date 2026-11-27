@@ -276,6 +276,43 @@ def test_fed_frn_interest_earned_on_a_closed_fiscal_year_end_stays_in_that_year(
     assert results.loc["2028-10-02", "CB_FRNAccrual"] == pytest.approx(FRN_DAILY)
 
 
+def test_the_fed_meets_cbos_published_stock_on_a_closed_fiscal_year_end(tmp_path):
+    """CBO publishes the Fed's Treasury stock at each fiscal-year end. 2028-09-30 is a Saturday:
+    the Fed cannot trade then, so it must buy on Friday what takes it to that published stock,
+    not stop at Friday's point on the path between year ends."""
+
+    from forecast_bundle_builders import build_fed_holdings_path_rows
+    from test_cbo_engine_integration import _write_csv
+    from test_issuance_rule import _engine_params, _portfolio, _portfolio_row
+    from test_treasury_calendar import _profile
+
+    start, end = "2028-09-20", "2028-10-03"
+    params = _engine_params(tmp_path, profile=_profile(nominal_only=True), mode="cbo_operating_cash_target_financing_v1",
+                            start=start, end=end, later_fiscal_years={2029: (1_100.0, 0.0)})
+    params["data_vintage"]["actuals_available_as_of"] = start
+    params["initial_bonds_df"] = _portfolio([
+        _portfolio_row(1, security_type="Fixed", years=91 / 365.25, maturity="2028-12-21", face=300.0),
+        _portfolio_row(4, security_type="Fixed", years=2.0, maturity="2029-09-30", face=200.0),
+        _portfolio_row(9, security_type="Fixed", years=2.0, maturity="2030-03-31", face=100.0, holder="CB"),
+        # The August 2028 refunding issues that September and October reopen.
+        *[_portfolio_row(900 + years, security_type="Fixed", years=float(years), maturity=f"{2028 + years}-08-15",
+                         face=20.0) for years in (10, 20, 30)],
+    ])
+    params["baseline_input_paths"]["fed_holdings_path_file"] = str(_write_csv(
+        tmp_path / "fed.csv",
+        build_fed_holdings_path_rows(
+            scenario_id="baseline", periods=build_simulation_calendar(start, end, "daily"), opening_state_date=start,
+            opening_cb_holdings_bil=100.0, cbo_fy_end_fed_holdings_bil={2028: 150.0, 2029: 200.0},
+            observation_date=start, available_date=start,
+        ),
+    ))
+    results = _simulate(params, start, end)
+    path = pd.read_csv(tmp_path / "fed.csv").set_index("period_end")["cbo_fed_holdings_target_bil"]
+    assert results.loc["2028-09-30", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
+    assert path["2028-09-29"] < 150.0 - 0.01  # Friday's point on the path falls short of the year end
+    assert results.loc["2028-09-29", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
+
+
 def test_the_opening_lot_check_reads_each_lot_by_its_id_not_its_row():
     """The opening portfolio lists the Fed's lots in no particular order; the verifier must
     rebuild each lot's opening premium from that lot's own terms and issue proceeds."""
