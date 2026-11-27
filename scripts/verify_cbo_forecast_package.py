@@ -322,6 +322,8 @@ APPROVED_OPENING_PORTFOLIO_KEYS = {
     "holder_totals_bil",
     "mode",
     "opening_cb_holdings_bil",
+    "simulation_start_cb_holdings_bil",
+    "simulation_start_tips_adjusted_principal_bil",
     "opening_close_date",
     "soma_snapshot_date",
     "opening_frn_accrued_interest_bil",
