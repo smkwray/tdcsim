@@ -34,6 +34,8 @@ POLICY_RATE_PATH_SCHEMA_VERSION = "tdcsim_policy_rate_path_v1"
 # The Table 4-3 path stays in the ordinary fiscal flow (CBO counts remittances as receipts);
 # the TGA receives the run's own remittance, built from the Fed's income statement.
 CBO_FED_REMITTANCE_ROLE = "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
+# The role of the fixed Table 4-3 input itself: added back to the ordinary fiscal flow only.
+CBO_TABLE_4_3_FISCAL_FLOW_ROLE = "cbo_table_4_3_remittance_added_back_to_ordinary_fiscal_flow_not_paid_to_tga"
 CBO_UNSUPPORTED_FED_COMPONENTS = (
     "fed_effective_interest_amortization",
     "fed_mbs_payment_clock",

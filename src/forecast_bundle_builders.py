@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from forecast_paths import (
-    CBO_FED_REMITTANCE_ROLE,
+    CBO_TABLE_4_3_FISCAL_FLOW_ROLE,
     FED_INCOME_PATH_SCHEMA_VERSION,
     POLICY_RATE_PATH_SCHEMA_VERSION,
     FED_REMITTANCE_PATH_SCHEMA_VERSION,
@@ -564,7 +564,7 @@ def build_fed_remittance_path_rows(
             "source_role": "hard_input",
             "runtime_role": "hard_flow",
             "source_status": "cbo_table_4_3_net_of_dts_fytd" if year == splice_year else "cbo_table_4_3",
-            "claim_boundary": CBO_FED_REMITTANCE_ROLE,
+            "claim_boundary": CBO_TABLE_4_3_FISCAL_FLOW_ROLE,
         })
     return rows
 

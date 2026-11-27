@@ -506,6 +506,23 @@ def test_table_4_3_remittance_stays_in_the_fiscal_flow_while_the_tga_gets_the_mo
     _verify(cbo, paths)
 
 
+def test_the_table_4_3_input_declares_itself_a_fiscal_flow_add_back_not_a_tga_payment():
+    """A consumer following the input's own label must not credit the TGA with CBO's path:
+    the TGA receives the run's modeled remittance, so the label says add-back only."""
+
+    from forecast_bundle_builders import build_fed_remittance_path_rows, build_primary_deficit_path_rows
+    from forecast_paths import CBO_FED_REMITTANCE_ROLE, CBO_TABLE_4_3_FISCAL_FLOW_ROLE
+
+    primary = build_primary_deficit_path_rows(
+        scenario_id="baseline", periods=build_simulation_calendar(START, END, "daily"),
+        primary_deficit_by_fiscal_year_bil={2026: 1.0, 2027: 1.0},
+    )
+    rows = build_fed_remittance_path_rows(primary, {"fiscal_year": 2026}, {"transaction_fytd_amt": "0"})
+    assert {row["claim_boundary"] for row in rows} == {CBO_TABLE_4_3_FISCAL_FLOW_ROLE}
+    assert "fiscal_flow" in CBO_TABLE_4_3_FISCAL_FLOW_ROLE and "not_paid_to_tga" in CBO_TABLE_4_3_FISCAL_FLOW_ROLE
+    assert CBO_TABLE_4_3_FISCAL_FLOW_ROLE != CBO_FED_REMITTANCE_ROLE
+
+
 def test_mbs_income_follows_the_nyfed_runoff_path_from_the_h41_opening():
     source = fed_income_source_fixture()
     periods = build_simulation_calendar("2026-06-21", "2036-09-30", "daily")
