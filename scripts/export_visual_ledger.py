@@ -511,9 +511,11 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   Treasury income is accrued on the Fed's own acquisition basis: `fed_coupon_accrual_bil`,
   `fed_tips_coupon_accrual_bil` and `fed_frn_accrual_bil` are interest earned (cash received plus the
   change in the accrued-interest receivable, so purchased accrued interest is not income),
-  `fed_tips_indexation_bil` is indexation on held TIPS, `fed_bill_discount_accretion_bil` and
-  `fed_coupon_premium_amortization_bil` amortize each lot's purchase discount or premium straight line,
-  and `fed_realized_gains_bil` books sales; they sum to `fed_treasury_income_accrued_bil`. Expenses accrue
+  `fed_tips_indexation_bil` is indexation on held TIPS, `fed_tips_floor_topup_bil` is the par Treasury
+  adds above indexed principal when a held TIPS is redeemed under its deflation floor,
+  `fed_bill_discount_accretion_bil` and `fed_coupon_premium_amortization_bil` amortize each lot's
+  purchase discount or premium straight line, and `fed_realized_gains_bil` books sales and
+  retirements; they sum to `fed_treasury_income_accrued_bil`. Expenses accrue
   on each day's closing balances at that day's rates: `fed_iorb_on_reserves_expense_bil`,
   `fed_iorb_on_fmu_balances_expense_bil` (designated financial market utilities' balances, a fixed share
   of other deposits), `fed_domestic_on_rrp_expense_bil` and `fed_foreign_repo_pool_expense_bil` (both at

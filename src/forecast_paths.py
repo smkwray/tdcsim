@@ -1349,7 +1349,7 @@ def verify_fed_remittances(
     if payments is not None:
         fed = payments["holder_sector"].astype(str).eq("CB")
         for kind, output in (("fixed_coupon", "CB_CouponCash"), ("tips_coupon", "CB_TIPSCouponCash"),
-                             ("frn_interest", "CB_FRNCash")):
+                             ("frn_interest", "CB_FRNCash"), ("tips_deflation_floor_topup", "CB_TIPSFloorTopup")):
             settled = _per_period(payments, dates, "amount_bil", fed & payments["payment_type"].eq(kind))
             _close(flows[output], settled, f"{output} against the run's payments to the Fed")
     if ledger is not None:

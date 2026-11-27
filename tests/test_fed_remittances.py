@@ -523,6 +523,49 @@ def test_the_table_4_3_input_declares_itself_a_fiscal_flow_add_back_not_a_tga_pa
     assert CBO_TABLE_4_3_FISCAL_FLOW_ROLE != CBO_FED_REMITTANCE_ROLE
 
 
+def test_the_fed_earns_a_tips_deflation_floor_and_the_exports_show_it(tmp_path):
+    """The audit's case: a held TIPS redeemed at par 100 with indexed principal 80. Treasury
+    pays the Fed 20 above the principal it held; that is Fed income, bound to the payment
+    evidence and shown among the exported lines that sum to Treasury income."""
+
+    from fed_income import FED_INCOME_EXPORT_FLOWS, TREASURY_INCOME_TERMS
+    from test_cbo_bounded_equivalence_cases import _run_equivalence
+    from test_cbo_engine_integration import _minimal_engine_params, _opening_tips_portfolio, _write_macro_path
+
+    paths = _build_temp_forecast_inputs(
+        tmp_path / "inputs", cbo_public_debt_target_bil=205.0, pre_issuance_controlled_debt_bil=100.0,
+        signed_primary_flow_bil=0.0, fed_income={**SMALL_FED, "h41_earnings_remittances_due_bil": 0.0},
+    )
+    paths["macro_forecast_path_file"] = _write_macro_path(tmp_path / "inputs", cpi_u_index=80.0)
+    opening = _opening_tips_portfolio(face_value=100.0, reference_cpi=100.0)
+    opening.loc[:, ["MaturityDate", "AdjustedPrincipal", "IndexRatio", "HolderType", "HolderSubBucket"]] = [
+        pd.Timestamp("2026-09-25"), 80.0, 0.8, "CB", "",
+    ]
+    params = _minimal_engine_params(paths, opening_controlled_debt_bil=0.0)
+    params["initial_bonds_df"] = opening
+    params["tips_params"] = {"cpi_start_level": 80.0, "cpi_annual_inflation": 0.0, "ref_cpi_lag_months": 0,
+                             "default_real_coupon_rate": 0.0}
+    results, _, sink = _run_equivalence(tmp_path, params)
+    assert results["CB_TIPSFloorTopup"].sum() == pytest.approx(20.0)
+    payments = pd.read_csv(sink.output_dir / "tdcsim_period_payment_aggregates.csv.gz")
+
+    def verify(frame):
+        return verify_fed_remittances(
+            _frame(frame), paths["fed_income_path_file"].parent, lots=results.attrs["fed_lot_journal"],
+            opening_portfolio=opening, final_portfolio=None, payments=payments,
+        )
+
+    verify(results)
+    moved = results.copy()  # the same income booked as indexation instead of the floor
+    moved["CB_TIPSIndexation"] += moved["CB_TIPSFloorTopup"]
+    moved["CB_TIPSFloorTopup"] = 0.0
+    with pytest.raises(ValueError, match="CB_TIPSFloorTopup against the run's payments"):
+        verify(moved)
+    # Every Treasury income line is exported, so the exported lines sum to the exported total.
+    assert set(TREASURY_INCOME_TERMS) <= set(FED_INCOME_EXPORT_FLOWS)
+    assert FED_INCOME_EXPORT_FLOWS["CB_TIPSFloorTopup"] == "fed_tips_floor_topup_bil"
+
+
 def test_mbs_income_follows_the_nyfed_runoff_path_from_the_h41_opening():
     source = fed_income_source_fixture()
     periods = build_simulation_calendar("2026-06-21", "2036-09-30", "daily")

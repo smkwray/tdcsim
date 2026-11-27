@@ -135,6 +135,7 @@ FED_INCOME_EXPORT_FLOWS = {
     "CB_TIPSCouponAccrual": "fed_tips_coupon_accrual_bil",
     "CB_FRNAccrual": "fed_frn_accrual_bil",
     "CB_TIPSIndexation": "fed_tips_indexation_bil",
+    "CB_TIPSFloorTopup": "fed_tips_floor_topup_bil",
     "CB_BillDiscountAccretion": "fed_bill_discount_accretion_bil",
     "CB_CouponPremiumAmortization": "fed_coupon_premium_amortization_bil",
     "CB_RealizedGains": "fed_realized_gains_bil",
