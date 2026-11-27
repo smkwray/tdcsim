@@ -522,6 +522,23 @@ def test_verifier_rebuilds_fed_amortization_from_the_lots_not_the_reported_total
         replay(output_dir)
 
 
+def test_verifier_rebuilds_the_fed_receivable_from_its_lots_terms(tmp_path):
+    """The audit's second probe: a billion of coupon income on the last day, carried through
+    the receivable, Treasury income, net income, earnings due and deferred asset, with every
+    hash refreshed. The receivable the delivered lots' terms imply exposes it."""
+
+    def fabricate(results):
+        last = results.index[-1]
+        for column in ("CB_CouponAccrual", "CB_TreasuryAccruedInterest", "CB_TreasuryInterestIncome", "CB_NetIncome",
+                       "CB_EarningsRemittancesDue"):
+            results.loc[last, column] += 1.0
+        results.loc[last, "CB_DeferredAsset"] = max(0.0, -results.loc[last, "CB_EarningsRemittancesDue"])
+
+    output_dir, verify, _ = _tampered_runner_run(tmp_path, fabricate)
+    with pytest.raises(ValueError, match="closing Fed accrued-interest receivable against its lots' terms"):
+        verify(output_dir)
+
+
 def test_replay_is_bound_to_the_results_file_delivered(tmp_path):
     """The audit's refresh left the output manifest's own record of the results stale, so the
     replay matched the original bytes while the consumer received others."""

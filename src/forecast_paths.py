@@ -1250,6 +1250,38 @@ def _check_fed_lot_boundaries(lots: pd.DataFrame, rebuilt: dict, *, opening_port
         raise ValueError("the Fed lots left open by the journal are not the Fed's lots in the final portfolio")
 
 
+def _rebuild_fed_receivable(portfolio: pd.DataFrame, day: pd.Timestamp, *, opening_day: pd.Timestamp,
+                            inputs: Path) -> float:
+    """The Fed's accrued-interest receivable at the close of ``day`` from the security terms of
+    the lots it holds: coupons and TIPS coupons accrued from their dated dates, owed coupons not
+    yet paid, and FRN interest accrued through the day, including closed days the portfolio
+    has not yet caught up at the FRN rate path's rates."""
+
+    from fed_income import accrued_interest
+    from simulation_calendar import is_fedwire_business_day
+    from sim_engine import _cbo_period_end_lookup, _fed_frn_unposted_accrual
+
+    held = portfolio["HolderType"].astype(str).eq("CB")
+    if "Status" in portfolio.columns:
+        held &= portfolio["Status"].astype(str).eq("Active")
+    fed = portfolio.loc[held].copy()
+    for column in ("IssueDate", "MaturityDate", "DatedDate", "LastAccrualDate"):
+        if column in fed.columns:
+            fed[column] = pd.to_datetime(fed[column], errors="coerce")
+    receivable = float(accrued_interest(fed, day).to_numpy().sum())
+    frn_path = inputs / "tdcsim_frn_rate_path.csv"
+    frn_frame = load_frn_rate_path(frn_path, allow_lookahead=True) if frn_path.is_file() else pd.DataFrame()
+    last_open = day
+    while day > opening_day and not is_fedwire_business_day(last_open.date()):
+        last_open -= pd.Timedelta(days=1)
+    scenario_id = str(frn_frame["scenario_id"].iloc[0]) if not frn_frame.empty else ""
+    return receivable + _fed_frn_unposted_accrual(
+        fed, day, t0=opening_day, scenario_id=scenario_id, last_payment_date=max(last_open, opening_day),
+        cbo_inputs={"frn_rate_path": frn_frame, "frn_rate_path_date_lookup": _cbo_period_end_lookup(frn_frame)}
+        if not frn_frame.empty else {},
+    )
+
+
 def verify_fed_remittances(
     results: pd.DataFrame,
     inputs_dir: str | os.PathLike[str],
@@ -1350,6 +1382,16 @@ def verify_fed_remittances(
     ):
         _close(flows[output], rebuilt[name], f"{output} against the Fed lot journal")
     _close(out["CB_TreasuryUnamortizedPremium"], rebuilt["closing_premium"], "Fed unamortized premium against its lots")
+    # The receivable at both ends, from the security terms of the lots held: with cash bound to
+    # the payments and accrued interest bought and sold bound to the lot journal, this pins the
+    # interest the Fed earned over the run.
+    _close([out["CB_TreasuryAccruedInterest"][0]],
+           [_rebuild_fed_receivable(opening_portfolio, dates.iloc[0], opening_day=dates.iloc[0], inputs=inputs)],
+           "opening Fed accrued-interest receivable against its lots' terms")
+    if final_portfolio is not None:
+        _close([out["CB_TreasuryAccruedInterest"][-1]],
+               [_rebuild_fed_receivable(final_portfolio, dates.iloc[-1], opening_day=dates.iloc[0], inputs=inputs)],
+               "closing Fed accrued-interest receivable against its lots' terms")
     _check_fed_lot_boundaries(lots, rebuilt, opening_portfolio=opening_portfolio, final_portfolio=final_portfolio,
                               dates=dates, net_premium=float(first["h41_treasury_net_premium_bil"]),
                               carried_lots=carried_lots)
