@@ -82,7 +82,7 @@ def test_opening_builder_and_verifier_roll_net_issuance_soma_and_mmf(tmp_path: P
             _book_row(4, 6, "2026-06-18", "OLD-BILL", "Banks"),
             _book_row(5, 4, "2026-06-18", "OLD-BILL", "CB"),
             _book_row(6, 20, "2028-06-15", "OLD-NOTE", "Banks", category="notes"),
-            _book_row(7, 5, "2028-06-15", "OLD-NOTE", "Private", PRIVATE_SUBBUCKET_MMF, category="notes"),
+            _book_row(7, 5, "2028-06-15", "OLD-NOTE", "Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, category="notes"),
             _book_row(8, 5, "2028-06-15", "OLD-NOTE", "CB", category="notes"),
             _book_row(9, 15, "2027-06-10", "KEEP-BILL", "Foreign"),
         ],
@@ -135,6 +135,13 @@ def test_opening_builder_and_verifier_roll_net_issuance_soma_and_mmf(tmp_path: P
         _verify_opening_counts_against_source_book(tmp_path, manifest)
     with pytest.raises(ValueError, match="simulation_start_date=2026-06-21"):
         smoke.load_opening_portfolio(book, simulation_start_date="2026-06-18", **arguments)
+    # The governed book must already be eligibility-clean: a money fund holding a note with
+    # two years left is an upstream defect, not something the roll may quietly reassign.
+    rows = list(csv.DictReader(book.open(newline="")))
+    rows[6]["HolderSubBucket"] = PRIVATE_SUBBUCKET_MMF
+    _write_rows(book, rows)
+    with pytest.raises(ValueError, match="ineligible OLD-NOTE"):
+        smoke.load_opening_portfolio(book, simulation_start_date=START, **arguments)
 
 
 def test_opening_cash_and_splice_use_same_close(tmp_path: Path) -> None:

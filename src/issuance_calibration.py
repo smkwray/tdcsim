@@ -1543,18 +1543,19 @@ def prestart_rollforward(
         group_fed = group["HolderType"].eq("CB")
         group_mmf = group["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF).fillna(False)
         eligible_at_close = mmf_may_acquire(template["SecurityType"], template["MaturityDate"], close)
-        ineligible = group_mmf & (not eligible_at_close)
+        if group_mmf.any() and not eligible_at_close:
+            # The governed book already holds money funds to eligible lots and the roll
+            # only adds eligible ones, so an ineligible lot here is a defect upstream.
+            raise IssuanceCalibrationError(f"the opening book gives money funds ineligible {cusip} at the close")
         total = float(group["FaceValue"].sum())
         fed_gap = target_fed - float(group.loc[group_fed, "FaceValue"].sum())
         # Reassign Fed differences against this CUSIP's non-Fed holders only.
-        # When the source book pays a money fund ineligible face, redistribute that
-        # stock among other holders of the CUSIP in proportion to their current face.
-        public = group.loc[~(group_fed | ineligible)]
+        public = group.loc[~group_fed]
         public_face = float(public["FaceValue"].sum())
         target_public = total - target_fed
         if target_public < -1e-9:
             raise IssuanceCalibrationError(f"SOMA holds more {cusip} than the rolled public debt")
-        if abs(fed_gap) <= 1e-9 and not ineligible.any():
+        if abs(fed_gap) <= 1e-9:
             result.extend(group.to_dict("records"))
             continue
         if public_face == 0 and target_public > 1e-9:
