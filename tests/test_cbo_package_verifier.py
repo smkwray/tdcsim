@@ -1299,7 +1299,7 @@ def _write_source_package(package: Path) -> dict:
     }
     _write_json(
         package / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json",
-        {"artifacts": {"initial_portfolio": {"noncb_weights": {"bills": shares, "nonbills": shares}}}},
+        {"artifacts": {"initial_portfolio": {"noncb_weights": {"bills": shares, "nonbills": shares, "frn_mmf_auction_share": 0.7}}}},
     )
     _write_csv(
         package / "sources" / "fiscaldata" / "tips_cpi_data_detail.csv",

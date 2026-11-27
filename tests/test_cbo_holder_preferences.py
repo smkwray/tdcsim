@@ -29,6 +29,8 @@ WEIGHTS = {
         "Private/domestic_nonbank_deposit_funded": 0.43,
         "Private/mmf_cash_fund_route": 0.05,
     },
+    # Money funds' calibrated share of new FRNs, from N-MFP.
+    "frn_mmf_auction_share": 0.70,
 }
 
 
@@ -36,8 +38,8 @@ def test_new_issuance_follows_opening_holdings_of_bills_or_longer_securities():
     preferences, routes = holder_profile_from_opening_weights(WEIGHTS)
 
     validate_holder_preferences_non_degenerate(preferences)
-    # Bills and FRNs keep their measured shares. Each longer security removes the
-    # money-fund share while preserving the proportions among the other holders.
+    # Bills keep their measured shares. Each longer security removes the money-fund share
+    # while preserving the proportions among the other holders.
     assert preferences["Foreign"]["bills_pct"] == pytest.approx(0.20)
     for category in ("notes", "bonds", "tips"):
         assert preferences["Banks"][f"{category}_pct"] == pytest.approx(0.08 / 0.95)
@@ -45,12 +47,30 @@ def test_new_issuance_follows_opening_holdings_of_bills_or_longer_securities():
         assert preferences["Private"][f"{category}_pct"] == pytest.approx(0.43 / 0.95)
         assert routes[category]["mmf_cash_fund_route"] == 0.0
         assert routes[category]["domestic_nonbank_deposit_funded"] == 1.0
-    assert preferences["Foreign"]["frn_pct"] == pytest.approx(0.44)
-    assert preferences["Private"]["frn_pct"] == pytest.approx(0.48)
     assert routes["bills"]["mmf_cash_fund_route"] == pytest.approx(0.5)
-    assert routes["frn"]["mmf_cash_fund_route"] == pytest.approx(0.05 / 0.48)
     # The Fed follows its own stock path and takes no new issuance.
     assert all(value == 0.0 for value in preferences["CB"].values())
+
+
+def test_money_funds_take_the_calibrated_frn_share_and_others_scale_pro_rata():
+    # Money funds hold about 70% of new FRN supply a month after issue, an order of magnitude
+    # above their 5% WAMEST share of longer securities. The other holders keep their WAMEST
+    # proportions over the remaining 30%.
+    preferences, routes = holder_profile_from_opening_weights(WEIGHTS)
+    mmf = preferences["Private"]["frn_pct"] * routes["frn"]["mmf_cash_fund_route"]
+    dn = preferences["Private"]["frn_pct"] * routes["frn"]["domestic_nonbank_deposit_funded"]
+
+    assert mmf == pytest.approx(0.70)
+    scale = 0.30 / 0.95
+    assert preferences["Banks"]["frn_pct"] == pytest.approx(0.08 * scale)
+    assert preferences["Foreign"]["frn_pct"] == pytest.approx(0.44 * scale)
+    assert dn == pytest.approx(0.43 * scale)
+    assert sum(preferences[holder]["frn_pct"] for holder in HOLDER_TYPES) == pytest.approx(1.0)
+    # Only FRNs change: notes still give money funds nothing, and bills keep their WAMEST split.
+    other = holder_profile_from_opening_weights({**WEIGHTS, "frn_mmf_auction_share": 0.20})
+    assert other[0]["Foreign"]["notes_pct"] == pytest.approx(preferences["Foreign"]["notes_pct"])
+    assert other[1]["bills"] == pytest.approx(routes["bills"])
+    assert other[0]["Foreign"]["frn_pct"] == pytest.approx(0.44 * 0.80 / 0.95)
 
 
 def test_profile_rows_carry_holder_and_route_shares():
@@ -110,6 +130,10 @@ def test_engine_issues_bills_and_frns_to_money_funds_and_routes_long_coupons_els
         {"bills": WEIGHTS["bills"]},
         {**WEIGHTS, "bills": {**WEIGHTS["bills"], "Banks": 0.30}},
         {**WEIGHTS, "nonbills": {"Banks": 1.0}},
+        # The calibrated FRN share is required and must be a share.
+        {"bills": WEIGHTS["bills"], "nonbills": WEIGHTS["nonbills"]},
+        {**WEIGHTS, "frn_mmf_auction_share": 1.0},
+        {**WEIGHTS, "frn_mmf_auction_share": "0.7"},
     ],
 )
 def test_malformed_opening_weights_raise(weights):

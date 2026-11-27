@@ -34,6 +34,7 @@ from mmf_eligibility import MMF_MAX_REMAINING_DAYS, mmf_eligible_mask
 from sim_pricing import evaluate_nominal_yield, value_treasury_security
 from tdc_shared import (
     DAYS_PER_YEAR_ACTUAL,
+    FRN_MMF_AUCTION_SHARE_KEY,
     MARKETABLE_PREFERENCE_CATEGORIES,
     MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
     MMF_DEPOSIT_PASS_THROUGH_SENSITIVITY_GRID,
@@ -95,6 +96,10 @@ FRN_OVERRIDE_CLAIM = (
 # securities within 397 days, each within this relative gap.
 NMFP_MIX_TOLERANCE = 0.05
 NMFP_MIX_BUCKETS = ("total", "bills", "frn", "coupon_le397")
+# FRN auction tranches, by settlement date, that calibrate the money-fund share of new FRN
+# supply: four two-year FRNs, each a new issue and two reopenings, measured on N-MFP
+# month-ends through April 2026.
+FRN_AUCTION_SHARE_WINDOW = ("2025-04-01", "2026-03-31")
 OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
 # WAMEST records each sector's Financial Accounts level basis. A market value (an LM series,
 # as for foreign holders) converts to par with its group's factor. Any other level (the FL
@@ -471,6 +476,67 @@ def _nmfp_bucket(security_class: str, maturity_date, record_date: str) -> str:
         return security_class
     days = (pd.Timestamp(maturity_date) - pd.Timestamp(record_date)).days
     return "coupon_le397" if days <= MMF_MAX_REMAINING_DAYS else "coupon_gt397"
+
+
+def calibrate_mmf_frn_auction_share(holdings: pd.DataFrame, auctions_path: Path) -> dict:
+    """Money funds' share of new FRN supply, from N-MFP holdings and auction results.
+
+    Treasury sells each two-year FRN as a new issue and two monthly reopenings, and N-MFP
+    reports month-end holdings, so a month after any tranche but the last the next one has
+    already settled. Each FRN whose tranches all settle in ``FRN_AUCTION_SHARE_WINDOW`` is
+    therefore one observation: money-fund holdings at the month-end one month after its
+    last tranche, over the public amount accepted (total less SOMA) across its tranches.
+    The share is the amount-weighted mean of the observations.
+    """
+
+    auctions = pd.read_csv(auctions_path, dtype=str)
+    missing = [column for column in ("cusip", "issue_date", "floating_rate", "total_accepted", "soma_accepted") if column not in auctions]
+    if missing:
+        raise ValueError(f"{auctions_path.name} lacks FRN auction columns {missing}")
+    frns = auctions.loc[auctions["floating_rate"].eq("Yes")].assign(issue=pd.to_datetime(auctions["issue_date"], errors="coerce"))
+    start, end = (pd.Timestamp(day) for day in FRN_AUCTION_SHARE_WINDOW)
+    in_window = sorted(set(frns.loc[frns["issue"].between(start, end), "cusip"]))
+    if not in_window:
+        raise ValueError(f"{auctions_path.name} has no FRN auction settling in {FRN_AUCTION_SHARE_WINDOW}")
+    filed = holdings.loc[holdings["security_class"].eq("frn")].set_index(["report_date", "cusip"])["value_bil"]
+    report_dates = set(holdings["report_date"])
+    observations = []
+    for cusip in in_window:
+        tranches = frns.loc[frns["cusip"].eq(cusip)].sort_values("issue")
+        if not tranches["issue"].between(start, end).all():
+            raise ValueError(f"FRN {cusip} has tranches outside the calibration window {FRN_AUCTION_SHARE_WINDOW}")
+        accepted = pd.to_numeric(tranches["total_accepted"], errors="coerce")
+        soma = pd.to_numeric(tranches["soma_accepted"], errors="coerce")
+        if accepted.isna().any() or soma.isna().any():
+            raise ValueError(f"{auctions_path.name} lacks accepted amounts for a tranche of FRN {cusip}")
+        public = float((accepted - soma).sum()) / 1e9
+        measured = (tranches["issue"].iloc[-1] + pd.offsets.MonthEnd(0) + pd.offsets.MonthEnd(1)).date().isoformat()
+        if measured not in report_dates:
+            raise ValueError(f"N-MFP holdings have no report at {measured}, a month after FRN {cusip}'s last tranche")
+        held = float(filed.get((measured, cusip), 0.0))
+        observations.append(
+            {
+                "cusip": cusip,
+                "tranche_issue_dates": [day.date().isoformat() for day in tranches["issue"]],
+                "public_accepted_bil": public,
+                "measured_at": measured,
+                "mmf_holdings_bil": held,
+                "share": held / public,
+            }
+        )
+    shares = [row["share"] for row in observations]
+    return {
+        "share": sum(row["mmf_holdings_bil"] for row in observations) / sum(row["public_accepted_bil"] for row in observations),
+        "range": [min(shares), max(shares)],
+        "window": list(FRN_AUCTION_SHARE_WINDOW),
+        "auctions": sum(len(row["tranche_issue_dates"]) for row in observations),
+        "rule": (
+            "per FRN whose tranches all settle in the window: N-MFP money-fund holdings one month-end after its "
+            "last tranche over the public amount accepted across its tranches; amount-weighted over FRNs"
+        ),
+        "observations": observations,
+        "auctions_source": {"file": auctions_path.name, "sha256": _sha256(auctions_path)},
+    }
 
 
 def _apply_mmf_frn_holdings(candidate_rows: list[dict], targets: dict[str, float]) -> dict:
@@ -1220,7 +1286,9 @@ def build_initial_portfolio(
     exchange uses book par (inflation-adjusted outstanding for TIPS). Money funds
     then hold their SEC N-MFP floating-rate notes by CUSIP at the record date, for an
     equal par of their bills (``_apply_mmf_frn_holdings``), and the book's money-fund
-    mix must match the filings within ``NMFP_MIX_TOLERANCE``.
+    mix must match the filings within ``NMFP_MIX_TOLERANCE``. Money funds' share of new
+    FRN supply is calibrated from the same filings (``calibrate_mmf_frn_auction_share``)
+    and recorded with the new-issuance weights.
     """
 
     soma_as_of, soma = load_soma_cusip_holdings(soma_path)
@@ -1457,6 +1525,8 @@ def build_initial_portfolio(
         "zips": nmfp_provenance["zips"],
     }
     mix_check = _check_mmf_mix(candidate_rows, filed, record_date=record_date)
+    frn_auction_share = calibrate_mmf_frn_auction_share(nmfp, auctions_path)
+    frn_auction_share["nmfp_source"] = {"file": nmfp_holdings_path.name, "sha256": _sha256(nmfp_holdings_path)}
 
     output_rows: list[dict] = []
     bond_id = 1
@@ -1616,13 +1686,21 @@ def build_initial_portfolio(
         "noncb_source": WAMEST_CANONICAL_RELATIVE_PATH,
         "noncb_source_sha256": _sha256(wamest_path),
         "wamest_date": noncb["wamest_date"],
-        # New-issuance holder shares read these measured shares; the opening book's own
-        # pre-swap split is opening_allocation.groups.*.route_weights.
+        # New-issuance holder shares read these measured shares, except that money funds
+        # take the N-MFP-calibrated share of new FRNs; the opening book's own pre-swap split
+        # is opening_allocation.groups.*.route_weights.
         "noncb_weights": {
-            group: {_route_key(route): share for route, share in shares.items()}
-            for group, shares in noncb["weights"].items()
+            **{
+                group: {_route_key(route): share for route, share in shares.items()}
+                for group, shares in noncb["weights"].items()
+            },
+            FRN_MMF_AUCTION_SHARE_KEY: frn_auction_share["share"],
         },
-        "noncb_weights_basis": "wamest_measured_market_value_shares_for_new_issuance_not_opening_split",
+        "noncb_weights_basis": (
+            "wamest_measured_market_value_shares_for_new_issuance_not_opening_split;"
+            "frn_money_fund_share_calibrated_from_sec_nmfp"
+        ),
+        "frn_mmf_auction_share_calibration": frn_auction_share,
         "opening_allocation": {
             "rule": OPENING_ALLOCATION_RULE,
             "measured_holdings_basis": "wamest_level_times_bill_share_by_level_basis",

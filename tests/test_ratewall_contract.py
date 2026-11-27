@@ -1138,18 +1138,32 @@ def _opening_book_inputs(
     ).to_csv(curve_path, index=False)
 
     auctions_path = tmp_path / "auctions.csv"
-    pd.DataFrame(
-        [
+    auctions = [
+        {
+            "issue_date": issue,
+            "cusip": cusip,
+            "soma_accepted": amount,
+            "inflation_index_security": tips,
+            "index_ratio_on_issue_date": ratio,
+            "floating_rate": "No",
+            "total_accepted": "",
+        }
+        for issue, cusip, amount, tips, ratio in (_OPENING_AUCTIONS if auction_rows is None else auction_rows)
+    ]
+    if auction_rows is None:
+        auctions += [
             {
                 "issue_date": issue,
                 "cusip": cusip,
-                "soma_accepted": amount,
-                "inflation_index_security": tips,
-                "index_ratio_on_issue_date": ratio,
+                "soma_accepted": soma,
+                "inflation_index_security": "No",
+                "index_ratio_on_issue_date": "",
+                "floating_rate": "Yes",
+                "total_accepted": total,
             }
-            for issue, cusip, amount, tips, ratio in (_OPENING_AUCTIONS if auction_rows is None else auction_rows)
+            for issue, cusip, soma, total in _CALIBRATION_FRN_AUCTIONS
         ]
-    ).to_csv(auctions_path, index=False)
+    pd.DataFrame(auctions).to_csv(auctions_path, index=False)
     return {
         "record_date": "2026-04-30",
         "table1_rows": table1,
@@ -1158,8 +1172,29 @@ def _opening_book_inputs(
         "wamest_path": wamest_path,
         "yield_curve_path": curve_path,
         "auctions_path": auctions_path,
-        "nmfp_holdings_path": _write_nmfp(tmp_path / rib.NMFP_HOLDINGS_FILENAME, nmfp_rows or _OPENING_NMFP_ROWS),
+        "nmfp_holdings_path": _write_nmfp(
+            tmp_path / rib.NMFP_HOLDINGS_FILENAME, [*(nmfp_rows or _OPENING_NMFP_ROWS), *_CALIBRATION_NMFP_ROWS]
+        ),
     }
+
+
+# Two FRNs settle in the calibration window, each a new issue and two reopenings of 86 bn
+# to the public (the Fed adds 2 bn at the new issue). A month after its last tranche money
+# funds hold 60.2 bn of the first and 51.6 bn of the second: shares 0.70 and 0.60, 0.65 in all.
+_CALIBRATION_FRN_AUCTIONS = [
+    ("2025-04-30", "FAKEFRNA1", "2000000000", "32000000000"),
+    ("2025-05-30", "FAKEFRNA1", "0", "28000000000"),
+    ("2025-06-27", "FAKEFRNA1", "0", "28000000000"),
+    ("2025-07-31", "FAKEFRNB1", "0", "30000000000"),
+    ("2025-08-29", "FAKEFRNB1", "0", "28000000000"),
+    ("2025-09-26", "FAKEFRNB1", "0", "28000000000"),
+]
+_CALIBRATION_NMFP_ROWS = [
+    # Before the last tranche settles; not the measurement.
+    ("2025-06-30", "FAKEFRNA1", "frn", "2027-04-30", 50.0),
+    ("2025-07-31", "FAKEFRNA1", "frn", "2027-04-30", 60.2),
+    ("2025-10-31", "FAKEFRNB1", "frn", "2027-07-31", 51.6),
+]
 
 
 # N-MFP money-fund holdings as (report date, CUSIP, class, maturity, value in bn).
@@ -1553,6 +1588,49 @@ def test_opening_book_rejects_n_mfp_holdings_without_matching_provenance(tmp_pat
     inputs = _opening_book_inputs(tmp_path, nmfp_rows=[_OPENING_NMFP_ROWS[2]])
     with pytest.raises(ValueError, match="no money-fund holdings reported at 2026-04-30"):
         rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+def test_opening_book_calibrates_the_money_fund_share_of_new_frns_from_n_mfp(tmp_path):
+    # Money funds' share of new FRN supply is measured, not assumed: their holdings a month
+    # after each FRN's last tranche over the public amount accepted across its tranches.
+    from cbo_holder_preferences import holder_profile_from_opening_weights
+
+    _, metadata = rib.build_initial_portfolio(tmp_path / "cohorts.csv", **_opening_book_inputs(tmp_path))
+    calibration = metadata["frn_mmf_auction_share_calibration"]
+    share = metadata["noncb_weights"]["frn_mmf_auction_share"]
+    assert share == pytest.approx((60.2 + 51.6) / 172.0)
+    assert calibration["range"] == pytest.approx([0.60, 0.70])
+    assert calibration["auctions"] == 6
+    observed = {row["cusip"]: row for row in calibration["observations"]}
+    assert observed["FAKEFRNA1"]["measured_at"] == "2025-07-31"
+    assert observed["FAKEFRNA1"]["public_accepted_bil"] == pytest.approx(86.0)
+    assert calibration["auctions_source"]["sha256"] == rib._sha256(tmp_path / "auctions.csv")
+    # The package's new-issuance profile reads these weights, so money funds take that share of new FRNs.
+    preferences, routes = holder_profile_from_opening_weights(metadata["noncb_weights"])
+    assert preferences["Private"]["frn_pct"] * routes["frn"]["mmf_cash_fund_route"] == pytest.approx(share)
+
+
+@pytest.mark.parametrize(
+    ("auctions", "nmfp", "message"),
+    [
+        # An FRN with a tranche outside the window would be measured with unpaired holdings.
+        (_CALIBRATION_FRN_AUCTIONS + [("2026-04-30", "FAKEFRNB1", "0", "28000000000")], _CALIBRATION_NMFP_ROWS, "outside the calibration window"),
+        (_CALIBRATION_FRN_AUCTIONS, _CALIBRATION_NMFP_ROWS[:2], "no report at 2025-10-31"),
+        ([*_CALIBRATION_FRN_AUCTIONS[:5], ("2025-09-26", "FAKEFRNB1", "0", "")], _CALIBRATION_NMFP_ROWS, "lacks accepted amounts"),
+        ([("2024-04-30", "FAKEFRNZ1", "0", "30000000000")], _CALIBRATION_NMFP_ROWS, "no FRN auction settling"),
+    ],
+)
+def test_frn_auction_share_calibration_fails_loudly_on_incomplete_inputs(tmp_path, auctions, nmfp, message):
+    auctions_path = tmp_path / "auctions.csv"
+    pd.DataFrame(
+        [
+            {"issue_date": issue, "cusip": cusip, "floating_rate": "Yes", "soma_accepted": soma, "total_accepted": total}
+            for issue, cusip, soma, total in auctions
+        ]
+    ).to_csv(auctions_path, index=False)
+    holdings, _ = rib.load_nmfp_mmf_holdings(_write_nmfp(tmp_path / rib.NMFP_HOLDINGS_FILENAME, nmfp))
+    with pytest.raises(ValueError, match=message):
+        rib.calibrate_mmf_frn_auction_share(holdings, auctions_path)
 
 
 def test_soma_loader_rejects_files_without_required_columns(tmp_path):

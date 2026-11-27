@@ -78,7 +78,7 @@ def _roll(tmp_path: Path, auctions: list[dict[str, str]], *, soma_rows=()):
     }
     return prestart_rollforward(
         BOOK, settlements, opening_close_date=CLOSE, record_date=RECORD, cusip_column="_cusip",
-        noncb_weights={"bills": shares, "nonbills": shares},
+        noncb_weights={"bills": shares, "nonbills": shares, "frn_mmf_auction_share": 0.7},
         soma=pd.DataFrame(soma_rows, columns=["cusip", "amount_mil", "maturity_date"]), soma_as_of_date="2026-06-17",
     )
 

@@ -3,8 +3,11 @@
 New issuance is divided among non-Fed holders in proportion to their holdings in the
 opening book: bills by holdings of bills, every other security type by holdings of
 longer securities. Those weights come from WAMEST and are recorded in the opening-book
-manifest. The money-fund share of ineligible issuance is redistributed to the other
-non-Fed holders. The Federal Reserve follows its own stock path.
+manifest. Floating-rate notes are the exception: money funds take the share of new FRN
+supply calibrated from SEC N-MFP filings, also recorded there, and the other non-Fed
+holders share the rest in their WAMEST proportions. The money-fund share of ineligible
+issuance is redistributed to the other non-Fed holders. The Federal Reserve follows its
+own stock path.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from issuance_calibration import BILL_TERM_WEEKS, COUPON_KIND_SECURITY_TYPE, COU
 from mmf_eligibility import mmf_may_acquire
 from sim_pricing import get_security_category_for_prefs
 from tdc_shared import (
+    FRN_MMF_AUCTION_SHARE_KEY,
     HOLDER_TYPES,
     MARKETABLE_PREFERENCE_CATEGORIES,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
@@ -44,14 +48,24 @@ def _eligible_auction_categories() -> set[str]:
     return {category for category, eligible in category_eligibility.items() if all(eligible)}
 
 
+def _with_mmf_share(shares: Mapping[str, float], mmf_share: float) -> dict[str, float]:
+    """Give money funds ``mmf_share`` and scale the other holders pro rata to the rest."""
+
+    others = sum(value for key, value in shares.items() if key != _MMF_KEY)
+    if others <= 0.0:
+        raise ValueError("opening-book noncb_weights give FRNs no holders besides money funds")
+    return {key: mmf_share if key == _MMF_KEY else value * (1.0 - mmf_share) / others for key, value in shares.items()}
+
+
 def holder_profile_from_opening_weights(
-    noncb_weights: Mapping[str, Mapping[str, float]],
+    noncb_weights: Mapping[str, Any],
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
     """Return (holder preferences, private subbucket shares) from opening-book weights.
 
     ``noncb_weights`` maps ``bills`` and ``nonbills`` to shares keyed ``Banks``,
     ``Foreign``, ``Private/domestic_nonbank_deposit_funded`` and
-    ``Private/mmf_cash_fund_route``, as written by ``ratewall_input_builder``.
+    ``Private/mmf_cash_fund_route``, and ``frn_mmf_auction_share`` to money funds'
+    calibrated share of new FRNs, as written by ``ratewall_input_builder``.
     """
 
     groups = {}
@@ -63,6 +77,9 @@ def holder_profile_from_opening_weights(
         if any(value < 0.0 for value in values.values()) or abs(sum(values.values()) - 1.0) > 1e-9:
             raise ValueError(f"opening-book noncb_weights[{group!r}] must be nonnegative and sum to 1")
         groups[group] = values
+    mmf_frn_share = noncb_weights.get(FRN_MMF_AUCTION_SHARE_KEY)
+    if isinstance(mmf_frn_share, bool) or not isinstance(mmf_frn_share, (int, float)) or not 0.0 < mmf_frn_share < 1.0:
+        raise ValueError(f"opening-book noncb_weights[{FRN_MMF_AUCTION_SHARE_KEY!r}] must be a share between 0 and 1")
 
     preferences: dict[str, dict[str, float]] = {
         holder: {f"{category}_pct": 0.0 for category in (*MARKETABLE_PREFERENCE_CATEGORIES, "nonmarketable")}
@@ -72,6 +89,8 @@ def holder_profile_from_opening_weights(
     eligible_categories = _eligible_auction_categories()
     for category in MARKETABLE_PREFERENCE_CATEGORIES:
         shares = groups["bills" if category == "bills" else "nonbills"]
+        if category == "frn":
+            shares = _with_mmf_share(shares, float(mmf_frn_share))
         if category not in eligible_categories:
             eligible_weight = sum(shares[key] for key in _WEIGHT_KEYS if key != _MMF_KEY)
             if eligible_weight <= 0.0:
@@ -108,7 +127,10 @@ def build_holder_profile_rows(
             "holder_subbucket": "",
             "source_role": "opening_book_stock_shares",
             "runtime_role": "new_issuance_holder_shares",
-            "claim_boundary": "new issuance follows WAMEST bill or nonbill shares among eligible non-Fed holders",
+            "claim_boundary": (
+                "new issuance follows WAMEST bill or nonbill shares among eligible non-Fed holders; "
+                "money funds take the SEC N-MFP-calibrated share of new FRNs"
+            ),
         }
         for category in MARKETABLE_PREFERENCE_CATEGORIES:
             row[f"{category}_pct"] = float(holder_prefs.get(f"{category}_pct", 0.0) or 0.0)
