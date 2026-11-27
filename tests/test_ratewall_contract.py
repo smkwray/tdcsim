@@ -1681,6 +1681,78 @@ def test_frn_auction_share_counts_a_verified_zero_holding(tmp_path):
     assert calibration["range"] == pytest.approx([0.0, 0.70])
 
 
+def _rebuilt_input_dir(tmp_path, name, **overrides):
+    """Rebuild an opening book into its own input directory, as the governed build does."""
+
+    sources = tmp_path / f"{name}_sources"
+    sources.mkdir()
+    inputs = _opening_book_inputs(sources, **overrides)
+    out = tmp_path / name
+    out.mkdir()
+    tables = {}
+    for key, rows in (("mspd_table_1", inputs["table1_rows"]), ("mspd_table_3_market", inputs["table3_rows"])):
+        tables[key] = tmp_path / f"{name}_{key}.csv"
+        pd.DataFrame([{**row, "record_date": "2026-04-30"} for row in rows]).to_csv(tables[key], index=False)
+    curve = out / rib.YIELD_CURVE_SURFACE_FILENAME
+    curve.write_bytes(inputs["yield_curve_path"].read_bytes())
+    nmfp = inputs["nmfp_holdings_path"]
+    for path in (nmfp, nmfp.with_suffix(".provenance.json")):
+        (out / path.name).write_bytes(path.read_bytes())
+    (out / "tdcsim_ratewall_input_manifest.json").write_text(
+        json.dumps({"artifacts": {}, "files": {curve.name: {"sha256": rib._sha256(curve)}}, "source_hierarchy": {}}),
+        encoding="utf-8",
+    )
+    manifest = rib.rebuild_opening_book(
+        out,
+        record_date="2026-04-30",
+        soma_holdings=inputs["soma_path"],
+        wamest_canonical=inputs["wamest_path"],
+        auctions_query=inputs["auctions_path"],
+        **tables,
+    )
+    return out, manifest, inputs["auctions_path"]
+
+
+def test_package_rederives_the_n_mfp_book_and_share_and_rejects_an_older_book(tmp_path):
+    # A package carries the book, its manifest and the N-MFP extract. Everything the
+    # manifest claims from the filings must rebuild from those exact files, so a book from
+    # before the filings were applied cannot ride along with the newer manifest.
+    out, manifest, auctions = _rebuilt_input_dir(tmp_path, "new", frns=_FRN_FIXTURE, nmfp_rows=_FRN_NMFP_ROWS)
+    book = out / rib.OPENING_BOOK_FILENAME
+    check = {
+        "book_path": book,
+        "nmfp_holdings_path": out / rib.NMFP_HOLDINGS_FILENAME,
+        "auctions_path": auctions,
+        "information_date": "2026-06-22",
+    }
+    result = rib.verify_opening_book_against_nmfp(manifest, **check)
+    assert result["frn_cusips"] == 2
+    assert result["frn_mmf_auction_share"] == pytest.approx((60.2 + 51.6) / 172.0)
+
+    # The older book: money funds filed 50 bn of the first FRN, not 60.
+    older_rows = [_FRN_NMFP_ROWS[0], *_FRN_NMFP_ROWS[1:2], ("2026-04-30", "FAKEFRN01", "frn", "2027-04-30", 50.0), _FRN_NMFP_ROWS[3]]
+    older, _, _ = _rebuilt_input_dir(tmp_path, "older", frns=_FRN_FIXTURE, nmfp_rows=older_rows)
+    book.write_bytes((older / rib.OPENING_BOOK_FILENAME).read_bytes())
+    with pytest.raises(ValueError, match="is not the file the opening-book manifest hashes"):
+        rib.verify_opening_book_against_nmfp(manifest, **check)
+    # Re-hashing the manifest to the older book still fails on the money funds' FRNs.
+    rehashed = json.loads(json.dumps(manifest))
+    rehashed["files"][rib.OPENING_BOOK_FILENAME]["sha256"] = rib._sha256(book)
+    with pytest.raises(ValueError, match=r"differ from the N-MFP filings: \['FAKEFRN01'\]"):
+        rib.verify_opening_book_against_nmfp(rehashed, **check)
+
+    out, manifest, auctions = _rebuilt_input_dir(tmp_path, "again", frns=_FRN_FIXTURE, nmfp_rows=_FRN_NMFP_ROWS)
+    check = {**check, "book_path": out / rib.OPENING_BOOK_FILENAME, "nmfp_holdings_path": out / rib.NMFP_HOLDINGS_FILENAME}
+    # An edited auction share no longer matches the calibration it claims.
+    edited = json.loads(json.dumps(manifest))
+    edited["artifacts"]["initial_portfolio"]["noncb_weights"]["frn_mmf_auction_share"] = 0.054
+    with pytest.raises(ValueError, match="auction share does not rebuild"):
+        rib.verify_opening_book_against_nmfp(edited, **check)
+    # Filings selected after the package's information date were not known on it.
+    with pytest.raises(ValueError, match="after the information date 2026-06-21"):
+        rib.verify_opening_book_against_nmfp(manifest, **{**check, "information_date": "2026-06-21"})
+
+
 def test_soma_loader_rejects_files_without_required_columns(tmp_path):
     path = tmp_path / "soma.csv"
     pd.DataFrame([{"As Of Date": "2026-04-29", "CUSIP": "'FAKEBILL1'"}]).to_csv(path, index=False)

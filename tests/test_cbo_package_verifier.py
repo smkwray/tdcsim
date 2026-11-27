@@ -17,6 +17,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from scripts.verify_cbo_forecast_package import REQUIRED_FILES, create_package_zip, verify_package
+import ratewall_input_builder as rib
 from cbo_opening_actuals import (
     ACTUALS_AVAILABLE_AS_OF, DTS_CASH_SOURCE, DTS_FISCAL_LINES, DTS_FLOWS_SOURCE,
     DTS_TGA_CLOSING_ACCOUNT, DTS_TGA_OPENING_ACCOUNT, OPENING_CLOSE_DATE,
@@ -233,6 +234,43 @@ def test_cbo_package_verifier_rejects_pending_cash_at_a_fiscal_year_end(tmp_path
     _refresh_manifest_hashes(package)
 
     with pytest.raises(ValueError, match="pending issuance at the fiscal-year end"):
+        verify_package(package)
+
+
+def test_cbo_package_verifier_rejects_an_older_opening_book_with_the_newer_manifest(tmp_path: Path) -> None:
+    # A book from before money funds were given their filed FRNs must not pass with the
+    # manifest and N-MFP extract that describe the newer book, even when every hash is refreshed.
+    package = _write_valid_package(tmp_path / "pkg")
+    book_path = package / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv"
+    rows = _read_csv(book_path)
+    for row in rows:
+        if row["HolderSubBucket"] == PRIVATE_SUBBUCKET_MMF:
+            row["HolderSubBucket"] = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+    _write_csv(book_path, list(rows[0]), rows)
+    _refresh_source_package_hashes(package)
+    _refresh_manifest_hashes(package)
+    with pytest.raises(ValueError, match="is not the file the opening-book manifest hashes"):
+        verify_package(package)
+
+    governed_path = package / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json"
+    governed = json.loads(governed_path.read_text(encoding="utf-8"))
+    governed["files"]["tdcsim_initial_portfolio_cohorts.csv"]["sha256"] = hashlib.sha256(book_path.read_bytes()).hexdigest()
+    _write_json(governed_path, governed)
+    _refresh_source_package_hashes(package)
+    _refresh_manifest_hashes(package)
+    with pytest.raises(ValueError, match="differ from the N-MFP filings"):
+        verify_package(package)
+
+
+def test_cbo_package_verifier_rejects_an_edited_frn_auction_share(tmp_path: Path) -> None:
+    package = _write_valid_package(tmp_path / "pkg")
+    governed_path = package / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json"
+    governed = json.loads(governed_path.read_text(encoding="utf-8"))
+    governed["artifacts"]["initial_portfolio"]["noncb_weights"]["frn_mmf_auction_share"] = 0.054
+    _write_json(governed_path, governed)
+    _refresh_source_package_hashes(package)
+    _refresh_manifest_hashes(package)
+    with pytest.raises(ValueError, match="auction share does not rebuild"):
         verify_package(package)
 
 
@@ -892,7 +930,10 @@ def _write_source_opening_book(package: Path) -> None:
         if security_type == "TIPS":
             source_row["FaceValue"] = source_row["AdjustedPrincipal"]
         if source_row["HolderType"] == "Private":
-            source_row["HolderSubBucket"] = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+            # Money funds hold the private FRNs, as their N-MFP filings in the package say.
+            source_row["HolderSubBucket"] = (
+                PRIVATE_SUBBUCKET_MMF if security_type == "FRN" else PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+            )
         rows.append(source_row)
     _write_csv(package / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv", list(rows[0]), rows)
 
@@ -1386,10 +1427,6 @@ def _write_source_package(package: Path) -> dict:
         "Banks": 0.25, "Foreign": 0.25, f"Private/{PRIVATE_SUBBUCKET_DOMESTIC_NONBANK}": 0.5,
         f"Private/{PRIVATE_SUBBUCKET_MMF}": 0.0,
     }
-    _write_json(
-        package / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json",
-        {"artifacts": {"initial_portfolio": {"noncb_weights": {"bills": shares, "nonbills": shares, "frn_mmf_auction_share": 0.7}}}},
-    )
     _write_csv(
         package / "sources" / "fiscaldata" / "tips_cpi_data_detail.csv",
         ["cusip", "original_issue_date", "index_date", "ref_cpi", "index_ratio"],
@@ -1417,16 +1454,25 @@ def _write_source_package(package: Path) -> dict:
     # and rates; the fixture's one bill settling before the start takes the matured rows.
     rollforward_fields = {"original_issue_date": "null", "int_rate": "null", "price_per100": "99.0",
                           "high_investment_rate": "4.0", "high_yield": "null"}
+    # The fixture's lone FRN reopening moves past the FRN calibration window, which admits only
+    # complete FRNs (a new issue and two reopenings); it still counts in the coupon mix.
     auction_rows = [
         {**row, "record_date": OPENING_CLOSE_DATE, "issue_date": OPENING_CLOSE_DATE, "maturity_date": "2026-09-17"}
-        if row["issue_date"] == "2026-06-16" else row
+        if row["issue_date"] == "2026-06-16"
+        else {**row, "record_date": "2026-04-24", "issue_date": "2026-04-24"}
+        if row["floating_rate"] == "Yes"
+        else row
         for row in _fixture_auctions()
     ]
     _write_auctions(
         package / "sources" / "fiscaldata" / "auctions_query.csv",
-        [{"cusip": f"AUC{index:03d}", **rollforward_fields, **row} for index, row in enumerate(auction_rows)],
-        columns=["record_date", *AUCTION_REQUIRED_COLUMNS, "cusip", *rollforward_fields],
+        [
+            *({"cusip": f"AUC{index:03d}", **rollforward_fields, **row} for index, row in enumerate(auction_rows)),
+            *_fixture_frn_calibration_auctions(rollforward_fields),
+        ],
+        columns=["record_date", *AUCTION_REQUIRED_COLUMNS, "cusip", *rollforward_fields, "reopening"],
     )
+    _write_governed_opening_sources(package, shares)
     _write_json(package / "sources" / CBO_REMITTANCE_SOURCE_FILE, cbo_remittance_source_fixture())
     fed_sources = fed_income_source_fixture()
     for document in fed_sources["documents"].values():
@@ -1437,6 +1483,8 @@ def _write_source_package(package: Path) -> dict:
     for rel in (
         "opening/tdcsim_initial_portfolio_cohorts.csv",
         "opening/tdcsim_ratewall_input_manifest.json",
+        f"opening/{rib.NMFP_HOLDINGS_FILENAME}",
+        f"opening/{rib.NMFP_PROVENANCE_FILENAME}",
         "fiscaldata/tips_cpi_data_detail.csv",
         "fiscaldata/frn_daily_indexes.csv",
         "fiscaldata/auctions_query.csv",
@@ -1484,6 +1532,91 @@ def _write_source_package(package: Path) -> dict:
         "source_file_count": len(source_entries),
         "source_files": source_entries,
     }
+
+
+# Two FRNs settle in the FRN calibration window, each a new issue and two reopenings of
+# 86 bn to the public; a month after the last tranche money funds hold 60.2 and 51.6 bn.
+FIXTURE_FRN_CALIBRATION = (
+    ("FIXFRNA1", ("2025-04-30", "2025-05-30", "2025-06-27"), "2027-04-30", "2025-07-31", 60.2),
+    ("FIXFRNB1", ("2025-07-31", "2025-08-29", "2025-09-26"), "2027-07-31", "2025-10-31", 51.6),
+)
+
+
+def _fixture_frn_calibration_auctions(fields: dict) -> list[dict]:
+    return [
+        {
+            **fields,
+            "record_date": issue,
+            "cusip": cusip,
+            "security_type": "Note",
+            "security_term": "2-Year" if index == 0 else "1-Year 11-Month",
+            "issue_date": issue,
+            "original_issue_date": issues[0] if index else "null",
+            "maturity_date": maturity,
+            "total_accepted": str((30 if index == 0 else 28) * 10**9),
+            "soma_accepted": "0",
+            "cash_management_bill_cmb": "No",
+            "floating_rate": "Yes",
+            "inflation_index_security": "No",
+            "reopening": "Yes" if index else "No",
+        }
+        for cusip, issues, maturity, _, _ in FIXTURE_FRN_CALIBRATION
+        for index, issue in enumerate(issues)
+    ]
+
+
+def _write_governed_opening_sources(package: Path, shares: dict) -> None:
+    """Write the N-MFP extract, its provenance and the governed manifest that binds them to the book.
+
+    Money funds filed exactly the book's private FRNs at the record date and nothing of the
+    other FRNs; the manifest's records are rebuilt from those files as the opening-book
+    build records them.
+    """
+
+    opening = package / "sources" / "opening"
+    book_path = opening / "tdcsim_initial_portfolio_cohorts.csv"
+    book = pd.read_csv(book_path, dtype={"cusip_or_synthetic_id": str, "HolderSubBucket": str})
+    frns = book.loc[book["SecurityType"].eq("FRN")]
+    money_funds = frns.loc[frns["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF)].groupby("cusip_or_synthetic_id")["FaceValue"].sum()
+    rows = [
+        ("2026-05-31", cusip, "frn", "2030-01-01", float(money_funds.get(cusip, 0.0)))
+        for cusip in sorted(set(frns["cusip_or_synthetic_id"]))
+    ] + [(measured, cusip, "frn", maturity, held) for cusip, _, maturity, measured, held in FIXTURE_FRN_CALIBRATION]
+    extract = opening / rib.NMFP_HOLDINGS_FILENAME
+    pd.DataFrame(
+        [
+            {"report_date": day, "cusip": cusip, "security_class": kind, "maturity_date": maturity, "value_bil": value,
+             "class_source": "mspd_cusip", "series_count": 1}
+            for day, cusip, kind, maturity, value in rows
+        ]
+    ).to_csv(extract, index=False)
+    _write_json(opening / rib.NMFP_PROVENANCE_FILENAME, {
+        "producer": "scripts/extract_sec_nmfp_mmf_holdings.py",
+        "zips": {"fixture_nmfp.zip": {"sha256": "0" * 64, "bytes": 1}},
+        "filed_through": ACTUALS_AVAILABLE_AS_OF,
+        "selected_filings": {"2026-05": [["S1", "0000000000-26-000001", "2026-06-05", "fixture_nmfp.zip"]]},
+        "output": {"file": extract.name, "sha256": hashlib.sha256(extract.read_bytes()).hexdigest()},
+    })
+    holdings, _ = rib.load_nmfp_mmf_holdings(extract)
+    filed = holdings.loc[holdings["report_date"].eq("2026-05-31")]
+    calibration = rib.calibrate_mmf_frn_auction_share(holdings, package / "sources" / "fiscaldata" / "auctions_query.csv")
+    calibration["nmfp_source"] = {"sha256": hashlib.sha256(extract.read_bytes()).hexdigest()}
+    _write_json(opening / "tdcsim_ratewall_input_manifest.json", {
+        "files": {
+            path.name: {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in (book_path, extract, opening / rib.NMFP_PROVENANCE_FILENAME)
+        },
+        "artifacts": {"initial_portfolio": {
+            "mspd_record_date": "2026-05-31",
+            "noncb_weights": {"bills": shares, "nonbills": shares, "frn_mmf_auction_share": calibration["share"]},
+            "opening_allocation": {"money_fund_frn_holdings_override": {
+                "by_cusip": {row.cusip: {"filed_bil": row.value_bil} for row in filed.itertuples()},
+                "source": {"sha256": calibration["nmfp_source"]["sha256"]},
+            }},
+            "nmfp_mix_check": rib._check_mmf_mix(book, filed, record_date="2026-05-31"),
+            "frn_mmf_auction_share_calibration": calibration,
+        }},
+    })
 
 
 def _frozen_treasury_observations() -> dict:
