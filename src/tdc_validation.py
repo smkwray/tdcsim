@@ -72,6 +72,7 @@ CBO_CONFIG_BLOCK_SCHEMAS = {
         'primary_deficit_path_file': None,
         'fed_remittance_path_file': None,
         'fed_income_path_file': None,
+        'policy_rate_path_file': None,
         'operating_cash_path_file': None,
         'cash_reconciliation_residual_file': None,
         'macro_forecast_path_file': None,

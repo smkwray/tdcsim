@@ -23,12 +23,7 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
-from forecast_paths import (
-    CBO_FED_REMITTANCE_ROLE,
-    FED_INCOME_PATH_FILE,
-    FED_REMITTANCE_PATH_FILE,
-    verify_fed_remittances,
-)
+from forecast_paths import CBO_FED_REMITTANCE_ROLE, verify_fed_remittances
 from mmf_eligibility import MmfEligibilityError, mmf_eligible_mask, mmf_may_acquire
 from issuance_calibration import CALIBRATION_FILE, verify_fiscal_close_cash
 from sim_engine import (
@@ -150,6 +145,8 @@ REQUIRED_SUMMARY_KEYS = (
 
 RUN_MANIFEST_V1 = "tdcsim_cbo_scenario_run_manifest_v1"
 RUN_MANIFEST_V2 = "tdcsim_cbo_scenario_run_manifest_v2"
+# v3: modeled Fed remittances reach the TGA; v1 and v2 manifests carried the fixed Table 4-3 path.
+RUN_MANIFEST_V3 = "tdcsim_cbo_scenario_run_manifest_v3"
 
 _BOUNDED_ARTIFACT_SPECS: dict[str, tuple[str, list[str]]] = {
     "ledger": ("tdcsim_period_ledger_totals.csv.gz", LEDGER_COLUMNS),
@@ -900,6 +897,7 @@ def _validate_run_manifest_schema(manifest: dict[str, Any]) -> None:
     schema_names = {
         RUN_MANIFEST_V1: "cbo-run-manifest-v1.schema.json",
         RUN_MANIFEST_V2: "cbo-run-manifest-v2.schema.json",
+        RUN_MANIFEST_V3: "cbo-run-manifest-v3.schema.json",
     }
     schema_name = schema_names.get(schema_version)
     if schema_name is None:
@@ -914,7 +912,7 @@ def _validate_run_manifest_schema(manifest: dict[str, Any]) -> None:
         validate_schema(manifest, schema, label="run_manifest")
     except Exception as exc:
         raise VerificationError(f"run manifest schema validation failed: {exc}") from exc
-    if schema_version == RUN_MANIFEST_V2:
+    if schema_version in {RUN_MANIFEST_V2, RUN_MANIFEST_V3}:
         milestones = manifest.get("execution_milestones")
         has_acceptance = isinstance(milestones, list) and (
             "parent_watchdog_accepted" in milestones
@@ -945,7 +943,7 @@ def _verify_release_claims(manifest: dict[str, Any]) -> None:
 
 
 def _is_bounded_manifest(manifest: Mapping[str, Any]) -> bool:
-    return manifest.get("schema_version") == RUN_MANIFEST_V2
+    return manifest.get("schema_version") in {RUN_MANIFEST_V2, RUN_MANIFEST_V3}
 
 
 def _manifest_funding_closure_mode(manifest: Mapping[str, Any]) -> str:
@@ -1730,15 +1728,21 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
     )
     fed_share = _max_abs(results, "CBOFedAuctionShare")
     fed_face = _max_abs(results, "CBOFedAuctionRolloverAddons")
-    trc_entry = (manifest.get("output_manifest") or {}).get("tdcsim_trc_results")
+    output_manifest = manifest.get("output_manifest") or {}
+
+    def evidence(name):
+        entry = output_manifest.get(name)
+        return _read_results(root / "outputs" / str(entry["path"])) if entry else None
+
     try:
-        trc_results = _read_results(root / "outputs" / str(trc_entry["path"])) if trc_entry else None
-        remittance_cash = verify_fed_remittances(
+        fed_checks = verify_fed_remittances(
             results,
-            inputs_dir / FED_REMITTANCE_PATH_FILE,
-            inputs_dir / FED_INCOME_PATH_FILE,
-            trc_results=trc_results,
+            inputs_dir,
+            trc_results=evidence("tdcsim_trc_results"),
+            ledger=evidence("ledger"),
+            payments=evidence("payment"),
         )
+        remittance_cash = fed_checks["max_remittance_bil"]
     except (OSError, ValueError, KeyError) as exc:
         raise VerificationError(f"Fed remittance verification failed: {exc}") from exc
     target_tolerance = (

@@ -513,7 +513,7 @@ def run_cbo_scenario(
             }
         manifest_path = staging / "tdcsim_cbo_run_manifest.json"
         with files("tdcsim_cbo").joinpath(
-            "schemas/cbo-run-manifest-v2.schema.json"
+            "schemas/cbo-run-manifest-v3.schema.json"
         ).open("r", encoding="utf-8") as handle:
             run_manifest_schema = json.load(handle)
         validate_schema(run_manifest, run_manifest_schema, label="run_manifest")
@@ -2312,7 +2312,7 @@ def _open04_code_surface_hashes() -> dict[str, str]:
         "contract_source_sha256": "contract.py",
         "manifest_source_sha256": "manifest.py",
         "run_manifest_schema_sha256": (
-            "schemas/cbo-run-manifest-v2.schema.json"
+            "schemas/cbo-run-manifest-v3.schema.json"
         ),
         "scenario_schema_sha256": "schemas/cbo-scenario-v1.schema.json",
         "scenario_writer_source_sha256": "open04_campaign.py",
@@ -2582,7 +2582,7 @@ def finalize_watchdog_handoff(
         poll_interval_seconds=result.poll_interval_seconds,
     )
     with files("tdcsim_cbo").joinpath(
-        "schemas/cbo-run-manifest-v2.schema.json"
+        "schemas/cbo-run-manifest-v3.schema.json"
     ).open("r", encoding="utf-8") as handle:
         run_manifest_schema = json.load(handle)
     validate_schema(finalized, run_manifest_schema, label="run_manifest")

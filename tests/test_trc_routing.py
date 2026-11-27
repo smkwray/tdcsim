@@ -345,18 +345,25 @@ def test_cbo_run_with_trc_routing_keeps_legacy_outputs_byte_identical(tmp_path: 
             legacy.output_dir / "outputs" / name
         ), name
     fed_balance_sheet = [
-        "CB_ReserveBalances", "CB_ONRRPBalances", "CB_IORBExpense", "CB_ONRRPExpense", "CB_NetIncome",
-        "CB_EarningsRemittancesDue", "CB_DeferredAsset", "CB_OtherLiabilitiesAndCapital",
+        "CB_ReserveBalances", "CB_DomesticONRRP", "CB_ForeignRepo", "CB_ForeignOfficialDeposits", "CB_IORBExpense",
+        "CB_DomesticONRRPExpense", "CB_ForeignRepoExpense", "CB_InterestPosted", "CB_ForeignRepoInterestReinvested",
+        "CB_InterestPayable", "CB_ForeignRepoInterestPayable", "CB_NetIncome", "CB_EarningsRemittancesDue",
+        "CB_DeferredAsset", "CB_OtherAssets",
     ]
     legacy_results = pd.read_csv(legacy.output_dir / "outputs" / results_name)
     routed_results = pd.read_csv(routed.output_dir / "outputs" / results_name)
     pd.testing.assert_frame_equal(
         routed_results.drop(columns=fed_balance_sheet), legacy_results.drop(columns=fed_balance_sheet), check_exact=True
     )
-    on_rrp_gap = routed_results["CB_ONRRPBalances"] - legacy_results["CB_ONRRPBalances"]
+    on_rrp_gap = routed_results["CB_DomesticONRRP"] - legacy_results["CB_DomesticONRRP"]
     assert on_rrp_gap.iloc[0] > 900_000.0
+    # The routed opening balances are an opening transfer out of reserves, one for one.
+    routed_opening = sum(
+        routed_results[column].iloc[0] - legacy_results[column].iloc[0]
+        for column in ("CB_DomesticONRRP", "CB_ForeignRepo", "CB_ForeignOfficialDeposits")
+    )
     reserve_gap = routed_results["CB_ReserveBalances"] - legacy_results["CB_ReserveBalances"]
-    assert reserve_gap.iloc[0] == pytest.approx(-on_rrp_gap.iloc[0])
+    assert reserve_gap.iloc[0] == pytest.approx(-routed_opening)
     legacy_summary = json.loads((legacy.output_dir / "outputs" / "summary.json").read_text())
     routed_summary = json.loads((routed.output_dir / "outputs" / "summary.json").read_text())
     for summary in (legacy_summary, routed_summary):

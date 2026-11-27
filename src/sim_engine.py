@@ -94,6 +94,8 @@ from forecast_paths import (
     load_fed_holdings_path,
     load_fed_income_path,
     load_fed_remittance_path,
+    load_policy_rate_path,
+    policy_rate_for_day,
     load_frn_rate_path,
     load_yield_curve_surface as load_forecast_yield_curve_surface,
     load_macro_forecast_path,
@@ -105,14 +107,15 @@ from forecast_paths import (
     resolve_baseline_input_paths,
 )
 from fed_income import (
+    ACCRUAL_TYPES,
     FED_INCOME_RESULT_COLUMNS,
-    INTEREST_EXPENSE_DAY_COUNT,
-    TREASURY_INCOME_COLUMNS,
+    FedBook,
     FedIncomeError,
-    FedOpeningBalanceSheet,
-    non_treasury_reserve_effect,
-    remittance_week,
-    settle_remittances,
+    FedOpening,
+    accrued_interest,
+    is_bill as fed_is_bill,
+    opening_premiums,
+    stock as fed_lot_stock,
 )
 from funding_plan import (
     calculate_pre_issuance_controlled_debt,
@@ -125,7 +128,12 @@ from ratewall_paths import (
     primary_flow_for_period,
     resolve_holder_absorption_scenario,
 )
-from simulation_calendar import add_fedwire_business_days, is_fedwire_business_day, is_securities_business_day
+from simulation_calendar import (
+    add_fedwire_business_days,
+    is_fedwire_business_day,
+    is_securities_business_day,
+    previous_fedwire_business_day,
+)
 from yield_curve_path import curve_for_date, load_yield_curve_surface
 
 
@@ -316,6 +324,7 @@ def _load_cbo_engine_inputs(params, scenario_name):
         'primary_deficit_path_file': paths.primary_deficit_path_file,
         'fed_remittance_path_file': paths.fed_remittance_path_file,
         'fed_income_path_file': paths.fed_income_path_file,
+        'policy_rate_path_file': paths.policy_rate_path_file,
         'operating_cash_path_file': paths.operating_cash_path_file,
         'cash_reconciliation_residual_file': paths.cash_reconciliation_residual_file,
         'fiscal_incidence_policy_file': paths.fiscal_incidence_policy_file,
@@ -340,6 +349,11 @@ def _load_cbo_engine_inputs(params, scenario_name):
     )
     fed_income = load_fed_income_path(
         paths.fed_income_path_file,
+        actuals_available_as_of=actuals_available_as_of,
+        allow_lookahead=allow_lookahead,
+    )
+    policy_rate_path = load_policy_rate_path(
+        paths.policy_rate_path_file,
         actuals_available_as_of=actuals_available_as_of,
         allow_lookahead=allow_lookahead,
     )
@@ -424,6 +438,7 @@ def _load_cbo_engine_inputs(params, scenario_name):
         'fed_remittance': fed_remittance,
         'fed_income': fed_income,
         'fed_income_lookup': _cbo_period_lookup(fed_income),
+        'policy_rate_path': policy_rate_path,
         'operating_cash': operating_cash,
         'cash_residual': cash_residual,
         'fiscal_incidence': fiscal_incidence,
@@ -559,12 +574,65 @@ def _fed_income_row(cbo_inputs, scenario_id, period_start, period_end):
     )
 
 
-def _fed_on_rrp_balance(trc_ledger, opening):
-    """ON RRP balances the Fed pays interest on: the run's routed balances, else the H.4.1 level."""
+def _fed_route_balances(trc_ledger):
+    """The routed ledger's Fed balances when the run has one; else the Fed book uses the observed opening."""
 
-    if trc_ledger is None:
-        return opening.on_rrp
-    return trc_ledger.balances['ONRRP_MMF'] + trc_ledger.balances['ForeignOfficialFedRRP']
+    return None if trc_ledger is None else dict(trc_ledger.balances)
+
+
+def _fed_rates(policy_rate_path, day, opening_day):
+    """Administered rates from the policy-rate path: IORB at the day's rate, ON RRP at the rate of
+    the last business day's trade."""
+
+    policy = policy_rate_for_day(policy_rate_path, day)
+    trade_day = max(pd.Timestamp(previous_fedwire_business_day(pd.Timestamp(day).date())), pd.Timestamp(opening_day))
+    iorb_spread = float(policy_rate_path['iorb_spread_pct'].iloc[0])
+    on_rrp_spread = float(policy_rate_path['on_rrp_spread_pct'].iloc[0])
+    return {
+        'policy': policy,
+        'iorb': policy + iorb_spread,
+        'on_rrp': policy_rate_for_day(policy_rate_path, trade_day) + on_rrp_spread,
+    }
+
+
+def _fed_accrued_by_type(rows, day):
+    accrued = accrued_interest(rows, day)
+    return {kind: float(accrued[kind].sum()) for kind in ACCRUAL_TYPES}
+
+
+def _register_new_fed_lots(bond_portfolio, fed_basis, day):
+    """Carry the Fed's new auction add-ons at the dirty price it paid, less accrued interest.
+
+    Runs before any Fed secondary trade, which can merge the Fed's lots of an issue.
+    """
+
+    day = pd.Timestamp(day).normalize()
+    cb_rows = bond_portfolio[bond_portfolio['HolderType'].eq('CB') & bond_portfolio['Status'].eq('Active')]
+    maturities = pd.to_datetime(cb_rows['MaturityDate']).dt.normalize()
+    new_lots = cb_rows[~cb_rows['BondID'].astype(int).isin(fed_basis['lots'].lots) & (maturities > day)]
+    if new_lots.empty:
+        return
+    new_accrued = accrued_interest(new_lots, day)
+    new_premiums = (
+        pd.to_numeric(new_lots['IssueProceeds'], errors='raise') - new_accrued.sum(axis=1) - fed_lot_stock(new_lots)
+    )
+    for kind in ACCRUAL_TYPES:
+        fed_basis['accrued_purchased'][kind] += float(new_accrued[kind].sum())
+    fed_basis['premium_acquired'] += float(new_premiums.sum())
+    new_bills = fed_is_bill(new_lots)
+    for idx, lot in new_lots.iterrows():
+        fed_basis['lots'].add(lot['BondID'], lot['MaturityDate'], float(new_premiums.at[idx]), bool(new_bills.at[idx]), day)
+
+
+def _new_fed_basis(lots):
+    return {
+        'lots': lots,
+        'accrued_purchased': dict.fromkeys(ACCRUAL_TYPES, 0.0),
+        'accrued_sold': dict.fromkeys(ACCRUAL_TYPES, 0.0),
+        'premium_acquired': 0.0,
+        'premium_sold': 0.0,
+        'realized_gains': 0.0,
+    }
 
 
 def _subtract_business_days(date_value, business_days):
@@ -1905,8 +1973,13 @@ def _transfer_public_marketable_debt_to_cb(
     tips_real_curve_rates=None,
     portfolio_row_budget=None,
     operation_summary=None,
+    fed_basis=None,
 ):
-    """Buy eligible issues and settle the same fraction of every seller lot of an issue."""
+    """Buy eligible issues and settle the same fraction of every seller lot of an issue.
+
+    With ``fed_basis`` the Fed's lot is carried at its clean acquisition cost: the dirty
+    settlement less the accrued interest bought, which is recorded separately.
+    """
     sold_by_holder = dict.fromkeys(HOLDER_TYPES, 0.0)
     sold_by_private_route = _zero_private_routes()
     if amount_to_purchase <= TGA_FLOOR_TOLERANCE:
@@ -1988,6 +2061,16 @@ def _transfer_public_marketable_debt_to_cb(
             lot['BondID'] = next_bond_id
             next_bond_id += 1
         lot[['HolderType', 'HolderSubBucket', 'TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket']] = ['CB', '', 'CB', '']
+        if fed_basis is not None:
+            bought_accrued = accrued_interest(sellers, current) * fraction
+            premium = float(proceeds.sum()) - float(bought_accrued.to_numpy().sum()) - float(quantity)
+            for kind in ACCRUAL_TYPES:
+                fed_basis['accrued_purchased'][kind] += float(bought_accrued[kind].sum())
+            fed_basis['premium_acquired'] += premium
+            fed_basis['lots'].merge(
+                cb_lots['BondID'].tolist(), lot['BondID'], lot['MaturityDate'],
+                bool(fed_is_bill(pd.DataFrame([lot])).iloc[0]), current, premium,
+            )
         fed_rows.append(lot)
         retired_indices.extend(issue['cb'])
 
@@ -2024,8 +2107,13 @@ def _transfer_cb_marketable_debt_to_public(
     tips_real_curve_rates=None,
     portfolio_row_budget=None,
     record_mmf_acquisition=None,
+    fed_basis=None,
 ):
-    """Move CB marketable holdings to the declared public buyer vector at dirty value."""
+    """Move CB marketable holdings to the declared public buyer vector at dirty value.
+
+    With ``fed_basis`` the sold part of the Fed's lot leaves at its carrying value and the
+    difference from the clean proceeds is a realized gain or loss.
+    """
     if bond_portfolio is None or bond_portfolio.empty:
         return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), 0.0
     remaining = max(0.0, float(amount_to_sell))
@@ -2080,6 +2168,19 @@ def _transfer_cb_marketable_debt_to_public(
         _cache_fed_transfer_price(bond_portfolio, idx, full_pricing)
         row = bond_portfolio.loc[idx].copy()
         fraction_sold = sale_amount / debt_base
+        if fed_basis is not None:
+            sold_accrued = accrued_interest(pd.DataFrame([row]), current_date) * fraction_sold
+            lots = fed_basis['lots']
+            premium_sold = (
+                lots.pop(row['BondID']) if sale_amount >= debt_base - TGA_FLOOR_TOLERANCE
+                else lots.scale(row['BondID'], 1.0 - fraction_sold)
+            )
+            for kind in ACCRUAL_TYPES:
+                fed_basis['accrued_sold'][kind] += float(sold_accrued[kind].sum())
+            fed_basis['premium_sold'] += premium_sold
+            fed_basis['realized_gains'] += (
+                pricing['dirty_value'] - float(sold_accrued.to_numpy().sum()) - sale_amount - premium_sold
+            )
         lot_buyers = buyer_mix
         if len(non_mmf_buyers) < len(buyer_mix) and not mmf_may_acquire(
             row['SecurityType'], row['MaturityDate'], current_date
@@ -4313,32 +4414,30 @@ def run_simulation(
         results.loc[t0, 'CBORemittanceStatus'] = CBO_FED_REMITTANCE_OPENING_STATUS
         results.loc[t0, 'CBORemittanceCashEffect'] = 0.0
         fed_first_row = _fed_income_row(cbo_inputs, cbo_scenario_id, t0, dates[1])
-        fed_opening = FedOpeningBalanceSheet.from_row(fed_first_row)
-        fed_on_rrp = _fed_on_rrp_balance(trc_ledger, fed_opening)
-        fed_reserves = fed_opening.rolled_reserves(
+        fed_policy_path = cbo_inputs['policy_rate_path']
+        fed_opening = FedOpening.from_row(fed_first_row)
+        fed_cb_rows = bond_portfolio[
+            bond_portfolio['HolderType'].eq('CB') & bond_portfolio['Status'].eq('Active')
+        ] if not bond_portfolio.empty else bond_portfolio
+        fed_book = FedBook(
+            fed_opening,
+            opening_day=t0,
             tga=float(results.loc[t0, 'TGA']),
-            on_rrp=fed_on_rrp,
-            soma_mbs=float(fed_first_row['soma_mbs_start_bil']),
-            currency=float(fed_first_row['currency_start_bil']),
+            treasury_book={
+                'premiums': opening_premiums(fed_cb_rows, t0, fed_opening.treasury_net_premium),
+                'accrued': _fed_accrued_by_type(fed_cb_rows, t0),
+                'stock': float(fed_lot_stock(fed_cb_rows).sum()),
+            },
+            path_row=fed_first_row,
+            route_balances=_fed_route_balances(trc_ledger),
         )
-        fed_due = fed_opening.earnings_remittances_due
-        fed_last_remittance_week = remittance_week(t0)
-        fed_short_tenor = float(fed_first_row['short_rate_tenor_years'])
-        fed_iorb_spread = float(fed_first_row['iorb_spread_pct'])
-        fed_on_rrp_spread = float(fed_first_row['on_rrp_spread_pct'])
-        fed_opening_short = 100.0 * float(evaluate_nominal_yield(
-            fed_short_tenor, current_yield_curve_years, current_yield_curve_rates,
-            method=yield_interpolation_method, floor_zero=yield_floor_zero, shock=evaluated_nominal_shock,
-        ))
-        results.loc[t0, 'CB_ShortRatePct'] = fed_opening_short
-        results.loc[t0, 'CB_IORBRatePct'] = fed_opening_short + fed_iorb_spread
-        results.loc[t0, 'CB_ONRRPRatePct'] = fed_opening_short + fed_on_rrp_spread
-        results.loc[t0, 'CB_ReserveBalances'] = fed_reserves
-        results.loc[t0, 'CB_ONRRPBalances'] = fed_on_rrp
-        results.loc[t0, 'CB_Currency'] = float(fed_first_row['currency_start_bil'])
-        results.loc[t0, 'CB_MBSHoldings'] = float(fed_first_row['soma_mbs_start_bil'])
-        results.loc[t0, 'CB_EarningsRemittancesDue'] = fed_due
-        results.loc[t0, 'CB_OtherLiabilitiesAndCapital'] = fed_opening.other_liabilities_and_capital
+        fed_basis = _new_fed_basis(fed_book.lots)
+        fed_opening_rates = _fed_rates(fed_policy_path, t0, t0)
+        for column, value in fed_book.opening_row().items():
+            results.loc[t0, column] = value
+        results.loc[t0, 'CB_PolicyRatePct'] = fed_opening_rates['policy']
+        results.loc[t0, 'CB_IORBRatePct'] = fed_opening_rates['iorb']
+        results.loc[t0, 'CB_ONRRPRatePct'] = fed_opening_rates['on_rrp']
     if not bond_portfolio.empty:
         active_bonds_initial = bond_portfolio[bond_portfolio['Status'] == 'Active'].copy()
         active_bonds_initial['DebtBase'] = np.where(active_bonds_initial['SecurityType'] == 'TIPS', active_bonds_initial['AdjustedPrincipal'].fillna(active_bonds_initial['FaceValue']), active_bonds_initial['FaceValue'])
@@ -4398,7 +4497,7 @@ def run_simulation(
     results.loc[t0, 'CB_TreasuryInterestCashReceived'] = 0.0
     results.loc[t0, ['CB_NetIncome', 'CB_Remittance']] = 0.0
     if cbo_funding_mode:
-        results.loc[t0, 'CB_DeferredAsset'] = max(0.0, -fed_due)
+        results.loc[t0, 'CB_DeferredAsset'] = max(0.0, -fed_opening.earnings_remittances_due)
     max_existing_id = 0
     if not bond_portfolio.empty and bond_portfolio['BondID'].notna().any():
         numeric_bond_ids = pd.to_numeric(bond_portfolio['BondID'], errors='coerce')
@@ -4524,6 +4623,7 @@ def run_simulation(
         nonmkt_interest_capitalized_period = 0.0
         tips_inflation_accretion_period = 0.0
         cb_tips_indexation_period = 0.0
+        cb_tips_floor_topup_period = 0.0
         auction_shift_weighted_sum = 0.0
         auction_shift_weighted_max = 0.0
         auction_shift_weight_total = 0.0
@@ -5039,6 +5139,8 @@ def run_simulation(
                     if security_type == 'TIPS'
                     else 0.0
                 )
+                if holder == 'CB':
+                    cb_tips_floor_topup_period += tips_deflation_floor_topup
                 if tips_deflation_floor_topup > TGA_FLOOR_TOLERANCE:
                     _handoff_append_payment(
                         handoff_tables,
@@ -5300,54 +5402,13 @@ def run_simulation(
         )
         cb_treasury_interest_cash_received_period = interest_paid_by_holder.get('CB', 0.0)
         if cbo_funding_mode:
-            fed_row = _fed_income_row(cbo_inputs, cbo_scenario_id, prev_date, current_date)
-            fed_treasury_income = {
-                'CB_BillDiscountIncome': bill_discount_interest_paid_by_holder.get('CB', 0.0),
-                'CB_CouponIncome': coupon_interest_paid_by_holder.get('CB', 0.0),
-                'CB_FRNIncome': frn_interest_paid_by_holder.get('CB', 0.0),
-                'CB_TIPSCouponIncome': tips_coupon_interest_paid_by_holder.get('CB', 0.0),
-                'CB_TIPSInflationCompensationIncome': tips_inflation_compensation_paid_by_holder.get('CB', 0.0),
-            }
-            fed_short = 100.0 * float(evaluate_nominal_yield(
-                fed_short_tenor, current_yield_curve_years, current_yield_curve_rates,
-                method=yield_interpolation_method, floor_zero=yield_floor_zero, shock=evaluated_nominal_shock,
-            ))
-            fed_iorb_rate = fed_short + fed_iorb_spread
-            fed_on_rrp_rate = fed_short + fed_on_rrp_spread
-            fed_accrual = (current_date - prev_date).days / INTEREST_EXPENSE_DAY_COUNT
-            fed_iorb_expense = fed_iorb_rate / 100.0 * fed_reserves * fed_accrual
-            fed_on_rrp_expense = fed_on_rrp_rate / 100.0 * fed_on_rrp * fed_accrual
-            fed_lines = {
-                'CB_MBSIncome': float(fed_row['soma_mbs_interest_bil']),
-                'CB_OtherIncome': float(fed_row['other_income_bil']),
-                'CB_IORBExpense': fed_iorb_expense,
-                'CB_ONRRPExpense': fed_on_rrp_expense,
-                'CB_OperatingExpenses': float(fed_row['operating_expenses_bil']),
-                'CB_Dividends': float(fed_row['dividends_bil']),
-            }
-            fed_treasury_total = sum(fed_treasury_income[column] for column in TREASURY_INCOME_COLUMNS)
-            cb_net_income_period = (
-                fed_treasury_total + fed_lines['CB_MBSIncome'] + fed_lines['CB_OtherIncome']
-                - fed_iorb_expense - fed_on_rrp_expense
-                - fed_lines['CB_OperatingExpenses'] - fed_lines['CB_Dividends']
-            )
-            fed_week = remittance_week(current_date)
-            fed_pay_day = is_fedwire_business_day(current_date) and fed_week > fed_last_remittance_week
-            if fed_pay_day:
-                fed_last_remittance_week = fed_week
-            fed_due, cb_remittance_period = settle_remittances(fed_due, cb_net_income_period, fed_pay_day)
-            current_deferred_asset = max(0.0, -fed_due)
+            # The weekly payment uses balances closed before today (paragraph 60.55).
+            cb_remittance_period = fed_book.remittance(current_date)
+            if cb_remittance_period > 0.0 and not payments_open:
+                raise FedIncomeError(f'Fed remittance on {current_date.date()}, a day Fedwire is closed')
+            cb_net_income_period = np.nan
+            current_deferred_asset = np.nan
             cb_remit_tga_change = cb_remittance_period
-            for column, value in (*fed_treasury_income.items(), *fed_lines.items()):
-                results.loc[current_date, column] = value
-            results.loc[current_date, 'CB_TreasuryInterestIncome'] = fed_treasury_total
-            results.loc[current_date, 'CB_ShortRatePct'] = fed_short
-            results.loc[current_date, 'CB_IORBRatePct'] = fed_iorb_rate
-            results.loc[current_date, 'CB_ONRRPRatePct'] = fed_on_rrp_rate
-            results.loc[current_date, 'CB_EarningsRemittancesDue'] = fed_due
-            results.loc[current_date, 'CB_OtherLiabilitiesAndCapital'] = (
-                fed_opening.other_liabilities_and_capital + fed_due - fed_opening.earnings_remittances_due
-            )
             results.loc[current_date, 'CBORemittanceStatus'] = CBO_FED_REMITTANCE_STATUS
         else:
             prev_deferred_asset = results.loc[prev_date, 'CB_DeferredAsset']
@@ -6372,6 +6433,8 @@ def run_simulation(
                 current_cb_after_issuance = 0.0
             fed_purchase_shortfall = cbo_fed_holdings_target - current_cb_after_issuance
             fed_target_tolerance = float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001)
+            if cbo_funding_mode and abs(fed_purchase_shortfall) > TGA_FLOOR_TOLERANCE:
+                _register_new_fed_lots(bond_portfolio, fed_basis, current_date)
             if fed_purchase_shortfall > TGA_FLOOR_TOLERANCE:
                 fed_transfer_before = {
                     'holder': _handoff_portfolio_stock_map(bond_portfolio),
@@ -6396,6 +6459,7 @@ def run_simulation(
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
                     operation_summary=purchase_operation,
+                    fed_basis=fed_basis if cbo_funding_mode else None,
                     portfolio_row_budget=(
                         handoff_tables.portfolio_row_budget
                         if bounded_handoff
@@ -6484,6 +6548,7 @@ def run_simulation(
                     current_yield_curve_rates,
                     fed_secondary_sale_buyer_mix,
                     record_mmf_acquisition=record_mmf_acquisition,
+                    fed_basis=fed_basis if cbo_funding_mode else None,
                     interpolation_method=yield_interpolation_method,
                     floor_zero=yield_floor_zero,
                     nominal_shock=evaluated_nominal_shock,
@@ -7026,28 +7091,45 @@ def run_simulation(
             )
             treasury_reserve_effect = trc_rows[-1]['TRC_Change']
         if cbo_funding_mode:
-            fed_reserves += treasury_reserve_effect + non_treasury_reserve_effect(
-                mbs_start=float(fed_row['soma_mbs_start_bil']),
-                mbs_end=float(fed_row['soma_mbs_end_bil']),
-                currency_start=float(fed_row['currency_start_bil']),
-                currency_end=float(fed_row['currency_end_bil']),
-                mbs_income=fed_lines['CB_MBSIncome'],
-                other_income=fed_lines['CB_OtherIncome'],
-                iorb_expense=fed_iorb_expense,
-                on_rrp_expense=fed_on_rrp_expense,
-                operating_expenses=fed_lines['CB_OperatingExpenses'],
-                dividends=fed_lines['CB_Dividends'],
+            fed_row = _fed_income_row(cbo_inputs, cbo_scenario_id, prev_date, current_date)
+            fed_cb_rows = bond_portfolio[bond_portfolio['HolderType'].eq('CB') & bond_portfolio['Status'].eq('Active')]
+            fed_lots = fed_basis['lots'].lots
+            fed_maturities = pd.to_datetime(fed_cb_rows['MaturityDate']).dt.normalize()
+            _register_new_fed_lots(bond_portfolio, fed_basis, current_date)
+            open_ids = set(fed_cb_rows.loc[fed_maturities > current_date, 'BondID'].astype(int))
+            if open_ids != {key for key, lot in fed_lots.items() if lot.maturity > current_date}:
+                raise FedIncomeError(f'the Fed lot book and the portfolio disagree at {current_date.date()}')
+            fed_values = fed_book.close_day(
+                prev_date,
+                current_date,
+                tga=current_tga,
+                remitted=cb_remittance_period,
+                # The named cash reconciliation residual reaches the TGA from outside the modeled
+                # flows; on the Fed's balance sheet it settles through reserves.
+                treasury_reserve_effect=treasury_reserve_effect - cbo_cash_residual_period,
+                treasury={
+                    'cash': {
+                        'coupon': coupon_interest_paid_by_holder.get('CB', 0.0),
+                        'tips': tips_coupon_interest_paid_by_holder.get('CB', 0.0),
+                        'frn': frn_interest_paid_by_holder.get('CB', 0.0),
+                    },
+                    'accrued_end': _fed_accrued_by_type(fed_cb_rows, current_date),
+                    'accrued_purchased': fed_basis['accrued_purchased'],
+                    'accrued_sold': fed_basis['accrued_sold'],
+                    'tips_indexation': cb_tips_indexation_period,
+                    'floor_topup': cb_tips_floor_topup_period,
+                    'realized_gains': fed_basis['realized_gains'],
+                    'premium_acquired': fed_basis['premium_acquired'],
+                    'premium_sold': fed_basis['premium_sold'],
+                    'stock': float(fed_lot_stock(fed_cb_rows).sum()),
+                },
+                path_row=fed_row,
+                rates=_fed_rates(fed_policy_path, current_date, t0),
+                route_balances=_fed_route_balances(trc_ledger),
             )
-            if fed_reserves < 0.0:
-                raise FedIncomeError(
-                    f'reserve balances fell below zero at {current_date.date()}: {fed_reserves!r}'
-                )
-            fed_on_rrp = _fed_on_rrp_balance(trc_ledger, fed_opening)
-            results.loc[current_date, 'CB_TreasuryReserveEffect'] = treasury_reserve_effect
-            results.loc[current_date, 'CB_ReserveBalances'] = fed_reserves
-            results.loc[current_date, 'CB_ONRRPBalances'] = fed_on_rrp
-            results.loc[current_date, 'CB_Currency'] = float(fed_row['currency_end_bil'])
-            results.loc[current_date, 'CB_MBSHoldings'] = float(fed_row['soma_mbs_end_bil'])
+            for column, value in fed_values.items():
+                results.loc[current_date, column] = value
+            fed_basis = _new_fed_basis(fed_book.lots)
         results.loc[current_date, 'TDC_Change'] = adjusted_deposit_change_period
         results.loc[current_date, 'TGAChange'] = current_tga - prev_tga
         results.loc[current_date, 'TDC_FiscalFlow'] = fiscal_deposit_change

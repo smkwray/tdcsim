@@ -42,8 +42,8 @@ def record_parent_watchdog_acceptance(
 ) -> dict[str, Any]:
     """Finalize a staged manifest with the parent's full-child RSS observation."""
 
-    if manifest.get("schema_version") != "tdcsim_cbo_scenario_run_manifest_v2":
-        raise ValueError("parent watchdog acceptance requires a bounded v2 manifest")
+    if manifest.get("schema_version") != "tdcsim_cbo_scenario_run_manifest_v3":
+        raise ValueError("parent watchdog acceptance requires a bounded v3 manifest")
     if manifest.get("status") != "pending_parent_watchdog_acceptance":
         raise ValueError("manifest is not awaiting parent watchdog acceptance")
     peak = int(peak_rss_bytes)
@@ -187,7 +187,7 @@ def build_run_manifest(
         }
     manifest = {
         "schema_version": (
-            "tdcsim_cbo_scenario_run_manifest_v2"
+            "tdcsim_cbo_scenario_run_manifest_v3"
             if bounded
             else "tdcsim_cbo_scenario_run_manifest_v1"
         ),

@@ -1,9 +1,9 @@
-"""Federal Reserve net income, deferred asset and remittances in CBO runs.
+"""Federal Reserve earnings, balance sheet and weekly remittances in CBO runs.
 
-The remittance must respond to what the run does: the Fed's Treasury income, the reserve
-balances it pays interest on, and the deferred asset it must repay first. These tests run
-the production engine on small fixtures and check each channel moves remittances, and
-hence Treasury financing, the way the Fed's income statement says it should.
+The remittance must follow the Fed's own books: income accrued on what the Fed paid for its
+securities, interest on the balances it actually owes, the pooled deferred asset, and the
+Reserve Banks' weekly payment rule. These tests run the production engine on small fixtures
+and check each channel, and that the verifier rejects books that do not close.
 """
 
 from __future__ import annotations
@@ -13,9 +13,9 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from fed_income import non_treasury_reserve_effect, remittance_week, settle_remittances
-from forecast_bundle_builders import build_fed_income_path_rows, fed_income_source_fixture
-from forecast_paths import verify_fed_remittances
+from fed_income import FedLotBook, first_remittance_day_of_year, remittance_basis_date, remittance_week, weekly_remittance
+from forecast_bundle_builders import build_fed_income_path_rows, fed_income_source_fixture, fed_net_premiums_bil
+from forecast_paths import check_earnings_due_closes, check_fed_balance_sheet_closes, verify_fed_remittances
 from sim_engine import run_simulation
 from simulation_calendar import build_simulation_calendar
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
@@ -23,15 +23,17 @@ from test_cbo_engine_integration import _build_temp_forecast_inputs, _minimal_en
 
 
 START, END = "2026-09-20", "2026-10-10"
-# Opening reserves land at 2,200 after the H.4.1 roll: the run's TGA opens at 800.
-SMALL_FED = {"h41_reserve_balances_bil": 3_000.0, "h41_tga_bil": 0.0, "iorb_spread_pct": 0.1}
+# Opening reserves land at 2,200 after the H.4.1 roll (the run's TGA opens at 800); a
+# steady other-income line keeps net income positive so remittances can flow.
+SMALL_FED = {"h41_reserve_balances_bil": 3_000.0, "h41_tga_bil": 0.0, "other_income_bil": 0.5}
 
 
 def _fed_note(face: float, coupon: float) -> dict:
     row = {column: pd.NA for column in BOND_PORTFOLIO_COLS}
     row.update({
         "BondID": 2, "SecurityType": "Fixed", "IssueDate": pd.Timestamp("2025-09-30"),
-        "MaturityDate": pd.Timestamp("2027-09-30"), "OriginalMaturityYears": 2.0, "FaceValue": face,
+        "MaturityDate": pd.Timestamp("2027-09-30"), "DatedDate": pd.Timestamp("2025-09-30"),
+        "OriginalMaturityYears": 2.0, "FaceValue": face,
         "CouponRate": coupon, "HolderType": "CB", "HolderSubBucket": "", "Status": "Active",
         "MaturityCategory": "notes", "OriginalPrincipal": face, "AdjustedPrincipal": face,
         "ReferenceCPI_Issue": 0.0, "IndexRatio": 1.0, "FixedSpread": 0.0, "AccruedInterest_FRN": 0.0,
@@ -41,7 +43,8 @@ def _fed_note(face: float, coupon: float) -> dict:
     return row
 
 
-def _run(tmp_path, *, fed_coupon: float = 0.04, remittance_bil: float = 0.0, **fed_income):
+def _run(tmp_path, *, fed_coupon: float = 0.04, remittance_bil: float = 0.0, rate_shift: float = 0.0,
+         **fed_income):
     periods = build_simulation_calendar(START, END, "daily")
     paths = _build_temp_forecast_inputs(
         tmp_path, periods=periods, period_start=START, period_end=END,
@@ -50,6 +53,7 @@ def _run(tmp_path, *, fed_coupon: float = 0.04, remittance_bil: float = 0.0, **f
         later_fiscal_years={2027: (1_750.0, 0.0)},
     )
     params = _minimal_engine_params(paths, opening_controlled_debt_bil=1_000.0)
+    params["yield_curve"]["rates"] = [rate + rate_shift for rate in params["yield_curve"]["rates"]]
     portfolio = params["initial_bonds_df"]
     params["initial_bonds_df"] = pd.concat(
         [portfolio, pd.DataFrame([_fed_note(500.0, fed_coupon)], columns=BOND_PORTFOLIO_COLS)],
@@ -59,42 +63,74 @@ def _run(tmp_path, *, fed_coupon: float = 0.04, remittance_bil: float = 0.0, **f
     return results, paths
 
 
-def _verify(results, paths) -> float:
-    return verify_fed_remittances(
-        results.reset_index(), paths["fed_remittance_path_file"], paths["fed_income_path_file"],
-    )
+def _frame(results):
+    return results.reset_index().rename(columns={"DebtHeld_CB": "DebtHeld_CentralBank"})
 
 
-def test_deferred_asset_blocks_remittances_until_net_income_has_repaid_it():
-    due = -5.0
-    due, paid = settle_remittances(due, -1.0, pay_today=True)
-    assert (due, paid) == (-6.0, 0.0)  # a loss adds to the deferred asset
-    due, paid = settle_remittances(due, 4.0, pay_today=True)
-    assert (due, paid) == (-2.0, 0.0)  # income repays it; nothing is remitted meanwhile
-    due, paid = settle_remittances(due, 3.0, pay_today=False)
-    assert (due, paid) == (1.0, 0.0)  # cleared, but the Banks remit only on a pay day
-    due, paid = settle_remittances(due, 2.0, pay_today=True)
-    assert (due, paid) == (0.0, 3.0)  # then all net income since the deferred asset cleared
-    due, paid = settle_remittances(due, -0.5, pay_today=True)
-    assert (due, paid) == (-0.5, 0.0)  # a new loss starts a new deferred asset
+def _verify(results, paths) -> dict:
+    return verify_fed_remittances(_frame(results), paths["fed_income_path_file"].parent)
 
 
-def test_remittances_are_weekly_and_a_closed_wednesday_pays_on_thursday():
-    assert remittance_week("2026-09-30") == pd.Timestamp("2026-09-30")
+def test_weekly_payment_is_the_lower_of_two_credit_balances_and_nothing_on_a_debit():
+    assert weekly_remittance(5.0, 7.0) == 5.0
+    assert weekly_remittance(7.0, 5.0) == 5.0
+    assert weekly_remittance(5.0, -0.1) == 0.0  # a debit the day before blocks the payment
+    assert weekly_remittance(-0.1, 5.0) == 0.0  # so does a debit last Wednesday
+    assert weekly_remittance(0.0, 5.0) == 0.0
+
+
+def test_remittance_days_and_the_first_payment_of_a_year():
     assert remittance_week("2026-10-06") == pd.Timestamp("2026-09-30")
-    # Veterans Day 2026 closes Fedwire on a Wednesday; Thursday is still in that week.
-    assert remittance_week("2026-11-12") == pd.Timestamp("2026-11-11")
+    # A regular week caps the payment at last Wednesday's balance ...
+    assert remittance_basis_date("2026-10-07") == pd.Timestamp("2026-09-30")
+    # ... Veterans Day closes Wednesday 2026-11-11, so Thursday pays against 2026-11-04 ...
+    assert remittance_basis_date("2026-11-12") == pd.Timestamp("2026-11-04")
+    # ... and the year's first payment uses the December 31 balance.
+    assert first_remittance_day_of_year(2027) == pd.Timestamp("2027-01-06")
+    assert remittance_basis_date("2027-01-06") == pd.Timestamp("2026-12-31")
+
+
+def test_a_wednesday_coupon_does_not_fund_that_wednesdays_remittance(tmp_path):
+    results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=0.0)
+    due = results["CB_EarningsRemittancesDue"]
+    for wednesday in ("2026-09-23", "2026-09-30", "2026-10-07"):
+        day = pd.Timestamp(wednesday)
+        cap = min(due.loc[day - pd.Timedelta(days=7)] if day - pd.Timedelta(days=7) in due.index
+                  else 0.0, due.loc[day - pd.Timedelta(days=1)])
+        assert results.loc[day, "CB_Remittance"] == pytest.approx(max(cap, 0.0))
+    # The opening Wednesday balance (zero) caps the first payment at nothing.
+    assert results.loc["2026-09-23", "CB_Remittance"] == 0.0
+    assert results["CB_Remittance"].sum() > 0.0
+    _verify(results, paths)
+
+
+def test_the_first_coupon_pays_down_the_opening_receivable(tmp_path):
+    results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=-100.0)
+    receivable = results["CB_TreasuryAccruedInterest"]
+    # Interest from 2026-03-31 (a month-end maturity pays on month ends) to the opening is a
+    # receivable, not income in the run.
+    assert receivable.iloc[0] == pytest.approx(500 * 0.04 / 2 * 173 / 183, rel=1e-6)
+    coupon_day = pd.Timestamp("2026-09-30")
+    assert results.loc[coupon_day, "CB_CouponCash"] == pytest.approx(10.0)
+    assert receivable.loc[coupon_day] == pytest.approx(0.0, abs=1e-12)
+    # The coupon earns only the days the Fed held it during the run.
+    earned = results.loc[START:"2026-09-30", "CB_CouponAccrual"].iloc[1:].sum()
+    assert earned == pytest.approx(10.0 - receivable.iloc[0])
+    assert results.loc[coupon_day, "CB_CouponAccrual"] < 0.1
+    _verify(results, paths)
 
 
 def test_higher_fed_coupon_income_raises_remittances_once_the_deferred_asset_is_clear(tmp_path):
     low, paths = _run(tmp_path / "low", fed_coupon=0.04, h41_earnings_remittances_due_bil=0.0)
     high, _ = _run(tmp_path / "high", fed_coupon=0.06, h41_earnings_remittances_due_bil=0.0)
-    # The note pays 10 (4%) or 15 (6%) on Wednesday 2026-09-30, a remittance day.
-    assert high["CB_CouponIncome"].sum() - low["CB_CouponIncome"].sum() == pytest.approx(5.0)
-    assert high["CB_Remittance"].sum() - low["CB_Remittance"].sum() == pytest.approx(5.0, abs=1e-6)
-    assert low.loc["2026-09-30", "CB_Remittance"] > 0.0
-    # With no deferred asset the extra coupon comes straight back: the Treasury's cash is unchanged.
-    assert high["TGA"].to_numpy() == pytest.approx(low["TGA"].to_numpy())
+    extra = (high["CB_CouponAccrual"] - low["CB_CouponAccrual"]).sum()
+    assert extra == pytest.approx(500 * 0.02 / 365 * 20, rel=0.05)
+    assert high["CB_Remittance"].sum() > low["CB_Remittance"].sum()
+    # Every extra dollar earned is either remitted or still owed to the Treasury.
+    passed_on = (high["CB_Remittance"].sum() + high["CB_EarningsRemittancesDue"].iloc[-1]) - (
+        low["CB_Remittance"].sum() + low["CB_EarningsRemittancesDue"].iloc[-1]
+    )
+    assert passed_on == pytest.approx(extra, rel=1e-3)
     _verify(low, paths)
 
 
@@ -102,8 +138,9 @@ def test_higher_fed_coupon_income_repays_more_deferred_asset_and_remits_nothing(
     low, _ = _run(tmp_path / "low", fed_coupon=0.04, h41_earnings_remittances_due_bil=-100.0)
     high, _ = _run(tmp_path / "high", fed_coupon=0.06, h41_earnings_remittances_due_bil=-100.0)
     assert low["CB_Remittance"].sum() == high["CB_Remittance"].sum() == 0.0
-    assert low["CB_DeferredAsset"].iloc[-1] - high["CB_DeferredAsset"].iloc[-1] == pytest.approx(5.0, abs=1e-6)
-    # While the deferred asset is positive the Treasury bears the extra coupon in full.
+    extra = (high["CB_CouponAccrual"] - low["CB_CouponAccrual"]).sum()
+    assert low["CB_DeferredAsset"].iloc[-1] - high["CB_DeferredAsset"].iloc[-1] == pytest.approx(extra, rel=1e-3)
+    # While the deferred asset is positive the Treasury bears the whole extra coupon.
     assert low["TGA"].iloc[-1] - high["TGA"].iloc[-1] == pytest.approx(5.0, abs=1e-6)
 
 
@@ -112,57 +149,105 @@ def test_higher_reserves_raise_iorb_expense_and_lower_remittances(tmp_path):
     flush, paths = _run(tmp_path / "flush", h41_earnings_remittances_due_bil=0.0, h41_reserve_balances_bil=5_000.0)
     gap = flush["CB_ReserveBalances"] - lean["CB_ReserveBalances"]
     assert gap.iloc[0] == pytest.approx(2_000.0)
-    # Each day's IORB is the rate times the reserves held overnight, actual/360.
-    expected = (flush["CB_IORBRatePct"] / 100.0 * gap.shift(1) / 360.0).iloc[1:]
+    # Each day's IORB is that day's rate on that day's closing reserves, actual/360.
+    expected = (flush["CB_IORBRatePct"] / 100.0 * gap / 360.0).iloc[1:]
     assert (flush["CB_IORBExpense"] - lean["CB_IORBExpense"]).iloc[1:].to_numpy() == pytest.approx(expected.to_numpy())
-    # About ten days of IORB on 2,000 more reserves (the extra IORB itself adds reserves),
-    # all paid before the 2026-09-30 remittance.
-    shortfall = 2_000.0 * flush["CB_IORBRatePct"].iloc[1] / 100.0 * 10 / 360.0
-    assert lean["CB_Remittance"].sum() - flush["CB_Remittance"].sum() == pytest.approx(shortfall, rel=1e-3)
+    assert flush["CB_Remittance"].sum() < lean["CB_Remittance"].sum()
     assert flush["TGA"].iloc[-1] < lean["TGA"].iloc[-1]
     _verify(flush, paths)
 
 
-def test_reserve_level_is_the_h41_balance_sheet_moved_by_the_runs_own_factors(tmp_path):
-    results, paths = _run(
-        tmp_path, h41_earnings_remittances_due_bil=0.0, h41_tga_bil=956.502, h41_reserve_balances_bil=2_936.355,
-        currency_growth_bil=0.3, soma_mbs_bil=1_964.8, soma_mbs_interest_bil=0.13, operating_expenses_bil=0.03,
+def test_fmu_balances_earn_iorb_and_interest_posts_on_the_next_business_day(tmp_path):
+    results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=0.0, other_deposits_bil=200.0)
+    fmu = results["CB_FMUBalances"]
+    assert fmu.iloc[0] == pytest.approx(100.0)  # the fixture's remunerated share is one half
+    assert results["CB_FMUInterestExpense"].iloc[1:].to_numpy() == pytest.approx(
+        (results["CB_IORBRatePct"] / 100.0 * fmu / 360.0).iloc[1:].to_numpy()
     )
-    # Rolling the Wednesday H.4.1 to the opening: the TGA fell from 956.502 to 800.
-    assert results["CB_ReserveBalances"].iloc[0] == pytest.approx(2_936.355 + 156.502)
-    step = results["CB_ReserveBalances"].diff().iloc[1:]
-    explained = (
-        results["CB_TreasuryReserveEffect"] - results["CB_Currency"].diff()
-        + results["CB_MBSHoldings"].diff() - results["CB_MBSIncome"] - results["CB_OtherIncome"]
-        + results["CB_IORBExpense"] + results["CB_ONRRPExpense"] + results["CB_OperatingExpenses"]
-        + results["CB_Dividends"]
-    ).iloc[1:]
-    assert step.to_numpy() == pytest.approx(explained.to_numpy())
-    # The Treasury part is the run's own reserve path; Treasury interest and remittances are not in it.
-    assert results["CB_TreasuryReserveEffect"].iloc[1:].to_numpy() == pytest.approx(
-        results["Reserves"].diff().iloc[1:].to_numpy()
+    # Saturday's and Sunday's interest posts on Monday, not on the weekend.
+    assert results.loc["2026-09-26", "CB_InterestPosted"] == 0.0
+    assert results.loc["2026-09-27", "CB_InterestPosted"] == 0.0
+    assert results.loc["2026-09-28", "CB_InterestPosted"] == pytest.approx(
+        results.loc["2026-09-27", "CB_InterestPayable"]
     )
-    assert results["CB_Currency"].iloc[-1] - results["CB_Currency"].iloc[0] == pytest.approx(0.3 * 20)
     _verify(results, paths)
 
 
-def test_table_4_3_remittance_stays_in_the_fiscal_flow_while_the_tga_gets_the_modeled_one(tmp_path):
-    neutral, _ = _run(tmp_path / "zero", h41_earnings_remittances_due_bil=-1_000.0)
-    cbo, paths = _run(tmp_path / "cbo", remittance_bil=2.338, h41_earnings_remittances_due_bil=-1_000.0)
-    # The fixture books 2.338 in each of FY2026 and FY2027 inside the window.
-    table_4_3 = cbo["CBOTable43RemittanceInFiscalFlow"].sum()
-    assert table_4_3 == pytest.approx(2 * 2.338)
-    assert cbo["CB_Remittance"].sum() == 0.0  # the deferred asset blocks the modeled remittance
-    # The public receives P + R_CBO, 99 percent of it in covered deposits ...
-    assert cbo["TDC_Level"].iloc[-1] - neutral["TDC_Level"].iloc[-1] == pytest.approx(0.99 * table_4_3)
-    # ... and the Treasury, short of the remittance CBO counted on, finances the gap.
-    assert neutral["TGA"].iloc[-1] - cbo["TGA"].iloc[-1] == pytest.approx(table_4_3, abs=1e-6)
-    _verify(cbo, paths)
+def test_a_long_yield_shock_leaves_iorb_and_on_rrp_unchanged(tmp_path):
+    base, _ = _run(tmp_path / "base", h41_earnings_remittances_due_bil=0.0)
+    shocked, _ = _run(tmp_path / "shocked", h41_earnings_remittances_due_bil=0.0, rate_shift=0.01)
+    for column in ("CB_PolicyRatePct", "CB_IORBRatePct", "CB_ONRRPRatePct"):
+        pd.testing.assert_series_equal(base[column], shocked[column], check_exact=True)
+    assert base["CB_IORBRatePct"].iloc[1] == pytest.approx(4.02)
+    assert base["CB_ONRRPRatePct"].iloc[1] == pytest.approx(3.87)
 
 
-def test_verifier_rejects_a_tampered_remittance_path(tmp_path):
+def test_a_bill_bought_at_99_earns_1_whatever_it_was_issued_at():
+    """Sol's case: issued at 97, bought by the Fed at 99, redeemed at 100."""
+
+    book = FedLotBook()
+    book.add(7, "2026-10-20", premium=99.0 - 100.0, bill=True, acquired="2026-09-30")
+    earned = 0.0
+    for day in pd.date_range("2026-10-01", "2026-10-20"):
+        bill, coupon = book.amortize(day - pd.Timedelta(days=1), day)
+        earned += bill + coupon
+    assert earned == pytest.approx(1.0)
+    assert 7 not in book.lots
+
+
+def test_a_premium_purchase_amortizes_against_income_to_maturity():
+    book = FedLotBook()
+    book.add(8, "2026-10-11", premium=2.0, bill=False, acquired="2026-10-01")
+    daily = [sum(book.amortize(day - pd.Timedelta(days=1), day)) for day in pd.date_range("2026-10-02", "2026-10-11")]
+    assert sum(daily) == pytest.approx(-2.0)
+    assert daily[0] == pytest.approx(-0.2)  # straight line over the ten days held
+
+
+def test_a_secondary_purchase_is_carried_at_its_clean_cost(tmp_path):
+    from forecast_bundle_builders import build_fed_holdings_path_rows
+    from test_cbo_engine_integration import _single_period, _write_csv
+
+    # The purchase settles on 2026-09-25, between coupon dates, so the Fed buys accrued interest.
+    window = _single_period("2026-09-20", "2026-09-25")
+    paths = _build_temp_forecast_inputs(tmp_path, periods=window, period_end="2026-09-25",
+                                        cbo_public_debt_target_bil=1_250.0)
+    paths["fed_holdings_path_file"] = _write_csv(tmp_path / "tdcsim_fed_holdings_path.csv", build_fed_holdings_path_rows(
+        scenario_id="baseline", periods=window, opening_state_date="2026-09-20", opening_cb_holdings_bil=0.0,
+        cbo_fy_end_fed_holdings_bil={2026: 20.0}, observation_date="2026-09-20", available_date="2026-09-20",
+    ))
+    results, _ = run_simulation(_minimal_engine_params(paths), "2026-09-20", "2026-09-25", freq="5D",
+                                scenario_name="baseline")
+    period = results.iloc[-1]
+    face, cash = period["CBOFedSecondaryPurchaseFace"], period["CBOFedSecondaryPurchaseCash"]
+    assert face > 0.0
+    # The Fed buys a bill: its lot carries the discount it paid (cash less face), which it then
+    # accretes, not the discount Treasury sold the bill at.
+    assert period["CB_AccruedInterestPurchased"] == 0.0
+    assert period["CB_PremiumAcquired"] == pytest.approx(cash - face)
+    assert period["CB_PremiumAcquired"] < 0.0
+    assert period["CB_TreasuryUnamortizedPremium"] == pytest.approx(cash - face)
+    # Nothing is earned on the day of purchase.
+    assert period["CB_BillDiscountAccretion"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_both_closing_checks_reject_tampering(tmp_path):
     results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=0.0)
-    assert _verify(results, paths) > 0.0
+    frame = _frame(results)
+    check_earnings_due_closes(frame, 0.0)
+    check_fed_balance_sheet_closes(frame)
+    understated = frame.copy()
+    understated.loc[understated.index[-1], "CB_EarningsRemittancesDue"] -= 0.5
+    with pytest.raises(ValueError, match="closing earnings due"):
+        check_earnings_due_closes(understated, 0.0)
+    unbooked = frame.copy()
+    unbooked.loc[5:, "CB_OtherDeposits"] += 1.0  # a liability that never drained reserves
+    with pytest.raises(ValueError, match="reserves against the Fed balance sheet"):
+        check_fed_balance_sheet_closes(unbooked)
+
+
+def test_verifier_rejects_a_tampered_remittance_and_income(tmp_path):
+    results, paths = _run(tmp_path, h41_earnings_remittances_due_bil=0.0)
+    assert _verify(results, paths)["max_remittance_bil"] > 0.0
     paid = results.index[results["CB_Remittance"] > 0.0][0]
     for column in ("CBORemittanceCashEffect", "CB_Remittance"):
         tampered = results.copy()
@@ -171,7 +256,7 @@ def test_verifier_rejects_a_tampered_remittance_path(tmp_path):
             _verify(tampered, paths)
     tampered = results.copy()
     tampered.loc[paid, "CB_IORBExpense"] -= 1.0
-    with pytest.raises(ValueError, match="CB_IORBExpense"):
+    with pytest.raises(ValueError, match="CB_IORBExpense|interest payable"):
         _verify(tampered, paths)
     tampered = results.copy()
     tampered["CBOTable43RemittanceInFiscalFlow"] += 0.01
@@ -179,45 +264,96 @@ def test_verifier_rejects_a_tampered_remittance_path(tmp_path):
         _verify(tampered, paths)
 
 
+def _tampered_runner_run(tmp_path, tamper):
+    from tdcsim_cbo import CboScenarioSpec, run_cbo_scenario
+    from tdcsim_cbo._json import read_json, write_json
+    from tdcsim_cbo.verifier import verify_scenario_run
+    from test_tdcsim_cbo_closeout_interface import _refresh_result_hashes, _runner_baseline_and_scenarios
+
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path, remittance_bil=1.0)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    assert verify_scenario_run(run.output_dir)["status"] == "pass"
+    results = pd.read_csv(run.results_path)
+    tamper(results)
+    results.to_csv(run.results_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_result_hashes(run.output_dir, manifest)
+    write_json(run.manifest_path, manifest)
+    return run.output_dir, verify_scenario_run
+
+
+def test_verifier_binds_fed_treasury_income_to_settlement_evidence(tmp_path):
+    """Sol's first probe: move income between Treasury lines on a payment day."""
+
+    def move(results):
+        day = results.index[results["CB_CouponCash"].abs() > 0.0]
+        row = day[0] if len(day) else 2
+        results.loc[row, "CB_CouponAccrual"] -= 1.0
+        results.loc[row, "CB_BillDiscountAccretion"] += 1.0
+
+    output_dir, verify = _tampered_runner_run(tmp_path, move)
+    with pytest.raises(ValueError, match="Fed remittance verification failed"):
+        verify(output_dir)
+
+
+def test_verifier_binds_the_tga_to_the_treasury_cash_journal(tmp_path):
+    """Sol's second probe: cut one day's closing TGA by 1 billion."""
+
+    def cut(results):
+        results.loc[3, "TGA"] -= 1.0
+
+    output_dir, verify = _tampered_runner_run(tmp_path, cut)
+    with pytest.raises(ValueError):
+        verify(output_dir)
+
+
+def test_table_4_3_remittance_stays_in_the_fiscal_flow_while_the_tga_gets_the_modeled_one(tmp_path):
+    neutral, _ = _run(tmp_path / "zero", h41_earnings_remittances_due_bil=-1_000.0)
+    cbo, paths = _run(tmp_path / "cbo", remittance_bil=2.338, h41_earnings_remittances_due_bil=-1_000.0)
+    table_4_3 = cbo["CBOTable43RemittanceInFiscalFlow"].sum()
+    assert table_4_3 == pytest.approx(2 * 2.338)  # 2.338 in each of FY2026 and FY2027
+    assert cbo["CB_Remittance"].sum() == 0.0
+    assert cbo["TDC_Level"].iloc[-1] - neutral["TDC_Level"].iloc[-1] == pytest.approx(0.99 * table_4_3)
+    assert neutral["TGA"].iloc[-1] - cbo["TGA"].iloc[-1] == pytest.approx(table_4_3, abs=1e-6)
+    _verify(cbo, paths)
+
+
 def test_mbs_income_follows_the_nyfed_runoff_path_from_the_h41_opening():
     source = fed_income_source_fixture()
     periods = build_simulation_calendar("2026-06-21", "2036-09-30", "daily")
-    curve = [{"scenario_id": "s", "curve_date": "2026-04-01", "tenor_years": 0.25, "nominal_rate": 3.35}]
-    rows = build_fed_income_path_rows(scenario_id="s", periods=periods, yield_rows=curve)
+    rows = build_fed_income_path_rows(scenario_id="s", periods=periods)
     first, last = rows[0], rows[-1]
     wac = float(source["soma_agency_mbs"]["weighted_average_coupon_pct"]) / 100.0
     assert first["soma_mbs_interest_bil"] == pytest.approx(wac * first["soma_mbs_start_bil"] / 365.25)
-    # The path is the H.4.1 level scaled by the NY Fed projection, so it opens near 1,964.8 ...
     assert first["soma_mbs_start_bil"] == pytest.approx(1_964.798, rel=2e-3)
-    # ... runs off to the projection's 2035 share of its mid-2026 level ...
     dec_2035 = next(row for row in rows if row["period_end"] == "2035-12-31")
     assert dec_2035["soma_mbs_end_bil"] / 1_964.798 == pytest.approx(677.0 / 1_950.6, rel=5e-3)
-    # ... and keeps running off after the projection ends, so income keeps falling.
     assert last["soma_mbs_end_bil"] < dec_2035["soma_mbs_end_bil"]
-    assert last["soma_mbs_interest_bil"] < first["soma_mbs_interest_bil"] / 3.0
-    # IORB opens at the observed 3.65 percent on the package curve's 3.35 percent bill rate.
-    assert first["iorb_spread_pct"] == pytest.approx(0.30)
-    assert first["on_rrp_spread_pct"] == pytest.approx(0.15)
+    # The MBS premium runs down with the holdings it belongs to.
+    premiums = fed_net_premiums_bil()
+    assert first["soma_mbs_premium_start_bil"] / first["soma_mbs_start_bil"] == pytest.approx(
+        premiums["mbs"] / 1_964.798
+    )
+    # Other liabilities and capital exclude the earnings due carried separately: +55.509.
+    assert first["h41_other_liabilities_and_capital_bil"] == pytest.approx(55.509)
+    assert first["remunerated_other_deposit_share"] == pytest.approx(220.5 / 259.503)
 
 
-def test_non_treasury_reserve_effect_signs():
-    base = dict(mbs_start=10.0, mbs_end=10.0, currency_start=5.0, currency_end=5.0, mbs_income=0.0,
-                other_income=0.0, iorb_expense=0.0, on_rrp_expense=0.0, operating_expenses=0.0, dividends=0.0)
-    assert non_treasury_reserve_effect(**{**base, "currency_end": 6.0}) == -1.0
-    assert non_treasury_reserve_effect(**{**base, "mbs_end": 9.0}) == -1.0
-    assert non_treasury_reserve_effect(**{**base, "iorb_expense": 1.0}) == 1.0
-    assert non_treasury_reserve_effect(**{**base, "mbs_income": 1.0}) == -1.0
+def test_net_premiums_split_by_class_and_reconcile_to_the_june_h41():
+    premiums = fed_net_premiums_bil()
+    assert sum(premiums.values()) == pytest.approx(215.113 - 25.650)
+    assert premiums["treasury"] == pytest.approx(156.283 * 189.463 / 193.870, rel=1e-6)
 
 
 def test_source_transcription_names_every_packaged_document():
     source = fed_income_source_fixture()
-    assert {doc["file"] for doc in source["documents"].values()} == {
+    assert {doc["file"] for doc in source["documents"].values()} >= {
         "fed/h41_2026-06-18.htm",
         "fed/fomc_implementation_note_2026-06-17.htm",
-        "fed/nyfed_omo2025_projection_data.xlsx",
-        "fed/nyfed_omo2025_report.pdf",
-        "fed/nyfed_soma_agency_holdings_2026-06-17.json",
-        "fed/reserve_banks_combined_financial_statements_2025.pdf",
+        "fed/nyfed_effr_2026-06-15_2026-06-19.json",
+        "fed/z1_2026-06-11_s125s5.htm",
+        "fed/reserve_banks_quarterly_report_2026q1.pdf",
+        "fed/fam_chapter6_reporting_requirements.htm",
     }
     assert date.fromisoformat(source["h41_wednesday_levels_mil"]["as_of_date"]) == date(2026, 6, 17)
 

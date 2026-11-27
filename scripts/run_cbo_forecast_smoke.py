@@ -66,6 +66,7 @@ from forecast_bundle_builders import (
     FED_INCOME_DOCUMENTS,
     FED_INCOME_SOURCE_FILE,
     build_fed_income_path_rows,
+    build_policy_rate_path_rows,
     fed_income_source_fixture,
     build_cash_reconciliation_residual_rows,
     MTS_TABLE_1_DEFICIT_SELECTOR,
@@ -84,6 +85,7 @@ from forecast_paths import (
     CBO_FED_REMITTANCE_ROLE,
     FED_INCOME_PATH_FILE,
     FED_REMITTANCE_PATH_FILE,
+    POLICY_RATE_PATH_FILE,
 )
 from fed_income import FED_INCOME_RESULT_COLUMNS
 from forecast_input_builder import (
@@ -490,7 +492,13 @@ def build_forecast_bundle(
         output_tenors=(1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0),
     )
     validate_yield_surface_rate_units(yield_rows)
-    fed_income_rows = build_fed_income_path_rows(scenario_id=SCENARIO_ID, periods=periods, yield_rows=yield_rows)
+    fed_income_rows = build_fed_income_path_rows(scenario_id=SCENARIO_ID, periods=periods)
+    policy_rate_rows = build_policy_rate_path_rows(
+        scenario_id=SCENARIO_ID,
+        simulation_start=SIMULATION_START_DATE,
+        simulation_end=SIMULATION_END_DATE,
+        economic_workbook=economic_path,
+    )
     frn_rate_rows = build_forward_frn_rate_path_rows(
         scenario_id=SCENARIO_ID,
         periods=periods,
@@ -527,6 +535,7 @@ def build_forecast_bundle(
     write_forecast_rows_csv(inputs / "tdcsim_primary_deficit_path.csv", primary_rows)
     write_forecast_rows_csv(inputs / FED_REMITTANCE_PATH_FILE, remittance_rows)
     write_forecast_rows_csv(inputs / FED_INCOME_PATH_FILE, fed_income_rows)
+    write_forecast_rows_csv(inputs / POLICY_RATE_PATH_FILE, policy_rate_rows)
     write_forecast_rows_csv(inputs / "tdcsim_operating_cash_path.csv", operating_cash_rows)
     write_forecast_rows_csv(inputs / "tdcsim_cash_reconciliation_residual.csv", zero_residual_rows)
     write_forecast_rows_csv(inputs / "tdcsim_macro_forecast_path.csv", macro_rows)
@@ -1733,6 +1742,7 @@ def _baseline_input_paths(inputs_dir: Path) -> dict[str, str]:
         "primary_deficit_path_file": str(inputs_dir / "tdcsim_primary_deficit_path.csv"),
         "fed_remittance_path_file": str(inputs_dir / FED_REMITTANCE_PATH_FILE),
         "fed_income_path_file": str(inputs_dir / FED_INCOME_PATH_FILE),
+        "policy_rate_path_file": str(inputs_dir / POLICY_RATE_PATH_FILE),
         "operating_cash_path_file": str(inputs_dir / "tdcsim_operating_cash_path.csv"),
         "cash_reconciliation_residual_file": str(inputs_dir / "tdcsim_cash_reconciliation_residual.csv"),
         "macro_forecast_path_file": str(inputs_dir / "tdcsim_macro_forecast_path.csv"),

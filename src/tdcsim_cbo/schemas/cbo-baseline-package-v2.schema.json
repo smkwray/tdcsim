@@ -20,7 +20,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "tdcsim_cbo_baseline_package_v1"
+      "const": "tdcsim_cbo_baseline_package_v2"
     },
     "package_id": {
       "type": "string",

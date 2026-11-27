@@ -29,6 +29,8 @@ from forecast_paths import (
     CBO_FED_REMITTANCE_STATUS,
     FED_INCOME_PATH_FILE,
     FED_INCOME_PATH_SCHEMA_VERSION,
+    POLICY_RATE_PATH_FILE,
+    POLICY_RATE_PATH_SCHEMA_VERSION,
     FED_REMITTANCE_PATH_FILE,
     FED_REMITTANCE_PATH_SCHEMA_VERSION,
     load_cash_reconciliation_residual,
@@ -99,30 +101,37 @@ def _write_fixture_remittance_path(tmp_path, primary_rows, remittance_bil=0.0):
 FIXTURE_FED_INCOME = {
     "soma_mbs_bil": 0.0,
     "soma_mbs_interest_bil": 0.0,
+    "soma_mbs_premium_bil": 0.0,
     "currency_bil": 0.0,
     "currency_growth_bil": 0.0,
+    "other_deposits_bil": 0.0,
+    "other_deposits_growth_bil": 0.0,
+    "other_liabilities_bil": 0.0,
     "other_income_bil": 0.0,
     "operating_expenses_bil": 0.0,
     "dividends_bil": 0.0,
     "h41_reserve_balances_bil": 2_000_000.0,
     "h41_tga_bil": 0.0,
-    "h41_on_rrp_bil": 0.0,
+    "h41_domestic_on_rrp_bil": 0.0,
+    "opening_domestic_on_rrp_bil": 0.0,
+    "h41_foreign_repo_bil": 0.0,
+    "h41_foreign_official_deposits_bil": 0.0,
     "h41_earnings_remittances_due_bil": -1_000_000_000.0,
-    "h41_other_liabilities_and_capital_bil": 0.0,
-    "iorb_spread_pct": 0.1,
-    "on_rrp_spread_pct": -0.05,
+    "h41_treasury_net_premium_bil": 0.0,
+    "remunerated_other_deposit_share": 0.5,
 }
+FIXTURE_POLICY_RATE = {"fed_funds_rate_pct": 4.0, "iorb_spread_pct": 0.02, "on_rrp_spread_pct": -0.13}
 
 
 def fixture_fed_income_rows(primary_rows, **overrides) -> list[dict[str, object]]:
-    """Fed income path rows for fixture periods; amounts per period, currency growing linearly."""
+    """Fed income path rows for fixture periods; amounts per period, growth linear per period."""
 
     values = {**FIXTURE_FED_INCOME, **overrides}
     unknown = set(values) - set(FIXTURE_FED_INCOME)
     if unknown:
         raise KeyError(f"unknown Fed income fixture keys: {sorted(unknown)}")
     rows = []
-    currency = values["currency_bil"]
+    currency, other_deposits = values["currency_bil"], values["other_deposits_bil"]
     for row in primary_rows:
         rows.append({
             "schema_version": FED_INCOME_PATH_SCHEMA_VERSION,
@@ -132,33 +141,70 @@ def fixture_fed_income_rows(primary_rows, **overrides) -> list[dict[str, object]
             "soma_mbs_start_bil": values["soma_mbs_bil"],
             "soma_mbs_end_bil": values["soma_mbs_bil"],
             "soma_mbs_interest_bil": values["soma_mbs_interest_bil"],
+            "soma_mbs_premium_start_bil": values["soma_mbs_premium_bil"],
+            "soma_mbs_premium_end_bil": values["soma_mbs_premium_bil"],
             "currency_start_bil": currency,
             "currency_end_bil": currency + values["currency_growth_bil"],
+            "other_deposits_start_bil": other_deposits,
+            "other_deposits_end_bil": other_deposits + values["other_deposits_growth_bil"],
+            "other_liabilities_and_capital_start_bil": values["other_liabilities_bil"],
+            "other_liabilities_and_capital_end_bil": values["other_liabilities_bil"],
             "other_income_bil": values["other_income_bil"],
             "operating_expenses_bil": values["operating_expenses_bil"],
             "dividends_bil": values["dividends_bil"],
             "h41_as_of_date": "2026-06-17",
             "h41_reserve_balances_bil": values["h41_reserve_balances_bil"],
             "h41_tga_bil": values["h41_tga_bil"],
-            "h41_on_rrp_bil": values["h41_on_rrp_bil"],
+            "h41_domestic_on_rrp_bil": values["h41_domestic_on_rrp_bil"],
+            "opening_domestic_on_rrp_bil": values["opening_domestic_on_rrp_bil"],
+            "h41_foreign_repo_bil": values["h41_foreign_repo_bil"],
+            "h41_foreign_official_deposits_bil": values["h41_foreign_official_deposits_bil"],
             "h41_soma_mbs_bil": values["soma_mbs_bil"],
             "h41_currency_bil": values["currency_bil"],
+            "h41_other_deposits_bil": values["other_deposits_bil"],
+            "h41_other_liabilities_and_capital_bil": values["other_liabilities_bil"],
             "h41_earnings_remittances_due_bil": values["h41_earnings_remittances_due_bil"],
-            "h41_other_liabilities_and_capital_bil": values["h41_other_liabilities_and_capital_bil"],
-            "short_rate_tenor_years": 0.25,
-            "iorb_spread_pct": values["iorb_spread_pct"],
-            "on_rrp_spread_pct": values["on_rrp_spread_pct"],
+            "h41_treasury_net_premium_bil": values["h41_treasury_net_premium_bil"],
+            "remunerated_other_deposit_share": values["remunerated_other_deposit_share"],
+            "previous_wednesday_date": "2026-06-17",
+            "previous_wednesday_due_bil": values["h41_earnings_remittances_due_bil"],
+            "year_end_date": "2025-12-31",
+            "year_end_due_bil": values["h41_earnings_remittances_due_bil"],
+            "opening_interest_payable_bil": 0.0,
+            "opening_foreign_repo_interest_payable_bil": 0.0,
             "source_role": "scenario_assumption",
             "runtime_role": "hard_flow",
             "source_status": "fixture",
             "claim_boundary": "fixture",
         })
         currency += values["currency_growth_bil"]
+        other_deposits += values["other_deposits_growth_bil"]
     return rows
+
+
+def fixture_policy_rate_rows(primary_rows, **overrides) -> list[dict[str, object]]:
+    values = {**FIXTURE_POLICY_RATE, **overrides}
+    first, last = primary_rows[0], primary_rows[-1]
+    return [{
+        "schema_version": POLICY_RATE_PATH_SCHEMA_VERSION,
+        "scenario_id": first["scenario_id"],
+        "period_start": pd.Timestamp(first["period_start"]).date().isoformat(),
+        "period_end": (pd.Timestamp(last["period_end"]) + pd.Timedelta(days=1)).date().isoformat(),
+        **values,
+        "rate_source": "fixture",
+        "source_role": "scenario_assumption",
+        "runtime_role": "hard_flow",
+        "source_status": "fixture",
+        "claim_boundary": "fixture",
+    }]
 
 
 def _write_fixture_fed_income_path(tmp_path, primary_rows, **overrides) -> Path:
     return _write_csv(tmp_path / FED_INCOME_PATH_FILE, fixture_fed_income_rows(primary_rows, **overrides))
+
+
+def _write_fixture_policy_rate_path(tmp_path, primary_rows, **overrides) -> Path:
+    return _write_csv(tmp_path / POLICY_RATE_PATH_FILE, fixture_policy_rate_rows(primary_rows, **overrides))
 
 
 def _single_period(period_start: str = "2026-09-20", period_end: str = "2026-09-30") -> list[SimulationPeriod]:
@@ -418,6 +464,7 @@ def _build_temp_forecast_inputs(
     cbo_net_interest_bil: float = 120.0,
     later_fiscal_years: dict[int, tuple[float, float]] | None = None,
     fed_income: dict[str, float] | None = None,
+    policy_rate: dict[str, float] | None = None,
 ) -> dict[str, Path]:
     """``later_fiscal_years`` maps a fiscal year after 2026 to (debt target, primary flow)."""
     periods = periods or _single_period(period_start, period_end)
@@ -479,6 +526,7 @@ def _build_temp_forecast_inputs(
         "primary_deficit_path_file": _write_csv(tmp_path / "tdcsim_primary_deficit_path.csv", primary_rows),
         "fed_remittance_path_file": _write_fixture_remittance_path(tmp_path, primary_rows, remittance_bil),
         "fed_income_path_file": _write_fixture_fed_income_path(tmp_path, primary_rows, **(fed_income or {})),
+        "policy_rate_path_file": _write_fixture_policy_rate_path(tmp_path, primary_rows, **(policy_rate or {})),
         "operating_cash_path_file": _write_csv(tmp_path / "tdcsim_operating_cash_path.csv", operating_cash_rows),
         "cash_reconciliation_residual_file": _write_csv(
             tmp_path / "tdcsim_cash_reconciliation_residual.csv",

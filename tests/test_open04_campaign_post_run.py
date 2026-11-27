@@ -377,7 +377,7 @@ def _materialize_complete_run(
     peak_rss_bytes = 512 * 1024**2
     event_count = 100 + _ROLE_INDEX[role]
     manifest: dict[str, Any] = {
-        "schema_version": "tdcsim_cbo_scenario_run_manifest_v2",
+        "schema_version": "tdcsim_cbo_scenario_run_manifest_v3",
         "status": "complete",
         "verification_grade": "bounded_replay_v1",
         "evidence_profile": "bounded_period_closure_v1",

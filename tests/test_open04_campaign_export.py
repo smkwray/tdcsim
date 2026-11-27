@@ -1657,7 +1657,7 @@ def _materialize_export_run(
         },
     }
     manifest = {
-        "schema_version": "tdcsim_cbo_scenario_run_manifest_v2",
+        "schema_version": "tdcsim_cbo_scenario_run_manifest_v3",
         "status": "complete",
         "verification_grade": "bounded_replay_v1",
         "evidence_profile": "bounded_period_closure_v1",

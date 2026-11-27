@@ -334,16 +334,16 @@ def test_run_cbo_scenario_fed_target_settles_with_modeled_remittance(tmp_path: P
     }
     assert fed_results["CB_Remittance"].tolist() == cash.tolist()
     assert (fed_results["CB_DeferredAsset"] > 0.0).all()
-    # The Fed's secondary purchases add income, so it repays more deferred asset than the noop run.
-    assert fed_results["CB_DeferredAsset"].iloc[-1] < noop_results["CB_DeferredAsset"].iloc[-1]
+    # The Fed's secondary purchases are carried at what it paid, not at the sellers' issue basis.
+    assert fed_results["CB_PremiumAcquired"].abs().sum() > noop_results["CB_PremiumAcquired"].abs().sum()
     assert fed.run_manifest["claim_boundary"]["remittance_role"] == (
         "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
     )
     assert fed.run_manifest["boundary_checks"]["remittance_role"] == fed.run_manifest["claim_boundary"]["remittance_role"]
     assert set(fed.run_manifest["unsupported_components"]) == {
-        "fed_accrual_basis_income", "fed_remunerated_other_deposits", "fed_valuation_gains_and_losses",
+        "fed_effective_interest_amortization", "fed_mbs_payment_clock", "fed_valuation_gains_and_losses",
         "mbs_prepayment_rate_response", "reserve_bank_level_remittances_under_system_deferred_asset",
-        "complete_budgetary_net_interest_mapping",
+        "fed_policy_rate_response_to_scenarios", "complete_budgetary_net_interest_mapping",
     }
     assert verify_scenario_run(fed.output_dir)["status"] == "pass"
     assert fed_results["CBORequiredFaceIssuance"].tolist() == pytest.approx(
@@ -540,7 +540,7 @@ def test_verifier_rejects_wrong_remittance_even_with_fresh_hashes(tmp_path: Path
     _refresh_result_hashes(run.output_dir, manifest)
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="Fed remittance verification failed: CB_Remittance differs"):
+    with pytest.raises(VerificationError, match="Fed remittance verification failed"):
         verify_scenario_run(run.output_dir)
 
 
@@ -1008,7 +1008,7 @@ def test_verifier_rejects_invalid_fed_remittance_claims(tmp_path: Path) -> None:
     manifest = read_json(run.manifest_path)
 
     unsupported = set(manifest["unsupported_components"])
-    for component in ("fed_accrual_basis_income", "reserve_bank_level_remittances_under_system_deferred_asset"):
+    for component in ("fed_effective_interest_amortization", "reserve_bank_level_remittances_under_system_deferred_asset"):
         for replacement in (set(), {"fed_remittances"}):
             invalid = {**manifest, "unsupported_components": sorted((unsupported - {component}) | replacement)}
             write_json(run.manifest_path, invalid)

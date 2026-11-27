@@ -1763,7 +1763,7 @@ def _run_role_evidence(
 ) -> dict[str, Any]:
     if (
         manifest.get("schema_version")
-        != "tdcsim_cbo_scenario_run_manifest_v2"
+        != "tdcsim_cbo_scenario_run_manifest_v3"
         or manifest.get("status") != "complete"
         or manifest.get("verification_grade") != "bounded_replay_v1"
         or manifest.get("evidence_profile")

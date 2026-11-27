@@ -43,7 +43,7 @@ from run_open04_reproduction import _assert_installed_distribution_import  # noq
 from simulation_calendar import is_fedwire_business_day, next_fedwire_business_day  # noqa: E402
 from tips_indexation import value_opening_tips  # noqa: E402
 
-SCHEMA_VERSION = "tdcsim_visual_ledger_v2"
+SCHEMA_VERSION = "tdcsim_visual_ledger_v3"
 HOLDER_COLUMNS = ("fed", "banks", "foreign", "mmf", "other_domestic")
 OPENING_PORTFOLIO = Path("compile/compiled/forecast_inputs/tdcsim_opening_portfolio.csv")
 OPENING_SOURCE = Path("compile/baseline/sources/opening/tdcsim_initial_portfolio_cohorts.csv")

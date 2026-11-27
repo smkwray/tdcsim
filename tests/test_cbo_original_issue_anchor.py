@@ -21,6 +21,7 @@ from test_cbo_engine_integration import (
     _single_period,
     _write_csv,
     _write_fixture_fed_income_path,
+    _write_fixture_policy_rate_path,
     _write_fixture_remittance_path,
 )
 
@@ -62,6 +63,7 @@ def _auction_forecast_inputs(tmp_path: Path) -> dict[str, Path]:
         ),
         "fed_remittance_path_file": _write_fixture_remittance_path(tmp_path, primary_rows),
         "fed_income_path_file": _write_fixture_fed_income_path(tmp_path, primary_rows),
+        "policy_rate_path_file": _write_fixture_policy_rate_path(tmp_path, primary_rows),
         "operating_cash_path_file": _write_csv(
             tmp_path / "tdcsim_operating_cash_path.csv",
             build_operating_cash_path_rows(

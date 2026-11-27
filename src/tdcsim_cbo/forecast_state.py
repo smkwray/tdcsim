@@ -28,12 +28,18 @@ class ForecastStateExportError(ValueError):
 
 # The Fed's closing balance sheet and deferred asset, carried into the next opening.
 FED_BALANCE_SHEET_STATE = {
-    "CB_ReserveBalances": "reserve_balances_bil",
-    "CB_ONRRPBalances": "on_rrp_bil",
-    "CB_MBSHoldings": "soma_mbs_bil",
-    "CB_Currency": "currency_bil",
-    "CB_EarningsRemittancesDue": "earnings_remittances_due_bil",
-    "CB_OtherLiabilitiesAndCapital": "other_liabilities_and_capital_bil",
+    "CB_ReserveBalances": "h41_reserve_balances_bil",
+    "CB_DomesticONRRP": "h41_domestic_on_rrp_bil",
+    "CB_ForeignRepo": "h41_foreign_repo_bil",
+    "CB_ForeignOfficialDeposits": "h41_foreign_official_deposits_bil",
+    "CB_MBSHoldings": "h41_soma_mbs_bil",
+    "CB_Currency": "h41_currency_bil",
+    "CB_OtherDeposits": "h41_other_deposits_bil",
+    "CB_OtherLiabilitiesAndCapital": "h41_other_liabilities_and_capital_bil",
+    "CB_EarningsRemittancesDue": "h41_earnings_remittances_due_bil",
+    "CB_TreasuryUnamortizedPremium": "h41_treasury_net_premium_bil",
+    "CB_InterestPayable": "opening_interest_payable_bil",
+    "CB_ForeignRepoInterestPayable": "opening_foreign_repo_interest_payable_bil",
 }
 
 
@@ -681,6 +687,16 @@ def _verified_closing_state(
         if not math.isfinite(value):
             raise ForecastStateExportError(f"rollforward closing {column} must be finite")
         fed_balance_sheet[key] = value
+    # The weekly rule needs last Wednesday's balance and, early in a year, December 31's.
+    due = pd.to_numeric(results["CB_EarningsRemittancesDue"], errors="raise")
+    wednesdays = dates[(dates.dt.weekday == 2) & dates.le(opening)]
+    if not wednesdays.empty:
+        fed_balance_sheet["previous_wednesday_date"] = wednesdays.iloc[-1].date().isoformat()
+        fed_balance_sheet["previous_wednesday_due_bil"] = float(due[wednesdays.index[-1]])
+    year_ends = dates[(dates.dt.month == 12) & (dates.dt.day == 31) & dates.le(opening)]
+    if not year_ends.empty:
+        fed_balance_sheet["year_end_date"] = year_ends.iloc[-1].date().isoformat()
+        fed_balance_sheet["year_end_due_bil"] = float(due[year_ends.index[-1]])
     if sha256_file(source.results_path) != source.results_sha256:
         raise ForecastStateExportError("rollforward results changed while reading the closing state")
     if sha256_file(source.final_portfolio_path) != source.final_portfolio_sha256:
@@ -796,19 +812,19 @@ def _anchor_fed_income_path(
     if frame.empty or pd.Timestamp(frame["period_start"].iloc[0]).normalize() != opening:
         raise ForecastStateExportError(f"{path.name} has no period starting at the opening state")
     first = frame.iloc[0]
-    if abs(float(first["soma_mbs_start_bil"]) - balance_sheet["soma_mbs_bil"]) > 1e-6 or abs(
-        float(first["currency_start_bil"]) - balance_sheet["currency_bil"]
-    ) > 1e-6:
-        raise ForecastStateExportError(f"{path.name} paths do not continue from the closing Fed balance sheet")
+    for stem, key in (("soma_mbs", "h41_soma_mbs_bil"), ("currency", "h41_currency_bil"),
+                      ("other_deposits", "h41_other_deposits_bil"),
+                      ("other_liabilities_and_capital", "h41_other_liabilities_and_capital_bil")):
+        if abs(float(first[f"{stem}_start_bil"]) - balance_sheet[key]) > 1e-6:
+            raise ForecastStateExportError(f"{path.name} paths do not continue from the closing Fed balance sheet")
+    # The closing balance sheet becomes the next opening. The rollforward's own route balances
+    # are not carried into the routing policy: a routed reopening books the difference from
+    # the policy's opening balances as an opening transfer against reserves.
     anchors = {
+        **balance_sheet,
         "h41_as_of_date": opening.date().isoformat(),
-        "h41_reserve_balances_bil": balance_sheet["reserve_balances_bil"],
         "h41_tga_bil": tga,
-        "h41_on_rrp_bil": balance_sheet["on_rrp_bil"],
-        "h41_soma_mbs_bil": balance_sheet["soma_mbs_bil"],
-        "h41_currency_bil": balance_sheet["currency_bil"],
-        "h41_earnings_remittances_due_bil": balance_sheet["earnings_remittances_due_bil"],
-        "h41_other_liabilities_and_capital_bil": balance_sheet["other_liabilities_and_capital_bil"],
+        "opening_domestic_on_rrp_bil": balance_sheet["h41_domestic_on_rrp_bil"],
     }
     original = {column: first[column] for column in anchors}
     for column, value in anchors.items():

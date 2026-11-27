@@ -134,11 +134,12 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
     assert {
         claim for claim in manifest["claim_boundary"]["excluded_claims"] if claim.startswith("does_not_model_")
     } == {
-        "does_not_model_fed_accrual_basis_income",
-        "does_not_model_fed_remunerated_other_deposits",
+        "does_not_model_fed_effective_interest_amortization",
+        "does_not_model_fed_mbs_payment_clock",
         "does_not_model_fed_valuation_gains_and_losses",
         "does_not_model_mbs_prepayment_rate_response",
         "does_not_model_reserve_bank_level_remittances_under_system_deferred_asset",
+        "does_not_model_fed_policy_rate_response_to_scenarios",
     }
     assert manifest["source_package"]["source_file_count"] >= len(SOURCE_PACKAGE_INPUTS)
     source_files = manifest["source_package"]["source_files"]

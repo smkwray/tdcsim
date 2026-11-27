@@ -441,7 +441,7 @@ def _package(
         for record in records.values()
     ]
     manifest: dict[str, Any] = {
-        "schema_version": "tdcsim_cbo_scenario_run_manifest_v2",
+        "schema_version": "tdcsim_cbo_scenario_run_manifest_v3",
         "run_id": "test-bounded-run",
         "status": "complete",
         "verification_grade": "bounded_replay_v1",
@@ -886,7 +886,7 @@ def test_manifest_schema_selection_rejects_unknown_version(
     tmp_path: Path,
 ) -> None:
     _root, manifest, _results, _rows = _package(tmp_path)
-    manifest["schema_version"] = "tdcsim_cbo_scenario_run_manifest_v3"
+    manifest["schema_version"] = "tdcsim_cbo_scenario_run_manifest_v4"
 
     with pytest.raises(VerificationError, match="unsupported run manifest"):
         _validate_run_manifest_schema(manifest)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import csv
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 from forecast_paths import (
     CBO_FED_REMITTANCE_ROLE,
     FED_INCOME_PATH_SCHEMA_VERSION,
+    POLICY_RATE_PATH_SCHEMA_VERSION,
     FED_REMITTANCE_PATH_SCHEMA_VERSION,
     operating_cash_runtime_role,
 )
@@ -63,8 +65,14 @@ FED_INCOME_DOCUMENTS = {
     "nyfed_soma_annual_report": "fed/nyfed_omo2025_report.pdf",
     "soma_agency_holdings": "fed/nyfed_soma_agency_holdings_2026-06-17.json",
     "reserve_banks_financial_statements": "fed/reserve_banks_combined_financial_statements_2025.pdf",
+    "reserve_banks_quarterly_report": "fed/reserve_banks_quarterly_report_2026q1.pdf",
+    "nyfed_effr": "fed/nyfed_effr_2026-06-15_2026-06-19.json",
+    "nyfed_reverse_repo_operations": "fed/nyfed_reverse_repo_operations_2026-06-10_2026-06-25.json",
+    "financial_accounts_ccp_table": "fed/z1_2026-06-11_s125s5.htm",
+    "financial_accounting_manual_chapter_6": "fed/fam_chapter6_reporting_requirements.htm",
 }
-FED_INCOME_CLAIM_BOUNDARY = "fed_income_lines_from_stated_sources_cash_basis_not_a_fed_forecast"
+FED_INCOME_CLAIM_BOUNDARY = "fed_balance_sheet_paths_and_smoothed_income_proxies_not_a_fed_forecast"
+POLICY_RATE_CLAIM_BOUNDARY = "observed_opening_fed_funds_spliced_to_cbo_quarterly_path_administered_rates_at_opening_spreads"
 DAYS_PER_YEAR = 365.25
 
 
@@ -113,6 +121,36 @@ def fed_income_source_fixture() -> dict[str, Any]:
                 "sha256": "3989982bc83546f15747ac86e98b695be0894d2fbd8d829b3000f3a9dcfd1ada",
                 "title": "Federal Reserve Banks Combined Financial Statements, 2025 and 2024",
             },
+            "reserve_banks_quarterly_report": {
+                "file": FED_INCOME_DOCUMENTS["reserve_banks_quarterly_report"],
+                "url": "https://www.federalreserve.gov/aboutthefed/files/quarterly-report-20260515.pdf",
+                "sha256": "ecddf45283b5325417e2c634338b90177f7804745fd73b0e227655c3166f9efd",
+                "title": "Federal Reserve Banks Combined Quarterly Financial Report, March 31, 2026",
+            },
+            "nyfed_effr": {
+                "file": FED_INCOME_DOCUMENTS["nyfed_effr"],
+                "url": "https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json?startDate=2026-06-15&endDate=2026-06-19",
+                "sha256": "e3e3729b3b6d7bf50e8318fcf2d90e2d9e2ca67239f4587acca40cb5c117fee6",
+                "title": "Effective federal funds rate, June 15-19, 2026",
+            },
+            "nyfed_reverse_repo_operations": {
+                "file": FED_INCOME_DOCUMENTS["nyfed_reverse_repo_operations"],
+                "url": "https://markets.newyorkfed.org/api/rp/reverserepo/propositions/search.json?startDate=2026-06-10&endDate=2026-06-25",
+                "sha256": "c9f8892f34755cc1864019a60ce083e05d86e14695f28f21d1b5233443d88862",
+                "title": "Overnight reverse repo operation results, June 10-25, 2026",
+            },
+            "financial_accounts_ccp_table": {
+                "file": FED_INCOME_DOCUMENTS["financial_accounts_ccp_table"],
+                "url": "https://www.federalreserve.gov/releases/z1/20260611/html/S125s5_s.htm",
+                "sha256": "81e3755efb2074f47e6ccf6b1ee94e2f72a087dfd6d034a7147720b213a08bf9",
+                "title": "Financial Accounts of the United States, June 11, 2026, table S.125s5.s",
+            },
+            "financial_accounting_manual_chapter_6": {
+                "file": FED_INCOME_DOCUMENTS["financial_accounting_manual_chapter_6"],
+                "url": "https://www.federalreserve.gov/aboutthefed/chapter-6-reporting-requirements.htm",
+                "sha256": "812ad973aea0f2d7297348051d0b87c865e70bb0cdf3bb0cd4a32961c28dad5b",
+                "title": "Financial Accounting Manual for Federal Reserve Banks, chapter 6 (paragraph 60.55)",
+            },
         },
         "h41_wednesday_levels_mil": {
             "as_of_date": "2026-06-17",
@@ -124,6 +162,11 @@ def fed_income_source_fixture() -> dict[str, Any]:
             "federal_reserve_notes_net": "2419354",
             "mortgage_backed_securities": "1964798",
             "us_treasury_securities_held_outright": "4487319",
+            "unamortized_premiums_on_securities_held_outright": "215113",
+            "unamortized_discounts_on_securities_held_outright": "-25650",
+            "total_assets": "6736424",
+            "foreign_official_deposits": "9440",
+            "other_deposits": "259503",
             "other_liabilities_and_capital": "-181188",
             "earnings_remittances_due_to_the_us_treasury": "-236697",
             "tables": "table 1 Wednesday level (reserves, TGA, reverse repos, other liabilities and capital); "
@@ -134,6 +177,35 @@ def fed_income_source_fixture() -> dict[str, Any]:
             "interest_on_reserve_balances": "3.65",
             "overnight_reverse_repo_offering_rate": "3.5",
             "federal_funds_target_range": "3.50-3.75",
+            "effective_federal_funds_rate_2026_06_18": "3.63",
+        },
+        "opening_domestic_on_rrp": {
+            "operation_date": "2026-06-18",
+            "total_accepted_bil": "0.251",
+            "note": "the last operation before the 2026-06-21 opening",
+        },
+        "financial_accounts_ccp_federal_reserve_deposits_bil": {
+            "series": "FL713129003",
+            "table": "S.125s5.s Central clearing counterparties (CCPs), line 3 Federal Reserve deposits",
+            "2026Q1": "220.5",
+        },
+        "reserve_banks_2026q1_mil": {
+            "treasury_amortized_cost_bills": "392830",
+            "treasury_amortized_cost_notes": "2244147",
+            "treasury_amortized_cost_bonds": "1909448",
+            "treasury_par_value": "4390142",
+            "residential_mbs_amortized_cost": "2026009",
+            "commercial_mbs_amortized_cost": "8115",
+            "residential_mbs_par_value": "1989009",
+            "commercial_mbs_par_value": "7672",
+            "gse_debt_amortized_cost": "2491",
+            "gse_debt_par_value": "2347",
+            "amortization_notes_and_bonds_q1": "-3948",
+            "amortization_mbs_q1": "-1156",
+            "accretion_bills_q1": "2778",
+            "reverse_repo_rate_domestic_pct": "3.50",
+            "reverse_repo_rate_foreign_official_pct": "3.50",
+            "tables": "7a, 7b (balances at amortized cost, March 31, 2026), 6 (par), 16 (reverse repo rates)",
         },
         "soma_agency_mbs": {
             "as_of_date": "2026-06-17",
@@ -186,6 +258,7 @@ def fed_income_source_fixture() -> dict[str, Any]:
             },
             "remittances_transferred_while_deferred_asset_grew": "6281",
             "deferred_asset_year_end": "243481",
+            "year_end_date": "2025-12-31",
             "statement": "Combined Statements of Operations and Note 12, year ended December 31, 2025",
         },
         "rules": {
@@ -195,10 +268,16 @@ def fed_income_source_fixture() -> dict[str, Any]:
             "mbs_runoff": "H.4.1 MBS scaled by the NY Fed year-end path, log-linear between year ends; after "
             "2035 the path keeps the 2034-2035 runoff rate",
             "mbs_income": "weighted-average coupon on period-start current face, actual/365.25",
-            "short_rate": "the run's own nominal curve at 0.25 years; IORB and ON RRP keep their spreads to the "
-            "package curve's 0.25-year rate at the simulation start",
-            "bank_level_remittances": "dropped: the rule is system-level, so no remittance is paid while the "
-            "system deferred asset is positive",
+            "policy_rate": "the observed effective federal funds rate until the first CBO quarter after the opening, "
+            "then CBO's quarterly federal funds rate; IORB is fed funds +2 basis points and ON RRP fed funds -13 "
+            "basis points, their observed opening spreads",
+            "pooling": "one pooled system account: no Reserve Bank remits while the combined balance is a debit "
+            "(at the opening Atlanta, St. Louis and Dallas had credits inside a combined debit, H.4.1 table 6 note 8)",
+            "premiums": "Treasury and MBS net premiums split by class from the 2026Q1 report (amortized cost less par) "
+            "and scaled to the June 17 H.4.1 total; bills keep their modeled discount, coupons share the rest",
+            "other_deposits": "H.4.1 other deposits grow at 4.0 percent; the designated FMU share (Financial Accounts "
+            "CCP Federal Reserve deposits, 2026Q1) earns IORB",
+            "other_liabilities_and_capital": "H.4.1 other liabilities and capital less earnings due grow at 4.0 percent",
         },
     }
 
@@ -222,13 +301,36 @@ def _mbs_projection_level(day: date, year_end_bil: Mapping[str, str]) -> float:
     return math.exp(right + slope * (day - right_day).days)
 
 
+def fed_net_premiums_bil() -> dict[str, float]:
+    """Treasury and MBS net premiums at the June 17 opening.
+
+    The 2026Q1 report gives each class's amortized cost and par (net premium = the
+    difference); the class amounts are scaled so they sum to the June 17 H.4.1 net of
+    unamortized premiums and discounts. GSE debt, not modeled, stays in other assets.
+    """
+
+    source = fed_income_source_fixture()
+    q1 = {key: Decimal(value) for key, value in source["reserve_banks_2026q1_mil"].items() if key != "tables"
+          and not key.endswith("_pct")}
+    treasury = (q1["treasury_amortized_cost_bills"] + q1["treasury_amortized_cost_notes"]
+                + q1["treasury_amortized_cost_bonds"] - q1["treasury_par_value"])
+    mbs = (q1["residential_mbs_amortized_cost"] + q1["commercial_mbs_amortized_cost"]
+           - q1["residential_mbs_par_value"] - q1["commercial_mbs_par_value"])
+    gse = q1["gse_debt_amortized_cost"] - q1["gse_debt_par_value"]
+    h41 = source["h41_wednesday_levels_mil"]
+    june = (Decimal(h41["unamortized_premiums_on_securities_held_outright"])
+            + Decimal(h41["unamortized_discounts_on_securities_held_outright"]))
+    scale = june / (treasury + mbs + gse)
+    return {"treasury": float(treasury * scale / 1000), "mbs": float(mbs * scale / 1000),
+            "gse": float(gse * scale / 1000)}
+
+
 def build_fed_income_path_rows(
     *,
     scenario_id: str,
     periods: Sequence[SimulationPeriod],
-    yield_rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Daily Fed income lines and balance-sheet paths from the transcribed sources."""
+    """Daily Fed balance-sheet paths and smoothed income proxies from the transcribed sources."""
 
     source = fed_income_source_fixture()
     h41 = source["h41_wednesday_levels_mil"]
@@ -241,38 +343,45 @@ def build_fed_income_path_rows(
     operating = Decimal(banks["operating_expenses"]) / 1000
     dividends = Decimal(banks["dividends_on_capital_stock"]) / 1000
     wac = float(source["soma_agency_mbs"]["weighted_average_coupon_pct"]) / 100
-    h41_mbs = float(Decimal(h41["mortgage_backed_securities"]) / 1000)
-    h41_currency = float(Decimal(h41["federal_reserve_notes_net"]) / 1000)
+
+    def bil(key: str) -> Decimal:
+        return Decimal(h41[key]) / 1000
+
+    h41_mbs = float(bil("mortgage_backed_securities"))
     mbs_anchor = _mbs_projection_level(as_of, projection["agency_mbs_year_end_bil"])
+    premiums = fed_net_premiums_bil()
+    due = bil("earnings_remittances_due_to_the_us_treasury")
+    other_liabilities = bil("other_liabilities_and_capital") - due
 
     def mbs(day: date) -> float:
         return h41_mbs * _mbs_projection_level(day, projection["agency_mbs_year_end_bil"]) / mbs_anchor
 
-    def currency(day: date) -> float:
-        return h41_currency * _fed_growth(as_of, day, growth)
+    def grown(level: Decimal, day: date) -> float:
+        return float(level) * _fed_growth(as_of, day, growth)
 
-    start = _as_date(periods[0].period_start)
-    curve_rows = [
-        row for row in yield_rows
-        if str(row["scenario_id"]) == scenario_id and _as_date(row["curve_date"]) <= start
-        and abs(float(row["tenor_years"]) - 0.25) < 1e-12
-    ]
-    if not curve_rows:
-        raise ValueError("the package curve has no 0.25-year rate at the simulation start")
-    opening_short = max(curve_rows, key=lambda row: _as_date(row["curve_date"]))["nominal_rate"]
-    rates = source["administered_rates_pct"]
     constants = {
         "h41_as_of_date": as_of.isoformat(),
-        "h41_reserve_balances_bil": float(Decimal(h41["reserve_balances_with_federal_reserve_banks"]) / 1000),
-        "h41_tga_bil": float(Decimal(h41["us_treasury_general_account"]) / 1000),
-        "h41_on_rrp_bil": float(Decimal(h41["reverse_repurchase_agreements"]) / 1000),
+        "h41_reserve_balances_bil": float(bil("reserve_balances_with_federal_reserve_banks")),
+        "h41_tga_bil": float(bil("us_treasury_general_account")),
+        "h41_domestic_on_rrp_bil": float(bil("reverse_repurchase_agreements_others")),
+        "opening_domestic_on_rrp_bil": float(Decimal(source["opening_domestic_on_rrp"]["total_accepted_bil"])),
+        "h41_foreign_repo_bil": float(bil("reverse_repurchase_agreements_foreign_official")),
+        "h41_foreign_official_deposits_bil": float(bil("foreign_official_deposits")),
         "h41_soma_mbs_bil": h41_mbs,
-        "h41_currency_bil": h41_currency,
-        "h41_earnings_remittances_due_bil": float(Decimal(h41["earnings_remittances_due_to_the_us_treasury"]) / 1000),
-        "h41_other_liabilities_and_capital_bil": float(Decimal(h41["other_liabilities_and_capital"]) / 1000),
-        "short_rate_tenor_years": 0.25,
-        "iorb_spread_pct": float(Decimal(rates["interest_on_reserve_balances"]) - Decimal(str(opening_short))),
-        "on_rrp_spread_pct": float(Decimal(rates["overnight_reverse_repo_offering_rate"]) - Decimal(str(opening_short))),
+        "h41_currency_bil": float(bil("federal_reserve_notes_net")),
+        "h41_other_deposits_bil": float(bil("other_deposits")),
+        "h41_other_liabilities_and_capital_bil": float(other_liabilities),
+        "h41_earnings_remittances_due_bil": float(due),
+        "h41_treasury_net_premium_bil": premiums["treasury"],
+        "remunerated_other_deposit_share": float(
+            Decimal(source["financial_accounts_ccp_federal_reserve_deposits_bil"]["2026Q1"]) / bil("other_deposits")
+        ),
+        "previous_wednesday_date": as_of.isoformat(),
+        "previous_wednesday_due_bil": float(due),
+        "year_end_date": banks["year_end_date"],
+        "year_end_due_bil": -float(Decimal(banks["deferred_asset_year_end"]) / 1000),
+        "opening_interest_payable_bil": 0.0,
+        "opening_foreign_repo_interest_payable_bil": 0.0,
     }
     rows = []
     for period in periods:
@@ -287,18 +396,99 @@ def build_fed_income_path_rows(
             "soma_mbs_start_bil": mbs(first),
             "soma_mbs_end_bil": mbs(last),
             "soma_mbs_interest_bil": wac * mbs(first) * year_fraction,
-            "currency_start_bil": currency(first),
-            "currency_end_bil": currency(last),
+            "soma_mbs_premium_start_bil": premiums["mbs"] * mbs(first) / h41_mbs,
+            "soma_mbs_premium_end_bil": premiums["mbs"] * mbs(last) / h41_mbs,
+            "currency_start_bil": grown(bil("federal_reserve_notes_net"), first),
+            "currency_end_bil": grown(bil("federal_reserve_notes_net"), last),
+            "other_deposits_start_bil": grown(bil("other_deposits"), first),
+            "other_deposits_end_bil": grown(bil("other_deposits"), last),
+            "other_liabilities_and_capital_start_bil": grown(other_liabilities, first),
+            "other_liabilities_and_capital_end_bil": grown(other_liabilities, last),
             "other_income_bil": float(other_income) * scale,
             "operating_expenses_bil": float(operating) * scale,
             "dividends_bil": float(dividends) * scale,
             **constants,
             "source_role": "scenario_assumption",
             "runtime_role": "hard_flow",
-            "source_status": "h41_nyfed_soma_projection_reserve_bank_2025_statements",
+            "source_status": "h41_nyfed_soma_projection_reserve_bank_statements_smoothed_daily_proxies",
             "claim_boundary": FED_INCOME_CLAIM_BOUNDARY,
         })
     return rows
+
+
+def cbo_quarterly_federal_funds_rate(economic_workbook: str | Path) -> dict[str, float]:
+    """CBO's quarterly federal funds rate (percent) from the economic projections workbook."""
+
+    from forecast_input_builder import _read_xlsx
+
+    rows = _read_xlsx(Path(economic_workbook))["1. Quarterly"]
+    header = next(row.values for row in rows if len(row.values) > 2 and row.values[1] == "Units")
+    matches = [row.values for row in rows if row.values and row.values[0] == "Federal funds rate"]
+    if len(matches) != 1:
+        raise ValueError(f"expected one quarterly federal funds rate row; found {len(matches)}")
+    return {
+        label: float(value)
+        for label, value in zip(header[2:], matches[0][2:], strict=False)
+        if re.fullmatch(r"\d{4}Q[1-4]", str(label)) and str(value).strip()
+    }
+
+
+def build_policy_rate_path_rows(
+    *,
+    scenario_id: str,
+    simulation_start: date | datetime | str,
+    simulation_end: date | datetime | str,
+    economic_workbook: str | Path,
+) -> list[dict[str, Any]]:
+    """Policy-rate path: the observed opening fed funds rate spliced to CBO's quarterly path."""
+
+    source = fed_income_source_fixture()
+    rates = source["administered_rates_pct"]
+    effr = Decimal(rates["effective_federal_funds_rate_2026_06_18"])
+    spreads = {
+        "iorb_spread_pct": float(Decimal(rates["interest_on_reserve_balances"]) - effr),
+        "on_rrp_spread_pct": float(Decimal(rates["overnight_reverse_repo_offering_rate"]) - effr),
+    }
+    quarterly = cbo_quarterly_federal_funds_rate(economic_workbook)
+    start, end = _as_date(simulation_start), _as_date(simulation_end)
+    first_quarter = date(start.year, 3 * ((start.month - 1) // 3) + 1, 1)
+    splice = _add_quarter(first_quarter)
+    common = {
+        "schema_version": POLICY_RATE_PATH_SCHEMA_VERSION,
+        "scenario_id": scenario_id,
+        **spreads,
+        "source_role": "scenario_assumption",
+        "runtime_role": "hard_flow",
+        "claim_boundary": POLICY_RATE_CLAIM_BOUNDARY,
+    }
+    rows = [{
+        **common,
+        "period_start": start.isoformat(),
+        "period_end": splice.isoformat(),
+        "fed_funds_rate_pct": float(effr),
+        "rate_source": "nyfed_effective_federal_funds_rate_2026-06-18",
+        "source_status": "observed_opening_rate_until_the_first_cbo_quarter",
+    }]
+    quarter = splice
+    while quarter <= end:
+        label = f"{quarter.year}Q{(quarter.month - 1) // 3 + 1}"
+        if label not in quarterly:
+            raise ValueError(f"CBO's federal funds rate path has no {label} value")
+        rows.append({
+            **common,
+            "period_start": quarter.isoformat(),
+            "period_end": _add_quarter(quarter).isoformat(),
+            "fed_funds_rate_pct": quarterly[label],
+            "rate_source": "cbo_2026_02_economic_projections_quarterly_federal_funds_rate",
+            "source_status": f"cbo_quarterly_{label}",
+        })
+        quarter = _add_quarter(quarter)
+    return rows
+
+
+def _add_quarter(day: date) -> date:
+    month = day.month + 3
+    return date(day.year + (month - 1) // 12, (month - 1) % 12 + 1, 1)
 
 
 def read_dts_fed_earnings_rows(path: str | Path, fiscal_year: int) -> list[dict[str, str]]:
