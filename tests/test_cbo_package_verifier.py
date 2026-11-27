@@ -1694,10 +1694,12 @@ def _roll_fixture_opening_book(package: Path) -> dict:
         "opening_rollforward_aligned_debt_base_bil": summary["opening_debt_base_bil"],
         "opening_rollforward_debt_base_delta_bil": summary["opening_debt_base_bil"] - summary["source_debt_base_bil"],
         "frn_source_boundary_note": "contract-compliant FRN opening accrual source",
-        "tips_rows_enriched": 265,
-        "tips_unique_cusips_enriched": 53,
-        "frn_rows_enriched": 40,
-        "frn_unique_cusips_enriched": 8,
+        # Counted from the rolled book: aligning to SOMA merges same-terms lots, so the
+        # enriched row counts follow the roll rather than the source book.
+        "tips_rows_enriched": int(rolled["SecurityType"].eq("TIPS").sum()),
+        "tips_unique_cusips_enriched": int(rolled.loc[rolled["SecurityType"].eq("TIPS"), "cusip_or_synthetic_id"].nunique()),
+        "frn_rows_enriched": int(rolled["SecurityType"].eq("FRN").sum()),
+        "frn_unique_cusips_enriched": int(rolled.loc[rolled["SecurityType"].eq("FRN"), "cusip_or_synthetic_id"].nunique()),
         "opening_tips_adjusted_principal_bil": 530.0,
         "opening_tips_reconstructed_original_principal_bil": 397.5,
         "opening_tips_indexation_accretion_embedded_bil": 132.5,
