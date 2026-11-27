@@ -42,10 +42,12 @@ COUPON_LIMITS = (
 )
 
 
-def issue_ids(lots: pd.DataFrame, bills: pd.Series) -> pd.Series:
-    """Use the carried issue ID. Derive a contractual key for older model books."""
+def issue_ids(lots: pd.DataFrame, bills: pd.Series, *, require_identified: bool = False) -> pd.Series:
+    """Use carried issue IDs, with contractual keys for wholly unidentified legacy books."""
     ids = lots.get("IssueID", pd.Series(pd.NA, index=lots.index)).astype("string").str.strip()
     missing = ids.isna() | ids.eq("")
+    if missing.any() and (require_identified or not missing.all()):
+        raise ValueError("marketable book requires complete issue IDs")
     for index, lot in lots.loc[missing].iterrows():
         maturity = pd.Timestamp(lot["MaturityDate"]).date()
         if bills.at[index]:
@@ -60,6 +62,18 @@ def issue_ids(lots: pd.DataFrame, bills: pd.Series) -> pd.Series:
         detail = {"FRN": "FixedSpread", "TIPS": "ReferenceCPI_Issue"}.get(lot["SecurityType"])
         ids.at[index] = f"{lot['SecurityType']}-{original}-{maturity}-{term}-{coupon}-{lot.get(detail)}"
     return ids
+
+
+def validate_issue_terms(lots: pd.DataFrame, ids: pd.Series, bills: pd.Series) -> None:
+    terms = lots[["SecurityType", "MaturityDate", "CouponRate"]].copy()
+    terms["CouponRate"] = terms["CouponRate"].round(12)
+    for security_type, field in (("FRN", "FixedSpread"), ("TIPS", "ReferenceCPI_Issue")):
+        if field in lots:
+            terms[field] = lots[field].where(lots["SecurityType"].eq(security_type)).round(12)
+    terms["bill"] = bills
+    terms["issue_id"] = ids
+    if terms.drop_duplicates()["issue_id"].duplicated().any():
+        raise ValueError("a marketable issue ID has inconsistent security terms")
 
 
 def purchase_sector(current: pd.Timestamp, maturity: pd.Timestamp, *, bill: bool) -> Sector | None:

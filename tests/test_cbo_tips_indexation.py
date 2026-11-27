@@ -329,16 +329,68 @@ def test_tips_real_yield_path_and_issue_price_support_premiums(tmp_path: Path) -
 def test_opening_par_uses_may_ratio_and_published_auction_cpi_for_new_cusip(tmp_path: Path) -> None:
     book = pd.DataFrame([
         {"SecurityType": "TIPS", "CUSIP": "SEASONED", "AdjustedPrincipal": 110.0, "FaceValue": 110.0},
-        {"SecurityType": "TIPS", "CUSIP": "NEW", "AdjustedPrincipal": 101.57, "FaceValue": 101.57},
+        {"SecurityType": "TIPS", "CUSIP": "NEW", "AdjustedPrincipal": 101.502, "FaceValue": 101.502},
     ])
     detail = pd.DataFrame([
-        {"index_date": pd.Timestamp("2026-05-31"), "cusip": "SEASONED", "index_ratio": 1.10, "ref_cpi": 330.10242},
+        {"index_date": pd.Timestamp("2026-05-29"), "cusip": "SEASONED", "index_ratio": 1.10, "ref_cpi": 329.88126},
         {"index_date": pd.Timestamp("2026-06-18"), "cusip": "NEW", "index_ratio": 1.01790, "ref_cpi": 331.80363},
     ])
     auctions = tmp_path / "auctions.csv"
     pd.DataFrame([{"cusip": "NEW", "auction_date": "2026-04-23", "ref_cpi_on_dated_date": 325.0}]).to_csv(auctions, index=False)
     par, sources = opening_tips_to_par(
-        book, detail=detail, auctions_path=auctions, record_date="2026-05-31", cusip_column="CUSIP",
+        book, detail=detail, auctions_path=auctions, valuation_date="2026-05-29", cusip_column="CUSIP",
     )
     assert par["FaceValue"].tolist() == pytest.approx([100, 100], abs=1e-6)
     assert sources["NEW"] == "treasury_daily_reference_cpi_divided_by_auction_dated_reference_cpi"
+
+
+def test_opening_tips_verifier_uses_independent_mspd_tranche_par(tmp_path: Path) -> None:
+    from scripts.verify_cbo_forecast_package import _verify_opening_tips_against_mspd
+
+    fiscaldata = tmp_path / "sources" / "fiscaldata"
+    opening = tmp_path / "sources" / "opening"
+    fiscaldata.mkdir(parents=True)
+    opening.mkdir()
+    # 1000 issued + 100 reopened - 100 redeemed leaves 1000 par. USD 1100
+    # million reported adjusted principal scales to the public cohort's 0.88
+    # billion. The published June ratio then marks 0.8 par to 0.904 billion.
+    fields = {
+        "record_date": "2026-05-31", "security_type_desc": "Marketable",
+        "security_class1_desc": "Inflation-Protected Securities", "security_class2_desc": "TIPS-A",
+    }
+    pd.DataFrame([
+        {**fields, "issued_amt": 1000, "redeemed_amt": 0, "outstanding_amt": None},
+        {**fields, "issued_amt": 100, "redeemed_amt": -100, "outstanding_amt": 1100},
+    ]).to_csv(fiscaldata / "mspd_table_3_market_2026-05-31.csv", index=False)
+    pd.DataFrame([{
+        "SecurityType": "TIPS", "cusip_or_synthetic_id": "TIPS-A", "AdjustedPrincipal": 0.88,
+    }]).to_csv(opening / "tdcsim_initial_portfolio_cohorts.csv", index=False)
+    pd.DataFrame([{
+        "cusip": "TIPS-A", "index_date": "2026-06-18", "index_ratio": 1.13,
+    }]).to_csv(fiscaldata / "tips_cpi_data_detail.csv", index=False)
+    lot = {"IssueID": "TIPS-A", "OriginalPrincipal": "0.8", "FaceValue": "0.8", "AdjustedPrincipal": "0.904"}
+    _verify_opening_tips_against_mspd(tmp_path, [lot])
+    with pytest.raises(ValueError, match="MSPD public par"):
+        _verify_opening_tips_against_mspd(tmp_path, [{**lot, "OriginalPrincipal": "0.79", "FaceValue": "0.79"}])
+    with pytest.raises(ValueError, match="MSPD June 18 adjusted principal"):
+        _verify_opening_tips_against_mspd(tmp_path, [{**lot, "AdjustedPrincipal": "0.9"}])
+
+
+def test_tips_path_carries_observed_reference_cpi_through_opening_weekend() -> None:
+    macro = [
+        {"scenario_id": "base", "period_start": "2026-04-01", "cbo_cpi_u_index": 331.0},
+        {"scenario_id": "base", "period_start": "2026-07-01", "cbo_cpi_u_index": 334.0},
+    ]
+    rows = build_monthly_tips_cpi_path_rows(
+        scenario_id="base", macro_forecast_rows=macro,
+        simulation_start_date="2026-06-21", simulation_end_date="2026-09-30",
+        reference_cpi_anchor_date="2026-06-18", opening_reference_cpi=331.80363,
+        observed_cpi_by_month={"2026-03-01": 330.213, "2026-04-01": 333.020},
+        observation_date="2026-02-11", available_date="2026-02-11",
+    )
+    days = pd.to_datetime(["2026-06-18", "2026-06-21"])
+    _, references = build_tips_daily_cpi_lookups_from_monthly_path(
+        pd.DataFrame(rows), days, scenario_id="base", default_value=0.0,
+    )
+    assert rows[0]["anchor_date"] == "2026-06-18"
+    assert references == dict(zip(days, (331.80363, 332.08433)))

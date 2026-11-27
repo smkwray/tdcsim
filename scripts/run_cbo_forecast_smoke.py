@@ -92,9 +92,11 @@ from frn_indexation import build_forward_frn_rate_path_rows, enrich_opening_frn_
 from issuance_calibration import (
     CALIBRATION_FILE,
     PRESTART_ROLLFORWARD_RULE,
+    bill_mask,
     build_issuance_calibration,
     engine_rule_profile,
 )
+from fed_purchase_policy import issue_ids, validate_issue_terms
 from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _fiscal_year_close_dates, run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar, previous_securities_business_day
 from tdc_shared import (
@@ -107,6 +109,7 @@ from tdcsim_cbo.bounded_output import BoundedResourceLimits, BoundedScenarioEvid
 from tips_indexation import (
     build_monthly_tips_cpi_path_rows,
     build_tips_real_yield_path_rows,
+    opening_tips_at_simulation_start,
 )
 
 
@@ -536,9 +539,13 @@ def build_forecast_bundle(
     manifest_entry = source_package["source_files"].get(SOURCE_PACKAGE_INPUTS["ratewall_input_manifest"], {})
     opening_portfolio_metadata["source_manifest_original_sha256"] = manifest_entry.get("original_sha256")
     opening_portfolio_metadata["source_manifest_portable_sha256"] = manifest_entry.get("sha256")
-    opening_cb_holdings_bil = _portfolio_total_debt_base(
-        initial_portfolio[initial_portfolio["HolderType"].astype(str) == "CB"]
+    runtime_portfolio = opening_tips_at_simulation_start(
+        initial_portfolio, opening_portfolio_metadata["simulation_start_tips_observation"],
     )
+    opening_cb_holdings_bil = _portfolio_total_debt_base(
+        runtime_portfolio[runtime_portfolio["HolderType"].eq("CB")]
+    )
+    opening_portfolio_metadata["simulation_start_cb_holdings_bil"] = opening_cb_holdings_bil
     fed_holdings_rows = build_fed_holdings_path_rows(
         scenario_id=SCENARIO_ID,
         periods=periods,
@@ -582,6 +589,8 @@ def build_forecast_bundle(
         simulation_start_date=SIMULATION_START_DATE,
         simulation_end_date=SIMULATION_END_DATE,
         opening_reference_cpi=_opening_tips_reference_cpi(initial_portfolio),
+        reference_cpi_anchor_date=OPENING_CLOSE_DATE,
+        observed_cpi_by_month=opening_portfolio_metadata["observed_tips_cpi_by_month"],
         reference_lag_months=3,
         pricing_horizon_end_date=_tips_pricing_horizon_end_date(yield_rows),
         observation_date=FORECAST_PUBLICATION_DATE,
@@ -632,7 +641,7 @@ def build_forecast_bundle(
     params = build_engine_params(
         inputs,
         baseline_input_paths,
-        initial_portfolio,
+        runtime_portfolio,
         base_tga_bil,
         sector_preferences={**holder_preferences, "__private_subbucket_shares__": private_subbucket_shares},
         issuance_calibration=issuance_calibration,
@@ -644,7 +653,7 @@ def build_forecast_bundle(
         periods=periods,
         manifest=manifest,
         baseline_input_paths=baseline_input_paths,
-        initial_portfolio=initial_portfolio,
+        initial_portfolio=runtime_portfolio,
         params=params,
     )
 
@@ -952,6 +961,10 @@ def build_manifest(
             "security_type_totals_bil": opening_portfolio_metadata["security_type_totals_bil"],
             "holder_totals_bil": opening_portfolio_metadata["holder_totals_bil"],
             "opening_cb_holdings_bil": float(opening_portfolio_metadata["holder_totals_bil"].get("CB", 0.0)),
+            "simulation_start_cb_holdings_bil": opening_portfolio_metadata["simulation_start_cb_holdings_bil"],
+            "simulation_start_tips_adjusted_principal_bil": opening_portfolio_metadata[
+                "simulation_start_tips_adjusted_principal_bil"
+            ],
             "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
         },
         "issuance_mix": {
@@ -1410,6 +1423,8 @@ def load_opening_portfolio(
     aligned = _apply_opening_coupon_terms(aligned)
     aligned = aligned[BOND_PORTFOLIO_COLS]
     aligned = aligned.astype(PORTFOLIO_DTYPES, errors="ignore")
+    bills = bill_mask(aligned)
+    validate_issue_terms(aligned, issue_ids(aligned, bills, require_identified=True), bills)
 
     debt_total = _portfolio_total_debt_base(aligned)
     if abs(debt_total - rollforward["opening_debt_base_bil"]) > 1e-6:

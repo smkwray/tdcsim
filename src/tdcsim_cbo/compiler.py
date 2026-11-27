@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import holder_targets
+import pandas as pd
 from evaluated_nominal_curve import (
     NOMINAL_EVALUATED_SHOCK_FILE,
     OPEN04_OUTPUT_CONTRACT,
@@ -31,6 +32,7 @@ from issuance_calibration import (
     load_calibration,
 )
 from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT, MMF_DEPOSIT_PASS_THROUGH_STATUS
+from tips_indexation import load_opening_tips_observation, opening_tips_at_simulation_start
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
@@ -1295,6 +1297,9 @@ def _ensure_opening_fed_target_identity(
 
 def _opening_cb_stock(path: Path) -> float:
     rows, _ = _read_csv(path)
+    observation = load_opening_tips_observation(path.parent)
+    if observation:
+        rows = opening_tips_at_simulation_start(pd.read_csv(path), observation).to_dict("records")
     total = 0.0
     for row in rows:
         if str(row.get("Status") or "") != "Active":

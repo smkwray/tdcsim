@@ -66,12 +66,17 @@ from tdc_shared import BOND_PORTFOLIO_COLS  # noqa: E402
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import (  # noqa: E402
     CALIBRATION_FILE,
+    bill_mask,
     build_issuance_calibration,
     verify_fiscal_close_cash,
 )
+from fed_purchase_policy import issue_ids, validate_issue_terms  # noqa: E402
 from sim_engine import _fiscal_year_close_dates  # noqa: E402
 from tips_indexation import (  # noqa: E402
     build_monthly_tips_cpi_path_rows,
+    build_tips_daily_cpi_lookups_from_monthly_path,
+    load_tips_cpi_detail,
+    observed_tips_cpi_months,
     build_tips_real_yield_path_rows,
 )
 
@@ -659,7 +664,7 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
             debt_targets,
             calendar,
             opening_cb_holdings=_manifest_float(
-                manifest.get("opening_portfolio_construction", {}), "opening_cb_holdings_bil"
+                manifest.get("opening_portfolio_construction", {}), "simulation_start_cb_holdings_bil"
             ),
         )
         _verify_run_summary(run_id, summary, metrics)
@@ -1380,7 +1385,11 @@ def _verify_opening_portfolio(root: Path, manifest: Mapping[str, Any]) -> None:
 
     if len(portfolio) != int(opening_manifest.get("row_count", -1)):
         raise ValueError("opening portfolio row count does not match parsed CSV")
+    lots = pd.read_csv(root / "forecast_inputs" / "tdcsim_opening_portfolio.csv", low_memory=False)
+    bills = bill_mask(lots)
+    validate_issue_terms(lots, issue_ids(lots, bills, require_identified=True), bills)
     tips_rows = [row for row in portfolio if row.get("SecurityType") == "TIPS"]
+    _verify_opening_tips_against_mspd(root, tips_rows)
     frn_rows = [row for row in portfolio if row.get("SecurityType") == "FRN"]
     if len(tips_rows) != int(opening_manifest.get("tips_rows_enriched", -1)):
         raise ValueError("opening TIPS row count does not match parsed CSV")
@@ -1455,6 +1464,97 @@ def _verify_opening_portfolio(root: Path, manifest: Mapping[str, Any]) -> None:
     _verify_opening_totals(opening_manifest, portfolio)
 
 
+def _verify_opening_tips_against_mspd(root: Path, tips_rows: list[dict[str, str]]) -> None:
+    """Recover par independently from reported MSPD issuance and redemptions."""
+    if not tips_rows:
+        return
+    sources = root / "sources"
+    mspd = pd.read_csv(sources / "fiscaldata" / "mspd_table_3_market_2026-05-31.csv")
+    tips = mspd.loc[
+        mspd["record_date"].eq(OPENING_PORTFOLIO_RECORD_DATE)
+        & mspd["security_class1_desc"].eq("Inflation-Protected Securities")
+        & mspd["security_type_desc"].eq("Marketable")
+    ].copy()
+    amounts = ["issued_amt", "redeemed_amt", "outstanding_amt"]
+    tips[amounts] = tips[amounts].apply(pd.to_numeric, errors="raise")
+    totals = tips.groupby("security_class2_desc")[amounts].sum(min_count=1)
+    cohorts = pd.read_csv(sources / "opening" / "tdcsim_initial_portfolio_cohorts.csv")
+    may_public = cohorts.loc[cohorts["SecurityType"].eq("TIPS")].groupby(
+        "cusip_or_synthetic_id"
+    )["AdjustedPrincipal"].sum()
+    published = pd.read_csv(sources / "fiscaldata" / "tips_cpi_data_detail.csv")
+    ratios = published.loc[published["index_date"].eq(OPENING_CLOSE_DATE)].set_index("cusip")["index_ratio"]
+    if not ratios.index.is_unique:
+        raise ValueError(f"duplicate published TIPS index ratios for {OPENING_CLOSE_DATE}")
+    opening = pd.DataFrame(tips_rows)
+    if set(opening["IssueID"]) != set(may_public.index):
+        raise ValueError("opening TIPS CUSIPs differ from the May public cohort book")
+    for column in ("OriginalPrincipal", "FaceValue", "AdjustedPrincipal"):
+        opening[column] = pd.to_numeric(opening[column], errors="raise")
+    for cusip, lots in opening.groupby("IssueID"):
+        if cusip not in totals.index or cusip not in may_public.index or cusip not in ratios.index:
+            raise ValueError(f"opening TIPS {cusip} lacks independent MSPD and Treasury CPI evidence")
+        issued, redeemed, reported = totals.loc[cusip]
+        mspd_par = issued + redeemed
+        if not all(math.isfinite(amount) and amount > 0 for amount in (mspd_par, reported, may_public[cusip], ratios[cusip])):
+            raise ValueError(f"opening TIPS {cusip} has invalid MSPD or CPI evidence")
+        may_ratio = reported / mspd_par
+        public_par = may_public[cusip] / may_ratio
+        # The builder's published valuation-day ratio has five decimal places.
+        # Bound the effect of rounding that ratio by half of one published unit.
+        half_tick = 0.000005
+        par_tolerance = public_par * half_tick / (may_ratio - half_tick) + NUMERIC_TOLERANCE
+        opening_par = float(lots["OriginalPrincipal"].sum())
+        opening_adjusted = float(lots["AdjustedPrincipal"].sum())
+        _assert_close(f"opening TIPS {cusip} MSPD public par", opening_par, public_par, par_tolerance)
+        _assert_close(f"opening TIPS {cusip} face", float(lots["FaceValue"].sum()), opening_par, NUMERIC_TOLERANCE)
+        _assert_close(
+            f"opening TIPS {cusip} MSPD June 18 adjusted principal",
+            opening_adjusted, public_par * ratios[cusip], par_tolerance * ratios[cusip] + NUMERIC_TOLERANCE,
+        )
+        _assert_close(
+            f"opening TIPS {cusip} published June 18 index ratio",
+            opening_adjusted, opening_par * ratios[cusip], NUMERIC_TOLERANCE,
+        )
+
+
+def _verify_tips_start_valuation(
+    root: Path, manifest: Mapping[str, Any], detail: pd.DataFrame, cpi_rows: list[dict[str, str]],
+) -> None:
+    inputs = root / "forecast_inputs"
+    start = pd.Timestamp(SIMULATION_START_DATE)
+    published = detail.loc[detail["index_date"].eq(start)].set_index("cusip")
+    reference, = published["ref_cpi"].unique()
+    portfolio = _read_csv_dicts(inputs / "tdcsim_opening_portfolio.csv")
+    tips = [row for row in portfolio if row["SecurityType"] == "TIPS"]
+    ratios = published["index_ratio"].loc[sorted({row["IssueID"] for row in tips})].to_dict()
+    metadata = _read_json(inputs / "tdcsim_opening_portfolio_metadata.json")
+    if metadata.get("simulation_start_tips_observation") != {
+        "index_date": SIMULATION_START_DATE, "reference_cpi": reference, "index_ratios": ratios,
+    }:
+        raise ValueError("simulation-start TIPS observation must match Treasury detail")
+    _, daily_reference = build_tips_daily_cpi_lookups_from_monthly_path(
+        pd.DataFrame(cpi_rows), [start], scenario_id=manifest["scenario_id"], default_value=0.0,
+        reference_lag_months=int(float(cpi_rows[0]["reference_lag_months"])),
+    )
+    _assert_close("simulation-start reference CPI", daily_reference[start], reference, NUMERIC_TOLERANCE)
+    start_tips = sum(_csv_float(row, "OriginalPrincipal") * ratios[row["IssueID"]] for row in tips)
+    start_cb = sum(
+        _csv_float(row, "OriginalPrincipal") * ratios[row["IssueID"]]
+        if row["SecurityType"] == "TIPS" else _csv_float(row, "FaceValue")
+        for row in portfolio if row["HolderType"] == "CB"
+    )
+    opening = manifest["opening_portfolio_construction"]
+    _assert_close(
+        "simulation-start adjusted TIPS principal", _manifest_float(opening, "simulation_start_tips_adjusted_principal_bil"),
+        start_tips, NUMERIC_TOLERANCE,
+    )
+    _assert_close(
+        "simulation-start Fed holdings", _manifest_float(opening, "simulation_start_cb_holdings_bil"),
+        start_cb, NUMERIC_TOLERANCE,
+    )
+
+
 def _verify_opening_totals(opening_manifest: Mapping[str, Any], portfolio: list[dict[str, str]]) -> None:
     security_totals: dict[str, float] = {}
     holder_totals: dict[str, float] = {}
@@ -1505,12 +1605,16 @@ def _verify_tips_forward_paths(root: Path, manifest: Mapping[str, Any]) -> None:
         if _csv_float(row, "tips_cpi_u_index") <= 0.0 or _csv_float(row, "cbo_cpi_u_index") <= 0.0:
             raise ValueError("TIPS CPI path CPI values must be positive")
     yield_rows = _read_csv_dicts(root / "forecast_inputs" / "tdcsim_yield_curve_surface.csv")
+    detail = load_tips_cpi_detail(root / "sources" / "fiscaldata" / "tips_cpi_data_detail.csv")
+    observed_cpi = observed_tips_cpi_months(detail, anchor_date=OPENING_CLOSE_DATE)
     expected_cpi_rows = build_monthly_tips_cpi_path_rows(
         scenario_id=str(manifest.get("scenario_id")),
         macro_forecast_rows=_read_csv_dicts(root / "forecast_inputs" / "tdcsim_macro_forecast_path.csv"),
         simulation_start_date=str(manifest.get("date_range", {}).get("simulation_start_date")),
         simulation_end_date=str(manifest.get("date_range", {}).get("simulation_end_date")),
         opening_reference_cpi=float(manifest["opening_portfolio_construction"]["opening_tips_reference_cpi"]),
+        reference_cpi_anchor_date=OPENING_CLOSE_DATE,
+        observed_cpi_by_month=observed_cpi,
         reference_lag_months=int(float(tips_manifest.get("reference_cpi_lag_months", cpi_rows[0]["reference_lag_months"]))),
         pricing_horizon_end_date=str(
             tips_manifest.get(
@@ -1522,6 +1626,7 @@ def _verify_tips_forward_paths(root: Path, manifest: Mapping[str, Any]) -> None:
         available_date=str(cpi_rows[0]["available_date"]),
     )
     _verify_csv_rows_match_expected("tdcsim_tips_cpi_path.csv", cpi_rows, expected_cpi_rows)
+    _verify_tips_start_valuation(root, manifest, detail, cpi_rows)
     nominal_by_key = {
         (row["curve_date"], row["tenor_years"]): _csv_float(row, "nominal_rate_decimal")
         for row in yield_rows
