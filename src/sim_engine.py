@@ -1554,8 +1554,12 @@ def _handoff_append_transfer_changes(
         )
 
 
-def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, current_date):
-    """Retire active public marketable debt at par, shortest maturities first."""
+def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, current_date, fed_basis=None):
+    """Retire active public marketable debt at par, shortest maturities first.
+
+    With ``fed_basis`` a retired Fed lot leaves at its carrying value plus accrued interest;
+    par less that is a realized gain or loss.
+    """
     if bond_portfolio is None or bond_portfolio.empty:
         return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), []
     remaining = max(0.0, float(amount_to_retire))
@@ -1590,6 +1594,17 @@ def _retire_public_marketable_debt_to_target(bond_portfolio, amount_to_retire, c
         if tdc_recipient['holder_sector'] == 'Private':
             paid_by_tdc_private_route[tdc_recipient['holder_subsector']] += retire_amount
         retire_fraction = retire_amount / debt_base
+        if holder == 'CB' and fed_basis is not None:
+            forfeited = accrued_interest(pd.DataFrame([row]), current_date) * retire_fraction
+            lots = fed_basis['lots']
+            premium_retired = (
+                lots.pop(row['BondID']) if retire_amount >= debt_base - TGA_FLOOR_TOLERANCE
+                else lots.scale(row['BondID'], 1.0 - retire_fraction)
+            )
+            for kind in ACCRUAL_TYPES:
+                fed_basis['accrued_sold'][kind] += float(forfeited[kind].sum())
+            fed_basis['premium_sold'] += premium_retired
+            fed_basis['realized_gains'] -= float(forfeited.to_numpy().sum()) + premium_retired
         retired_face = float(row['FaceValue']) * retire_fraction
         retired_adjusted = (
             float(row.get('AdjustedPrincipal', debt_base)) * retire_fraction
@@ -5507,6 +5522,7 @@ def run_simulation(
                         bond_portfolio,
                         amount_to_retire,
                         current_date,
+                        fed_basis=fed_basis if cbo_funding_mode else None,
                     )
                 )
                 cbo_buyback_face_retired = retired_amount
