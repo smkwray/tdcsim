@@ -33,12 +33,10 @@ from sim_helpers import (
 from sim_plotting import plot_multi_results
 from sim_pricing import (
     _is_bill_like_fixed,
-    calculate_accrued_interest,
     calculate_bond_market_price,
     calculate_coupon_rate,
     calculate_face_from_proceeds_target,
     calculate_issue_price_ratio,
-    find_last_coupon_date,
     get_coupon_dates_in_period,
     get_maturity_category,
     get_payment_date,
@@ -554,8 +552,6 @@ __all__ = [
     'calculate_coupon_rate',
     'get_payment_date',
     'get_coupon_dates_in_period',
-    'find_last_coupon_date',
-    'calculate_accrued_interest',
     'calculate_bond_market_price',
     'calculate_portfolio_value_and_composition',
     'execute_preference_trades',

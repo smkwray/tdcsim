@@ -609,90 +609,6 @@ def _normalize_payment_frequency(value, fallback):
         return int(round(float(fallback)))
     return frequency
 
-def find_last_coupon_date(settlement_date, issue_date, frequency=2):
-    """
-    Finds the most recent coupon payment date that occurred on or before the settlement_date.
-    """
-    if pd.isna(issue_date) or pd.isna(settlement_date) or settlement_date < issue_date:
-        return pd.NaT
-    if frequency not in [2, 4]:
-        frequency = 2
-    months_between_payments = 12 // frequency
-    issue_month = issue_date.month
-    issue_day = issue_date.day
-    potential_payment_months = sorted([(issue_month + i * months_between_payments - 1) % 12 + 1 for i in range(frequency)])
-    last_found_coupon_date = pd.NaT
-    for year_to_check in [settlement_date.year, settlement_date.year - 1]:
-        for month in reversed(potential_payment_months):
-            try:
-                potential_date = get_payment_date(year_to_check, month, issue_day)
-                if potential_date <= settlement_date and potential_date >= issue_date:
-                    if pd.isna(last_found_coupon_date) or potential_date > last_found_coupon_date:
-                        last_found_coupon_date = potential_date
-            except ValueError:
-                continue
-        if not pd.isna(last_found_coupon_date):
-            break
-    return issue_date if pd.isna(last_found_coupon_date) else last_found_coupon_date
-
-def calculate_accrued_interest(face_value, coupon_rate, settlement_date, issue_date, security_type='Fixed', adjusted_principal=None, accrued_frn=None, frequency=2):
-    """
-    Calculates accrued interest for a bond up to the settlement date.
-    """
-    if pd.isna(settlement_date) or pd.isna(issue_date) or settlement_date <= issue_date:
-        return 0.0
-    if pd.isna(face_value) or face_value < TGA_FLOOR_TOLERANCE:
-        return 0.0
-    if security_type == 'FRN':
-        return accrued_frn if accrued_frn is not None and accrued_frn > 0 else 0.0
-    if security_type == 'NonMarketable':
-        return 0.0
-    if security_type not in ['Fixed', 'TIPS']:
-        return 0.0
-    if coupon_rate <= TGA_FLOOR_TOLERANCE:
-        return 0.0
-    principal_base = face_value
-    if security_type == 'TIPS':
-        if adjusted_principal is not None and adjusted_principal > TGA_FLOOR_TOLERANCE:
-            principal_base = adjusted_principal
-        elif face_value > TGA_FLOOR_TOLERANCE:
-            principal_base = face_value
-        else:
-            return 0.0
-    if principal_base < TGA_FLOOR_TOLERANCE:
-        return 0.0
-    last_coupon_dt = find_last_coupon_date(settlement_date, issue_date, frequency)
-    if pd.isna(last_coupon_dt):
-        last_coupon_dt = issue_date
-    months_between = 12 // frequency
-    issue_month = issue_date.month
-    issue_day = issue_date.day
-    potential_payment_months = [(issue_month + i * months_between - 1) % 12 + 1 for i in range(frequency)]
-    next_coupon_dt = pd.NaT
-    year_cursor = last_coupon_dt.year
-    search_limit = settlement_date.year + 2
-    while pd.isna(next_coupon_dt) and year_cursor < search_limit:
-        for month in potential_payment_months:
-            try:
-                potential_next_dt = get_payment_date(year_cursor, month, issue_day)
-                if potential_next_dt > last_coupon_dt:
-                    if pd.isna(next_coupon_dt) or potential_next_dt < next_coupon_dt:
-                        next_coupon_dt = potential_next_dt
-            except ValueError:
-                continue
-        if not pd.isna(next_coupon_dt):
-            break
-        year_cursor += 1
-    if pd.isna(next_coupon_dt):
-        return 0.0
-    days_accrued = (settlement_date - last_coupon_dt).days
-    days_in_period = (next_coupon_dt - last_coupon_dt).days
-    if days_accrued < 0 or days_in_period <= 0:
-        return 0.0
-    periodic_coupon_payment = principal_base * coupon_rate / frequency
-    accrued = periodic_coupon_payment * (days_accrued / days_in_period)
-    return max(0.0, accrued)
-
 def calculate_bond_market_price(face_value, coupon_rate, maturity_date, current_date, discount_yield, security_type='Fixed', adjusted_principal=None, original_principal=None, accrued_frn=None, frequency=2):
     """
     Calculates the 'clean' market price (present value of future cash flows).
@@ -783,7 +699,5 @@ __all__ = [
     'calculate_coupon_rate',
     'get_payment_date',
     'get_coupon_dates_in_period',
-    'find_last_coupon_date',
-    'calculate_accrued_interest',
     'calculate_bond_market_price',
 ]

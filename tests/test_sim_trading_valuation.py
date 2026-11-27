@@ -3,7 +3,8 @@
 import pandas as pd
 import pytest
 
-from sim_pricing import calculate_accrued_interest, calculate_bond_market_price
+from fed_income import accrued_interest
+from sim_pricing import calculate_bond_market_price
 from sim_trading import calculate_portfolio_value_and_composition
 from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES
 
@@ -63,17 +64,22 @@ def _legacy_discounted_cash_flow(row, *, frequency=2):
     )
 
 
-def _expected_accrued(row, *, frequency=2):
-    return calculate_accrued_interest(
-        row['FaceValue'],
-        row['CouponRate'],
-        CURRENT_DATE,
-        row['IssueDate'],
-        row['SecurityType'],
-        row.get('AdjustedPrincipal'),
-        row.get('AccruedInterest_FRN'),
-        frequency,
-    )
+def _expected_accrued(row):
+    return float(accrued_interest(pd.DataFrame([row]), CURRENT_DATE).to_numpy().sum())
+
+
+def test_preference_trades_accrue_from_treasurys_dated_date():
+    """912810UT3 was issued on 2026-03-02 but dated 2026-02-15: on 2026-06-22 a buyer owes
+    127 of the half-year's 181 days of its 4.625 percent coupon, 16.2258 per 1,000, not the
+    14.0761 that accruing from the issue date gives."""
+
+    portfolio = pd.DataFrame([_bond_row(
+        IssueDate=pd.Timestamp('2026-03-02'), DatedDate=pd.Timestamp('2026-02-15'),
+        MaturityDate=pd.Timestamp('2056-02-15'), OriginalMaturityYears=30.0, CouponRate=0.04625,
+        FaceValue=1000.0, OriginalPrincipal=1000.0, AdjustedPrincipal=1000.0, MaturityCategory='bonds',
+    )], columns=BOND_PORTFOLIO_COLS).astype(PORTFOLIO_DTYPES, errors='ignore')
+    calculate_portfolio_value_and_composition(portfolio, pd.Timestamp('2026-06-22'), CURVE_YEARS, CURVE_RATES)
+    assert portfolio.iloc[0]['AccruedInterest'] == pytest.approx(16.2258, abs=1e-4)
 
 
 def test_mid_coupon_fixed_uses_discounted_cash_flows_as_dirty_value():

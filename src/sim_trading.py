@@ -21,8 +21,8 @@ from tdc_shared import (
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
 )
+from fed_income import accrued_interest as lot_accrued_interest
 from sim_pricing import (
-    calculate_accrued_interest,
     calculate_bond_market_price,
     get_security_category_for_prefs,
     get_yield_for_maturity,
@@ -124,16 +124,9 @@ def calculate_portfolio_value_and_composition(
                 row.get('AccruedInterest_FRN'),
                 frequency,
             )
-            accrued_interest = calculate_accrued_interest(
-                row['FaceValue'],
-                row['CouponRate'],
-                current_date,
-                row['IssueDate'],
-                security_type,
-                row.get('AdjustedPrincipal'),
-                row.get('AccruedInterest_FRN'),
-                frequency,
-            )
+            # Accrued from Treasury's dated date on the maturity-anchored schedule, as every trade
+            # and the Fed's book accrue it.
+            accrued_interest = float(lot_accrued_interest(pd.DataFrame([row]), current_date).to_numpy().sum())
             coupon_rate = row['CouponRate']
             # The legacy pricing kernel returns a dirty discounted-cash-flow value for
             # coupon-bearing Fixed/TIPS, but a clean par value for FRNs/nonmarketables.
