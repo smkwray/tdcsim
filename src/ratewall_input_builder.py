@@ -5,7 +5,8 @@ allocations. MSPD supplies security-level marketable Treasury cohorts and NY Fed
 SOMA supplies Federal Reserve holdings by CUSIP. No public source gives other
 holders by CUSIP, so the non-Fed remainder of each security is split by WAMEST
 sector bill and nonbill holdings: banks, foreign holders and money funds keep their
-measured holdings converted to par, and domestic nonbanks take the rest.
+measured holdings converted to par, and domestic nonbanks take the rest. Money funds'
+floating-rate notes are the exception: SEC Form N-MFP reports them by CUSIP.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ import yaml
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
 from cbo_yield_curve_surface import INTERPOLATION_METHOD
-from mmf_eligibility import mmf_eligible_mask
+from mmf_eligibility import MMF_MAX_REMAINING_DAYS, mmf_eligible_mask
 from sim_pricing import evaluate_nominal_yield, value_treasury_security
 from tdc_shared import (
     DAYS_PER_YEAR_ACTUAL,
@@ -61,7 +62,8 @@ BOND_HISTORY_SOURCE = (
     "CB from NY Fed SOMA by CUSIP plus SOMA auction add-ons settling by the record date; "
     "banks, foreign and money funds at WAMEST bill and nonbill holdings converted to par, "
     "domestic nonbanks take the rest of the non-Fed remainder; "
-    "money funds exchange ineligible holdings with domestic nonbanks at equal par"
+    "money funds exchange ineligible holdings with domestic nonbanks at equal par; "
+    "money funds hold their SEC N-MFP floating-rate notes by CUSIP, exchanged for their bills at equal par"
 )
 WAMEST_CANONICAL_RELATIVE_PATH = "wamest/outputs/full_coverage_release/canonical_sector_maturity.csv"
 # Opening-book holder routes for non-Fed holders: (HolderType, HolderSubBucket).
@@ -75,6 +77,24 @@ NONCB_OPENING_ROUTES = (
 # they take whatever non-Fed par the measured routes do not hold.
 NONCB_RESIDUAL_ROUTE = ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK)
 MMF_OPENING_ROUTE = ("Private", PRIVATE_SUBBUCKET_MMF)
+# SEC Form N-MFP money-fund Treasury holdings by report month-end and CUSIP, written by
+# scripts/extract_sec_nmfp_mmf_holdings.py beside a provenance file naming its sources.
+NMFP_HOLDINGS_FILENAME = "sec_nmfp_mmf_treasury_holdings.csv"
+NMFP_HOLDINGS_COLUMNS = ("report_date", "cusip", "security_class", "maturity_date", "value_bil", "class_source", "series_count")
+NMFP_SECURITY_CLASSES = frozenset({"bill", "frn", "fixed_coupon", "tips", "unresolved"})
+# Money funds hold their filed floating-rate notes by CUSIP. N-MFP reports value; an FRN
+# resets weekly and prices within a few basis points of par, so its value is read as par.
+# Domestic nonbanks give the notes first, foreign holders and banks only the shortfall,
+# each pro rata to its holding of the CUSIP; every giver takes money-fund bills at equal par.
+FRN_OVERRIDE_GIVER_TIERS = ((NONCB_RESIDUAL_ROUTE,), (("Foreign", ""), ("Banks", "")))
+FRN_OVERRIDE_CLAIM = (
+    "observed-holdings override of the WAMEST maturity split for FRNs only, by owner decision: "
+    "SEC N-MFP filings of money-fund FRN holdings outrank the model's estimated split for this instrument"
+)
+# The opening money-fund book must match the filings' total, bills, FRNs and coupon
+# securities within 397 days, each within this relative gap.
+NMFP_MIX_TOLERANCE = 0.05
+NMFP_MIX_BUCKETS = ("total", "bills", "frn", "coupon_le397")
 OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
 # WAMEST records each sector's Financial Accounts level basis. A market value (an LM series,
 # as for foreign holders) converts to par with its group's factor. Any other level (the FL
@@ -412,6 +432,160 @@ def load_soma_cusip_holdings(path: Path) -> tuple[str, pd.DataFrame]:
             "maturity_date": maturity.dt.date.astype(str),
         }
     )
+
+
+def load_nmfp_mmf_holdings(path: Path) -> tuple[pd.DataFrame, dict]:
+    """Return the N-MFP money-fund Treasury holdings and the provenance its producer wrote.
+
+    The provenance file must describe these exact bytes, so the book never binds to an
+    extract whose sources are unrecorded.
+    """
+
+    provenance_path = path.with_suffix(".provenance.json")
+    if not path.exists() or not provenance_path.exists():
+        raise ValueError(f"N-MFP money-fund holdings {path.name} or its provenance file is missing")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if provenance.get("output", {}).get("sha256") != _sha256(path) or not provenance.get("zips"):
+        raise ValueError(f"{provenance_path.name} does not describe {path.name} and its source zips")
+    frame = pd.read_csv(path, dtype={"report_date": str, "cusip": str, "security_class": str, "maturity_date": str})
+    missing = [column for column in NMFP_HOLDINGS_COLUMNS if column not in frame.columns]
+    if missing or frame.empty:
+        raise ValueError(f"N-MFP money-fund holdings {path.name} is empty or lacks columns: {missing}")
+    value = pd.to_numeric(frame["value_bil"], errors="coerce")
+    unknown = sorted(set(frame["security_class"]) - NMFP_SECURITY_CLASSES)
+    coupon = frame["security_class"].isin({"fixed_coupon", "tips"})
+    bad = value.isna() | (value < 0) | frame["report_date"].isna() | frame["cusip"].isna()
+    bad |= coupon & pd.to_datetime(frame["maturity_date"], errors="coerce").isna()
+    if unknown or bad.any() or frame.duplicated(["report_date", "cusip"]).any():
+        raise ValueError(
+            f"N-MFP money-fund holdings {path.name} has unknown classes {unknown}, {int(bad.sum())} unusable rows "
+            "or a CUSIP twice in one month"
+        )
+    return frame.assign(value_bil=value), provenance
+
+
+def _nmfp_bucket(security_class: str, maturity_date, record_date: str) -> str:
+    if security_class == "bill":
+        return "bills"
+    if security_class in {"frn", "unresolved"}:
+        return security_class
+    days = (pd.Timestamp(maturity_date) - pd.Timestamp(record_date)).days
+    return "coupon_le397" if days <= MMF_MAX_REMAINING_DAYS else "coupon_gt397"
+
+
+def _apply_mmf_frn_holdings(candidate_rows: list[dict], targets: dict[str, float]) -> dict:
+    """Give money funds their filed FRN holdings by CUSIP for an equal par of their bills.
+
+    Sector totals do not change. Within each FRN the notes come from domestic nonbanks
+    first, then from foreign holders and banks for the shortfall, each pro rata to its
+    holdings of the CUSIP; the givers take money-fund bills pro rata across the bill lots.
+    """
+
+    tolerance = 1e-9
+    frn_items: dict[str, list[dict]] = {}
+    for item in candidate_rows:
+        if item["security_type"] == "FRN":
+            frn_items.setdefault(item["cusip"], []).append(item)
+    unknown = sorted(set(targets) - set(frn_items))
+    if unknown:
+        raise ValueError(f"N-MFP money-fund FRN holdings name CUSIPs that are not FRNs in the opening book: {unknown}")
+
+    def held(items: list[dict], route: tuple[str, str]) -> float:
+        return sum(item["route_faces"][route] for item in items)
+
+    moved = {route: 0.0 for tier in FRN_OVERRIDE_GIVER_TIERS for route in tier}
+    by_cusip = {}
+    for cusip, items in sorted(frn_items.items()):
+        before = held(items, MMF_OPENING_ROUTE)
+        target = targets.get(cusip, 0.0)
+        noncb = sum(held(items, route) for route in NONCB_OPENING_ROUTES)
+        if target > noncb + tolerance:
+            raise ValueError(f"money funds filed {target:.6f} bn of {cusip}, more than its non-Fed outstanding {noncb:.6f} bn")
+        if target < before - tolerance:
+            raise ValueError(
+                f"money funds filed {target:.6f} bn of {cusip}, less than the {before:.6f} bn the opening split gives them; "
+                "the override only moves FRNs to money funds"
+            )
+        remaining = max(0.0, target - before)
+        takes = {}
+        for tier in FRN_OVERRIDE_GIVER_TIERS:
+            pool = sum(held(items, route) for route in tier)
+            take = min(remaining, pool)
+            for route in tier:
+                takes[route] = take * held(items, route) / pool if pool > 0.0 else 0.0
+            remaining -= take
+        for route, take in takes.items():
+            route_total = held(items, route)
+            for item in items:
+                amount = take * item["route_faces"][route] / route_total if route_total > 0.0 else 0.0
+                item["route_faces"][route] = max(0.0, item["route_faces"][route] - amount)
+                item["route_faces"][MMF_OPENING_ROUTE] += amount
+            moved[route] += take
+        by_cusip[cusip] = {
+            "filed_bil": target,
+            "pre_override_bil": before,
+            "from_bil": {_route_key(route): take for route, take in takes.items()},
+        }
+
+    bill_items = [item for item in candidate_rows if item["class_key"] == "Bills"]
+    mmf_bills = held(bill_items, MMF_OPENING_ROUTE)
+    total_moved = sum(moved.values())
+    if total_moved > mmf_bills + tolerance:
+        raise ValueError(f"money funds need {total_moved:.6f} bn of bills to give for their filed FRNs but hold {mmf_bills:.6f} bn")
+    if total_moved > 0.0:
+        for item in bill_items:
+            weight = item["route_faces"][MMF_OPENING_ROUTE] / mmf_bills
+            item["route_faces"][MMF_OPENING_ROUTE] = max(0.0, item["route_faces"][MMF_OPENING_ROUTE] - total_moved * weight)
+            for route, amount in moved.items():
+                item["route_faces"][route] += amount * weight
+    return {
+        "claim": FRN_OVERRIDE_CLAIM,
+        "rule": (
+            "money funds hold their N-MFP FRN value, read as par, by CUSIP; domestic nonbanks give first, "
+            "foreign holders and banks the shortfall, pro rata to their holdings of the CUSIP; "
+            "each giver takes money-fund bills at equal par, pro rata across the bill lots"
+        ),
+        "frn_to_mmf_bil_by_sector": {_route_key(route): amount for route, amount in moved.items()},
+        "bills_from_mmf_bil_by_sector": {_route_key(route): amount for route, amount in moved.items()},
+        "by_cusip": by_cusip,
+    }
+
+
+def _check_mmf_mix(candidate_rows: list[dict], filed: pd.DataFrame, *, record_date: str) -> dict:
+    """Compare the opening money-fund book with the N-MFP filings; raise outside the tolerance."""
+
+    model = {"bills": 0.0, "frn": 0.0, "coupon_le397": 0.0, "coupon_gt397": 0.0}
+    for item in candidate_rows:
+        security_class = "frn" if item["security_type"] == "FRN" else "bill" if item["class_key"] == "Bills" else "coupon"
+        model[_nmfp_bucket(security_class, item["maturity_date"], record_date)] += item["route_faces"][MMF_OPENING_ROUTE]
+    filings = {bucket: 0.0 for bucket in (*model, "unresolved")}
+    for row in filed.itertuples(index=False):
+        filings[_nmfp_bucket(row.security_class, row.maturity_date, record_date)] += row.value_bil
+    model["total"] = sum(model.values())
+    filings["total"] = sum(filings.values())
+    buckets = {}
+    failed = []
+    for bucket in NMFP_MIX_BUCKETS:
+        if filings[bucket] > 0.0:
+            gap = model[bucket] / filings[bucket] - 1.0
+        else:
+            gap = 0.0 if model[bucket] == 0.0 else math.inf
+        buckets[bucket] = {"model_par_bil": model[bucket], "filed_value_bil": filings[bucket], "relative_gap": gap}
+        if not abs(gap) <= NMFP_MIX_TOLERANCE:
+            failed.append(f"{bucket} {model[bucket]:.3f} vs {filings[bucket]:.3f} bn")
+    if failed:
+        raise ValueError(
+            f"opening money-fund book is more than {NMFP_MIX_TOLERANCE:.0%} from the N-MFP filings at {record_date}: "
+            + "; ".join(failed)
+        )
+    return {
+        "report_date": record_date,
+        "tolerance": NMFP_MIX_TOLERANCE,
+        "basis": "model book par against filed value; FRN value is read as par",
+        "buckets": buckets,
+        "filed_unresolved_value_bil": filings["unresolved"],
+        "status": "pass",
+    }
 
 
 def load_soma_auction_add_ons(path: Path, *, after: str, through: str) -> tuple[int, dict[str, float]]:
@@ -1024,6 +1198,7 @@ def build_initial_portfolio(
     wamest_path: Path,
     yield_curve_path: Path,
     auctions_path: Path,
+    nmfp_holdings_path: Path,
 ) -> tuple[pd.DataFrame, dict]:
     """Write the MSPD security-level opening book with CUSIP-level CB and WAMEST-split remainders.
 
@@ -1042,7 +1217,10 @@ def build_initial_portfolio(
     share. The uniform CUSIP split does not use that sector's detailed maturity
     profile. Money funds exchange every ineligible lot for an equal amount of
     eligible domestic nonbank paper, pro rata across the eligible lots. The
-    exchange uses book par (inflation-adjusted outstanding for TIPS).
+    exchange uses book par (inflation-adjusted outstanding for TIPS). Money funds
+    then hold their SEC N-MFP floating-rate notes by CUSIP at the record date, for an
+    equal par of their bills (``_apply_mmf_frn_holdings``), and the book's money-fund
+    mix must match the filings within ``NMFP_MIX_TOLERANCE``.
     """
 
     soma_as_of, soma = load_soma_cusip_holdings(soma_path)
@@ -1263,6 +1441,22 @@ def build_initial_portfolio(
         if amount > 0.0:
             totals = swap_by_class[direction]
             totals[class_name] = totals.get(class_name, 0.0) + amount
+    nmfp, nmfp_provenance = load_nmfp_mmf_holdings(nmfp_holdings_path)
+    filed = nmfp.loc[nmfp["report_date"].eq(record_date)]
+    if filed.empty:
+        raise ValueError(f"{nmfp_holdings_path.name} has no money-fund holdings reported at {record_date}")
+    frn_override = _apply_mmf_frn_holdings(
+        candidate_rows, filed.loc[filed["security_class"].eq("frn")].set_index("cusip")["value_bil"].to_dict()
+    )
+    frn_override["source"] = {
+        "file": nmfp_holdings_path.name,
+        "sha256": _sha256(nmfp_holdings_path),
+        "report_date": record_date,
+        "producer": nmfp_provenance.get("producer"),
+        "value_basis": nmfp_provenance.get("value_basis"),
+        "zips": nmfp_provenance["zips"],
+    }
+    mix_check = _check_mmf_mix(candidate_rows, filed, record_date=record_date)
 
     output_rows: list[dict] = []
     bond_id = 1
@@ -1285,6 +1479,8 @@ def build_initial_portfolio(
             price_ratio = _bill_tranche_price(cusip, bill_tranches.get(cusip, []), cusip_outstanding.get(cusip, math.nan))
         group = item["group"]
         has_add_on = soma_add_ons.get(cusip, 0.0) > 0.0
+        frn_observed = item["security_type"] == "FRN"
+        frn_override_leg = frn_observed or item["class_key"] == "Bills"
         routes = [
             (holder, subbucket, face) for (holder, subbucket), face in item["route_faces"].items()
         ]
@@ -1293,6 +1489,7 @@ def build_initial_portfolio(
             if face_value <= 1e-9:
                 continue
             is_cb = holder == "CB"
+            is_mmf_frn = frn_observed and (holder, holder_subbucket) == MMF_OPENING_ROUTE
             original_principal = face_value if item["security_type"] == "TIPS" else 0.0
             output_rows.append(
                 {
@@ -1343,6 +1540,8 @@ def build_initial_portfolio(
                         "fiscaldata_mspd_table_3_market;nyfed_soma_cusip_holdings"
                         + (";fiscaldata_auctions_soma_accepted" if has_add_on else "")
                         if is_cb
+                        else "fiscaldata_mspd_table_3_market;sec_nmfp_mmf_holdings"
+                        if is_mmf_frn
                         else "fiscaldata_mspd_table_3_market;wamest_sector_bill_share"
                     ),
                     "source_key": f"{record_date}:{class_desc}:{cusip}",
@@ -1350,7 +1549,7 @@ def build_initial_portfolio(
                         "class_matured_unpaid_total"
                         if is_matured
                         else "security_level_observed_holder"
-                        if is_cb
+                        if is_cb or is_mmf_frn
                         else "security_cohort_remainder_with_sector_bill_nonbill_allocation"
                     ),
                     "central_default_eligible": "true",
@@ -1362,6 +1561,8 @@ def build_initial_portfolio(
                             f"cb_from_nyfed_soma_asof_{soma_as_of}"
                             + (f"_plus_auction_soma_add_ons_through_{record_date}" if has_add_on else "")
                             if is_cb
+                            else f"mmf_frn_holdings_from_sec_nmfp_{record_date}_value_read_as_par"
+                            if is_mmf_frn
                             else f"noncb_remainder_split_by_wamest_{noncb['wamest_date']}_{group}_holdings_at_par_"
                             "domestic_nonbank_residual_not_cusip_holder_evidence"
                             + (
@@ -1369,6 +1570,7 @@ def build_initial_portfolio(
                                 if (holder, holder_subbucket) in (MMF_OPENING_ROUTE, NONCB_RESIDUAL_ROUTE)
                                 else ""
                             )
+                            + (";mmf_nmfp_frn_holdings_override" if frn_override_leg else "")
                         )
                     ),
                     "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
@@ -1446,6 +1648,7 @@ def build_initial_portfolio(
                 "as_of_date": record_date,
                 "face_bil_by_class": swap_by_class,
             },
+            "money_fund_frn_holdings_override": frn_override,
             "groups": {
                 group: {
                     "par_to_market_factor": factors[group],
@@ -1475,6 +1678,7 @@ def build_initial_portfolio(
             },
         },
         "holder_totals_bil": dict(sorted(holder_totals.items())),
+        "nmfp_mix_check": mix_check,
     }
     return frame, metadata
 
@@ -2107,6 +2311,7 @@ def build_all(
         wamest_path=ratewall_root.parent / WAMEST_CANONICAL_RELATIVE_PATH,
         yield_curve_path=output_dir / YIELD_CURVE_SURFACE_FILENAME,
         auctions_path=auctions_query,
+        nmfp_holdings_path=output_dir / NMFP_HOLDINGS_FILENAME,
     )
     artifacts["initial_portfolio"]["soma_source_url"] = soma_url
     _, artifacts["primary_flow"] = build_primary_flow_path(
@@ -2131,7 +2336,7 @@ def build_all(
         holder_absorption_calibration=holder_absorption_calibration,
     )
 
-    files = sorted(output_dir.glob("*.csv")) + [config_path]
+    files = sorted(output_dir.glob("*.csv")) + [(output_dir / NMFP_HOLDINGS_FILENAME).with_suffix(".provenance.json"), config_path]
     manifest = {
         "schema_version": "0.1.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2169,7 +2374,8 @@ def rebuild_opening_book(
     The SOMA file is copied beside the book, and the manifest's opening-book entry and
     file hashes are replaced; the other artifacts in the directory are left as they are.
     The book is priced on the directory's yield curve surface, which must be the one the
-    manifest records.
+    manifest records, and reads the directory's N-MFP money-fund holdings
+    (``NMFP_HOLDINGS_FILENAME``), whose hashes the manifest then records.
     """
 
     manifest_path = output_dir / "tdcsim_ratewall_input_manifest.json"
@@ -2189,6 +2395,7 @@ def rebuild_opening_book(
     if soma_holdings.resolve() != soma_path.resolve():
         soma_path.write_bytes(soma_holdings.read_bytes())
     book_path = output_dir / "tdcsim_initial_portfolio_cohorts.csv"
+    nmfp_path = output_dir / NMFP_HOLDINGS_FILENAME
     _, metadata = build_initial_portfolio(
         book_path,
         record_date=record_date,
@@ -2198,10 +2405,11 @@ def rebuild_opening_book(
         wamest_path=wamest_canonical,
         yield_curve_path=curve_path,
         auctions_path=auctions_query,
+        nmfp_holdings_path=nmfp_path,
     )
     metadata["mspd_source_sha256"] = {path.name: _sha256(path) for path in (mspd_table_1, mspd_table_3_market)}
     manifest["artifacts"]["initial_portfolio"] = metadata
-    for path in (book_path, soma_path):
+    for path in (book_path, soma_path, nmfp_path, nmfp_path.with_suffix(".provenance.json")):
         manifest["files"][path.name] = {"sha256": _sha256(path), "bytes": path.stat().st_size}
     manifest["source_hierarchy"]["bond_history"] = BOND_HISTORY_SOURCE
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

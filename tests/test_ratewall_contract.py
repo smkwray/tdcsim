@@ -1020,13 +1020,17 @@ def _opening_book_inputs(
     soma_as_of="2026-04-29",
     wamest_levels=None,
     auction_rows=None,
+    nmfp_rows=None,
+    frns=(),
 ):
-    """Synthetic MSPD, SOMA, WAMEST, curve and auction inputs shaped like the real files.
+    """Synthetic MSPD, SOMA, WAMEST, curve, auction and N-MFP inputs shaped like the real files.
 
     One bill, one note and one TIPS security; 100,000 of notes matured on the record
     date and are unpaid; 1% of notes are held intragovernmentally, so Table 1 is below
     the Table 3 class total. The baseline curve is a flat 5% on and before the record
-    date, so the bill and the 4% note trade below par.
+    date, so the bill and the 4% note trade below par. ``frns`` adds floating-rate notes as
+    (CUSIP, outstanding in millions). The money funds' N-MFP filings at the record date sit
+    within the mix tolerance of the book they produce.
     """
 
     table1 = [
@@ -1067,6 +1071,13 @@ def _opening_book_inputs(
         security("Inflation-Protected Securities", "Total Treasury TIPS", "300000", issue=""),
         *(extra_table3 or []),
     ]
+    if frns:
+        frn_total = str(sum(float(outstanding) for _, outstanding in frns))
+        table1.append(
+            {"security_type_desc": "Marketable", "security_class_desc": "Floating Rate Notes", "debt_held_public_mil_amt": frn_total}
+        )
+        table3 += [security("Floating Rate Notes", cusip, outstanding, "2027-04-30", "4.0") for cusip, outstanding in frns]
+        table3.append(security("Floating Rate Notes", "Total Treasury Floating Rate Notes", frn_total, issue=""))
     soma = soma_rows or [
         ("FAKEBILL1", "Bills", "2026-09-01", "100000000000", ""),
         ("FAKENOTE1", "NotesBonds", "2031-01-01", "500000000000", ""),
@@ -1147,7 +1158,45 @@ def _opening_book_inputs(
         "wamest_path": wamest_path,
         "yield_curve_path": curve_path,
         "auctions_path": auctions_path,
+        "nmfp_holdings_path": _write_nmfp(tmp_path / rib.NMFP_HOLDINGS_FILENAME, nmfp_rows or _OPENING_NMFP_ROWS),
     }
+
+
+# N-MFP money-fund holdings as (report date, CUSIP, class, maturity, value in bn).
+# The book gives money funds 487.6 bn of bills and 19.1 bn of notes matured on the record
+# date; the filings sit within 2% of each.
+_OPENING_NMFP_ROWS = [
+    ("2026-04-30", "FAKEBILL1", "bill", "2026-09-01", 480.0),
+    ("2026-04-30", "FAKEMAT01", "fixed_coupon", "2026-04-30", 19.0),
+    # Filed in another month, so not part of this book's check.
+    ("2026-03-31", "FAKEBILL1", "bill", "2026-09-01", 1.0),
+]
+
+
+def _write_nmfp(path: Path, rows) -> Path:
+    """Write an N-MFP extract and the provenance file its producer would write beside it."""
+
+    pd.DataFrame(
+        [
+            {
+                "report_date": report_date,
+                "cusip": cusip,
+                "security_class": security_class,
+                "maturity_date": maturity,
+                "value_bil": value,
+                "class_source": "mspd_cusip",
+                "series_count": 1,
+            }
+            for report_date, cusip, security_class, maturity, value in rows
+        ]
+    ).to_csv(path, index=False)
+    provenance = {
+        "producer": "scripts/extract_sec_nmfp_mmf_holdings.py",
+        "zips": {"fake_nmfp.zip": {"sha256": "0" * 64, "bytes": 1}},
+        "output": {"file": path.name, "sha256": rib._sha256(path)},
+    }
+    path.with_suffix(".provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+    return path
 
 
 def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path):
@@ -1355,6 +1404,9 @@ def test_opening_book_rebuild_keeps_manifest_bound_to_the_files(tmp_path):
     other = {"sha256": "unchanged", "bytes": 4}
     curve = out / rib.YIELD_CURVE_SURFACE_FILENAME
     curve.write_bytes(inputs["yield_curve_path"].read_bytes())
+    nmfp = inputs["nmfp_holdings_path"]
+    for path in (nmfp, nmfp.with_suffix(".provenance.json")):
+        (out / path.name).write_bytes(path.read_bytes())
     rebuild = {
         "record_date": "2026-04-30",
         "mspd_table_1": t1,
@@ -1381,13 +1433,126 @@ def test_opening_book_rebuild_keeps_manifest_bound_to_the_files(tmp_path):
 
     on_disk = json.loads((out / "tdcsim_ratewall_input_manifest.json").read_text(encoding="utf-8"))
     assert on_disk == manifest
-    for name in ("tdcsim_initial_portfolio_cohorts.csv", rib.SOMA_HOLDINGS_FILENAME):
+    provenance = nmfp.with_suffix(".provenance.json").name
+    for name in ("tdcsim_initial_portfolio_cohorts.csv", rib.SOMA_HOLDINGS_FILENAME, rib.NMFP_HOLDINGS_FILENAME, provenance):
         assert manifest["files"][name]["sha256"] == rib._sha256(out / name)
     assert manifest["files"]["other.csv"] == other
     assert manifest["artifacts"]["other"] == {"rows": 1}
     assert manifest["artifacts"]["initial_portfolio"]["cb_source"] == "nyfed_soma_treasury_holdings_by_cusip"
     assert manifest["artifacts"]["initial_portfolio"]["opening_allocation"]["curve_sha256"] == rib._sha256(curve)
     assert set(manifest["artifacts"]["initial_portfolio"]["mspd_source_sha256"]) == {t1.name, t3.name}
+
+
+# Two FRNs, 100 and 50 bn, none held by the Fed. Money funds filed 60 bn of the first,
+# more than they and domestic nonbanks hold of it, and 10 bn of the second, which
+# domestic nonbanks can cover alone. Bills and matured notes sit within 1% of the book.
+_FRN_FIXTURE = (("FAKEFRN01", "100000"), ("FAKEFRN02", "50000"))
+_FRN_NMFP_ROWS = [
+    ("2026-04-30", "FAKEBILL1", "bill", "2026-09-01", 420.0),
+    ("2026-04-30", "FAKEMAT01", "fixed_coupon", "2026-04-30", 15.3),
+    ("2026-04-30", "FAKEFRN01", "frn", "2027-04-30", 60.0),
+    ("2026-04-30", "FAKEFRN02", "frn", "2027-04-30", 10.0),
+]
+
+
+def test_money_funds_hold_their_filed_frns_for_bills_drawing_domestic_nonbanks_first(tmp_path):
+    # Observed filings outrank the uniform split for FRNs only: money funds hold what they
+    # filed, the notes come from domestic nonbanks before foreign holders and banks, and
+    # every giver takes money-fund bills at equal par, so no sector's par changes.
+    inputs = _opening_book_inputs(tmp_path, frns=_FRN_FIXTURE, nmfp_rows=_FRN_NMFP_ROWS)
+    frame, metadata = rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+    book = frame.assign(FaceValue=frame["FaceValue"].astype(float))
+    route = (book["HolderType"] + "/" + book["HolderSubBucket"].fillna("")).str.rstrip("/")
+    face = book.groupby([book["cusip_or_synthetic_id"], route])["FaceValue"].sum()
+    dn, mmf = "Private/domestic_nonbank_deposit_funded", "Private/mmf_cash_fund_route"
+    allocation = metadata["opening_allocation"]
+    weights = allocation["groups"]["nonbills"]["route_weights"]
+    override = allocation["money_fund_frn_holdings_override"]
+    moved = override["frn_to_mmf_bil_by_sector"]
+
+    assert face[("FAKEFRN01", mmf)] == pytest.approx(60.0)
+    assert face[("FAKEFRN02", mmf)] == pytest.approx(10.0)
+    # Domestic nonbanks cover the second FRN alone: foreign holders and banks keep the split.
+    for holder in ("Foreign", "Banks"):
+        assert face[("FAKEFRN02", holder)] == pytest.approx(50.0 * weights[holder])
+    assert face[("FAKEFRN02", dn)] > 1.0
+    assert override["by_cusip"]["FAKEFRN02"]["from_bil"]["Foreign"] == 0.0
+    # For the first, domestic nonbanks give all they hold, and foreign holders and banks the
+    # shortfall in proportion to their holdings.
+    assert ("FAKEFRN01", dn) not in face.index
+    assert face[("FAKEFRN01", "Foreign")] + face[("FAKEFRN01", "Banks")] == pytest.approx(40.0)
+    assert face[("FAKEFRN01", "Foreign")] / face[("FAKEFRN01", "Banks")] == pytest.approx(weights["Foreign"] / weights["Banks"])
+    assert moved["Foreign"] + moved["Banks"] == pytest.approx(100.0 * (weights["Foreign"] + weights["Banks"]) - 40.0)
+    assert moved["Foreign"] > 1.0 and moved["Banks"] > 0.1
+
+    # Equal par: each sector keeps its opening par, and each giver's bills rise by the notes it gave.
+    totals = book.groupby(route)["FaceValue"].sum()
+    for key in (dn, "Foreign", "Banks", mmf):
+        expected = allocation["groups"]["bills"]["par_bil"][key] + allocation["groups"]["nonbills"]["par_bil"][key]
+        assert totals[key] == pytest.approx(expected)
+    for key in ("Foreign", "Banks"):
+        assert face[("FAKEBILL1", key)] == pytest.approx(allocation["groups"]["bills"]["par_bil"][key] + moved[key])
+    assert override["bills_from_mmf_bil_by_sector"] == moved
+    assert sum(moved.values()) == pytest.approx(
+        sum(row["filed_bil"] - row["pre_override_bil"] for row in override["by_cusip"].values())
+    )
+    assert override["source"]["zips"] == {"fake_nmfp.zip": {"sha256": "0" * 64, "bytes": 1}}
+
+    check = metadata["nmfp_mix_check"]
+    assert check["status"] == "pass" and check["buckets"]["frn"]["relative_gap"] == pytest.approx(0.0)
+    mmf_frns = book.loc[book["SecurityType"].eq("FRN") & route.eq(mmf)]
+    assert set(mmf_frns["observability_tier"]) == {"security_level_observed_holder"}
+    assert mmf_frns["source_family"].str.contains("sec_nmfp").all()
+
+
+@pytest.mark.parametrize(
+    ("frns", "filed_frns", "message"),
+    [
+        # Filings above the non-Fed outstanding cannot be met by any exchange.
+        (_FRN_FIXTURE, {"FAKEFRN01": 101.0, "FAKEFRN02": 10.0}, "more than its non-Fed outstanding"),
+        # Money funds must hold the bills they give.
+        ((("FAKEFRN01", "1000000"),), {"FAKEFRN01": 600.0}, "bills to give"),
+        # The override only moves notes to money funds; a filing below the split is not handled silently.
+        (_FRN_FIXTURE, {"FAKEFRN01": 60.0, "FAKEFRN02": 1.0}, "less than"),
+        (_FRN_FIXTURE, {"FAKEFRN01": 60.0}, "less than"),
+        (_FRN_FIXTURE, {"FAKEFRN01": 60.0, "FAKEFRN02": 10.0, "FAKEFRN09": 1.0}, "not FRNs in the opening book"),
+    ],
+)
+def test_frn_override_fails_loudly_when_the_filings_cannot_be_met(tmp_path, frns, filed_frns, message):
+    rows = _FRN_NMFP_ROWS[:2] + [("2026-04-30", cusip, "frn", "2027-04-30", value) for cusip, value in filed_frns.items()]
+    inputs = _opening_book_inputs(tmp_path, frns=frns, nmfp_rows=rows)
+    with pytest.raises(ValueError, match=message):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+@pytest.mark.parametrize(
+    ("filed_bills", "passes"),
+    [(465.0, True), (463.0, False), (512.0, True), (514.0, False)],
+)
+def test_opening_book_rejects_a_money_fund_mix_outside_the_filings_tolerance(tmp_path, filed_bills, passes):
+    # The book gives money funds 487.6 bn of bills: 465 and 512 filed are within 5%, 463 and
+    # 514 are not, and a book that far from the filings must not be released.
+    rows = [("2026-04-30", "FAKEBILL1", "bill", "2026-09-01", filed_bills), *_OPENING_NMFP_ROWS[1:]]
+    inputs = _opening_book_inputs(tmp_path, nmfp_rows=rows)
+    if passes:
+        _, metadata = rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+        assert abs(metadata["nmfp_mix_check"]["buckets"]["bills"]["relative_gap"]) <= rib.NMFP_MIX_TOLERANCE
+    else:
+        with pytest.raises(ValueError, match="more than 5% from the N-MFP filings"):
+            rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+        assert not (tmp_path / "cohorts.csv").exists()
+
+
+def test_opening_book_rejects_n_mfp_holdings_without_matching_provenance(tmp_path):
+    inputs = _opening_book_inputs(tmp_path)
+    path = inputs["nmfp_holdings_path"]
+    path.write_text(path.read_text(encoding="utf-8").replace("480.0", "481.0"), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not describe"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+    # A month with no filings at the record date is missing input, not an empty override.
+    inputs = _opening_book_inputs(tmp_path, nmfp_rows=[_OPENING_NMFP_ROWS[2]])
+    with pytest.raises(ValueError, match="no money-fund holdings reported at 2026-04-30"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
 
 
 def test_soma_loader_rejects_files_without_required_columns(tmp_path):
