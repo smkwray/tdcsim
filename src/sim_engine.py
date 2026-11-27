@@ -40,6 +40,8 @@ from tdc_shared import (
 import holder_targets
 import fed_purchase_policy
 from issuance_calibration import (
+    CASH_MANAGEMENT_BILL_KIND,
+    CASH_MANAGEMENT_BILL_WEEKS,
     active_special_categories,
     bill_days,
     bill_issuance_amount,
@@ -119,7 +121,7 @@ OPERATING_CASH_RESULT_COLUMNS = (
     'IssuanceNeedProceeds',
     'PendingIssuanceProceeds',
     'EarlySettlementProceeds',
-    'FiscalYearCloseSettlementProceeds',
+    'CashManagementBillProceeds',
     'FedRolloverFace',
     'FedRolloverProceeds',
     'FedRolloverReallocatedStock',
@@ -129,6 +131,7 @@ OPERATING_CASH_RESULT_COLUMNS = (
 FED_ROLLOVER_ISSUANCE_LEG = 'fed_rollover_add_on'
 CASH_FINANCING_ISSUANCE_LEGS = frozenset({'tga_floor_cash_financing', 'operating_cash_target_financing'})
 CASH_FUNDING_MODE = 'cash_tga_target'
+_CASH_MANAGEMENT_BILL_KEY = (CASH_MANAGEMENT_BILL_KIND, float(CASH_MANAGEMENT_BILL_WEEKS))
 
 
 def _is_cbo_funding_mode(params):
@@ -2408,7 +2411,7 @@ def _quote_settlements(
     """Price the securities settling today on Treasury's terms.
 
     A calendar settlement is a new issue or a reopening as the calendar says; a
-    settlement off the calendar (early, or at the fiscal-year close) reopens the
+    settlement off the calendar for the cash floor reopens the
     security's latest issue, or is a new issue if none is outstanding yet. A new coupon
     issue is dated on its calendar dated date and matures tenor years later; its coupon
     comes from the issue kernel at the tenor's auction yield. One settling after its
@@ -2425,6 +2428,21 @@ def _quote_settlements(
     schedule = []
     for key, security_type, maturity_years, weekly_days, amount in settled:
         if amount <= TGA_FLOOR_TOLERANCE:
+            continue
+        if key == _CASH_MANAGEMENT_BILL_KEY:
+            maturity = pd.Timestamp(bill_maturity(current.date(), CASH_MANAGEMENT_BILL_WEEKS))
+            days_to_maturity = int((maturity - current).days)
+            item = _quote_supply_item(
+                'Fixed', days_to_maturity / DAYS_PER_YEAR_ACTUAL, amount,
+                face_target_mode=False, issuance_leg=issuance_leg, current_date=current,
+                bill_term_days=weekly_days, bill_days_to_maturity=days_to_maturity, pricing=pricing,
+            )
+            item.update(
+                supply_key=key, maturity_date=maturity, dated_date=current,
+                security_label=f'{CASH_MANAGEMENT_BILL_KIND}-{current.date()}',
+                settlement_kind=CASH_MANAGEMENT_BILL_KIND, is_reopening=False,
+            )
+            schedule.append(item)
             continue
         event = due_events.get(key)
         settlement_kind = 'calendar' if event is not None else off_calendar_kind[key]
@@ -2832,8 +2850,7 @@ def _build_issuance_supply_schedule(
 
 
 def _fiscal_year_close_dates(issuance_profile, start_date, end_date):
-    """Last business days of the close months in ``[start_date, end_date]``: the books
-    close and everything pending settles there."""
+    """Last business days of the configured close months in the run window."""
 
     return [
         pd.Timestamp(value)
@@ -2857,6 +2874,42 @@ def _due_settlement_events(settlement_schedule, settlement_dates, prev_date, cur
     return due
 
 
+def _last_settlements_before_close(settlement_schedule, close_dates):
+    """Last calendar settlement of each key in each fiscal-year segment."""
+    schedule = iter(settlement_schedule.items())
+    next_event = next(schedule, None)
+    last_by_close = {}
+    for close in close_dates:
+        last = {}
+        while next_event is not None and next_event[0] <= close:
+            day, events = next_event
+            last.update(dict.fromkeys(events, day))
+            next_event = next(schedule, None)
+        last_by_close[close] = last
+    return last_by_close
+
+
+def _redirect_financing_before_close(allocations, issuance_profile, last_settlements, current_date):
+    """Redirect a lapsed security's need to regular bills available through the close."""
+    available = {key for key, day in last_settlements.items() if day >= current_date}
+    eligible = [item for item in allocations if item[0] in available]
+    stranded = sum(item[-1] for item in allocations if item[0] not in available)
+    if stranded <= TGA_FLOOR_TOLERANCE:
+        return eligible
+    bills = [
+        (term, bill_supply_key(int(term['weeks']))) for term in issuance_profile['bill_terms']
+        if bill_supply_key(int(term['weeks'])) in available
+    ]
+    if not bills:
+        weeks = CASH_MANAGEMENT_BILL_WEEKS
+        return [*eligible, (_CASH_MANAGEMENT_BILL_KEY, 'Fixed', bill_maturity_years(weeks), bill_days(weeks), stranded)]
+    shares = sum(float(term['share']) for term, _ in bills)
+    for term, key in bills:
+        proceeds = stranded * float(term['share']) / shares
+        eligible.append((key, *_supply_terms(key, issuance_profile), proceeds))
+    return eligible
+
+
 def _decide_and_settle_pending(
     pending,
     *,
@@ -2866,7 +2919,8 @@ def _decide_and_settle_pending(
     due_keys,
     projected_tga_without_settlement,
     current_date,
-    settle_all=False,
+    last_settlements=None,
+    fiscal_close_today=False,
     can_settle=True,
 ):
     """Add the day's split to pending balances and release the ones due today.
@@ -2874,8 +2928,8 @@ def _decide_and_settle_pending(
     The split counts pending face as already issued. If settling only what is due would
     leave the TGA negative, every pending bill settles early the same day, and pending
     coupon securities too if the bills are not enough. Mutates ``pending``; returns the
-    settling allocations, the proceeds settled early and the proceeds settled by the
-    fiscal-year close (an accounting close) that were not otherwise due.
+    settling allocations and proceeds settled early. Any cash-management bill
+    decided after the last regular bill settlement settles on the fiscal close.
     """
 
     controlled_debt, controlled_bills = pre_issuance_position
@@ -2890,6 +2944,10 @@ def _decide_and_settle_pending(
         controlled_bills=controlled_bills,
         current_date=current_date,
     )
+    if last_settlements is not None:
+        allocations = _redirect_financing_before_close(
+            allocations, issuance_profile, last_settlements, current_date,
+        )
     for key, security_type, maturity_years, weekly_days, amount in allocations:
         if amount <= TGA_FLOOR_TOLERANCE:
             continue
@@ -2899,19 +2957,19 @@ def _decide_and_settle_pending(
             pending[key] = [security_type, maturity_years, weekly_days, amount]
     if not can_settle:
         # The securities market is closed: nothing settles, so the TGA must not need it.
-        if due_keys or settle_all or projected_tga_without_settlement < 0.0:
+        if due_keys or fiscal_close_today or projected_tga_without_settlement < 0.0:
             raise RuntimeError(
                 f'issuance would have to settle on {pd.Timestamp(current_date).date()}, '
                 'a day the securities market is closed'
             )
-        return [], 0.0, 0.0
+        return [], 0.0
     settling = [key for key in due_keys if key in pending]
-    sweep = 0.0
-    if settle_all:
-        for key, item in pending.items():
-            if key not in settling:
-                settling.append(key)
-                sweep += item[3]
+    if fiscal_close_today:
+        if _CASH_MANAGEMENT_BILL_KEY in pending:
+            settling.append(_CASH_MANAGEMENT_BILL_KEY)
+        stranded_keys = set(pending).difference(settling)
+        if stranded_keys:
+            raise RuntimeError(f'Pending financing missed the fiscal close on {current_date.date()}: {sorted(stranded_keys)}')
     settled_cash = sum(pending[key][3] for key in settling)
     early = 0.0
     # Bills first; coupon securities settle early only if the bills cannot keep the TGA
@@ -2920,14 +2978,14 @@ def _decide_and_settle_pending(
         if projected_tga_without_settlement + settled_cash + early >= 0.0:
             break
         for key, item in pending.items():
-            if (key[0] == 'bill') == (early_kind == 'bill') and key not in settling:
+            if (key[0] == 'bill') == (early_kind == 'bill') and key not in settling and key != _CASH_MANAGEMENT_BILL_KEY:
                 settling.append(key)
                 early += item[3]
     settled = []
     for key in settling:
         security_type, maturity_years, weekly_days, amount = pending.pop(key)
         settled.append((key, security_type, maturity_years, weekly_days, amount))
-    return settled, early, sweep
+    return settled, early
 
 
 def _schedule_issuance_leg(
@@ -3751,7 +3809,9 @@ def run_simulation(
     if cbo_operating_cash_financing_mode:
         # Only this mode decides cash needs and settles them on a calendar; the debt-path
         # modes keep their result columns unchanged.
-        for numeric_col in (*OPERATING_CASH_RESULT_COLUMNS, 'FedRolloverCashSizingDifference'):
+        for numeric_col in (
+            *OPERATING_CASH_RESULT_COLUMNS, 'FedRolloverCashSizingDifference', 'FedRolloverCashEstimateRevision',
+        ):
             results[numeric_col] = 0.0
     for status_col in [
         'CBOFedStockMode',
@@ -3917,6 +3977,7 @@ def run_simulation(
         fiscal_year_close_dates = (
             _fiscal_year_close_dates(issuance_profile, dates[0], dates[-1]) if batched_settlement else []
         )
+        close_settlement_plan = _last_settlements_before_close(settlement_schedule, fiscal_year_close_dates)
         settlement_calendar_data = copy.deepcopy(issuance_profile.get('settlement_calendar'))
         pending_issuance = {}
         current_sector_prefs = copy.deepcopy(params.get('sector_preferences', {}))
@@ -5415,11 +5476,13 @@ def run_simulation(
         else:
             primary_issuance_leg = 'ordinary_issuance'
         early_settlement_proceeds = 0.0
-        fiscal_year_close_settlement_proceeds = 0.0
+        cash_management_bill_proceeds = 0.0
+        close_books_today = False
         rollover_prices = {}
         rollover_stock_by_class = {}
         estimated_rollover = {}
         fed_rollover_cash_estimate = 0.0
+        initial_rollover_cash_estimate = 0.0
         fed_rollover_reallocated_stock = 0.0
         fed_only_rollover_classes = []
         if batched_settlement and cbo_fed_allocation_override_active:
@@ -5466,7 +5529,8 @@ def run_simulation(
                 issuance_profile=issuance_profile,
                 prices=rollover_prices,
             )
-            fed_rollover_cash_estimate = sum(face * price for face, price, _ in estimated_rollover.values())
+            initial_rollover_cash_estimate = sum(face * price for face, price, _ in estimated_rollover.values())
+            fed_rollover_cash_estimate = initial_rollover_cash_estimate
             fed_rollover_cash = fed_rollover_cash_estimate
             fed_rollover_stock = sum(face * stock for face, _price, stock in estimated_rollover.values())
             fed_redeemed_face = cb_matured - fed_rollover_stock
@@ -5486,10 +5550,9 @@ def run_simulation(
         if batched_settlement:
             if issuance_profile.get('settlement_calendar') != settlement_calendar_data:
                 raise ValueError('the settlement calendar cannot change during a run')
-            close_books_today = (
-                bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(current_date))
-                > bisect.bisect_right(fiscal_year_close_dates, pd.Timestamp(settle_window_start))
-            )
+            close_index = bisect.bisect_left(fiscal_year_close_dates, current_date)
+            close_day = fiscal_year_close_dates[close_index] if close_index < len(fiscal_year_close_dates) else None
+            close_books_today = current_date == close_day
             if not payments_open:
                 if total_issuance_target_period > TGA_FLOOR_TOLERANCE:
                     raise RuntimeError(
@@ -5497,23 +5560,9 @@ def run_simulation(
                         'a day Fedwire is closed'
                     )
                 total_issuance_target_period = 0.0
-            settlement_allocations, early_settlement_proceeds, fiscal_year_close_settlement_proceeds = _decide_and_settle_pending(
-                pending_issuance,
-                need=total_issuance_target_period,
-                issuance_profile=issuance_profile,
-                pre_issuance_position=pre_issuance_position,
-                due_keys=list(due_events),
-                projected_tga_without_settlement=projected_tga_pre_issuance + cbo_cash_residual_period + fed_rollover_cash,
-                current_date=current_date,
-                settle_all=close_books_today,
-                can_settle=market_open,
-            )
-            operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
-            off_calendar_kind = 'fiscal_year_close' if close_books_today else 'early_settlement'
-            issuance_supply_schedule = _quote_settlements(
-                settlement_allocations,
+            quote_settlements = functools.partial(
+                _quote_settlements,
                 due_events=due_events,
-                off_calendar_kind={item[0]: off_calendar_kind for item in settlement_allocations},
                 issuance_leg=primary_issuance_leg,
                 current_date=current_date,
                 pricing=issuance_pricing,
@@ -5523,13 +5572,65 @@ def run_simulation(
                 reference_cpi_on=lambda day: float(results.loc[pd.Timestamp(day).normalize(), 'Reference_CPI']),
                 frn_accrual_per_face=frn_accrual_per_face,
             )
-            fed_rollover, fed_only_rollover_classes = _fed_rollover_allocation(
-                rollover_stock_by_class,
-                offering_face={item['supply_key']: item['face_amount'] for item in issuance_supply_schedule},
-                issuance_profile=issuance_profile,
-                prices=rollover_prices,
+            net_cash_before_rollover = projected_tga_pre_issuance + cbo_cash_residual_period
+            # Re-size if the price difference would leave a cash gap over a
+            # Fedwire closure, at fiscal close, or below the TGA floor.
+            retry_possible = bool(rollover_prices)
+            next_day_closed = retry_possible and not is_fedwire_business_day(current_date + pd.Timedelta(days=1))
+            if retry_possible:
+                previous_pending = {key: item.copy() for key, item in pending_issuance.items()}
+                previous_registry = issue_registry.copy()
+            for attempt in range(16):
+                if attempt:
+                    pending_issuance.clear()
+                    pending_issuance.update({key: item.copy() for key, item in previous_pending.items()})
+                    issue_registry.clear()
+                    issue_registry.update(previous_registry)
+                    fed_rollover_cash_estimate = fed_rollover_cash
+                    total_issuance_target_period = max(
+                        0.0, cbo_operating_cash_target - net_cash_before_rollover - fed_rollover_cash_estimate
+                        - sum(item[3] for item in pending_issuance.values())
+                    )
+                settlement_allocations, early_settlement_proceeds = _decide_and_settle_pending(
+                    pending_issuance,
+                    need=total_issuance_target_period,
+                    issuance_profile=issuance_profile,
+                    pre_issuance_position=pre_issuance_position,
+                    due_keys=list(due_events),
+                    projected_tga_without_settlement=net_cash_before_rollover + fed_rollover_cash_estimate,
+                    current_date=current_date,
+                    last_settlements=close_settlement_plan.get(close_day),
+                    fiscal_close_today=close_books_today,
+                    can_settle=market_open,
+                )
+                operating_cash_settlement_proceeds = sum(item[-1] for item in settlement_allocations)
+                issuance_supply_schedule = quote_settlements(
+                    settlement_allocations,
+                    off_calendar_kind={item[0]: 'early_settlement' for item in settlement_allocations},
+                )
+                fed_rollover, fed_only_rollover_classes = _fed_rollover_allocation(
+                    rollover_stock_by_class,
+                    offering_face={item['supply_key']: item['face_amount'] for item in issuance_supply_schedule},
+                    issuance_profile=issuance_profile,
+                    prices=rollover_prices,
+                )
+                fed_rollover_cash = sum(face * price for face, price, _ in fed_rollover.values())
+                expected_tga = net_cash_before_rollover + fed_rollover_cash + operating_cash_settlement_proceeds
+                if close_books_today:
+                    on_cash_path = abs(expected_tga - cbo_operating_cash_target) <= TGA_FLOOR_TOLERANCE
+                elif next_day_closed:
+                    pending_cash = sum(item[3] for item in pending_issuance.values())
+                    on_cash_path = expected_tga + pending_cash >= cbo_operating_cash_target - TGA_FLOOR_TOLERANCE
+                else:
+                    on_cash_path = True
+                if on_cash_path and expected_tga >= -TGA_FLOOR_TOLERANCE:
+                    break
+                if not retry_possible or abs(fed_rollover_cash - fed_rollover_cash_estimate) <= TGA_FLOOR_TOLERANCE:
+                    break  # The cash checks below report a gap issuance could not close.
+            cash_management_bill_proceeds = sum(
+                item['proceeds'] for item in issuance_supply_schedule
+                if item['settlement_kind'] == CASH_MANAGEMENT_BILL_KIND
             )
-            fed_rollover_cash = sum(face * price for face, price, _ in fed_rollover.values())
             fed_rollover_reallocated_stock = 0.5 * sum(
                 abs(fed_rollover.get(key, (0.0,))[0] - estimated_rollover.get(key, (0.0,))[0]) * stock_per_face
                 for key, (_, stock_per_face) in rollover_prices.items()
@@ -5811,6 +5912,8 @@ def run_simulation(
                         if sec_type == 'Fixed':
                             maturity_category_val = get_maturity_category(mat_yrs, issuance_profile)
                         new_tranche = {'BondID': next_bond_id_to_assign, 'FaceValue': route_face_value, 'HolderType': holder, 'HolderSubBucket': holder_subbucket if holder == 'Private' else '', 'TDCPrincipalHolderType': holder, 'TDCPrincipalHolderSubBucket': holder_subbucket if holder == 'Private' else '', 'SecurityType': sec_type, 'IssueDate': current_date, 'MaturityDate': maturity_date, 'DatedDate': dated_date_val, 'OriginalDatedDate': dated_date_val, 'FirstInterestPaymentDate': first_interest_payment_date_val, 'InterestPaymentFrequency': interest_payment_frequency_val, 'OriginalMaturityYears': mat_yrs, 'CouponRate': coupon_rate_val, 'Status': 'Active', 'MaturityCategory': maturity_category_val, 'OriginalPrincipal': original_principal_val, 'AdjustedPrincipal': adjusted_principal_val, 'ReferenceCPI_Issue': reference_cpi_issue_val, 'IndexRatio': index_ratio_init_val, 'FixedSpread': fixed_spread_val, 'AccruedInterest_FRN': accrued_frn_val, 'BenchmarkRate_FRN': 0.0, 'LastAccrualDate': last_accrual_date_val, 'IssuePriceRatio': issue_price_ratio_val, 'IssueProceeds': issue_proceeds_val, 'IssueYieldAtIssue': issue_yield_val, 'TimeToMaturity': np.nan, 'DiscountYield': np.nan, 'CleanPrice': np.nan, 'AccruedInterest': np.nan, 'DirtyValue': np.nan, 'DirtyPriceRatio': np.nan}
+                        if details.get('settlement_kind') == CASH_MANAGEMENT_BILL_KIND:
+                            new_tranche['IsCashManagementBill'] = True
                         new_bonds_added_list.append(new_tranche)
                         tranche_stock = adjusted_principal_val if sec_type == 'TIPS' else route_face_value
                         if is_noncash_intragovernmental_issuance:
@@ -5875,7 +5978,11 @@ def run_simulation(
                     if col not in new_bonds_df.columns:
                         dtype = PORTFOLIO_DTYPES.get(col, 'object')
                         new_bonds_df[col] = pd.NA if dtype == 'Int64' else pd.NaT if dtype == 'datetime64[ns]' else np.nan
-                new_bonds_df = new_bonds_df[BOND_PORTFOLIO_COLS]
+                runtime_columns = list(BOND_PORTFOLIO_COLS)
+                if 'IsCashManagementBill' in new_bonds_df:
+                    new_bonds_df['IsCashManagementBill'] = new_bonds_df['IsCashManagementBill'].eq(True)
+                    runtime_columns.append('IsCashManagementBill')
+                new_bonds_df = new_bonds_df[runtime_columns]
                 new_bonds_df = new_bonds_df.astype(PORTFOLIO_DTYPES, errors='ignore')
                 if bounded_handoff:
                     handoff_tables.check_portfolio_rows(
@@ -5926,10 +6033,13 @@ def run_simulation(
                 item[3] for item in pending_issuance.values()
             )
             results.loc[current_date, 'EarlySettlementProceeds'] = early_settlement_proceeds
-            results.loc[current_date, 'FiscalYearCloseSettlementProceeds'] = fiscal_year_close_settlement_proceeds
+            results.loc[current_date, 'CashManagementBillProceeds'] = cash_management_bill_proceeds
             results.loc[current_date, 'FedRolloverFace'] = fed_rollover_face_issued
             results.loc[current_date, 'FedRolloverProceeds'] = fed_rollover_proceeds
             results.loc[current_date, 'FedRolloverCashSizingDifference'] = fed_rollover_proceeds - fed_rollover_cash_estimate
+            results.loc[current_date, 'FedRolloverCashEstimateRevision'] = (
+                fed_rollover_cash_estimate - initial_rollover_cash_estimate
+            )
             results.loc[current_date, 'FedRolloverReallocatedStock'] = fed_rollover_reallocated_stock
             if fed_only_rollover_classes:
                 results.loc[current_date, 'FedRolloverFedOnlyClasses'] = '|'.join(fed_only_rollover_classes)
@@ -6624,6 +6734,11 @@ def run_simulation(
                     f"TGA={current_tga:.12f}, floor={validation_floor:.12f}"
                 )
         if cbo_operating_cash_financing_mode:
+            if close_books_today and abs(current_tga - cbo_operating_cash_target) > target_tolerance:
+                raise RuntimeError(
+                    f'Fiscal close did not meet the operating-cash target at {current_date.date()}: '
+                    f'TGA={current_tga:.12f}, target={cbo_operating_cash_target:.12f}'
+                )
             # The TGA plus what is decided but not yet settled sits on the target on every
             # day with a need, and never below it; a cash flow booked after issuance would
             # break this.

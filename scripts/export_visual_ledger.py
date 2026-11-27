@@ -29,6 +29,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import pandas as pd  # noqa: E402
 
+from issuance_calibration import (  # noqa: E402
+    CASH_MANAGEMENT_BILL_KIND,
+    CASH_MANAGEMENT_BILL_WEEKS,
+    bill_maturity,
+    bill_supply_key,
+    coupon_supply_key,
+    fiscal_year_close_dates,
+    settlement_events,
+)
 from run_open04_reproduction import _assert_installed_distribution_import  # noqa: E402
 from simulation_calendar import is_fedwire_business_day, next_fedwire_business_day  # noqa: E402
 
@@ -127,8 +136,8 @@ def build_issues(flows: list[dict[str, Any]]) -> pd.DataFrame:
     """One row per security and settlement date, on the terms the engine issued it.
 
     The engine names each security (a reopening carries the reopened security's name),
-    dates it and says whether the settlement was on Treasury's calendar, early, or at the
-    fiscal-year close; a reopening therefore appears on several settlement dates under one
+    dates it and distinguishes calendar auctions, early settlements and the
+    cash-management bill; a reopening therefore appears on several settlement dates under one
     security id.
     """
 
@@ -136,6 +145,9 @@ def build_issues(flows: list[dict[str, Any]]) -> pd.DataFrame:
     missing = [field for field in ISSUE_TERM_FIELDS if field not in frame.columns or frame[field].isna().any()]
     if missing:
         raise SystemExit(f"issuance events lack the engine's issue terms: {missing}")
+    allowed_kinds = {"calendar", "early_settlement", CASH_MANAGEMENT_BILL_KIND}
+    if not frame["settlement_kind"].isin(allowed_kinds).all():
+        raise SystemExit("an issuance event has an unknown settlement kind")
     frame["settlement_date"] = pd.to_datetime(frame["period_end"]).dt.normalize()
     frame["term"] = frame["weighted_original_term_years"].astype(float)
     frame["kind"] = [security_type(t, y) for t, y in zip(frame["instrument_type"], frame["term"])]
@@ -169,6 +181,35 @@ def build_issues(flows: list[dict[str, Any]]) -> pd.DataFrame:
         "cash_proceeds_total", "is_reopening", "settlement_day_kind", "model_tranche_ids",
     ]
     return out[columns].sort_values(["settlement_date", "security_type", "original_term_years"]).reset_index(drop=True)
+
+
+def check_issues_against_calendar(issues: pd.DataFrame, results: pd.DataFrame, profile: dict) -> None:
+    start, end = results.index[0].date(), results.index[-1].date()
+    closes = set(fiscal_year_close_dates(profile, start, end))
+    regular_events = {(event.settle, event.key) for event in settlement_events(profile, start, end)}
+    for row in issues.itertuples(index=False):
+        day = row.settlement_date.date()
+        if row.settlement_day_kind == CASH_MANAGEMENT_BILL_KIND:
+            if (day not in closes or row.security_type != "bill" or row.is_reopening or row.face_fed != 0
+                    or row.maturity_date.date() != bill_maturity(day, CASH_MANAGEMENT_BILL_WEEKS)):
+                raise SystemExit(f"invalid cash-management bill on {day}")
+        elif row.settlement_day_kind == "calendar":
+            key = (
+                bill_supply_key(round(row.original_term_years * DAYS_PER_YEAR / 7))
+                if row.security_type == "bill"
+                else coupon_supply_key(
+                    "Fixed" if row.security_type in {"note", "bond"} else row.security_type,
+                    row.original_term_years,
+                )
+            )
+            if (day, key) not in regular_events:
+                raise SystemExit(f"{key} settled off its auction calendar on {day}")
+    for kind, column in (("early_settlement", "EarlySettlementProceeds"),
+                         (CASH_MANAGEMENT_BILL_KIND, "CashManagementBillProceeds")):
+        cash = issues[issues["settlement_day_kind"].eq(kind)].groupby("settlement_date")["cash_proceeds_total"].sum()
+        gap = cash.reindex(results.index, fill_value=0.0) - results[column]
+        if not gap.abs().max() <= TOLERANCE_BIL:
+            raise SystemExit(f"{kind} issuance does not match the run's cash proceeds")
 
 
 def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame) -> pd.DataFrame:
@@ -390,8 +431,10 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   when interest starts (buyers pay what has accrued since it or the last coupon),
   `maturity_date` the contractual maturity and `maturity_payment_date` the day principal is
   paid. `settlement_day_kind` is `calendar`, `early_settlement` (pending issuance settled
-  early to keep the TGA from going negative) or `fiscal_year_close` (everything pending
-  settles on the fiscal year's last business day); off-calendar settlements reopen each
+  early to keep the TGA from going negative) or `cash_management_bill` (a separate bill
+  issued on the last business day of the fiscal year for cash needs after the last
+  regular bill settlement). Its term is two weeks, with maturity rolling forward
+  to the next securities business day if needed. Early settlements reopen each
   security's latest issue. `model_tranche_ids` lists the model's per-holder rows.
 - `fiscal.csv`: one row per day. `primary_deficit` is the net fiscal flow out of the TGA
   ({fiscal_note}). `fiscal_to_du` is the part landing in covered deposits (TDC_FiscalFlow);
@@ -454,6 +497,9 @@ def main(argv: list[str] | None = None) -> int:
         row["security_id_tranche"] = str(row["security_id"])
     aggregate_gap = check_against_aggregates(run_dir, flows)
     issues = build_issues(flows)
+    from tdcsim_cbo.runner import _issuance_profile
+
+    check_issues_against_calendar(issues, results, _issuance_profile(run_dir / OPENING_PORTFOLIO.parent))
     maturities_checked = check_maturities(run_dir, issues)
     if issues.duplicated(["security_id", "settlement_date"]).any():
         raise SystemExit("a security settles twice on one day")

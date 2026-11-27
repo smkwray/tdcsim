@@ -23,6 +23,7 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
+from issuance_calibration import CALIBRATION_FILE, verify_fiscal_close_cash
 from sim_engine import (
     CBO_FUNDING_MODE,
     CASH_FINANCING_ISSUANCE_LEGS,
@@ -1650,6 +1651,11 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         )
     elif funding_closure_mode == CBO_OPERATING_CASH_TARGET_FINANCING_MODE:
         _verify_operating_cash_financing_results(results)
+        try:
+            calibration = read_json(inputs_dir / CALIBRATION_FILE)
+            verify_fiscal_close_cash(results, calibration, tolerance=_BOUNDED_TARGET_TOLERANCE_BIL)
+        except (ValueError, OSError) as exc:
+            raise VerificationError(str(exc)) from exc
     fed_excess = float(
         (
             pd.to_numeric(results["CBOFedAuctionRolloverAddons"], errors="raise")
