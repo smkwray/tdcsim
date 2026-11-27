@@ -118,12 +118,8 @@ DEFAULT_RATEWALL_INPUT_MANIFEST = PROJECT_ROOT / "data" / "ratewall_inputs" / "t
 DEFAULT_TIPS_CPI_DETAIL = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "tips_cpi_data_detail.csv"
 DEFAULT_FRN_DAILY_INDEXES = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "frn_daily_indexes.csv"
 DEFAULT_MTS_TABLE_1 = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mts_table_1.csv"
-DEFAULT_DTS_OPERATING_CASH_BALANCE = (
-    PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "dts_operating_cash_balance.csv"
-)
-DEFAULT_DTS_DEPOSITS_WITHDRAWALS = (
-    PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "dts_deposits_withdrawals_operating_cash.csv"
-)
+DEFAULT_DTS_OPERATING_CASH_BALANCE = PROJECT_ROOT / "data" / "ratewall_inputs" / Path(DTS_CASH_SOURCE).name
+DEFAULT_DTS_DEPOSITS_WITHDRAWALS = PROJECT_ROOT / "data" / "ratewall_inputs" / Path(DTS_FLOWS_SOURCE).name
 DEFAULT_OPENING_SOMA = PROJECT_ROOT / "data" / "ratewall_inputs" / Path(SOMA_SOURCE).name
 DEFAULT_MSPD_TABLE_1 = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mspd_table_1.csv"
 DEFAULT_MSPD_TABLE_3_MARKET = (
