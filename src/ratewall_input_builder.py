@@ -992,6 +992,28 @@ def _opening_route_par(measured_mil: dict, *, noncb_par_bil: float, factor: floa
     return {route: par[route] for route in NONCB_OPENING_ROUTES}
 
 
+def _bill_discount_price(discount_yield: float, issue_date: pd.Timestamp, maturity_date: pd.Timestamp) -> float:
+    """Auction price per unit face of a bill sold at ``discount_yield`` (actual/360)."""
+
+    day_count = max(1.0, (maturity_date - issue_date).days)
+    return max(0.75, min(1.0, 1.0 - discount_yield * day_count / 360.0))
+
+
+def _bill_tranche_price(cusip: str, tranches: list[tuple[float, float]], outstanding_mil: float) -> float:
+    """Face-weighted issue price over every auction tranche of one bill.
+
+    The tranches must account for the bill's whole outstanding amount, so a missing or
+    duplicated reopening fails here rather than mispricing the issue's proceeds.
+    """
+
+    face = sum(amount for amount, _ in tranches)
+    if not tranches or not math.isfinite(outstanding_mil) or abs(face - outstanding_mil) > MSPD_TOTAL_TOLERANCE_MIL:
+        raise ValueError(
+            f"MSPD Table 3 bill tranches of {cusip} sum to {face} million, not its outstanding {outstanding_mil}"
+        )
+    return sum(amount * price for amount, price in tranches) / face
+
+
 def build_initial_portfolio(
     output_path: Path,
     *,
@@ -1039,6 +1061,10 @@ def build_initial_portfolio(
     skipped: dict[str, int] = {}
     class_totals: dict[str, float] = {}
     unmatured_totals: dict[str, float] = {}
+    # Every auction tranche of each bill, as (face outstanding, issue price per unit face).
+    # A reopened bill was sold at a different price at each auction; its historical
+    # proceeds are the sum over tranches, not the first tranche's price on the whole issue.
+    bill_tranches: dict[str, list[tuple[float, float]]] = {}
     for row in table3_rows:
         class_desc = str(row.get("security_class1_desc", ""))
         class_key = _class_key(class_desc)
@@ -1057,6 +1083,14 @@ def build_initial_portfolio(
             continue
         issue_date = pd.to_datetime(row.get("issue_date"), errors="coerce")
         maturity_date = pd.to_datetime(row.get("maturity_date"), errors="coerce")
+        if class_key == "Bills" and not pd.isna(issue_date) and not pd.isna(maturity_date):
+            tranche_face = _safe_float(row.get("issued_amt"), math.nan) + _safe_float(row.get("redeemed_amt"), 0.0)
+            tranche_yield = _safe_float(row.get("yield_pct"), math.nan) / 100.0
+            if not math.isfinite(tranche_face) or not math.isfinite(tranche_yield):
+                raise ValueError(f"MSPD Table 3 bill tranche {label} issued {issue_date.date()} lacks an amount or yield")
+            bill_tranches.setdefault(label, []).append(
+                (tranche_face, _bill_discount_price(tranche_yield, issue_date, maturity_date))
+            )
         if not math.isfinite(outstanding):
             # Reopening detail rows repeat a security without an outstanding amount.
             skipped["no_outstanding_amount"] = skipped.get("no_outstanding_amount", 0) + 1
@@ -1243,9 +1277,12 @@ def build_initial_portfolio(
         maturity_category = item.get("maturity_category") or _maturity_category(class_desc, maturity_years)
         is_bill = maturity_category == "bills" and coupon_rate <= 1e-12
         price_ratio = 1.0
-        if is_bill:
-            day_count = max(1.0, (item["maturity_date"] - item["issue_date"]).days)
-            price_ratio = max(0.75, min(1.0, 1.0 - issue_yield * day_count / 360.0))
+        if is_bill and is_matured:
+            # Matured-unpaid bills are one synthetic row per class with no auction tranches;
+            # they redeem at the opening at their own declared yield.
+            price_ratio = _bill_discount_price(issue_yield, item["issue_date"], item["maturity_date"])
+        elif is_bill:
+            price_ratio = _bill_tranche_price(cusip, bill_tranches.get(cusip, []), cusip_outstanding.get(cusip, math.nan))
         group = item["group"]
         has_add_on = soma_add_ons.get(cusip, 0.0) > 0.0
         routes = [

@@ -1048,6 +1048,8 @@ def _opening_book_inputs(
             "maturity_date": maturity,
             "interest_rate_pct": rate,
             "yield_pct": "4.0",
+            "issued_amt": outstanding,
+            "redeemed_amt": "0",
         }
 
     table3 = [
@@ -1478,3 +1480,28 @@ def test_ratewall_source_backed_yield_surface_has_curve_scenarios(tmp_path):
         merged["nominal_rate_higher"].astype(float)
         > merged["nominal_rate_baseline"].astype(float)
     ).all()
+
+
+def test_a_reopened_bill_is_priced_over_every_auction_tranche():
+    # 912797UB1 (MSPD Table 3, 2026-05-31) was auctioned three times before it matured on
+    # 2026-06-23. Pricing the whole issue at the first tranche's discount overstated its
+    # historical discount, which the engine later reports as bill interest at redemption.
+    maturity = pd.Timestamp("2026-06-23")
+    tranches = [
+        (69193.5912, rib._bill_discount_price(0.03595, pd.Timestamp("2026-02-24"), maturity)),
+        (75998.3991, rib._bill_discount_price(0.03605, pd.Timestamp("2026-04-28"), maturity)),
+        (103895.3776, rib._bill_discount_price(0.0361, pd.Timestamp("2026-05-26"), maturity)),
+    ]
+    # Each tranche reproduces Treasury's auction price per 100.
+    assert [round(100 * price, 6) for _, price in tranches] == [98.811653, 99.439222, 99.719222]
+    price = rib._bill_tranche_price("912797UB1", tranches, 249087.3679)
+    public_face = 249.068759812
+    assert public_face * price == pytest.approx(247.528717238, abs=1e-6)
+    assert public_face * tranches[0][1] == pytest.approx(246.108958123, abs=1e-6)  # the old first-tranche basis
+
+
+def test_bill_tranches_must_cover_the_outstanding_amount():
+    with pytest.raises(ValueError, match="bill tranches of X1 sum to"):
+        rib._bill_tranche_price("X1", [(100.0, 0.99)], 250.0)
+    with pytest.raises(ValueError, match="bill tranches of X2 sum to"):
+        rib._bill_tranche_price("X2", [], 250.0)
