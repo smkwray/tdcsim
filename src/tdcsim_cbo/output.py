@@ -54,6 +54,7 @@ SUMMARY_COLUMNS = [
     "CBOFedMaturitiesAndRedemptions",
     "CBOFedSecondaryPurchaseFace",
     "CBOFedSecondaryPurchaseCash",
+    "CBOFedPurchaseOperation",
     "CBOFedSecondaryPurchaseReserveEffect",
     "CBOFedSecondaryPurchaseDepositEffect",
     "CBOFedSecondarySaleCash",

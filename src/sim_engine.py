@@ -4,6 +4,7 @@
 import bisect
 import copy
 import functools
+import json
 import time
 import traceback
 from collections import defaultdict
@@ -31,11 +32,13 @@ from tdc_shared import (
     PRIVATE_SUBBUCKET_MMF,
     PRIVATE_SUBBUCKETS,
     PRIVATE_SUBBUCKET_SHARES_KEY,
+    PUBLIC_MARKETABLE_SECURITY_TYPES,
     SECURITY_TYPES,
     TGA_FLOOR_TOLERANCE,
     TRANSFER_SCALABLE_COLUMNS,
 )
 import holder_targets
+import fed_purchase_policy
 from issuance_calibration import (
     active_special_categories,
     bill_days,
@@ -1738,6 +1741,103 @@ def _earliest_lot(bond_portfolio, eligible_indices):
     return holder_targets.economic_lot_order(bond_portfolio.loc[tied])[0]
 
 
+def _purchase_issue_allocations(issues, amount):
+    """Water-fill pro rata by non-SOMA par, expressing both sides in path stock units."""
+    allocations = {}
+    remaining = amount
+    for sectors in (fed_purchase_policy.BILL_SECTORS, fed_purchase_policy.COUPON_SECTORS):
+        initial = remaining
+        eligible = {sector: {key: row for key, row in issues.items() if row['sector'] == sector}
+                    for sector in sectors}
+
+        def fill(sector, target):
+            pool = {
+                key: (row['public_stock'], row['capacity'] - allocations.get(key, 0.0))
+                for key, row in eligible[sector].items()
+                if row['capacity'] - allocations.get(key, 0.0) > TGA_FLOOR_TOLERANCE
+            }
+            while pool and target > TGA_FLOOR_TOLERANCE:
+                scale = target / sum(weight for weight, _ in pool.values())
+                capped = [key for key, (weight, cap) in pool.items() if weight * scale >= cap]
+                if not capped:
+                    for key, (weight, _) in pool.items():
+                        allocations[key] = allocations.get(key, 0.0) + weight * scale
+                    return 0.0
+                for key in capped:
+                    _, cap = pool.pop(key)
+                    allocations[key] = allocations.get(key, 0.0) + cap
+                    target -= cap
+            return target
+
+        remaining = sum(fill(sector, initial * sector.weight) for sector in sectors)
+        for sector in sectors:
+            remaining = fill(sector, remaining)
+        if remaining <= TGA_FLOOR_TOLERANCE:
+            break
+    return allocations, remaining
+
+
+def _purchase_issues(portfolio, current):
+    """Identify operational issues using the opening book's economic security terms.
+
+    The runtime book carries lot IDs. Regular bills of the same maturity are
+    fungible. Coupon issues and their reopenings share type, maturity and coupon,
+    with spread for FRNs and the original reference CPI for TIPS.
+    """
+    marketable = portfolio.loc[
+        portfolio['Status'].eq('Active') & portfolio['SecurityType'].isin(PUBLIC_MARKETABLE_SECURITY_TYPES)
+    ].sort_values('BondID', kind='stable')
+    if marketable.empty:
+        return {}
+    marketable = marketable.assign(_maturity=pd.to_datetime(marketable['MaturityDate']).dt.normalize())
+    if marketable['_maturity'].isna().any():
+        raise ValueError('Fed purchase book contains an active marketable security without a maturity')
+    bills = bill_mask(marketable)
+    nominal_coupons = marketable.loc[marketable['SecurityType'].eq('Fixed') & ~bills]
+    # The newest issue in each nominal tenor is on the run. Comparing maturity
+    # within each tenor keeps reopening settlement dates out of the comparison.
+    tenors = nominal_coupons['OriginalMaturityYears'].round()
+    on_the_run = nominal_coupons.groupby(tenors)['_maturity'].transform('max').eq(nominal_coupons['_maturity'])
+
+    eligible = marketable.loc[
+        ~marketable.index.isin(on_the_run.index[on_the_run])
+        & ~marketable.get('IsCashManagementBill', pd.Series(False, index=marketable.index)).fillna(False)
+        & (marketable['_maturity'] > current + pd.Timedelta(days=fed_purchase_policy.EXCLUDED_MATURITY_DAYS))
+        & (marketable['_maturity'] <= current + pd.DateOffset(months=fed_purchase_policy.COUPON_SECTORS[-1].max_months))
+    ].copy()
+    eligible['_bill'] = bills.loc[eligible.index]
+    eligible['_coupon'] = eligible['CouponRate'].where(~eligible['_bill'], 0.0)
+    eligible['_term_detail'] = eligible['FixedSpread'].where(
+        eligible['SecurityType'].eq('FRN'), eligible['ReferenceCPI_Issue'].where(eligible['SecurityType'].eq('TIPS'), 0.0)
+    )
+    issues = {}
+    for key, issue in eligible.groupby(
+        ['_bill', 'SecurityType', '_maturity', '_coupon', '_term_detail'], dropna=False, sort=True
+    ):
+        is_bill, security_type, maturity, _, _ = key
+        sector = fed_purchase_policy.purchase_sector(current, maturity, bill=is_bill)
+        if sector is None:
+            continue
+        face = issue['FaceValue']
+        if not np.isfinite(face).all() or (face < 0.0).any():
+            raise ValueError(f'Fed purchase issue {key} has invalid par outstanding')
+        cb = issue['HolderType'].eq('CB')
+        sellers = issue.loc[issue['HolderType'].isin(('Banks', 'Private', 'Foreign')) & face.gt(0.0)]
+        public_par = float(sellers['FaceValue'].sum())
+        cap = min(public_par, fed_purchase_policy.par_capacity(float(face.sum()), float(face[cb].sum()), bill=is_bill))
+        if cap <= TGA_FLOOR_TOLERANCE:
+            continue
+        # Apply the issue limits to par. The SOMA path is in indexed stock for TIPS.
+        stock = float(sellers['AdjustedPrincipal'].sum()) if security_type == 'TIPS' else public_par
+        if not np.isfinite(stock) or stock <= 0.0:
+            raise ValueError(f'Fed purchase issue {key} has invalid public debt stock')
+        issues[key] = {
+            'sector': sector, 'public_stock': stock, 'capacity': cap * stock / public_par,
+            'sellers': sellers.index, 'cb': issue.index[cb],
+        }
+    return issues
+
+
 def _transfer_public_marketable_debt_to_cb(
     bond_portfolio,
     amount_to_purchase,
@@ -1751,106 +1851,109 @@ def _transfer_public_marketable_debt_to_cb(
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
     portfolio_row_budget=None,
+    operation_summary=None,
 ):
-    """Move public marketable debt to CB and return dirty-value settlement by seller."""
-    if bond_portfolio is None or bond_portfolio.empty:
-        return bond_portfolio, 0.0, {h: 0.0 for h in HOLDER_TYPES}, _zero_private_routes(), 0.0
-    remaining = max(0.0, float(amount_to_purchase))
-    sold_by_holder = {h: 0.0 for h in HOLDER_TYPES}
+    """Buy eligible issues and settle the same fraction of every seller lot of an issue."""
+    sold_by_holder = dict.fromkeys(HOLDER_TYPES, 0.0)
     sold_by_private_route = _zero_private_routes()
-    holder_order = ['Private', 'Banks', 'Foreign']
-    next_bond_id = None
-    purchased_total = 0.0
-    purchase_cash = 0.0
-    new_rows = []
-    while remaining > TGA_FLOOR_TOLERANCE:
-        idx = None
-        for holder in holder_order:
-            holder_mask = (
-                (bond_portfolio['Status'] == 'Active')
-                & (bond_portfolio['SecurityType'].isin(['Fixed', 'TIPS', 'FRN']))
-                & (bond_portfolio['HolderType'] == holder)
-            )
-            if not holder_mask.any():
-                continue
-            holder_rows = bond_portfolio.loc[holder_mask, ['SecurityType', 'FaceValue', 'AdjustedPrincipal', 'MaturityDate']]
-            holder_debt_base = np.where(
-                holder_rows['SecurityType'] == 'TIPS',
-                holder_rows['AdjustedPrincipal'].fillna(holder_rows['FaceValue']),
-                holder_rows['FaceValue'],
-            )
-            eligible_indices = holder_rows.index[pd.Series(holder_debt_base, index=holder_rows.index) > TGA_FLOOR_TOLERANCE]
-            if len(eligible_indices) == 0:
-                continue
-            idx = _earliest_lot(bond_portfolio, eligible_indices)
-            break
-        if idx is None:
-            break
-        row = bond_portfolio.loc[idx].copy()
-        debt_base = _bond_debt_base(row)
-        if debt_base <= TGA_FLOOR_TOLERANCE:
-            bond_portfolio.loc[idx, 'FaceValue'] = 0.0
-            continue
-        purchase_amount = min(remaining, debt_base)
-        pricing = _fed_secondary_dirty_value(
-            row,
-            purchase_amount,
-            current_date,
-            yield_curve_years,
-            yield_curve_rates,
-            interpolation_method=interpolation_method,
-            floor_zero=floor_zero,
-            nominal_shock=nominal_shock,
-            tips_real_curve_years=tips_real_curve_years,
-            tips_real_curve_rates=tips_real_curve_rates,
-        )
-        full_pricing = {**pricing}
-        scale_to_full = debt_base / purchase_amount
-        for key in ('clean_value', 'accrued_interest', 'dirty_value'):
-            full_pricing[key] *= scale_to_full
-        _cache_fed_transfer_price(bond_portfolio, idx, full_pricing)
-        fraction = purchase_amount / debt_base
-        holder = str(row['HolderType'])
-        dirty_value = pricing['dirty_value']
-        sold_by_holder[holder] = sold_by_holder.get(holder, 0.0) + dirty_value
-        if holder == 'Private':
-            route = _private_subbucket(row)
-            sold_by_private_route[route] += dirty_value
-        if purchase_amount >= debt_base - TGA_FLOOR_TOLERANCE:
-            bond_portfolio.loc[idx, 'HolderType'] = 'CB'
-            bond_portfolio.loc[idx, 'HolderSubBucket'] = ''
-            bond_portfolio.loc[idx, 'TDCPrincipalHolderType'] = 'CB'
-            bond_portfolio.loc[idx, 'TDCPrincipalHolderSubBucket'] = ''
-        else:
-            cb_row = bond_portfolio.loc[idx].copy()
-            if next_bond_id is None:
-                next_bond_id = _next_portfolio_bond_id(bond_portfolio)
-            cb_row['BondID'] = next_bond_id
-            next_bond_id += 1
-            cb_row['HolderType'] = 'CB'
-            cb_row['HolderSubBucket'] = ''
-            cb_row['TDCPrincipalHolderType'] = 'CB'
-            cb_row['TDCPrincipalHolderSubBucket'] = ''
-            for col in _FED_TRANSFER_SCALABLE_COLUMNS:
-                if col in bond_portfolio.columns and pd.notna(bond_portfolio.loc[idx, col]):
-                    original_value = float(bond_portfolio.loc[idx, col])
-                    cb_row[col] = original_value * fraction
-                    bond_portfolio.loc[idx, col] = original_value * (1.0 - fraction)
-            new_rows.append(cb_row)
-        purchased_total += purchase_amount
-        purchase_cash += dirty_value
-        remaining -= purchase_amount
-    if new_rows:
-        if (
-            portfolio_row_budget is not None
-            and len(bond_portfolio) + len(new_rows) > int(portfolio_row_budget)
-        ):
-            raise RuntimeError(
-                'Portfolio-row budget would be exceeded by a Fed secondary purchase split.'
-            )
-        bond_portfolio = pd.concat([bond_portfolio, pd.DataFrame(new_rows)], ignore_index=True)
-    return bond_portfolio, purchased_total, sold_by_holder, sold_by_private_route, purchase_cash
+    if amount_to_purchase <= TGA_FLOOR_TOLERANCE:
+        return bond_portfolio, 0.0, sold_by_holder, sold_by_private_route, 0.0
+    current = pd.Timestamp(current_date).normalize()
+    issues = _purchase_issues(bond_portfolio, current) if bond_portfolio is not None else {}
+    allocations, shortfall = _purchase_issue_allocations(issues, amount_to_purchase)
+    if shortfall > TGA_FLOOR_TOLERANCE:
+        raise RuntimeError(f'Fed purchase capacity exhausted on {current.date()}: shortfall={shortfall:.12f} billion')
 
+    row_growth = sum(1 - len(issues[key]['cb']) for key in allocations)
+    if portfolio_row_budget is not None and len(bond_portfolio) + row_growth > int(portfolio_row_budget):
+        raise RuntimeError('Portfolio-row budget would be exceeded by a Fed secondary purchase split.')
+
+    portfolio = bond_portfolio.copy()
+    next_bond_id = _next_portfolio_bond_id(portfolio)
+    price = functools.partial(
+        _fed_secondary_dirty_value, current_date=current, yield_curve_years=yield_curve_years,
+        yield_curve_rates=yield_curve_rates, interpolation_method=interpolation_method,
+        floor_zero=floor_zero, nominal_shock=nominal_shock, tips_real_curve_years=tips_real_curve_years,
+        tips_real_curve_rates=tips_real_curve_rates,
+    )
+    scalable = [col for col in TRANSFER_SCALABLE_COLUMNS if col in portfolio]
+    sector_totals = {}
+    route_totals = defaultdict(lambda: {'par': 0.0, 'cash': 0.0})
+    seller_updates = []
+    fed_rows = []
+    retired_indices = []
+    for key, quantity in allocations.items():
+        is_bill, security_type, _, _, _ = key
+        issue = issues[key]
+        fraction = quantity / issue['public_stock']
+        indices = issue['sellers'].append(issue['cb'])
+        priced = portfolio.loc[indices].copy()
+        face = priced['FaceValue']
+        # All bills of an issue have one market price. FRN accrued interest and
+        # coupon cash on opening lots retain the existing dirty valuation.
+        if is_bill:
+            quote = price(priced.iloc[0], float(face.iloc[0]))
+            for column, value in [('CleanPrice', 'clean_value'), ('AccruedInterest', 'accrued_interest'),
+                                  ('DirtyValue', 'dirty_value')]:
+                priced[column] = face * (quote[value] / face.iloc[0])
+            priced['DiscountYield'] = quote['discount_yield']
+            priced['TimeToMaturity'] = quote['time_to_maturity']
+        else:
+            quotes = [
+                price(row, value) if (value := _bond_debt_base(row)) > TGA_FLOOR_TOLERANCE
+                else dict.fromkeys(('clean_value', 'accrued_interest', 'dirty_value', 'discount_yield', 'time_to_maturity'), np.nan)
+                for _, row in priced.iterrows()
+            ]
+            for column, value in [('CleanPrice', 'clean_value'), ('AccruedInterest', 'accrued_interest'),
+                                  ('DirtyValue', 'dirty_value'), ('DiscountYield', 'discount_yield'),
+                                  ('TimeToMaturity', 'time_to_maturity')]:
+                priced[column] = [quote[value] for quote in quotes]
+        stock = priced['AdjustedPrincipal'] if security_type == 'TIPS' else face
+        priced['DirtyPriceRatio'] = priced['DirtyValue'] / stock
+        sellers = priced.loc[issue['sellers']].copy()
+        cb_lots = priced.loc[issue['cb']]
+        proceeds = sellers['DirtyValue'] * fraction
+        for idx, row in sellers.iterrows():
+            cash = float(proceeds.at[idx])
+            holder = str(row['HolderType'])
+            route = holder
+            sold_by_holder[holder] += cash
+            if holder == 'Private':
+                route = _private_subbucket(row)
+                sold_by_private_route[route] += cash
+            route_totals[route]['cash'] += cash
+            route_totals[route]['par'] += float(row['FaceValue']) * fraction
+
+        lot = (cb_lots if not cb_lots.empty else sellers).sort_values(['IssueDate', 'BondID']).iloc[0].copy()
+        lot[scalable] = (
+            pd.concat([cb_lots[scalable], sellers[scalable] * fraction]).sum(min_count=1)
+        )
+        lot['IssuePriceRatio'] = lot['IssueProceeds'] / lot['FaceValue']
+        lot['DirtyPriceRatio'] = lot['DirtyValue'] / _bond_debt_base(lot)
+        if cb_lots.empty:
+            lot['BondID'] = next_bond_id
+            next_bond_id += 1
+        lot[['HolderType', 'HolderSubBucket', 'TDCPrincipalHolderType', 'TDCPrincipalHolderSubBucket']] = ['CB', '', 'CB', '']
+        fed_rows.append(lot)
+        retired_indices.extend(issue['cb'])
+
+        sector = sector_totals.setdefault(issue['sector'].name, {
+            'par': 0.0, 'stock': 0.0, 'cash': 0.0, 'issues': 0, 'capacity_binds': 0,
+        })
+        sector['par'] += float(sellers['FaceValue'].sum()) * fraction
+        sector['stock'] += quantity
+        sector['cash'] += float(proceeds.sum())
+        sector['issues'] += 1
+        sector['capacity_binds'] += int(issue['capacity'] - quantity <= TGA_FLOOR_TOLERANCE)
+        sellers[scalable] *= 1.0 - fraction
+        seller_updates.append(sellers)
+
+    sellers = pd.concat(seller_updates)
+    portfolio.loc[sellers.index, sellers.columns] = sellers
+    portfolio = pd.concat([portfolio.drop(index=retired_indices), pd.DataFrame(fed_rows)], ignore_index=True)
+    if operation_summary is not None:
+        operation_summary.update(source=fed_purchase_policy.SOURCE_URL, sectors=sector_totals, seller_routes=dict(route_totals))
+    return portfolio, sum(allocations.values()), sold_by_holder, sold_by_private_route, sum(sold_by_holder.values())
 
 def _transfer_cb_marketable_debt_to_public(
     bond_portfolio,
@@ -5904,6 +6007,7 @@ def run_simulation(
                     'holder': _handoff_portfolio_stock_map(bond_portfolio),
                     'route': _handoff_portfolio_stock_map(bond_portfolio, route=True),
                 }
+                purchase_operation = {}
                 (
                     bond_portfolio,
                     fed_secondary_purchase_face,
@@ -5921,6 +6025,7 @@ def run_simulation(
                     nominal_shock=evaluated_nominal_shock,
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
+                    operation_summary=purchase_operation,
                     portfolio_row_budget=(
                         handoff_tables.portfolio_row_budget
                         if bounded_handoff
@@ -5982,6 +6087,7 @@ def run_simulation(
                 results.loc[current_date, 'CBOFedSecondaryPurchaseDepositEffect'] = fed_secondary_deposit_effect
                 results.loc[current_date, 'CBOFedSecondaryPurchaseFace'] = fed_secondary_purchase_face
                 results.loc[current_date, 'CBOFedSecondaryPurchaseCash'] = fed_secondary_purchase_cash
+                results.loc[current_date, 'CBOFedPurchaseOperation'] = json.dumps(purchase_operation, sort_keys=True)
                 results.loc[current_date, 'CBOFedAcquisitionChannel'] = (
                     'synthetic_secondary_purchase_to_hit_cbo_stock_path'
                 )

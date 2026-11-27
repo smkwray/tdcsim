@@ -234,6 +234,7 @@ RESULT_COLUMNS = [
     "CBOFedAuctionShare",
     "CBOFedSecondaryPurchaseFace",
     "CBOFedSecondaryPurchaseCash",
+    "CBOFedPurchaseOperation",
     "CBOFedSecondaryPurchaseReserveEffect",
     "CBOFedSecondaryPurchaseDepositEffect",
     "CBOFedSecondarySaleCash",
