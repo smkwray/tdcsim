@@ -220,3 +220,61 @@ def test_source_transcription_names_every_packaged_document():
         "fed/reserve_banks_combined_financial_statements_2025.pdf",
     }
     assert date.fromisoformat(source["h41_wednesday_levels_mil"]["as_of_date"]) == date(2026, 6, 17)
+
+
+def _document_text(path) -> str:
+    import html
+    import re
+    import shutil
+    import subprocess
+
+    if path.suffix == ".pdf":
+        pdftotext = shutil.which("pdftotext")
+        assert pdftotext, "pdftotext is required to verify the Fed income transcription"
+        text = subprocess.run([pdftotext, "-layout", str(path), "-"], check=True, capture_output=True, text=True).stdout
+    else:
+        text = html.unescape(re.sub(r"<[^>]+>", " ", path.read_text(encoding="utf-8", errors="replace")))
+    return re.sub(r"\s+", " ", text)
+
+
+@pytest.mark.integration
+def test_fed_income_transcription_matches_the_source_documents():
+    """Every transcribed figure must appear in the document whose hash the package pins."""
+
+    import hashlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "data" / "fed_income_sources"
+    source = fed_income_source_fixture()
+    texts = {}
+    for key, document in source["documents"].items():
+        path = root / Path(document["file"]).name
+        assert path.is_file(), f"Fed income source document is missing: {path.name}"
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == document["sha256"], key
+        if path.suffix in {".pdf", ".htm"}:
+            texts[key] = _document_text(path)
+
+    def published(value: str) -> str:
+        return f"{float(value):,.0f}"
+
+    for key, value in source["h41_wednesday_levels_mil"].items():
+        if key in {"as_of_date", "tables"}:
+            continue
+        assert published(value) in texts["h41"], key
+    assert "Wednesday Jun 17, 2026" in texts["h41"]
+    note = texts["fomc_implementation_note"]
+    rates = source["administered_rates_pct"]
+    assert f"interest rate paid on reserve balances at {rates['interest_on_reserve_balances']} percent" in note
+    assert f"offering rate of {rates['overnight_reverse_repo_offering_rate']} percent" in note
+    assert "Effective June 18, 2026" in note
+    report = texts["nyfed_soma_annual_report"]
+    assert "(4.0 percent)" in report and "early 2030" in report
+    statements = texts["reserve_banks_financial_statements"]
+    banks = source["reserve_banks_2025_mil"]
+    for value in (banks["operating_expenses"], banks["dividends_on_capital_stock"],
+                  banks["remittances_transferred_while_deferred_asset_grew"], banks["deferred_asset_year_end"],
+                  *banks["excluded_valuation_items"].values()):
+        assert published(value).lstrip("-") in statements, value
+    for value in banks["other_income"].values():
+        if value not in {"216", "-14"}:  # sums of two published lines
+            assert published(value).lstrip("-") in statements, value
