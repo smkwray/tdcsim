@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tdc_shared import HOLDER_TYPES, PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS
+from tdc_shared import HOLDER_TYPES, PREFERENCE_CATEGORIES, PRIVATE_AUCTION_SUBBUCKETS
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec
 from tdcsim_cbo._json import write_json
 from test_tdcsim_cbo_baseline import _write_release_package
@@ -25,8 +25,8 @@ def test_scenario_schema_taxonomy_matches_shared_registry() -> None:
         definitions['holderPreferenceRow']['properties']['security_type']['enum']
     ) == tuple(PREFERENCE_CATEGORIES)
     assert set(definitions['holderShares']['properties']) == set(HOLDER_TYPES)
-    assert set(definitions['privateRouteShares']['properties']) == set(PRIVATE_SUBBUCKETS)
-    assert set(definitions['privateRouteShares']['required']) == set(PRIVATE_SUBBUCKETS)
+    assert set(definitions['privateRouteShares']['properties']) == set(PRIVATE_AUCTION_SUBBUCKETS)
+    assert set(definitions['privateRouteShares']['required']) == set(PRIVATE_AUCTION_SUBBUCKETS)
 
 
 def test_scenario_spec_canonical_hash_is_stable(tmp_path: Path) -> None:

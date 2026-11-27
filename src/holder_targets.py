@@ -29,11 +29,13 @@ import numpy as np
 import pandas as pd
 
 from issuance_calibration import bill_mask
+from mmf_eligibility import mmf_may_acquire
 from simulation_calendar import previous_securities_business_day
 from tdc_shared import (
     INTRAGOV_HOLDERS,
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,
+    PRIVATE_SUBBUCKET_MMF_ADDED,
     PRIVATE_SUBBUCKETS,
     PUBLIC_MARKETABLE_SECURITY_TYPES,
     TRANSFER_SCALABLE_COLUMNS,
@@ -48,12 +50,14 @@ PARTICIPANTS = (
     ("Foreign", ""),
     ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK),
     ("Private", PRIVATE_SUBBUCKET_MMF),
+    ("Private", PRIVATE_SUBBUCKET_MMF_ADDED),
 )
 PARTICIPANT_LABELS = {
     ("Banks", ""): "Banks",
     ("Foreign", ""): "Foreign",
     ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK): "PrivateDomesticNonbank",
     ("Private", PRIVATE_SUBBUCKET_MMF): "PrivateMMF",
+    ("Private", PRIVATE_SUBBUCKET_MMF_ADDED): "PrivateMMFAdded",
 }
 PHASES = ("pre", "build", "hold")
 TRANSFER_EVENT_TYPE = "holder_target_secondary_transfer"
@@ -106,6 +110,7 @@ class HolderTargetPath:
     tolerance_bil: float
     rows: Mapping[pd.Timestamp, tuple[str, dict[tuple[str, str], float]]]
     bill_change_weights: Mapping[tuple[str, str], float] | None = None
+    frozen_routes: tuple[tuple[str, str], ...] = ()
 
     @property
     def stock_column_stem(self) -> str:
@@ -179,7 +184,10 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
     for day, (_, targets) in dated.items():
         if set(targets) != set(PARTICIPANTS):
             raise HolderTargetError(f"holder targets on {day.date()} must name every public holder route")
-    return HolderTargetPath(tolerance_bil=tolerance, rows=dated, bill_change_weights=weights)
+    frozen_routes = ()
+    if config.get("buyer_private_route") == PRIVATE_SUBBUCKET_MMF_ADDED:
+        frozen_routes = (("Private", PRIVATE_SUBBUCKET_MMF),)
+    return HolderTargetPath(tolerance_bil=tolerance, rows=dated, bill_change_weights=weights, frozen_routes=frozen_routes)
 
 
 def closing_stocks(portfolio: pd.DataFrame) -> dict[str, dict[tuple[str, str], float]]:
@@ -408,6 +416,10 @@ def rebalance_holder_positions(
     holder_columns = ["HolderType", "HolderSubBucket", "TDCPrincipalHolderType", "TDCPrincipalHolderSubBucket"]
     for index, take, seller, buyer in pieces:
         row = portfolio.loc[index].copy()
+        if buyer[1] == PRIVATE_SUBBUCKET_MMF_ADDED and not mmf_may_acquire(
+            row["SecurityType"], row["MaturityDate"], day
+        ):
+            raise HolderTargetError(f"{PARTICIPANT_LABELS[buyer]} cannot acquire bill {row['BondID']} on {day.date()}")
         face = float(row["FaceValue"])
         pricing = price(row, take)
         cash = float(pricing["dirty_value"])
@@ -572,6 +584,8 @@ def declared_weights(override: Mapping[str, Any]) -> dict[tuple[str, str], float
     named = [buyer, *donors, *unchanged]
     if len(named) != len(set(named)) or set(named) != set(PARTICIPANTS) or len(donors) != len(override["displacement"]):
         raise HolderTargetError("the buyer, donors and unchanged routes must name every public holder route once")
+    if buyer[1] == PRIVATE_SUBBUCKET_MMF_ADDED and ("Private", PRIVATE_SUBBUCKET_MMF) not in unchanged:
+        raise HolderTargetError("ordinary money funds must be unchanged when the added position is the buyer")
     weights = displacement_weights({route: stock for route, (stock, _) in donors.items()} | {
         route: 0.0 for route in PARTICIPANTS if route not in donors
     }, buyer=buyer, donors=list(donors))

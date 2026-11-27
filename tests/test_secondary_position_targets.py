@@ -23,7 +23,10 @@ from forecast_bundle_builders import build_fed_holdings_path_rows
 from settlement_routes import TRC_ROUTE_STATES, TRC_ROUTING_SCHEMA_VERSION, TrcRoutingError
 from sim_engine import run_simulation
 from simulation_calendar import build_simulation_calendar
-from tdc_shared import BOND_PORTFOLIO_COLS, PORTFOLIO_DTYPES, PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
+from tdc_shared import (
+    BOND_PORTFOLIO_COLS, MMF_ADDED_TDC_COLUMNS, PORTFOLIO_DTYPES, PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
+    PRIVATE_SUBBUCKET_MMF, PRIVATE_SUBBUCKET_MMF_ADDED,
+)
 from tdcsim_cbo.bounded_output import BoundedResourceLimits, BoundedScenarioEvidenceSink
 from test_cbo_engine_integration import _build_temp_forecast_inputs, _minimal_engine_params, _write_csv
 
@@ -32,6 +35,7 @@ ORIGIN, BUILD_END = "2026-09-24", "2026-09-28"
 DNB, MMF = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
 BANKS, FOREIGN = ("Banks", ""), ("Foreign", "")
 PRIVATE_DNB, PRIVATE_MMF = ("Private", DNB), ("Private", MMF)
+PRIVATE_MMF_ADDED = ("Private", PRIVATE_SUBBUCKET_MMF_ADDED)
 TOLERANCE = 1.0e-6
 
 
@@ -343,7 +347,7 @@ def test_trades_settle_at_the_dated_bill_price(tmp_path) -> None:
         return _fed_secondary_dirty_value(row, amount, day, years, [0.04] * len(years),
                                           interpolation_method="linear", floor_zero=False)
 
-    gaps = {BANKS: -10.0, FOREIGN: 10.0, PRIVATE_DNB: 0.0, PRIVATE_MMF: 0.0}
+    gaps = {BANKS: -10.0, FOREIGN: 10.0, PRIVATE_DNB: 0.0, PRIVATE_MMF: 0.0, PRIVATE_MMF_ADDED: 0.0}
     _, report = ht.rebalance_holder_positions(_book(), gaps, current_date=day, price=price)
 
     def closed_form(maturity: str, face: float) -> float:
@@ -421,6 +425,52 @@ def test_too_little_on_rrp_raises_with_the_route_and_date(tmp_path) -> None:
         _run(params, tmp_path / "run")
 
 
+def test_added_mmf_position_routes_purchases_redemptions_and_reinvestment(tmp_path) -> None:
+    params = _params(tmp_path / "inputs", fed=False)
+    observed, _, _ = _run(params, tmp_path / "observed")
+    position = {"settlement_route": "covered_deposit_settled", "opening_on_rrp_bil": 60.0}
+    params[PRIVATE_SUBBUCKET_MMF_ADDED] = position
+    base, _, base_closure = _run(params, tmp_path / "base")
+    assert base["TDC_Change"].equals(observed["TDC_Change"])
+    assert base.attrs["trc_results"]["TRC_Change"].equals(observed.attrs["trc_results"]["TRC_Change"])
+    assert base["Reserves"].iloc[0] == observed["Reserves"].iloc[0] - 60.0
+    assert base.attrs["trc_results"]["ONRRP_MMF"].iloc[0] == observed.attrs["trc_results"]["ONRRP_MMF"].iloc[0] + 60.0
+    rows, _ = _targets(base_closure, buyer=PRIVATE_MMF_ADDED, donors=MMF_DONORS, size=60.0)
+    params["holder_position_target"] = {
+        "mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows,
+        "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED,
+    }
+    deposits, dep_portfolio, dep_closure = _run(params, tmp_path / "deposits")
+    position["settlement_route"] = "on_rrp_mmf"
+    onrrp, rrp_portfolio, rrp_closure = _run(params, tmp_path / "onrrp")
+    pd.testing.assert_frame_equal(dep_portfolio, rrp_portfolio)
+    pd.testing.assert_frame_equal(ht.closing_holder_stocks(dep_closure), ht.closing_holder_stocks(rrp_closure))
+    trade_columns = [column for column in ht.RESULT_COLUMNS if column.startswith(("HolderTargetBought", "HolderTargetSold"))]
+    assert deposits[trade_columns].equals(onrrp[trade_columns])
+    for result in (deposits, onrrp):
+        assert result["HolderStock_PrivateMMF"].to_numpy() == pytest.approx(base["HolderStock_PrivateMMF"].to_numpy())
+        assert result["HolderStock_PrivateMMFAdded"].iloc[0] == 0.0
+        assert result["HolderStock_PrivateMMFAdded"].iloc[-1] == pytest.approx(60.0)
+        assert result["HolderTargetSoldFace_PrivateMMF"].sum() == 0.0
+        assert result["HolderTargetBoughtFace_PrivateMMF"].sum() == 0.0
+    additions = deposits[list(MMF_ADDED_TDC_COLUMNS.values())]
+    assert additions[MMF_ADDED_TDC_COLUMNS["TDC_PrincipalToDU"]].sum() > 0
+    payments = pd.read_csv(tmp_path / "deposits" / "tdcsim_period_payment_aggregates.csv.gz")
+    discounts = payments[payments["holder_subsector"].eq(PRIVATE_SUBBUCKET_MMF_ADDED)
+                         & payments["payment_type"].eq("bill_discount")]
+    paid_discount = float(discounts["amount_bil"].sum())
+    assert paid_discount > 0.0
+    assert additions[MMF_ADDED_TDC_COLUMNS["TDC_BillDiscountInterestToDU"]].sum() == pytest.approx(paid_discount)
+    cash = additions.sum(axis=1).to_numpy()
+    assert (deposits["TDC_Change"] - onrrp["TDC_Change"]).to_numpy() == pytest.approx(cash, abs=1e-10)
+    dep_trc, rrp_trc = (r.attrs["trc_results"] for r in (deposits, onrrp))
+    assert (dep_trc["TRC_Change"] - rrp_trc["TRC_Change"]).to_numpy() == pytest.approx(cash, abs=1e-10)
+    assert (rrp_trc["ONRRP_MMF"] - observed.attrs["trc_results"]["ONRRP_MMF"]).min() >= 0.0
+    position["opening_on_rrp_bil"] = 0.1
+    with pytest.raises(TrcRoutingError, match="ONRRP_MMF is negative"):
+        _run(params, tmp_path / "overdrawn")
+
+
 # --- The controller on a hand-built book ---
 
 
@@ -439,7 +489,7 @@ def test_a_holder_above_target_sells_its_excess_rather_than_being_overwritten() 
     book = _book()
     before = ht.holder_stocks(book)
     total_face = float(book["FaceValue"].sum())
-    gaps = {BANKS: -10.0, FOREIGN: 4.0, PRIVATE_DNB: 6.0, PRIVATE_MMF: 0.0}
+    gaps = {BANKS: -10.0, FOREIGN: 4.0, PRIVATE_DNB: 6.0, PRIVATE_MMF: 0.0, PRIVATE_MMF_ADDED: 0.0}
     after_book, report = ht.rebalance_holder_positions(book, gaps, current_date="2026-09-25", price=_price)
     after = ht.holder_stocks(after_book)
     for participant, gap in gaps.items():
@@ -483,7 +533,7 @@ def test_a_transferred_bill_redeems_to_its_new_holder_with_its_issue_discount(ba
 
 def test_redemption_follows_the_new_holder_and_keeps_its_original_issue_discount() -> None:
     book = _book()
-    gaps = {BANKS: 30.0, FOREIGN: 0.0, PRIVATE_DNB: -30.0, PRIVATE_MMF: 0.0}
+    gaps = {BANKS: 30.0, FOREIGN: 0.0, PRIVATE_DNB: -30.0, PRIVATE_MMF: 0.0, PRIVATE_MMF_ADDED: 0.0}
     after, _ = ht.rebalance_holder_positions(book, gaps, current_date="2026-09-25", price=_price)
     bought = after[(after["HolderType"] == "Banks") & (after["MaturityCategory"] == "bills") & ~after["BondID"].isin([1, 2])]
     assert not bought.empty
@@ -495,7 +545,7 @@ def test_redemption_follows_the_new_holder_and_keeps_its_original_issue_discount
 
 
 def test_a_seller_without_enough_bills_raises_with_route_date_and_shortfall() -> None:
-    gaps = {BANKS: 0.0, FOREIGN: 0.0, PRIVATE_DNB: 300.0, PRIVATE_MMF: -300.0}
+    gaps = {BANKS: 0.0, FOREIGN: 0.0, PRIVATE_DNB: 300.0, PRIVATE_MMF: -300.0, PRIVATE_MMF_ADDED: 0.0}
     with pytest.raises(ht.HolderTargetError, match=r"PrivateMMF holds 180\.000000 billion of eligible bills on "
                        r"2026-09-25, short of the 300\.000000 billion its sale requires \(shortfall 120\.000000\)"):
         ht.rebalance_holder_positions(_book(), gaps, current_date="2026-09-25", price=_price)
@@ -550,7 +600,7 @@ def test_targets_that_do_not_sum_to_the_public_stock_raise() -> None:
 def test_sales_spread_over_remaining_maturity_buckets_in_proportion_to_holdings() -> None:
     # Foreign holds 80 maturing within a month and 70 beyond six months: a sale of 15
     # takes 8 and 7, not the shortest bills first.
-    gaps = {BANKS: 15.0, FOREIGN: -15.0, PRIVATE_DNB: 0.0, PRIVATE_MMF: 0.0}
+    gaps = {BANKS: 15.0, FOREIGN: -15.0, PRIVATE_DNB: 0.0, PRIVATE_MMF: 0.0, PRIVATE_MMF_ADDED: 0.0}
     after, _ = ht.rebalance_holder_positions(_book(), gaps, current_date="2026-09-25", price=_price)
     bought = after[(after["HolderType"] == "Banks") & ~after["BondID"].isin([1, 2, 3])]
     by_maturity = bought.groupby("MaturityDate")["FaceValue"].sum()
@@ -559,7 +609,7 @@ def test_sales_spread_over_remaining_maturity_buckets_in_proportion_to_holdings(
 
 
 def test_splitting_or_reordering_identical_lots_leaves_the_outcome_unchanged() -> None:
-    gaps = {BANKS: 25.0, FOREIGN: -5.0, PRIVATE_DNB: -12.0, PRIVATE_MMF: -8.0}
+    gaps = {BANKS: 25.0, FOREIGN: -5.0, PRIVATE_DNB: -12.0, PRIVATE_MMF: -8.0, PRIVATE_MMF_ADDED: 0.0}
     one, one_report = ht.rebalance_holder_positions(_book(), gaps, current_date="2026-09-25", price=_price)
     split = [dict(row) for row in OPENING]
     halves = []
@@ -610,6 +660,7 @@ def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monk
     baseline = CboBaselinePackage.open(package, attestation_path=attestation)
     family = {
         "schema_version": FAMILY_SPEC_SCHEMA, "family_id": "positions_fixture", "as_of_date": "2026-11-21",
+        "opening_mmf_added_on_rrp_bil": 20.0,
         "simulation": {"start_date": "2026-09-20", "end_date": "2026-09-30"},
         "scenarios": [
             {"role": "baseline", "scenario_id": "positions_fixture_baseline", "label": "Baseline",
@@ -618,9 +669,17 @@ def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monk
              "holder_position_target": {
                  "buyer_holder": "Banks", "buyer_private_route": "", "size_bil": 20.0, "origin": "2026-09-23",
                  "build_end": "2026-09-26", "donors": [["Foreign", ""], ["Private", DNB], ["Private", MMF]],
-                 "unchanged_routes": []}},
+                 "unchanged_routes": [list(PRIVATE_MMF_ADDED)]}},
         ],
     }
+    mmf = copy.deepcopy(family["scenarios"][1])
+    mmf.update(role="mmf_onrrp", scenario_id="positions_fixture_mmf_onrrp", label="Added money-fund position",
+               mmf_added_position_settlement="on_rrp_mmf")
+    mmf["holder_position_target"].update(
+        buyer_holder="Private", buyer_private_route=PRIVATE_SUBBUCKET_MMF_ADDED, donors=list(map(list, MMF_DONORS)),
+        unchanged_routes=[list(PRIVATE_MMF)],
+    )
+    family["scenarios"].append(mmf)
     scenario_dir = tmp_path / "scenarios"
     scenario_dir.mkdir()
     routing = tmp_path / "routing.json"
@@ -661,22 +720,26 @@ def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monk
     assert abs(components[("2026-09-30", "reconciliation_residual")]) <= TOLERANCE
     # Banks pay with reserves, so deposit-funded donors' deposits rise by what they receive.
     assert components[("2026-09-30", "secondary_settlements_target_trades")] > 0.0
+    mmf_case = _case(family, root, "mmf_onrrp", _load(root / "baseline" / "run"), ht)
+    assert any(c["component"] == "secondary_settlements_target_trades_added_mmf_position"
+               and c["scenario_minus_baseline_bil"] == 0.0 for c in mmf_case["components"])
+    issuance = pd.read_csv(root / "mmf_onrrp/run/outputs/tdcsim_period_issuance_aggregates.csv.gz")
+    assert PRIVATE_SUBBUCKET_MMF_ADDED not in set(issuance["holder_subsector"])
     with pytest.raises(SystemExit, match="baseline reference"):
         (root / "baseline" / "run" / "tdcsim_cbo_run_manifest.json").write_text("{}")
         _case(family, root, "banks", _load(root / "baseline" / "run"), ht)
 
 
-@pytest.mark.parametrize("family", ["buyer_shift_v1", "buyer_shift_onrrp_v1"])
-def test_every_shipped_buyer_takes_its_position_from_every_other_holder(family) -> None:
-    # Each other public holder sells in proportion to its bills, so no route may sit out: a
-    # money-fund buyer buys from other domestic nonbanks as well as banks and foreign holders.
-    spec = json.loads((Path(__file__).resolve().parents[1] / "scenarios" / f"{family}.json").read_text())
-    cases = [item["holder_position_target"] for item in spec["scenarios"] if "holder_position_target" in item]
-    assert cases
-    for case in cases:
-        buyer = (case["buyer_holder"], case["buyer_private_route"])
-        assert case["unchanged_routes"] == []
-        assert sorted(tuple(donor) for donor in case["donors"]) == sorted(set(ht.PARTICIPANTS) - {buyer})
+def test_shipped_buyer_family_has_one_baseline_and_identical_mmf_positions() -> None:
+    spec = json.loads((Path(__file__).resolve().parents[1] / "scenarios" / "buyer_shift_v2.json").read_text())
+    cases = {item["role"]: item for item in spec["scenarios"]}
+    assert list(cases) == ["baseline", "banks", "foreign", "mmf_deposits", "mmf_onrrp"]
+    deposits = cases["mmf_deposits"]["holder_position_target"]
+    assert deposits == cases["mmf_onrrp"]["holder_position_target"]
+    assert deposits["size_bil"] == spec["opening_mmf_added_on_rrp_bil"] == 500.0
+    assert tuple(deposits["donors"]) == tuple(map(list, MMF_DONORS))
+    assert deposits["unchanged_routes"] == [list(PRIVATE_MMF)]
+    assert all(case["mmf_deposit_pass_through"] == 1.0 for case in cases.values())
 
 
 # --- Declarations the contract and compiler refuse ---
@@ -692,7 +755,7 @@ def _declaration(**changes) -> dict:
             {"holder_type": "Private", "holder_subbucket": DNB, "origin_bill_stock_bil": 200.0, "weight": -0.4},
             {"holder_type": "Private", "holder_subbucket": MMF, "origin_bill_stock_bil": 150.0, "weight": -0.3},
         ],
-        "unchanged_routes": [],
+        "unchanged_routes": [dict(zip(("holder_type", "holder_subbucket"), PRIVATE_MMF_ADDED))],
     }
     override.update(changes)
     return override
@@ -700,7 +763,7 @@ def _declaration(**changes) -> dict:
 
 def test_declared_weights_must_be_each_donors_share_of_origin_bills() -> None:
     weights = ht.declared_weights(_declaration())
-    assert weights == {BANKS: 1.0, FOREIGN: -0.3, PRIVATE_DNB: -0.4, PRIVATE_MMF: -0.3}
+    assert weights == {BANKS: 1.0, FOREIGN: -0.3, PRIVATE_DNB: -0.4, PRIVATE_MMF: -0.3, PRIVATE_MMF_ADDED: 0.0}
     skewed = _declaration()
     skewed["displacement"][0]["weight"] = -0.35
     with pytest.raises(ht.HolderTargetError, match="share of the donors' origin bills"):

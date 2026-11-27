@@ -90,11 +90,12 @@ from .output import (
     TDC_OVERLAP_POLICY,
     _route_stock_closure_handoff_tables,
     hash_output_tree,
+    tdc_component_amount,
     write_bounded_scenario_outputs,
     write_scenario_outputs,
 )
 from .process_watchdog import THREAD_LIMIT_ENVIRONMENT_VARIABLES
-from tdc_shared import INTRAGOV_HOLDERS
+from tdc_shared import INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF_ADDED
 from .runtime_identity import (
     assert_loaded_distribution_modules,
     distribution_identity,
@@ -1460,6 +1461,10 @@ def _verify_bounded_engine_replay(
         manifest, inputs_dir, row_metadata=row_metadata
     )
     params = runner_module._engine_runtime_params(params)
+    verify_routing = PRIVATE_SUBBUCKET_MMF_ADDED in params
+    if verify_routing:
+        trc_metadata = read_json(root / "outputs" / "tdcsim_trc_metadata.json")
+        params["trc_routing"] = trc_metadata["routing_input"]
     engine_scenario_id = runner_module._compiled_scenario_id(inputs_dir)
     thresholds = bounded.get("memory_thresholds")
     if not isinstance(thresholds, dict):
@@ -1572,7 +1577,12 @@ def _verify_bounded_engine_replay(
             compression=str(output_manifest.get("compression") or "gzip"),
             metadata=row_metadata,
         )
-        for logical_name in ("results", "final_portfolio"):
+        required_outputs = ["results", "final_portfolio"]
+        if verify_routing:
+            required_outputs.append("tdcsim_trc_results")
+            if results.attrs["trc_metadata"]["routing"] != trc_metadata["routing"]:
+                raise VerificationError("bounded engine replay disagrees on the added money-fund routing policy")
+        for logical_name in required_outputs:
             expected = output_manifest.get(logical_name)
             actual = replay_manifest.get(logical_name)
             if expected is None and actual is None:
@@ -3523,7 +3533,7 @@ def _verify_bounded_tdc_components(
         for key, spec in specs.items():
             _bounded_close(
                 amounts[period].get(key, 0.0),
-                float(result[str(spec["column"])]),
+                tdc_component_amount(result, spec),
                 label=f"bounded TDC component/result bridge {key}",
             )
     return totals

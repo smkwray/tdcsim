@@ -982,6 +982,9 @@ def _materialize_required_adapter_assumptions(
         )
         runtime_payload["mmf_deposit_pass_through_status"] = "scenario_override"
         runtime_changed = True
+    if "mmf_added_position" in overrides:
+        runtime_payload["mmf_added_position"] = dict(overrides["mmf_added_position"])
+        runtime_changed = True
     if "fiscal_incidence" in overrides:
         runtime_payload["fiscal_incidence_policy_status"] = "scenario_override"
         runtime_changed = True

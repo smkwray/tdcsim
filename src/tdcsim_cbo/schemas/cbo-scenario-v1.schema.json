@@ -222,6 +222,15 @@
         "mmf_deposit_pass_through": {
           "$ref": "#/$defs/mmfDepositPassThroughOverride"
         },
+        "mmf_added_position": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["settlement_route", "opening_on_rrp_bil"],
+          "properties": {
+            "settlement_route": {"enum": ["covered_deposit_settled", "on_rrp_mmf"]},
+            "opening_on_rrp_bil": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
         "holder_position_target": {
           "oneOf": [
             {"$ref": "#/$defs/holderPositionTargetOverride"},
@@ -1990,7 +1999,8 @@
           "enum": [
             "",
             "domestic_nonbank_deposit_funded",
-            "mmf_cash_fund_route"
+            "mmf_cash_fund_route",
+            "mmf_added_position"
           ]
         },
         "target_path": {
@@ -2125,7 +2135,8 @@
                 "enum": [
                   "",
                   "domestic_nonbank_deposit_funded",
-                  "mmf_cash_fund_route"
+                  "mmf_cash_fund_route",
+                  "mmf_added_position"
                 ]
               }
             }

@@ -48,7 +48,8 @@ from tdc_shared import (
     MARKETABLE_PREFERENCE_CATEGORIES,
     MATURITY_CATEGORIES,
     PORTFOLIO_DTYPES,
-    PRIVATE_SUBBUCKETS,
+    PRIVATE_AUCTION_SUBBUCKETS,
+    PRIVATE_SUBBUCKET_MMF_ADDED,
     PRIVATE_SUBBUCKET_SHARES_KEY,
     SECURITY_TYPES,
 )
@@ -438,6 +439,8 @@ def run_cbo_scenario(
             if not isinstance(trc_metadata, Mapping):
                 raise RunnerError("TRC routing was supplied but the engine returned no TRC metadata")
             results.attrs["trc_metadata"] = {**dict(trc_metadata), "routing_source": trc_routing_source}
+            if PRIVATE_SUBBUCKET_MMF_ADDED in engine_params:
+                results.attrs["trc_metadata"]["routing_input"] = engine_params["trc_routing"]
         boundaries = validate_run_boundaries(
             results, inputs, funding_closure_mode=funding_closure_mode
         )
@@ -918,6 +921,9 @@ def build_runtime_params(
     }
     if holder_target is not None:
         params["holder_position_target"] = holder_target
+    runtime = _runtime_assumptions(inputs)
+    if PRIVATE_SUBBUCKET_MMF_ADDED in runtime:
+        params[PRIVATE_SUBBUCKET_MMF_ADDED] = runtime[PRIVATE_SUBBUCKET_MMF_ADDED]
     return params
 
 
@@ -947,6 +953,8 @@ def _holder_position_target(inputs: Path) -> dict[str, Any] | None:
     }
     if "bill_change_weights" in declaration:
         config["bill_change_weights"] = declaration["bill_change_weights"]
+    if "buyer_private_route" in declaration:
+        config["buyer_private_route"] = declaration["buyer_private_route"]
     return config
 
 
@@ -1651,7 +1659,9 @@ def _private_subbucket_shares(frame: pd.DataFrame) -> dict[str, dict[str, float]
         return shares
     holder = frame.get("holder_type", frame.get("HolderType", pd.Series("", index=frame.index))).fillna("").astype(str)
     subbucket = frame["holder_subbucket"].fillna("").astype(str)
-    private_rows = frame.loc[(holder == "Private") & subbucket.isin(PRIVATE_SUBBUCKETS)].copy()
+    if ((holder == "Private") & (subbucket == PRIVATE_SUBBUCKET_MMF_ADDED)).any():
+        raise RunnerError("the added money-fund position cannot appear in auction holder preferences")
+    private_rows = frame.loc[(holder == "Private") & subbucket.isin(PRIVATE_AUCTION_SUBBUCKETS)].copy()
     if private_rows.empty:
         return shares
     for category in categories:
@@ -1678,7 +1688,7 @@ def _private_subbucket_shares(frame: pd.DataFrame) -> dict[str, dict[str, float]
         total = sum(category_values.values())
         if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
             raise RunnerError(f"private route shares for {category} must sum to 1.0, got {total}")
-        shares[category] = {route: category_values.get(route, 0.0) for route in PRIVATE_SUBBUCKETS}
+        shares[category] = {route: category_values.get(route, 0.0) for route in PRIVATE_AUCTION_SUBBUCKETS}
     return shares
 
 

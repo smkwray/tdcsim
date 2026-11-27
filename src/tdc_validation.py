@@ -15,7 +15,7 @@ from tdc_shared import (
     MATURITY_CATEGORIES,
     PREFERENCE_CATEGORIES,
     PRIVATE_SUBBUCKET_SHARES_KEY,
-    PRIVATE_SUBBUCKETS,
+    PRIVATE_AUCTION_SUBBUCKETS,
     TGA_FLOOR_TOLERANCE,
 )
 
@@ -267,7 +267,7 @@ def validate_event_path(path_keys: Sequence[str]) -> Tuple[bool, str]:
             len(path_keys) == 4
             and path_keys[1] == PRIVATE_SUBBUCKET_SHARES_KEY
             and path_keys[2] in MARKETABLE_PREFERENCE_CATEGORIES
-            and path_keys[3] in PRIVATE_SUBBUCKETS
+            and path_keys[3] in PRIVATE_AUCTION_SUBBUCKETS
         ):
             return True, ""
         if len(path_keys) == 2 and path_keys[1] in _HOLDER_TYPES_SET:

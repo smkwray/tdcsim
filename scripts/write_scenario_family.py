@@ -48,7 +48,9 @@ import holder_targets as ht  # noqa: E402
 from simulation_calendar import previous_securities_business_day  # noqa: E402
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec  # noqa: E402
 from tdcsim_cbo._json import canonical_json_sha256, sha256_file, write_json  # noqa: E402
-from tdc_shared import HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_SUBBUCKETS  # noqa: E402
+from tdc_shared import (  # noqa: E402
+    HOLDER_TYPES, MARKETABLE_PREFERENCE_CATEGORIES, PRIVATE_AUCTION_SUBBUCKETS, PRIVATE_SUBBUCKET_MMF_ADDED,
+)
 from issuance_calibration import CALIBRATION_FILE, ISSUANCE_RULE_MODE, load_calibration, target_for_date  # noqa: E402
 from write_cbo_example_scenarios import _baseline_coupling, _scenario  # noqa: E402
 
@@ -59,7 +61,7 @@ DEBT_STOCK_FILE = "tdcsim_debt_stock_path.csv"
 ITEM_KEYS = frozenset({
     "role", "scenario_id", "label", "notes", "holder_shift", "bill_share_change", "bill_holder_shift",
     "bill_buyer_shift", "fed_holdings_change", "key_rate_shocks_bp", "rate_path", "mmf_deposit_pass_through",
-    "holder_position_target",
+    "holder_position_target", "mmf_added_position_settlement",
 })
 SUBKEYS = {
     "bill_holder_shift": frozenset({"absorbers"}),
@@ -281,11 +283,11 @@ def bill_buyer_rows(
     if others <= 0.0:
         raise ValueError(f"{holder} already takes every bill")
     if private_route is not None:
-        if holder != "Private" or private_route not in PRIVATE_SUBBUCKETS:
-            raise ValueError(f"a private route needs holder Private and one of {list(PRIVATE_SUBBUCKETS)}")
+        if holder != "Private" or private_route not in PRIVATE_AUCTION_SUBBUCKETS:
+            raise ValueError(f"a private route needs holder Private and one of {list(PRIVATE_AUCTION_SUBBUCKETS)}")
         if baseline_route_share is None or not 0.0 <= baseline_route_share <= 1.0:
             raise ValueError("a private route needs its baseline bill route share in [0, 1]")
-        (other_route,) = [route for route in PRIVATE_SUBBUCKETS if route != private_route]
+        (other_route,) = [route for route in PRIVATE_AUCTION_SUBBUCKETS if route != private_route]
     stocks = sorted(bill_stock_by_date)
     start = pd.Timestamp(build[0]).normalize()
     dates = sorted({start, pd.Timestamp(build[1]).normalize()} | set(pd.date_range(start, stocks[-1][0], freq="ME")))
@@ -670,6 +672,13 @@ def family_scenarios(
                 "mode": "fixed_fraction",
                 "value": float(item["mmf_deposit_pass_through"]),
             }
+        if "opening_mmf_added_on_rrp_bil" in family:
+            overrides[PRIVATE_SUBBUCKET_MMF_ADDED] = {
+                "settlement_route": item.get("mmf_added_position_settlement", "covered_deposit_settled"),
+                "opening_on_rrp_bil": float(family["opening_mmf_added_on_rrp_bil"]),
+            }
+        elif "mmf_added_position_settlement" in item:
+            raise ValueError(f"{item['role']}: added money-fund settlement needs a common opening ON RRP balance")
         if item.get("holder_position_target"):
             if shift or "holder_preferences" in overrides or item.get("fed_holdings_change"):
                 raise ValueError(f"{item['role']}: a holder position target is the scenario's only holdings change")
