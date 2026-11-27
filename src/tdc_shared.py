@@ -45,6 +45,8 @@ PRIVATE_SUBBUCKET_MMF = 'mmf_cash_fund_route'
 PRIVATE_SUBBUCKET_MMF_ADDED = 'mmf_added_position'
 # Key under which holder-preference blocks carry the private route split of each category.
 PRIVATE_SUBBUCKET_SHARES_KEY = '__private_subbucket_shares__'
+# Key under which the opening-book new-issuance weights carry money funds' calibrated share of new FRNs.
+FRN_MMF_AUCTION_SHARE_KEY = 'frn_mmf_auction_share'
 PRIVATE_AUCTION_SUBBUCKETS = (
     PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
     PRIVATE_SUBBUCKET_MMF,

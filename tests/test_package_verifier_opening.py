@@ -94,7 +94,7 @@ def test_opening_builder_and_verifier_roll_net_issuance_soma_and_mmf(tmp_path: P
     }
     governed.write_text(json.dumps({"artifacts": {"initial_portfolio": {
         "cb_source": smoke.OPENING_PORTFOLIO_CB_SOURCE, "mspd_record_date": "2026-05-31",
-        "noncb_weights": {"bills": shares, "nonbills": shares},
+        "noncb_weights": {"bills": shares, "nonbills": shares, "frn_mmf_auction_share": 0.7},
     }}}))
     _write_auctions(auctions)
     _write_rows(soma, [
