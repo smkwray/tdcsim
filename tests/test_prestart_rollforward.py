@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from issuance_calibration import IssuanceCalibrationError, prestart_rollforward, prestart_settlements
-from tdc_shared import PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
+from tdc_shared import PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF, TRANSFER_SCALABLE_COLUMNS
 
 RECORD = "2026-05-31"
 CLOSE = "2026-06-18"
@@ -120,3 +120,18 @@ def test_soma_transfer_keeps_reopened_bill_tranche_proceeds(tmp_path) -> None:
     assert bill.groupby("IssuePriceRatio")["FaceValue"].sum().to_dict() == pytest.approx({0.988: 10, 0.99: 50})
     assert bill["IssueProceeds"].sum() == pytest.approx(10 * 0.988 + 50 * 0.99)
     assert bill.loc[bill["HolderType"].eq("CB"), "FaceValue"].sum() == pytest.approx(30)
+
+
+def test_a_tiny_soma_gap_merges_into_the_fed_tranche_lots_instead_of_leaving_slivers(tmp_path) -> None:
+    # A few thousand dollars between the SOMA snapshot and the book must not leave
+    # sliver lots: a sliver indexes or accrues by less than the accounting journal
+    # records each day, so the results and the journal would disagree over a year.
+    gap = 2.0e-6
+    opening, _, _ = _roll(tmp_path, WINDOW, soma_rows=[("RB", (30.0 + gap) * 1000.0, "2026-06-30")])
+    bill = opening.loc[opening["_cusip"].eq("RB")]
+    cb = bill.loc[bill["HolderType"].eq("CB")]
+    assert cb["FaceValue"].sum() == pytest.approx(30.0 + gap, abs=1e-12)
+    assert cb.groupby("IssuePriceRatio").size().max() == 1
+    terms = [column for column in opening.columns if column not in TRANSFER_SCALABLE_COLUMNS and column != "BondID"]
+    assert not opening.duplicated(terms).any()
+    assert bill["IssueProceeds"].sum() == pytest.approx(10 * 0.988 + 50 * 0.99)

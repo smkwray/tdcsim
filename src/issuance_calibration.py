@@ -1431,6 +1431,34 @@ def _opening_issue_terms(issue, template: Mapping | None, security_fields: list[
     }
 
 
+def _merge_identical_lots(book: pd.DataFrame, scalable: Sequence[str]) -> pd.DataFrame:
+    """One lot per holder route and tranche: merge lots that differ only in size.
+
+    Aligning to SOMA moves a share of every tranche of a CUSIP, so a gap of a few
+    thousand dollars between the snapshot and the book leaves slivers beside the
+    holder's existing lot of the same tranche. Slivers that small index by less than
+    the accounting journal records each day, so the accretion in the results and the
+    journal would part. Lots with the same holder, route and terms are one position;
+    their sizes add and the lowest lot ID is kept.
+    """
+
+    keys = [column for column in book.columns if column not in scalable and column != "BondID"]
+    if book.empty:
+        return book
+    frame = book.reset_index(drop=True)
+    group_ids = frame.groupby(keys, dropna=False, sort=False).ngroup()
+    if group_ids.nunique() == len(frame):
+        return frame
+    merged = []
+    for _, lots in frame.groupby(group_ids, sort=False):
+        first = lots.loc[lots["BondID"].idxmin()].to_dict()
+        for column in scalable:
+            values = lots[column]
+            first[column] = values.sum(min_count=1) if values.notna().any() else first[column]
+        merged.append(first)
+    return pd.DataFrame.from_records(merged, columns=book.columns)
+
+
 def prestart_rollforward(
     book: pd.DataFrame,
     settlements: pd.DataFrame,
@@ -1632,7 +1660,7 @@ def prestart_rollforward(
                 if route == PRIVATE_SUBBUCKET_MMF:
                     mmf_acquisitions.add((opening_close_date, row["SecurityType"], row["MaturityDate"].date().isoformat()))
 
-    aligned = pd.DataFrame.from_records(result, columns=book.columns)
+    aligned = _merge_identical_lots(pd.DataFrame.from_records(result, columns=book.columns), scalable)
     if "IssueProceeds" in rolled:
         closing_proceeds = aligned.groupby(cusip_column)["IssueProceeds"].sum(min_count=1)
         for cusip, original in rolled.groupby(cusip_column)["IssueProceeds"].sum(min_count=1).items():
