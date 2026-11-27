@@ -1167,9 +1167,9 @@ def _opening_book_inputs(
     }
 
 
-# Two FRNs settle in the calibration window, each a new issue and two reopenings of 86 bn
-# to the public (the Fed adds 2 bn at the new issue). A month after its last tranche money
-# funds hold 60.2 bn of the first and 51.6 bn of the second: shares 0.70 and 0.60, 0.65 in all.
+# One FRN a quarter settles in the calibration window, each a new issue and two reopenings
+# of 86 bn to the public (the Fed adds 2 bn at the first new issue). A month after its last
+# tranche money funds hold 60.2, 51.6, 64.5 and 55.9 bn: shares 0.70, 0.60, 0.75 and 0.65.
 _CALIBRATION_FRN_AUCTIONS = [
     # issue date, CUSIP, reopening, SOMA accepted, total accepted (dollars)
     ("2025-04-30", "FAKEFRNA1", "No", "2000000000", "32000000000"),
@@ -1178,8 +1178,19 @@ _CALIBRATION_FRN_AUCTIONS = [
     ("2025-07-31", "FAKEFRNB1", "No", "0", "30000000000"),
     ("2025-08-29", "FAKEFRNB1", "Yes", "0", "28000000000"),
     ("2025-09-26", "FAKEFRNB1", "Yes", "0", "28000000000"),
+    ("2025-10-31", "FAKEFRNC1", "No", "0", "30000000000"),
+    ("2025-11-28", "FAKEFRNC1", "Yes", "0", "28000000000"),
+    ("2025-12-26", "FAKEFRNC1", "Yes", "0", "28000000000"),
+    # Reopened twice in February, so it is measured at March's month-end, not at the
+    # fixture book's April record date.
+    ("2026-01-30", "FAKEFRND1", "No", "0", "30000000000"),
+    ("2026-02-13", "FAKEFRND1", "Yes", "0", "28000000000"),
+    ("2026-02-27", "FAKEFRND1", "Yes", "0", "28000000000"),
 ]
-_CALIBRATION_FRN_MATURITY = {"FAKEFRNA1": "2027-04-30", "FAKEFRNB1": "2027-07-31", "FAKEFRNZ1": "2026-04-30"}
+_CALIBRATION_FRN_MATURITY = {
+    "FAKEFRNA1": "2027-04-30", "FAKEFRNB1": "2027-07-31", "FAKEFRNC1": "2027-10-31", "FAKEFRND1": "2028-01-31",
+    "FAKEFRNE1": "2027-08-31", "FAKEFRNZ1": "2026-04-30",
+}
 
 
 def _frn_auction_rows(tranches) -> list[dict]:
@@ -1210,6 +1221,8 @@ _CALIBRATION_NMFP_ROWS = [
     ("2025-06-30", "FAKEFRNA1", "frn", "2027-04-30", 50.0),
     ("2025-07-31", "FAKEFRNA1", "frn", "2027-04-30", 60.2),
     ("2025-10-31", "FAKEFRNB1", "frn", "2027-07-31", 51.6),
+    ("2026-01-31", "FAKEFRNC1", "frn", "2027-10-31", 64.5),
+    ("2026-03-31", "FAKEFRND1", "frn", "2028-01-31", 55.9),
 ]
 
 
@@ -1626,9 +1639,9 @@ def test_opening_book_calibrates_the_money_fund_share_of_new_frns_from_n_mfp(tmp
     _, metadata = rib.build_initial_portfolio(tmp_path / "cohorts.csv", **_opening_book_inputs(tmp_path))
     calibration = metadata["frn_mmf_auction_share_calibration"]
     share = metadata["noncb_weights"]["frn_mmf_auction_share"]
-    assert share == pytest.approx((60.2 + 51.6) / 172.0)
-    assert calibration["range"] == pytest.approx([0.60, 0.70])
-    assert calibration["auctions"] == 6
+    assert share == pytest.approx(_FOUR_FRN_SHARE)
+    assert calibration["range"] == pytest.approx([0.60, 0.75])
+    assert calibration["auctions"] == 12
     observed = {row["cusip"]: row for row in calibration["observations"]}
     assert observed["FAKEFRNA1"]["measured_at"] == "2025-07-31"
     assert observed["FAKEFRNA1"]["public_accepted_bil"] == pytest.approx(86.0)
@@ -1640,6 +1653,7 @@ def test_opening_book_calibrates_the_money_fund_share_of_new_frns_from_n_mfp(tmp
 
 _TRANCHES = _CALIBRATION_FRN_AUCTIONS
 _NOT_THREE_TRANCHES = "not a 2-Year new issue and two reopenings"
+_FOUR_FRN_SHARE = (60.2 + 51.6 + 64.5 + 55.9) / 344.0
 
 
 def _calibrate(tmp_path, auctions, nmfp):
@@ -1660,8 +1674,19 @@ def _calibrate(tmp_path, auctions, nmfp):
         ([row for row in _TRANCHES if row[0] != "2025-08-29"], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
         ([row for row in _TRANCHES if row[0] != "2025-09-26"], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
         (_TRANCHES + [_TRANCHES[1]], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
-        (_TRANCHES[1:], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
-        ([*_TRANCHES[:5], ("2025-09-26", "FAKEFRNB1", "Yes", "0", "")], _CALIBRATION_NMFP_ROWS, "positive public amount"),
+        # Without its new issue the quarter shows no FRN coming to market.
+        (_TRANCHES[1:], _CALIBRATION_NMFP_ROWS, r"quarters \['2025Q2'\]"),
+        # A source missing a whole FRN would calibrate on the rest; the window's quarters
+        # say which FRNs must be there, whatever CUSIPs the source lists.
+        ([row for row in _TRANCHES if row[1] != "FAKEFRND1"], _CALIBRATION_NMFP_ROWS, r"quarters \['2026Q1'\]"),
+        ([row for row in _TRANCHES if row[1] != "FAKEFRNA1"], _CALIBRATION_NMFP_ROWS, r"quarters \['2025Q2'\]"),
+        # Two new FRNs in one quarter is not the declared issuance pattern either.
+        (
+            _TRANCHES + [("2025-08-29", "FAKEFRNE1", "No", "0", "30000000000")],
+            _CALIBRATION_NMFP_ROWS,
+            r"quarters \['2025Q3'\]",
+        ),
+        ([*_TRANCHES[:5], ("2025-09-26", "FAKEFRNB1", "Yes", "0", ""), *_TRANCHES[6:]], _CALIBRATION_NMFP_ROWS, "positive public amount"),
         # The month is reported but the FRN is absent: missing coverage, not zero holdings.
         (_TRANCHES, [*_CALIBRATION_NMFP_ROWS[:2], ("2025-10-31", "FAKEFRNA1", "frn", "2027-04-30", 60.0)], "do not cover FRN FAKEFRNB1"),
         ([("2024-04-30", "FAKEFRNZ1", "No", "0", "30000000000")], _CALIBRATION_NMFP_ROWS, "no FRN auction settling"),
@@ -1675,10 +1700,10 @@ def test_frn_auction_share_calibration_fails_loudly_on_incomplete_inputs(tmp_pat
 def test_frn_auction_share_counts_a_verified_zero_holding(tmp_path):
     # The extract writes a zero row for an outstanding FRN no fund holds; that is evidence
     # of no money-fund holdings, so it enters the share as zero.
-    nmfp = [*_CALIBRATION_NMFP_ROWS[:2], ("2025-10-31", "FAKEFRNB1", "frn", "2027-07-31", 0.0)]
+    nmfp = [*_CALIBRATION_NMFP_ROWS[:2], ("2025-10-31", "FAKEFRNB1", "frn", "2027-07-31", 0.0), *_CALIBRATION_NMFP_ROWS[3:]]
     calibration = _calibrate(tmp_path, _TRANCHES, nmfp)
-    assert calibration["share"] == pytest.approx(60.2 / 172.0)
-    assert calibration["range"] == pytest.approx([0.0, 0.70])
+    assert calibration["share"] == pytest.approx((60.2 + 64.5 + 55.9) / 344.0)
+    assert calibration["range"] == pytest.approx([0.0, 0.75])
 
 
 def _rebuilt_input_dir(tmp_path, name, **overrides):
@@ -1727,7 +1752,26 @@ def test_package_rederives_the_n_mfp_book_and_share_and_rejects_an_older_book(tm
     }
     result = rib.verify_opening_book_against_nmfp(manifest, **check)
     assert result["frn_cusips"] == 2
-    assert result["frn_mmf_auction_share"] == pytest.approx((60.2 + 51.6) / 172.0)
+    # The published donor amounts must match the book against the pre-override allocation:
+    # reporting that banks gave nothing does not pass while the book shows they did.
+    override = manifest["artifacts"]["initial_portfolio"]["opening_allocation"]["money_fund_frn_holdings_override"]
+    assert override["frn_to_mmf_bil_by_sector"]["Banks"] > 0.1
+    unreported = json.loads(json.dumps(manifest))
+    unreported_override = unreported["artifacts"]["initial_portfolio"]["opening_allocation"]["money_fund_frn_holdings_override"]
+    unreported_override["frn_to_mmf_bil_by_sector"]["Banks"] = 0.0
+    unreported_override["bills_from_mmf_bil_by_sector"]["Banks"] = 0.0
+    with pytest.raises(ValueError, match="Banks gave .* but the manifest reports 0.000000 and 0.000000"):
+        rib.verify_opening_book_against_nmfp(unreported, **check)
+    # Moving the reported amounts between donors keeps the total but not each sector's share.
+    shifted = json.loads(json.dumps(manifest))
+    shifted_override = shifted["artifacts"]["initial_portfolio"]["opening_allocation"]["money_fund_frn_holdings_override"]
+    moved = shifted_override["frn_to_mmf_bil_by_sector"]["Banks"]
+    for record in ("frn_to_mmf_bil_by_sector", "bills_from_mmf_bil_by_sector"):
+        shifted_override[record]["Banks"] = 0.0
+        shifted_override[record]["Foreign"] += moved
+    with pytest.raises(ValueError, match="gave .* against the pre-override allocation"):
+        rib.verify_opening_book_against_nmfp(shifted, **check)
+    assert result["frn_mmf_auction_share"] == pytest.approx(_FOUR_FRN_SHARE)
 
     # The older book: money funds filed 50 bn of the first FRN, not 60.
     older_rows = [_FRN_NMFP_ROWS[0], *_FRN_NMFP_ROWS[1:2], ("2026-04-30", "FAKEFRN01", "frn", "2027-04-30", 50.0), _FRN_NMFP_ROWS[3]]

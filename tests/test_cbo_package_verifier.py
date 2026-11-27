@@ -1566,11 +1566,13 @@ def _write_source_package(package: Path) -> dict:
     }
 
 
-# Two FRNs settle in the FRN calibration window, each a new issue and two reopenings of
-# 86 bn to the public; a month after the last tranche money funds hold 60.2 and 51.6 bn.
+# One FRN a quarter settles in the FRN calibration window, each a new issue and two
+# reopenings of 86 bn to the public; a month after the last tranche money funds hold them.
 FIXTURE_FRN_CALIBRATION = (
     ("FIXFRNA1", ("2025-04-30", "2025-05-30", "2025-06-27"), "2027-04-30", "2025-07-31", 60.2),
     ("FIXFRNB1", ("2025-07-31", "2025-08-29", "2025-09-26"), "2027-07-31", "2025-10-31", 51.6),
+    ("FIXFRNC1", ("2025-10-31", "2025-11-28", "2025-12-26"), "2027-10-31", "2026-01-31", 64.5),
+    ("FIXFRND1", ("2026-01-30", "2026-02-27", "2026-03-27"), "2028-01-31", "2026-04-30", 55.9),
 )
 
 
@@ -1602,7 +1604,9 @@ def _write_governed_opening_sources(package: Path, shares: dict) -> None:
 
     Money funds filed exactly the book's private FRNs at the record date and nothing of the
     other FRNs; the manifest's records are rebuilt from those files as the opening-book
-    build records them.
+    build records them. Before the override, domestic nonbanks held the money funds' FRNs
+    (a third of each FRN's non-Fed par, as banks and foreign holders did) and gave them for
+    an equal par of money-fund bills.
     """
 
     opening = package / "sources" / "opening"
@@ -1631,6 +1635,13 @@ def _write_governed_opening_sources(package: Path, shares: dict) -> None:
     })
     holdings, _ = rib.load_nmfp_mmf_holdings(extract)
     filed = holdings.loc[holdings["report_date"].eq("2026-05-31")]
+    dn, mmf = f"Private/{PRIVATE_SUBBUCKET_DOMESTIC_NONBANK}", f"Private/{PRIVATE_SUBBUCKET_MMF}"
+    given = float(money_funds.sum())
+    noncb = book.loc[book["HolderType"].ne("CB")]
+    routes = (noncb["HolderType"] + "/" + noncb["HolderSubBucket"].fillna("")).str.rstrip("/")
+    is_bill = noncb["MaturityCategory"].eq("bills") & noncb["SecurityType"].ne("FRN")
+    bills_now = {key: 0.0 for key in ("Banks", "Foreign", dn, mmf)}
+    bills_now.update(noncb.loc[is_bill].groupby(routes[is_bill])["FaceValue"].sum().to_dict())
     calibration = rib.calibrate_mmf_frn_auction_share(holdings, package / "sources" / "fiscaldata" / "auctions_query.csv")
     calibration["nmfp_source"] = {"sha256": hashlib.sha256(extract.read_bytes()).hexdigest()}
     _write_json(opening / "tdcsim_ratewall_input_manifest.json", {
@@ -1641,10 +1652,22 @@ def _write_governed_opening_sources(package: Path, shares: dict) -> None:
         "artifacts": {"initial_portfolio": {
             "mspd_record_date": "2026-05-31",
             "noncb_weights": {"bills": shares, "nonbills": shares, "frn_mmf_auction_share": calibration["share"]},
-            "opening_allocation": {"money_fund_frn_holdings_override": {
-                "by_cusip": {row.cusip: {"filed_bil": row.value_bil} for row in filed.itertuples()},
-                "source": {"sha256": calibration["nmfp_source"]["sha256"]},
-            }},
+            "opening_allocation": {
+                "groups": {
+                    "nonbills": {"route_weights": {"Banks": 1 / 3, "Foreign": 1 / 3, dn: 1 / 3, mmf: 0.0}},
+                    "bills": {"par_bil": {**bills_now, dn: bills_now[dn] - given, mmf: bills_now[mmf] + given}},
+                },
+                "money_fund_eligibility_swap": {"face_bil_by_class": {"to_mmf": {}, "from_mmf": {}}},
+                "money_fund_frn_holdings_override": {
+                    "by_cusip": {
+                        row.cusip: {"filed_bil": row.value_bil, "from_bil": {dn: row.value_bil, "Foreign": 0.0, "Banks": 0.0}}
+                        for row in filed.itertuples()
+                    },
+                    "frn_to_mmf_bil_by_sector": {dn: given, "Foreign": 0.0, "Banks": 0.0},
+                    "bills_from_mmf_bil_by_sector": {dn: given, "Foreign": 0.0, "Banks": 0.0},
+                    "source": {"sha256": calibration["nmfp_source"]["sha256"]},
+                },
+            },
             "nmfp_mix_check": rib._check_mmf_mix(book, filed, record_date="2026-05-31"),
             "frn_mmf_auction_share_calibration": calibration,
         }},
