@@ -673,6 +673,12 @@ def test_gse_debt_earns_each_lots_coupon_until_it_matures_and_no_2025_realized_l
     assert rows.loc["2026-06-22", "agency_debt_premium_start_bil"] == pytest.approx(expected)
     # The first lot (486 million) is repaid on 2029-05-15 and stops earning that day.
     assert rows.loc["2029-05-15", "agency_debt_start_bil"] - rows.loc["2029-05-15", "agency_debt_end_bil"] == pytest.approx(0.486)
+    # Freddie Mac 3134A4AA2 matures on Saturday 2031-03-15: interest stops then, and its 316 million
+    # is repaid on Monday, the next Fedwire business day, so weekend reserves still hold it.
+    assert rows.loc["2031-03-16", "agency_debt_interest_bil"] < rows.loc["2031-03-15", "agency_debt_interest_bil"]
+    for weekend in ("2031-03-15", "2031-03-16"):
+        assert rows.loc[weekend, "agency_debt_start_bil"] == pytest.approx(rows.loc[weekend, "agency_debt_end_bil"])
+    assert rows.loc["2031-03-17", "agency_debt_start_bil"] - rows.loc["2031-03-17", "agency_debt_end_bil"] == pytest.approx(0.316)
     after = rows.loc["2032-07-16":]
     assert (after[["agency_debt_end_bil", "agency_debt_interest_bil", "agency_debt_premium_end_bil"]] == 0.0).all().all()
     banks = source["reserve_banks_2025_mil"]["other_income"]

@@ -17,7 +17,7 @@ from forecast_paths import (
     FED_REMITTANCE_PATH_SCHEMA_VERSION,
     operating_cash_runtime_role,
 )
-from simulation_calendar import SimulationPeriod, is_fedwire_business_day
+from simulation_calendar import SimulationPeriod, is_fedwire_business_day, next_fedwire_business_day
 
 
 DATE_TOLERANCE_BIL = 0.000001
@@ -373,8 +373,9 @@ def build_fed_income_path_rows(
     def mbs(day: date) -> float:
         return h41_mbs * _mbs_projection_level(day, projection["agency_mbs_year_end_bil"]) / mbs_anchor
 
-    # GSE debt: each lot earns its coupon until it matures, when its par is repaid; the class
-    # premium is shared by par times remaining life and amortized straight line to maturity.
+    # GSE debt: each lot earns its coupon until it matures and its par is repaid on the next
+    # Fedwire business day; the class premium is shared by par times remaining life and
+    # amortized straight line to maturity.
     agency = [
         (date.fromisoformat(lot["maturity_date"]), float(Decimal(lot["par"]) / 10**9), float(lot["coupon_pct"]) / 100)
         for lot in source["soma_agency_debt"]["lots"]
@@ -382,8 +383,11 @@ def build_fed_income_path_rows(
     weights = [par * (maturity - as_of).days for maturity, par, _ in agency]
     agency_premium = [premiums["gse"] * weight / sum(weights) for weight in weights]
 
+    # Interest stops at maturity; par is repaid, and leaves reserves, on the next Fedwire day.
+    repaid_on = [next_fedwire_business_day(maturity) for maturity, _, _ in agency]
+
     def agency_par(day: date) -> float:
-        return sum(par for maturity, par, _ in agency if maturity > day)
+        return sum(par for (_, par, _), repaid in zip(agency, repaid_on) if repaid > day)
 
     def agency_premium_at(day: date) -> float:
         return sum(premium * max(0, (maturity - day).days) / (maturity - as_of).days
