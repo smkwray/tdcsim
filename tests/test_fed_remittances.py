@@ -276,6 +276,33 @@ def test_fed_frn_interest_earned_on_a_closed_fiscal_year_end_stays_in_that_year(
     assert results.loc["2028-10-02", "CB_FRNAccrual"] == pytest.approx(FRN_DAILY)
 
 
+def test_the_opening_lot_check_reads_each_lot_by_its_id_not_its_row():
+    """The opening portfolio lists the Fed's lots in no particular order; the verifier must
+    rebuild each lot's opening premium from that lot's own terms and issue proceeds."""
+
+    from forecast_paths import _check_fed_lot_boundaries
+    from fed_income import FED_LOT_JOURNAL_COLUMNS, opening_premiums
+
+    bill = {**_fed_note(100.0, 0.0), "BondID": 9, "IssueDate": pd.Timestamp("2026-07-01"),
+            "MaturityDate": pd.Timestamp("2026-12-31"), "DatedDate": pd.Timestamp("2026-07-01"),
+            "OriginalMaturityYears": 0.5, "MaturityCategory": "bills", "IssueProceeds": 98.0}
+    note = _fed_note(500.0, 0.04)  # BondID 2
+    portfolio = pd.DataFrame([bill, note], columns=BOND_PORTFOLIO_COLS)  # the bill's row first
+    day = pd.Timestamp("2026-09-20")
+    book = FedLotBook()
+    for key, (maturity, premium, is_bill, lot_stock, proceeds) in sorted(opening_premiums(portfolio, day, 5.0).items()):
+        book.open(key, maturity, premium, is_bill, day, stock=lot_stock, proceeds=proceeds)
+    journal = pd.DataFrame(book.journal, columns=FED_LOT_JOURNAL_COLUMNS)
+    assert journal["bond_id"].tolist() == [2, 9]
+    _check_fed_lot_boundaries(journal, {"lots": {}}, opening_portfolio=portfolio, final_portfolio=None,
+                              dates=pd.Series([day]), net_premium=5.0, carried_lots=None)
+    swapped = journal.copy()  # each lot recorded with the other's premium
+    swapped["premium_bil"] = swapped["premium_bil"].to_numpy()[::-1]
+    with pytest.raises(ValueError, match="opening Fed lot premium"):
+        _check_fed_lot_boundaries(swapped, {"lots": {}}, opening_portfolio=portfolio, final_portfolio=None,
+                                  dates=pd.Series([day]), net_premium=5.0, carried_lots=None)
+
+
 def test_a_bill_bought_at_99_earns_1_whatever_it_was_issued_at():
     """Sol's case: issued at 97, bought by the Fed at 99, redeemed at 100."""
 

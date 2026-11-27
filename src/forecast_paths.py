@@ -1204,6 +1204,7 @@ def _check_fed_lot_boundaries(lots: pd.DataFrame, rebuilt: dict, *, opening_port
     cb = fed_rows(opening_portfolio)
     cb = cb.set_index(pd.to_numeric(cb["BondID"], errors="raise").astype(int), drop=False)
     keys = sorted(cb.index)
+    cb = cb.loc[keys]  # every comparison below is by lot, in one order
     if opened.index.has_duplicates or set(opened.index) != set(keys):
         raise ValueError("Fed lot journal does not open exactly the Fed's opening lots")
     opened = opened.loc[keys]
