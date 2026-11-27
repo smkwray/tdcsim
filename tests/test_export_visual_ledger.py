@@ -126,7 +126,8 @@ def test_opening_book_lists_pre_start_replacements_under_their_own_cusips(tmp_pa
     import export_visual_ledger as ledger
 
     def row(bond_id, issue, maturity, face, holder="Banks"):
-        return {"BondID": bond_id, "SecurityType": "Fixed", "IssueDate": issue, "MaturityDate": maturity,
+        return {"BondID": bond_id, "SecurityType": "Fixed", "MaturityCategory": "bills",
+                "IssueDate": issue, "MaturityDate": maturity,
                 "OriginalMaturityYears": 0.33, "CouponRate": 0.0, "FaceValue": face, "AdjustedPrincipal": 0.0,
                 "HolderType": holder, "HolderSubBucket": None}
 
@@ -155,3 +156,38 @@ def test_opening_book_lists_pre_start_replacements_under_their_own_cusips(tmp_pa
         tmp_path / ledger.ROLLFORWARD, index=False)
     with pytest.raises(SystemExit, match="neither in the source book"):
         ledger.build_opening(tmp_path)
+
+
+def test_reopening_uses_opening_cusip_for_a_ten_year_note(tmp_path) -> None:
+    import export_visual_ledger as ledger
+
+    cusip = "91282CQQ7"
+    dated = "2026-05-15"
+    maturity = "2036-05-15"
+    for path in (ledger.OPENING_PORTFOLIO, ledger.OPENING_SOURCE, ledger.ROLLFORWARD):
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    elapsed_years = (pd.Timestamp(maturity) - pd.Timestamp(dated)).days / 365.25
+    assert elapsed_years > 10.0
+    pd.DataFrame([{
+        "BondID": 1, "SecurityType": "Fixed", "MaturityCategory": "notes",
+        "IssueDate": dated, "MaturityDate": maturity, "OriginalMaturityYears": elapsed_years,
+        "CouponRate": 0.04375, "FaceValue": 65, "AdjustedPrincipal": 0,
+        "HolderType": "Banks", "HolderSubBucket": None,
+    }]).to_csv(tmp_path / ledger.OPENING_PORTFOLIO, index=False)
+    pd.DataFrame([{"BondID": 1, "cusip_or_synthetic_id": cusip, "MaturityDate": maturity}]).to_csv(
+        tmp_path / ledger.OPENING_SOURCE, index=False,
+    )
+    pd.DataFrame([{"row_type": "summary", "replacement_bond_id": None, "replacement_cusip": None}]).to_csv(
+        tmp_path / ledger.ROLLFORWARD, index=False,
+    )
+    event = _event("2026-07-15", "Banks", "", 3.0, reopening=True)
+    event.update(
+        security_label=f"fixed-10y-{maturity}", maturity_date=maturity, dated_date=dated, coupon_rate_decimal=0.04375,
+    )
+    opening = ledger.build_opening(tmp_path)
+    issues = ledger.build_issues([event])
+    renamed = ledger.name_reopened_opening_securities(issues, opening)
+
+    assert opening["security_type"].item() == renamed["security_type"].item() == "note"
+    assert set(opening["security_id"]) | set(renamed["security_id"]) == {cusip}
+    pd.testing.assert_frame_equal(renamed.drop(columns="security_id"), issues.drop(columns="security_id"))

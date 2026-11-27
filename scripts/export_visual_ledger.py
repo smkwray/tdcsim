@@ -174,17 +174,21 @@ def build_issues(flows: list[dict[str, Any]]) -> pd.DataFrame:
 def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame) -> pd.DataFrame:
     """Give a reopening of an opening-book security that security's CUSIP."""
 
-    lookup = {
-        (kind, pd.Timestamp(maturity), round(float(coupon), 9)): security_id
-        for security_id, kind, maturity, coupon in zip(
-            opening["security_id"], opening["security_type"], opening["maturity_date"], opening["coupon_rate"]
-        )
-    }
+    lookup = {}
+    for security_id, kind, maturity, coupon in opening[
+        ["security_id", "security_type", "maturity_date", "coupon_rate"]
+    ].itertuples(index=False, name=None):
+        key = (kind, pd.Timestamp(maturity), round(float(coupon), 9))
+        lookup.setdefault(key, set()).add(security_id)
     out = issues.copy()
-    for index, row in out.iterrows():
+    for index, row in issues.loc[issues["is_reopening"]].iterrows():
         key = (row["security_type"], pd.Timestamp(row["maturity_date"]), round(float(row["coupon_rate"]), 9))
-        if row["is_reopening"] and key in lookup:
-            out.loc[index, "security_id"] = lookup[key]
+        matches = lookup.get(key)
+        if not matches:
+            continue
+        if len(matches) != 1:
+            raise SystemExit(f"reopening {row['security_id']} matches multiple opening securities: {sorted(matches)}")
+        out.loc[index, "security_id"] = next(iter(matches))
     return out
 
 
@@ -195,7 +199,15 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     joined = book["cusip_or_synthetic_id"].notna()
     if (book.loc[joined, "MaturityDate"] != book.loc[joined, "MaturityDate_source"]).any():
         raise SystemExit("opening book and its source disagree on maturity dates")
-    book["kind"] = [security_type(t, float(y)) for t, y in zip(book["SecurityType"], book["OriginalMaturityYears"])]
+    book["kind"] = book["SecurityType"]
+    fixed = book["SecurityType"].eq("Fixed")
+    # The opening book carries the Treasury class. An elapsed-days term can put a
+    # ten-year note just above ten years when the span includes a leap day.
+    book.loc[fixed, "kind"] = book.loc[fixed, "MaturityCategory"].map(
+        {"bills": "bill", "notes": "note", "bonds": "bond"}
+    )
+    if not book["kind"].isin(("bill", "note", "bond", "TIPS", "FRN")).all():
+        raise SystemExit("opening portfolio contains an unclassifiable security")
     # Rows not in the source book are the pre-start rollforward's reinvestment in Treasury
     # issues settling before the opening; the run's rollforward diagnostics name their CUSIPs.
     rollforward = pd.read_csv(run_dir / ROLLFORWARD, low_memory=False)
@@ -206,8 +218,8 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     book["holder"] = [holder_column(h, s) for h, s in zip(book["HolderType"], book["HolderSubBucket"])]
     book["debt_basis"] = book["AdjustedPrincipal"].where(book["SecurityType"].eq("TIPS"), book["FaceValue"])
     keys = ["security_id", "kind", "IssueDate", "MaturityDate", "CouponRate"]
-    if (book.groupby("security_id")[["IssueDate", "MaturityDate", "CouponRate"]].nunique() > 1).any().any():
-        raise SystemExit("an opening security id carries more than one issue date, maturity or coupon")
+    if (book.groupby("security_id")[["kind", "IssueDate", "MaturityDate", "CouponRate"]].nunique() > 1).any().any():
+        raise SystemExit("an opening security id carries more than one type, issue date, maturity or coupon")
     face = book.pivot_table(index=keys, columns="holder", values="FaceValue", aggfunc="sum", fill_value=0.0).reset_index()
     for column in HOLDER_COLUMNS:
         if column not in face:
@@ -455,14 +467,14 @@ def main(argv: list[str] | None = None) -> int:
     aggregate_gap = check_against_aggregates(run_dir, flows)
     issues = build_issues(flows)
     maturities_checked = check_maturities(run_dir, issues)
+    opening = build_opening(run_dir)
+    issues = name_reopened_opening_securities(issues, opening)
     if issues.duplicated(["security_id", "settlement_date"]).any():
         raise SystemExit("a security settles twice on one day")
     for column in ("settlement_date", "maturity_payment_date"):
         closed = [day for day in pd.to_datetime(issues[column]) if not is_fedwire_business_day(day)]
         if closed:
             raise SystemExit(f"{column} falls on a day Fedwire is closed: {closed[:3]}")
-    opening = build_opening(run_dir)
-    issues = name_reopened_opening_securities(issues, opening)
     manifest = json.loads((run_dir / RUN_MANIFEST).read_text(encoding="utf-8"))
     scenario_id = (manifest.get("scenario") or {}).get("scenario_id")
     if not scenario_id:
