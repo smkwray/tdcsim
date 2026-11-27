@@ -664,7 +664,7 @@ def _fed_stock_at(bond_portfolio, anchor, reference_cpi):
     return float(face.where(~tips, adjusted)[~paid].sum())
 
 
-def _fed_year_end_trade(bond_portfolio, current, anchor, anchor_stock, anchor_cpi, current_cpi):
+def _fed_year_end_trade(bond_portfolio, current, anchor, anchor_stock, anchor_cpi, current_cpi, tolerance):
     """The stock the Fed buys (positive) or sells (negative) today so that its stock at the close of
     ``anchor``, with no trades between, is ``anchor_stock``.
 
@@ -699,12 +699,19 @@ def _fed_year_end_trade(bond_portfolio, current, anchor, anchor_stock, anchor_cp
         return moved
 
     trade = anchor_stock - base
+    best = None
     for _ in range(8):
         miss = anchor_stock - (base + at_anchor(trade))
         if abs(miss) <= 1e-10:
             return trade
+        if best is None or abs(miss) < abs(best[1]):
+            best = (trade, miss)
         trade += miss
-    raise RuntimeError(f'the Fed cannot size its trade for the fiscal-year end {anchor.date()}: miss {miss!r}')
+    # Trades below the transfer floor are not made, so a residual that small cannot be closed;
+    # it is accepted when it lies within the stock tolerance the run holds the Fed to.
+    if abs(best[1]) <= tolerance:
+        return best[0]
+    raise RuntimeError(f'the Fed cannot size its trade for the fiscal-year end {anchor.date()}: miss {best[1]!r}')
 
 
 def _new_fed_basis(lots):
@@ -6606,6 +6613,7 @@ def run_simulation(
                 cbo_fed_holdings_target = current_cb_after_issuance + _fed_year_end_trade(
                     bond_portfolio, current_date, fed_year_end, float(fed_year_end_row['cbo_fed_holdings_target_bil']),
                     cbo_reference_cpi_lookup.get(fed_year_end, current_ref_cpi), current_ref_cpi,
+                    float(funding_rule_cfg.get('target_tolerance_bil', 0.000001) or 0.000001),
                 )
                 results.loc[current_date, 'CBOFedHoldingsTarget'] = cbo_fed_holdings_target
             fed_purchase_shortfall = cbo_fed_holdings_target - current_cb_after_issuance

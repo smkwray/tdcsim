@@ -340,13 +340,21 @@ def test_the_year_end_trade_allows_for_the_tips_it_buys_or_sells():
     book = _portfolio([tips(1, "Private", 50.0), tips(2, "CB", 10.0)])
     base = _fed_stock_at(book, year_end, 340.02)
     for wanted in (base + 0.1, base - 0.1):  # a purchase and a sale of TIPS
-        trade = _fed_year_end_trade(book, friday, year_end, wanted, 340.02, 340.0)
+        trade = _fed_year_end_trade(book, friday, year_end, wanted, 340.02, 340.0, 1e-6)
         naive = wanted - base
         assert abs(naive * 340.02 / 340.0 - naive) == pytest.approx(0.1 * 0.02 / 340.0, rel=1e-6)  # the audit's 5.9e-6
         if trade > 0:
             allocations, _ = _purchase_issue_allocations(_purchase_issues(book, friday), trade)
             assert sum(allocations.values()) == pytest.approx(trade)
         assert base + trade * 340.02 / 340.0 == pytest.approx(wanted, abs=1e-10)
+    # The audit's case: a year end 4e-10 above or below the stock the book reaches without trading
+    # needs a trade below the transfer floor, which is never made; the residual lies within the
+    # run's stock tolerance, so positioning accepts it instead of stopping the run.
+    for wanted in (base + 4e-10, base - 4e-10):
+        trade = _fed_year_end_trade(book, friday, year_end, wanted, 340.02, 340.0, 1e-6)
+        assert abs(trade) < 1e-9 and abs(base + trade - wanted) <= 1e-6
+    with pytest.raises(RuntimeError, match="cannot size its trade"):
+        _fed_year_end_trade(book, friday, year_end, base + 4e-10, 340.02, 340.0, 1e-10)
 
 
 
