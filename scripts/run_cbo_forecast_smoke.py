@@ -70,6 +70,7 @@ from forecast_bundle_builders import (
     build_operating_cash_path_rows,
     build_primary_deficit_path_rows,
     calculate_public_debt_bridge_components,
+    opening_cbo_public_debt_bil,
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
@@ -414,9 +415,10 @@ def build_forecast_bundle(
         scenario_id=SCENARIO_ID,
         periods=periods,
         opening_state_date=OPENING_STATE_DATE,
-        opening_cbo_federal_debt_held_public_bil=(
-            OPENING_CBO_FEDERAL_DEBT_HELD_PUBLIC_BIL
-            + opening_portfolio_metadata["opening_rollforward_debt_base_delta_bil"]
+        opening_cbo_federal_debt_held_public_bil=opening_cbo_public_debt_bil(
+            _portfolio_total_debt_base(initial_portfolio),
+            bridge["public_nonmarketable_treasury_bil"],
+            bridge["non_treasury_and_definition_residual_bil"],
         ),
         cbo_fy_end_public_debt_targets_bil={
             int(row["fiscal_year"]): float(row["debt_held_public_end_bil"])
@@ -802,6 +804,8 @@ def build_manifest(
                 "debt_held_public_end_bil": float(fy2026["debt_held_public_end_bil"]),
             },
             "current_fy_splice": {
+                "source_status": current_fy_splice["source_status"],
+                "claim_boundary": current_fy_splice["claim_boundary"],
                 "actual_total_deficit_fytd_bil": float(current_fy_splice["actual_total_deficit_fytd_bil"]),
                 "actual_net_interest_fytd_bil": float(current_fy_splice["actual_net_interest_fytd_bil"]),
                 "actual_primary_deficit_fytd_bil": float(

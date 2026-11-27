@@ -124,5 +124,6 @@ def build_opening_fy_splice(
         mts_table_9_selector=MTS_NET_INTEREST_SELECTOR,
         observation_date=OPENING_CLOSE_DATE,
         available_date=ACTUALS_AVAILABLE_AS_OF,
-        source_status="may_mts_fytd_and_june_dts_cash_flows_spliced_to_cbo_full_year_primary_deficit",
+        source_status="may_mts_fytd_plus_june_dts_cash_proxy_spliced_to_cbo_full_year_primary_deficit",
+        claim_boundary="june_stub_is_a_dts_cash_proxy_tga_residual_tests_only_the_cash_identity",
     )

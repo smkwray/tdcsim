@@ -24,6 +24,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from forecast_bundle_builders import opening_cbo_public_debt_bil  # noqa: E402
 from forecast_input_builder import (  # noqa: E402
     BUDGET_WORKBOOK_SHA256,
     ECONOMIC_WORKBOOK_SHA256,
@@ -1273,9 +1274,12 @@ def _verify_debt_stock_path(root: Path, manifest: Mapping[str, Any]) -> dict[str
         debt_bridge = manifest.get("source_values", {}).get("debt_bridge", {})
         if not isinstance(debt_bridge, Mapping):
             raise ValueError("manifest source_values.debt_bridge must be populated")
-        opening_public_target = _manifest_float(debt_bridge, "treasury_public_debt_bil") + _manifest_float(
-            debt_bridge,
-            "non_treasury_and_definition_residual_bil",
+        portfolio = _read_csv_dicts(root / "forecast_inputs" / "tdcsim_opening_portfolio.csv")
+        marketable = sum(map(_opening_debt_base, portfolio))
+        opening_public_target = opening_cbo_public_debt_bil(
+            marketable,
+            _manifest_float(debt_bridge, "public_nonmarketable_treasury_bil"),
+            _manifest_float(debt_bridge, "non_treasury_and_definition_residual_bil"),
         )
         anchor_points.append((opening_date, opening_public_target))
     for row, parsed_date in zip(rows, parsed_dates):

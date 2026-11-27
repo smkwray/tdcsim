@@ -229,3 +229,36 @@ def test_worktree_builds_record_the_same_portable_paths(tmp_path: Path, monkeypa
     assert smoke._portable_path(sibling) == "other/data/x.csv"
     assert smoke._portable_path(main / "data" / "inputs.json") == "data/inputs.json"
     assert smoke._portable_path(worktree / "scripts" / "run.py") == "scripts/run.py"
+
+
+def test_debt_verifier_reconstructs_first_period_end_from_rolled_opening(tmp_path: Path) -> None:
+    from forecast_bundle_builders import build_debt_stock_path_rows, opening_cbo_public_debt_bil
+    from simulation_calendar import build_simulation_calendar
+    from scripts.verify_cbo_forecast_package import _verify_debt_stock_path
+
+    inputs = tmp_path / "forecast_inputs"
+    _write_rows(inputs / "tdcsim_opening_portfolio.csv", [
+        {"SecurityType": "Fixed", "FaceValue": 100, "AdjustedPrincipal": 0},
+        {"SecurityType": "TIPS", "FaceValue": 10, "AdjustedPrincipal": 20},
+    ])
+    _write_rows(inputs / "tdcsim_cbo_fiscal_baseline.csv", [
+        {"fiscal_year": 2026, "debt_held_public_end_bil": 221},
+    ])
+    nonmarketable, residual = 4, -3
+    periods = build_simulation_calendar("2026-06-21", "2026-09-30", "daily")
+    rows = build_debt_stock_path_rows(
+        scenario_id="cbo_full_horizon_local_smoke_3m", periods=periods,
+        opening_state_date="2026-06-21",
+        opening_cbo_federal_debt_held_public_bil=opening_cbo_public_debt_bil(120, nonmarketable, residual),
+        cbo_fy_end_public_debt_targets_bil={2026: 221},
+        public_nonmarketable_treasury_bil=nonmarketable, non_treasury_and_definition_residual_bil=residual,
+        observation_date="2026-06-18", available_date="2026-06-22",
+    )
+    assert rows[0]["period_end"] == "2026-06-22"
+    assert rows[0]["cbo_federal_debt_held_public_target_bil"] == pytest.approx(121 + 100 / 101)
+    _write_rows(inputs / "tdcsim_debt_stock_path.csv", rows)
+    _verify_debt_stock_path(tmp_path, {"date_range": {"simulation_start_date": "2026-06-21"}, "source_values": {
+        "row_counts": {"period_rows": len(rows)},
+        "debt_bridge": {"treasury_public_debt_bil": 104, "public_nonmarketable_treasury_bil": nonmarketable,
+                        "non_treasury_and_definition_residual_bil": residual},
+    }})

@@ -226,6 +226,11 @@ def build_current_fy_splice_row_from_fiscaldata(
     )
 
 
+def opening_cbo_public_debt_bil(marketable: float, nonmarketable: float, definition_residual: float) -> float:
+    """Bridge the opening marketable debt base to CBO's public debt definition."""
+    return marketable + nonmarketable + definition_residual
+
+
 def build_debt_stock_path_rows(
     *,
     scenario_id: str,
