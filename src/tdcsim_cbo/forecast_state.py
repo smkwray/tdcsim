@@ -13,6 +13,8 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from forecast_paths import FED_INCOME_PATH_FILE
+
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
 from .compiler import digest_input_tree, input_tree_hashes
@@ -22,6 +24,17 @@ from .runner import run_cbo_scenario
 
 class ForecastStateExportError(ValueError):
     """Raised when a forecast opening state cannot be exported safely."""
+
+
+# The Fed's closing balance sheet and deferred asset, carried into the next opening.
+FED_BALANCE_SHEET_STATE = {
+    "CB_ReserveBalances": "reserve_balances_bil",
+    "CB_ONRRPBalances": "on_rrp_bil",
+    "CB_MBSHoldings": "soma_mbs_bil",
+    "CB_Currency": "currency_bil",
+    "CB_EarningsRemittancesDue": "earnings_remittances_due_bil",
+    "CB_OtherLiabilitiesAndCapital": "other_liabilities_and_capital_bil",
+}
 
 
 @dataclass(frozen=True)
@@ -660,6 +673,14 @@ def _verified_closing_state(
             raise ForecastStateExportError("rollforward closing DebtHeld_CB must be numeric") from exc
         if not math.isfinite(reported_fed_holdings) or abs(reported_fed_holdings - fed_holdings) > tolerance:
             raise ForecastStateExportError("closing DebtHeld_CB does not match the final portfolio")
+    fed_balance_sheet = {}
+    for column, key in FED_BALANCE_SHEET_STATE.items():
+        if column not in closing.index:
+            raise ForecastStateExportError(f"rollforward results omit the Fed balance sheet: {column}")
+        value = float(closing[column])
+        if not math.isfinite(value):
+            raise ForecastStateExportError(f"rollforward closing {column} must be finite")
+        fed_balance_sheet[key] = value
     if sha256_file(source.results_path) != source.results_sha256:
         raise ForecastStateExportError("rollforward results changed while reading the closing state")
     if sha256_file(source.final_portfolio_path) != source.final_portfolio_sha256:
@@ -681,6 +702,7 @@ def _verified_closing_state(
             "holdings_basis": "face_except_tips_adjusted_principal",
             "relationship_status": "verified",
         },
+        "fed_balance_sheet": fed_balance_sheet,
         "source_run_manifest_sha256": source.manifest_sha256,
         "source_results_sha256": source.results_sha256,
         "source_final_portfolio_sha256": source.final_portfolio_sha256,
@@ -744,12 +766,56 @@ def _anchor_opening_controls(
         },
         holder_type="CB",
     )
+    fed_income = _anchor_fed_income_path(
+        inputs / FED_INCOME_PATH_FILE,
+        opening=opening,
+        tga=float(initial_values["tga"]),
+        balance_sheet=closing_state["fed_balance_sheet"],
+    )
     return {
         "schema_version": "tdcsim_cbo_opening_control_adjustments_v1",
         "opening_state_date": state_window.opening_state_date,
         "operating_cash": cash_adjustment,
         "fed_holdings": fed_adjustment,
+        "fed_income": fed_income,
     }
+
+
+def _anchor_fed_income_path(
+    path: Path, *, opening: pd.Timestamp, tga: float, balance_sheet: Mapping[str, float]
+) -> dict[str, Any]:
+    """Open the Fed's balance sheet and deferred asset where the rollforward closed them."""
+
+    if not path.is_file():
+        raise ForecastStateExportError(f"opening control is missing: {path.name}")
+    frame = pd.read_csv(path)
+    ends = pd.to_datetime(frame["period_end"], errors="coerce").dt.normalize()
+    if ends.isna().any():
+        raise ForecastStateExportError(f"{path.name} contains malformed period_end values")
+    frame = frame.loc[ends.gt(opening)].copy()
+    if frame.empty or pd.Timestamp(frame["period_start"].iloc[0]).normalize() != opening:
+        raise ForecastStateExportError(f"{path.name} has no period starting at the opening state")
+    first = frame.iloc[0]
+    if abs(float(first["soma_mbs_start_bil"]) - balance_sheet["soma_mbs_bil"]) > 1e-6 or abs(
+        float(first["currency_start_bil"]) - balance_sheet["currency_bil"]
+    ) > 1e-6:
+        raise ForecastStateExportError(f"{path.name} paths do not continue from the closing Fed balance sheet")
+    anchors = {
+        "h41_as_of_date": opening.date().isoformat(),
+        "h41_reserve_balances_bil": balance_sheet["reserve_balances_bil"],
+        "h41_tga_bil": tga,
+        "h41_on_rrp_bil": balance_sheet["on_rrp_bil"],
+        "h41_soma_mbs_bil": balance_sheet["soma_mbs_bil"],
+        "h41_currency_bil": balance_sheet["currency_bil"],
+        "h41_earnings_remittances_due_bil": balance_sheet["earnings_remittances_due_bil"],
+        "h41_other_liabilities_and_capital_bil": balance_sheet["other_liabilities_and_capital_bil"],
+    }
+    original = {column: first[column] for column in anchors}
+    for column, value in anchors.items():
+        frame[column] = value
+    frame["source_status"] = "verified_rollforward_closing_fed_balance_sheet_anchor"
+    frame.to_csv(path, index=False)
+    return {"file": path.name, "action": "opened_at_closing_fed_balance_sheet", "source_opening": original}
 
 
 def _anchor_opening_control(
