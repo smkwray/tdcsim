@@ -9,7 +9,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from forecast_paths import CBO_FED_REMITTANCE_ROLE, FED_REMITTANCE_PATH_SCHEMA_VERSION, operating_cash_runtime_role
+from forecast_paths import (
+    CBO_FED_REMITTANCE_ROLE,
+    FED_INCOME_PATH_SCHEMA_VERSION,
+    FED_REMITTANCE_PATH_SCHEMA_VERSION,
+    operating_cash_runtime_role,
+)
 from simulation_calendar import SimulationPeriod, is_fedwire_business_day
 
 
@@ -48,6 +53,252 @@ def cbo_remittance_source_fixture() -> dict[str, Any]:
         },
         "published_totals_bil": {"2027-2031": "164.3", "2027-2036": "928.4"},
     }
+
+
+FED_INCOME_SOURCE_FILE = "fed/fed_income_sources.json"
+FED_INCOME_DOCUMENTS = {
+    "h41": "fed/h41_2026-06-18.htm",
+    "fomc_implementation_note": "fed/fomc_implementation_note_2026-06-17.htm",
+    "nyfed_soma_projection_data": "fed/nyfed_omo2025_projection_data.xlsx",
+    "nyfed_soma_annual_report": "fed/nyfed_omo2025_report.pdf",
+    "soma_agency_holdings": "fed/nyfed_soma_agency_holdings_2026-06-17.json",
+    "reserve_banks_financial_statements": "fed/reserve_banks_combined_financial_statements_2025.pdf",
+}
+FED_INCOME_CLAIM_BOUNDARY = "fed_income_lines_from_stated_sources_cash_basis_not_a_fed_forecast"
+DAYS_PER_YEAR = 365.25
+
+
+def fed_income_source_fixture() -> dict[str, Any]:
+    """Transcription of every Fed income and balance-sheet source, with each original's hash.
+
+    Money amounts are USD millions as published unless the key says otherwise.
+    """
+
+    return {
+        "schema_version": "tdcsim_fed_income_sources_v1",
+        "documents": {
+            "h41": {
+                "file": FED_INCOME_DOCUMENTS["h41"],
+                "url": "https://www.federalreserve.gov/releases/h41/20260618/",
+                "sha256": "519777d077d4806251238aa67d97cf3f476a07673f6c3d2f323f0e26823ee2a6",
+                "title": "H.4.1 Factors Affecting Reserve Balances, release of June 18, 2026",
+            },
+            "fomc_implementation_note": {
+                "file": FED_INCOME_DOCUMENTS["fomc_implementation_note"],
+                "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260617a1.htm",
+                "sha256": "2db878e0d9d82665c907fe1475bff29f68377622120b7fb8df497ee8aea49d34",
+                "title": "Implementation Note issued June 17, 2026",
+            },
+            "nyfed_soma_projection_data": {
+                "file": FED_INCOME_DOCUMENTS["nyfed_soma_projection_data"],
+                "url": "https://www.newyorkfed.org/medialibrary/media/markets/omo/omo2025-data.xlsx",
+                "sha256": "ccafeef7f0107caf74397593575e42defaf69a16f7dbee2736370da3876b7ce3",
+                "title": "Projections chart data for Open Market Operations during 2025 (released April 2026)",
+            },
+            "nyfed_soma_annual_report": {
+                "file": FED_INCOME_DOCUMENTS["nyfed_soma_annual_report"],
+                "url": "https://www.newyorkfed.org/medialibrary/media/markets/omo/omo2025-pdf.pdf",
+                "sha256": "0eb6a6990dfc05bf80542cd54ef89565f8b6351c4c7e7d5d4138a93dad08d600",
+                "title": "Open Market Operations during 2025, Federal Reserve Bank of New York",
+            },
+            "soma_agency_holdings": {
+                "file": FED_INCOME_DOCUMENTS["soma_agency_holdings"],
+                "url": "https://markets.newyorkfed.org/api/soma/agency/get/asof/2026-06-17.json",
+                "sha256": "970a0622ddb2fbf880ddfe77f4edb44d3e209090306ea0ee424ca27ce3be2df7",
+                "title": "SOMA agency holdings by CUSIP as of June 17, 2026",
+            },
+            "reserve_banks_financial_statements": {
+                "file": FED_INCOME_DOCUMENTS["reserve_banks_financial_statements"],
+                "url": "https://www.federalreserve.gov/aboutthefed/files/combinedfinstmt2025.pdf",
+                "sha256": "3989982bc83546f15747ac86e98b695be0894d2fbd8d829b3000f3a9dcfd1ada",
+                "title": "Federal Reserve Banks Combined Financial Statements, 2025 and 2024",
+            },
+        },
+        "h41_wednesday_levels_mil": {
+            "as_of_date": "2026-06-17",
+            "reserve_balances_with_federal_reserve_banks": "2936355",
+            "us_treasury_general_account": "956502",
+            "reverse_repurchase_agreements": "335625",
+            "reverse_repurchase_agreements_foreign_official": "328797",
+            "reverse_repurchase_agreements_others": "6828",
+            "federal_reserve_notes_net": "2419354",
+            "mortgage_backed_securities": "1964798",
+            "us_treasury_securities_held_outright": "4487319",
+            "other_liabilities_and_capital": "-181188",
+            "earnings_remittances_due_to_the_us_treasury": "-236697",
+            "tables": "table 1 Wednesday level (reserves, TGA, reverse repos, other liabilities and capital); "
+            "table 5 (notes, MBS, Treasury securities); table 6 Total (earnings remittances due)",
+        },
+        "administered_rates_pct": {
+            "effective_date": "2026-06-18",
+            "interest_on_reserve_balances": "3.65",
+            "overnight_reverse_repo_offering_rate": "3.5",
+            "federal_funds_target_range": "3.50-3.75",
+        },
+        "soma_agency_mbs": {
+            "as_of_date": "2026-06-17",
+            "current_face_mil": "1964797.733684066",
+            "weighted_average_coupon_pct": "2.4985508468642283",
+            "method": "current-face-weighted coupon of every MBS and CMBS CUSIP; the coupon is the percentage in "
+            "the security description",
+        },
+        "nyfed_soma_projection": {
+            "agency_mbs_year_end_bil": {
+                "2025": "2039", "2026": "1861", "2027": "1692", "2028": "1533", "2029": "1387",
+                "2030": "1249", "2031": "1112", "2032": "990", "2033": "877", "2034": "771", "2035": "677",
+            },
+            "soma_net_income_baseline_bil": {
+                "2026": "37.2", "2027": "63.9", "2028": "78.5", "2029": "96.5", "2030": "112",
+                "2031": "126.7", "2032": "139.8", "2033": "150.7", "2034": "161.4", "2035": "174.3",
+            },
+            "reserve_balances_year_end_bil": {
+                "2026": "3068", "2027": "3195", "2028": "3325", "2029": "3457", "2030": "3604",
+                "2031": "3748", "2032": "3897", "2033": "4053", "2034": "4216", "2035": "4385",
+            },
+            "liability_growth_pct": "4.0",
+            "liability_growth_rule": "Federal Reserve liabilities grow from December 2025 levels in line with "
+            "nominal GDP; long-run nominal GDP growth 4.0 percent (Appendix 4)",
+            "deferred_asset_extinguished": "early 2030",
+            "administered_rate_rule": "IORB 10 basis points below the top of the target range; ON RRP at the bottom",
+            "sheets": "Chart 27 (Agency MBS), Chart 28 (Baseline), Chart 25 (Baseline)",
+        },
+        "reserve_banks_2025_mil": {
+            "operating_expenses": "9800",
+            "dividends_on_capital_stock": "1688",
+            "other_income": {
+                "loans_to_depository_institutions_and_other_loans": "216",
+                "securities_purchased_under_agreements_to_resell": "70",
+                "gse_debt_securities": "129",
+                "foreign_currency_denominated_investments": "291",
+                "central_bank_liquidity_swaps": "4",
+                "treasury_securities_losses_net": "-42",
+                "mbs_losses_net": "-72",
+                "soma_other": "33",
+                "income_from_services": "542",
+                "reimbursable_services_to_government_agencies": "934",
+                "other_components_of_net_benefit_costs": "88",
+                "other": "80",
+                "consolidated_variable_interest_entities_net": "-14",
+            },
+            "excluded_valuation_items": {
+                "foreign_currency_translation_gains": "1572",
+                "other_comprehensive_loss": "-796",
+            },
+            "remittances_transferred_while_deferred_asset_grew": "6281",
+            "deferred_asset_year_end": "243481",
+            "statement": "Combined Statements of Operations and Note 12, year ended December 31, 2025",
+        },
+        "rules": {
+            "income_line_growth": "operating expenses, dividends and other income grow from their 2025 levels, "
+            "centered on 2025-07-02, at the NY Fed projection's 4.0 percent liability growth",
+            "currency": "Federal Reserve notes grow from the H.4.1 level at 4.0 percent a year",
+            "mbs_runoff": "H.4.1 MBS scaled by the NY Fed year-end path, log-linear between year ends; after "
+            "2035 the path keeps the 2034-2035 runoff rate",
+            "mbs_income": "weighted-average coupon on period-start current face, actual/365.25",
+            "short_rate": "the run's own nominal curve at 0.25 years; IORB and ON RRP keep their spreads to the "
+            "package curve's 0.25-year rate at the simulation start",
+            "bank_level_remittances": "dropped: the rule is system-level, so no remittance is paid while the "
+            "system deferred asset is positive",
+        },
+    }
+
+
+def _fed_growth(start: date, end: date, rate_pct: Decimal) -> float:
+    return float(1 + rate_pct / 100) ** ((end - start).days / DAYS_PER_YEAR)
+
+
+def _mbs_projection_level(day: date, year_end_bil: Mapping[str, str]) -> float:
+    import math
+
+    points = sorted((date(int(year), 12, 31), math.log(float(value))) for year, value in year_end_bil.items())
+    if day < points[0][0]:
+        raise ValueError("Fed MBS path starts after the requested date")
+    for (left_day, left), (right_day, right) in zip(points, points[1:]):
+        if day <= right_day:
+            weight = (day - left_day).days / (right_day - left_day).days
+            return math.exp(left + (right - left) * weight)
+    (left_day, left), (right_day, right) = points[-2], points[-1]
+    slope = (right - left) / (right_day - left_day).days
+    return math.exp(right + slope * (day - right_day).days)
+
+
+def build_fed_income_path_rows(
+    *,
+    scenario_id: str,
+    periods: Sequence[SimulationPeriod],
+    yield_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Daily Fed income lines and balance-sheet paths from the transcribed sources."""
+
+    source = fed_income_source_fixture()
+    h41 = source["h41_wednesday_levels_mil"]
+    as_of = date.fromisoformat(h41["as_of_date"])
+    projection = source["nyfed_soma_projection"]
+    growth = Decimal(projection["liability_growth_pct"])
+    banks = source["reserve_banks_2025_mil"]
+    base_day = date(2025, 7, 2)
+    other_income = sum(Decimal(value) for value in banks["other_income"].values()) / 1000
+    operating = Decimal(banks["operating_expenses"]) / 1000
+    dividends = Decimal(banks["dividends_on_capital_stock"]) / 1000
+    wac = float(source["soma_agency_mbs"]["weighted_average_coupon_pct"]) / 100
+    h41_mbs = float(Decimal(h41["mortgage_backed_securities"]) / 1000)
+    h41_currency = float(Decimal(h41["federal_reserve_notes_net"]) / 1000)
+    mbs_anchor = _mbs_projection_level(as_of, projection["agency_mbs_year_end_bil"])
+
+    def mbs(day: date) -> float:
+        return h41_mbs * _mbs_projection_level(day, projection["agency_mbs_year_end_bil"]) / mbs_anchor
+
+    def currency(day: date) -> float:
+        return h41_currency * _fed_growth(as_of, day, growth)
+
+    start = _as_date(periods[0].period_start)
+    curve_rows = [
+        row for row in yield_rows
+        if str(row["scenario_id"]) == scenario_id and _as_date(row["curve_date"]) <= start
+        and abs(float(row["tenor_years"]) - 0.25) < 1e-12
+    ]
+    if not curve_rows:
+        raise ValueError("the package curve has no 0.25-year rate at the simulation start")
+    opening_short = max(curve_rows, key=lambda row: _as_date(row["curve_date"]))["nominal_rate"]
+    rates = source["administered_rates_pct"]
+    constants = {
+        "h41_as_of_date": as_of.isoformat(),
+        "h41_reserve_balances_bil": float(Decimal(h41["reserve_balances_with_federal_reserve_banks"]) / 1000),
+        "h41_tga_bil": float(Decimal(h41["us_treasury_general_account"]) / 1000),
+        "h41_on_rrp_bil": float(Decimal(h41["reverse_repurchase_agreements"]) / 1000),
+        "h41_soma_mbs_bil": h41_mbs,
+        "h41_currency_bil": h41_currency,
+        "h41_earnings_remittances_due_bil": float(Decimal(h41["earnings_remittances_due_to_the_us_treasury"]) / 1000),
+        "h41_other_liabilities_and_capital_bil": float(Decimal(h41["other_liabilities_and_capital"]) / 1000),
+        "short_rate_tenor_years": 0.25,
+        "iorb_spread_pct": float(Decimal(rates["interest_on_reserve_balances"]) - Decimal(str(opening_short))),
+        "on_rrp_spread_pct": float(Decimal(rates["overnight_reverse_repo_offering_rate"]) - Decimal(str(opening_short))),
+    }
+    rows = []
+    for period in periods:
+        first, last = _as_date(period.period_start), _as_date(period.period_end)
+        year_fraction = (last - first).days / DAYS_PER_YEAR
+        scale = _fed_growth(base_day, last, growth) * year_fraction
+        rows.append({
+            "schema_version": FED_INCOME_PATH_SCHEMA_VERSION,
+            "scenario_id": scenario_id,
+            "period_start": first.isoformat(),
+            "period_end": last.isoformat(),
+            "soma_mbs_start_bil": mbs(first),
+            "soma_mbs_end_bil": mbs(last),
+            "soma_mbs_interest_bil": wac * mbs(first) * year_fraction,
+            "currency_start_bil": currency(first),
+            "currency_end_bil": currency(last),
+            "other_income_bil": float(other_income) * scale,
+            "operating_expenses_bil": float(operating) * scale,
+            "dividends_bil": float(dividends) * scale,
+            **constants,
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_flow",
+            "source_status": "h41_nyfed_soma_projection_reserve_bank_2025_statements",
+            "claim_boundary": FED_INCOME_CLAIM_BOUNDARY,
+        })
+    return rows
 
 
 def read_dts_fed_earnings_rows(path: str | Path, fiscal_year: int) -> list[dict[str, str]]:

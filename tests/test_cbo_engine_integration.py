@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +27,8 @@ from forecast_bundle_builders import (
 from forecast_input_builder import write_forecast_rows_csv
 from forecast_paths import (
     CBO_FED_REMITTANCE_STATUS,
+    FED_INCOME_PATH_FILE,
+    FED_INCOME_PATH_SCHEMA_VERSION,
     FED_REMITTANCE_PATH_FILE,
     FED_REMITTANCE_PATH_SCHEMA_VERSION,
     load_cash_reconciliation_residual,
@@ -90,6 +91,74 @@ def _write_fixture_remittance_path(tmp_path, primary_rows, remittance_bil=0.0):
         }
         for row in primary_rows
     ])
+
+
+# A neutral Fed: a deferred asset no fixture can repay, so the TGA receives no remittance.
+# Routing fixtures give ON RRP up to 1,000,000 of capacity, which the balance sheet takes
+# out of reserves, so the neutral Fed opens with reserves that cover it.
+FIXTURE_FED_INCOME = {
+    "soma_mbs_bil": 0.0,
+    "soma_mbs_interest_bil": 0.0,
+    "currency_bil": 0.0,
+    "currency_growth_bil": 0.0,
+    "other_income_bil": 0.0,
+    "operating_expenses_bil": 0.0,
+    "dividends_bil": 0.0,
+    "h41_reserve_balances_bil": 2_000_000.0,
+    "h41_tga_bil": 0.0,
+    "h41_on_rrp_bil": 0.0,
+    "h41_earnings_remittances_due_bil": -1_000_000_000.0,
+    "h41_other_liabilities_and_capital_bil": 0.0,
+    "iorb_spread_pct": 0.1,
+    "on_rrp_spread_pct": -0.05,
+}
+
+
+def fixture_fed_income_rows(primary_rows, **overrides) -> list[dict[str, object]]:
+    """Fed income path rows for fixture periods; amounts per period, currency growing linearly."""
+
+    values = {**FIXTURE_FED_INCOME, **overrides}
+    unknown = set(values) - set(FIXTURE_FED_INCOME)
+    if unknown:
+        raise KeyError(f"unknown Fed income fixture keys: {sorted(unknown)}")
+    rows = []
+    currency = values["currency_bil"]
+    for row in primary_rows:
+        rows.append({
+            "schema_version": FED_INCOME_PATH_SCHEMA_VERSION,
+            "scenario_id": row["scenario_id"],
+            "period_start": row["period_start"],
+            "period_end": row["period_end"],
+            "soma_mbs_start_bil": values["soma_mbs_bil"],
+            "soma_mbs_end_bil": values["soma_mbs_bil"],
+            "soma_mbs_interest_bil": values["soma_mbs_interest_bil"],
+            "currency_start_bil": currency,
+            "currency_end_bil": currency + values["currency_growth_bil"],
+            "other_income_bil": values["other_income_bil"],
+            "operating_expenses_bil": values["operating_expenses_bil"],
+            "dividends_bil": values["dividends_bil"],
+            "h41_as_of_date": "2026-06-17",
+            "h41_reserve_balances_bil": values["h41_reserve_balances_bil"],
+            "h41_tga_bil": values["h41_tga_bil"],
+            "h41_on_rrp_bil": values["h41_on_rrp_bil"],
+            "h41_soma_mbs_bil": values["soma_mbs_bil"],
+            "h41_currency_bil": values["currency_bil"],
+            "h41_earnings_remittances_due_bil": values["h41_earnings_remittances_due_bil"],
+            "h41_other_liabilities_and_capital_bil": values["h41_other_liabilities_and_capital_bil"],
+            "short_rate_tenor_years": 0.25,
+            "iorb_spread_pct": values["iorb_spread_pct"],
+            "on_rrp_spread_pct": values["on_rrp_spread_pct"],
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_flow",
+            "source_status": "fixture",
+            "claim_boundary": "fixture",
+        })
+        currency += values["currency_growth_bil"]
+    return rows
+
+
+def _write_fixture_fed_income_path(tmp_path, primary_rows, **overrides) -> Path:
+    return _write_csv(tmp_path / FED_INCOME_PATH_FILE, fixture_fed_income_rows(primary_rows, **overrides))
 
 
 def _single_period(period_start: str = "2026-09-20", period_end: str = "2026-09-30") -> list[SimulationPeriod]:
@@ -348,6 +417,7 @@ def _build_temp_forecast_inputs(
     remittance_bil: float = 0.0,
     cbo_net_interest_bil: float = 120.0,
     later_fiscal_years: dict[int, tuple[float, float]] | None = None,
+    fed_income: dict[str, float] | None = None,
 ) -> dict[str, Path]:
     """``later_fiscal_years`` maps a fiscal year after 2026 to (debt target, primary flow)."""
     periods = periods or _single_period(period_start, period_end)
@@ -408,6 +478,7 @@ def _build_temp_forecast_inputs(
         "debt_stock_path_file": _write_csv(tmp_path / "tdcsim_debt_stock_path.csv", debt_rows),
         "primary_deficit_path_file": _write_csv(tmp_path / "tdcsim_primary_deficit_path.csv", primary_rows),
         "fed_remittance_path_file": _write_fixture_remittance_path(tmp_path, primary_rows, remittance_bil),
+        "fed_income_path_file": _write_fixture_fed_income_path(tmp_path, primary_rows, **(fed_income or {})),
         "operating_cash_path_file": _write_csv(tmp_path / "tdcsim_operating_cash_path.csv", operating_cash_rows),
         "cash_reconciliation_residual_file": _write_csv(
             tmp_path / "tdcsim_cash_reconciliation_residual.csv",
@@ -1545,37 +1616,6 @@ def test_operating_cash_target_and_residual_do_not_resize_required_face_issuance
     assert baseline["CBOCashReconciliationResidual"] != pytest.approx(
         cash_sensitivity["CBOCashReconciliationResidual"]
     )
-
-
-def test_fed_remittance_changes_fiscal_incidence_without_changing_financing(tmp_path: Path) -> None:
-    start, end = "2026-09-20", "2026-09-30"
-    periods = build_simulation_calendar(start, end, "daily")
-    runs = []
-    for remittance in (0.0, 2.338):
-        paths = _build_temp_forecast_inputs(
-            tmp_path / str(remittance), periods=periods, remittance_bil=remittance,
-        )
-        params = _minimal_engine_params(paths)
-        routing_path = Path(__file__).resolve().parents[1] / "trc_routing_open04_v2.json"
-        params["trc_routing"] = json.loads(routing_path.read_text(encoding="utf-8"))
-        results, _ = run_simulation(params, start, end, freq="D", scenario_name="baseline")
-        runs.append(results)
-    baseline, remitting = runs
-    assert remitting["CBORemittanceCashEffect"].sum() == pytest.approx(2.338)
-    assert remitting["TDC_Level"].iloc[-1] - baseline["TDC_Level"].iloc[-1] == pytest.approx(2.31462)
-    assert (
-        remitting.attrs["trc_results"]["TRC_Cumulative"].iloc[-1]
-        - baseline.attrs["trc_results"]["TRC_Cumulative"].iloc[-1]
-    ) == pytest.approx(2.338)
-    for column in ("PrimaryDeficit", "TGA", "NewDebtIssued", "AuctionProceeds", "TotalDebt_Agg"):
-        pd.testing.assert_series_equal(remitting[column], baseline[column], check_exact=True)
-    transfers = [
-        row for row in remitting.attrs["handoff_tables"]["tdcsim_accounting_journal"]
-        if row["leg_type"] == "central_bank_remittance"
-    ]
-    assert sum(row["treasury_cash_change_bil"] for row in transfers) == pytest.approx(2.338)
-    assert all(row["holder_sector"] == "Treasury" and row["counterparty_sector"] == "CB" for row in transfers)
-    assert all(row["deposit_change_bil"] == row["reserve_change_bil"] == 0.0 for row in transfers)
 
 
 def test_cbo_fed_holdings_path_uses_secondary_purchase_not_auction_share(tmp_path: Path) -> None:

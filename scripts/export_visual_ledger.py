@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import pandas as pd  # noqa: E402
 
+from fed_income import FED_INCOME_EXPORT_FLOWS, FED_INCOME_EXPORT_LEVELS  # noqa: E402
 from issuance_calibration import (  # noqa: E402
     CASH_MANAGEMENT_BILL_KIND,
     CASH_MANAGEMENT_BILL_WEEKS,
@@ -335,11 +336,25 @@ def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, iss
     return daily.reset_index().rename(columns={"Date": "date"})
 
 
+def build_fed_remittances(results: pd.DataFrame) -> pd.DataFrame:
+    """Daily modeled remittance to the TGA with the Fed income lines and balance sheet behind it."""
+
+    columns = {"CBORemittanceCashEffect": "fed_to_tga_bil", **FED_INCOME_EXPORT_FLOWS, **FED_INCOME_EXPORT_LEVELS}
+    missing = [column for column in columns if column not in results.columns]
+    if missing:
+        raise SystemExit(f"results lack Fed income columns {missing}")
+    frame = results[list(columns)].rename(columns=columns)
+    if frame.isna().any().any():
+        raise SystemExit("Fed remittance series has gaps")
+    return frame.reset_index().rename(columns={"Date": "date"})
+
+
 def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Daily net fiscal flow and its deposit, non-deposit and reserve incidence.
 
-    The active incidence policy splits the ordinary fiscal flow, equal to the
-    primary deficit plus Fed remittances, across the two recipient groups.
+    The active incidence policy splits the ordinary fiscal flow, equal to CBO's primary
+    deficit plus CBO's Table 4-3 Fed remittances (CBO counts them as receipts), across the
+    two recipient groups. The Fed-to-TGA remittance the run models is in fed_remittances.csv.
     """
 
     policies = pd.read_csv(run_dir / FISCAL_POLICY)
@@ -353,15 +368,18 @@ def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[
     trc = pd.read_csv(run_dir / TRC, parse_dates=["Date"]).set_index("Date")
     fiscal = pd.DataFrame(index=results.index)
     fiscal["primary_deficit"] = results["PrimaryDeficit"]
-    ordinary_fiscal_flow = results["PrimaryDeficit"] + results["CBORemittanceCashEffect"]
+    ordinary_fiscal_flow = results["PrimaryDeficit"] + results["CBOTable43RemittanceInFiscalFlow"]
     fiscal["fiscal_to_du"] = results["TDC_FiscalFlow"]
     fiscal["fiscal_to_rs"] = outside_share * ordinary_fiscal_flow
     fiscal["trc_fiscal_flow"] = trc["TRC_FiscalFlow"].reindex(results.index)
+    fiscal["cbo_table_4_3_remittance_bil"] = results["CBOTable43RemittanceInFiscalFlow"]
     if fiscal.isna().any().any():
         raise SystemExit("fiscal series has gaps")
     identity_gap = float((fiscal["fiscal_to_du"] + fiscal["fiscal_to_rs"] - ordinary_fiscal_flow).abs().max())
     if ordinary_fiscal_flow.isna().any() or identity_gap > TOLERANCE_BIL:
-        raise SystemExit(f"fiscal incidence does not add up to the primary deficit plus Fed remittances (gap {identity_gap})")
+        raise SystemExit(
+            f"fiscal incidence does not add up to the primary deficit plus Table 4-3 remittances (gap {identity_gap})"
+        )
     reserve_gap = float((fiscal["trc_fiscal_flow"] - ordinary_fiscal_flow).abs().max())
     if reserve_gap > TOLERANCE_BIL:
         raise SystemExit(f"TRC fiscal flow differs from the ordinary fiscal flow by {reserve_gap}")
@@ -472,14 +490,33 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   regular bill settlement). Its term is two weeks, with maturity rolling forward
   to the next securities business day if needed. Early settlements reopen each
   security's latest issue. `model_tranche_ids` lists the model's per-holder rows.
-- `fiscal.csv`: one row per day. `primary_deficit` is the net fiscal flow out of the TGA
-  including remittance revenue ({fiscal_note}). `fiscal_to_du` is the part landing in covered deposits (TDC_FiscalFlow);
-  `fiscal_to_rs` is the part settling outside covered deposits, here the reserve-settled share
-  of the run's fiscal incidence policy ({rs_share:.0%}; foreign and other shares are zero), so
-  the two sum to `primary_deficit` plus the Fed-to-TGA remittance every day. `trc_fiscal_flow` is the reserve effect
-  (TRC_FiscalFlow). Gross outlays and receipts are not modeled separately.
-- `fed_remittances.csv`: one row per day. `fed_to_tga_bil` is the transfer from the Fed to the
-  TGA on the fixed CBO path. It changes the TGA but has zero direct deposit and reserve effect.
+- `fiscal.csv`: one row per day. `primary_deficit` is CBO's primary deficit, which counts Fed
+  remittances as receipts ({fiscal_note}). `cbo_table_4_3_remittance_bil` is CBO's Table 4-3 Fed
+  remittance on the same daily weights. The ordinary fiscal flow paid to the public is
+  `primary_deficit` plus `cbo_table_4_3_remittance_bil`: `fiscal_to_du` is the part landing in
+  covered deposits (TDC_FiscalFlow) and `fiscal_to_rs` the part settling outside covered deposits,
+  here the reserve-settled share of the run's fiscal incidence policy ({rs_share:.0%}; foreign and
+  other shares are zero), so the two sum to that ordinary fiscal flow every day. `trc_fiscal_flow`
+  is its reserve effect (TRC_FiscalFlow). Gross outlays and receipts are not modeled separately.
+  The Table 4-3 remittance is never paid into the TGA; the TGA receives the modeled remittance in
+  `fed_remittances.csv`.
+- `fed_remittances.csv`: one row per day. `fed_to_tga_bil` is the remittance the run models and
+  pays from the Fed to the TGA: the Reserve Banks' net income, paid weekly on the first Fedwire
+  business day from each Wednesday once the deferred asset is repaid. It changes the TGA but has
+  zero direct deposit and reserve effect. The income lines are daily, cash basis:
+  `fed_treasury_interest_income_bil` (the sum of bill discount at maturity, coupons, floating-rate
+  interest, TIPS coupons and TIPS inflation compensation at maturity, as the run pays them),
+  `fed_mbs_income_bil` (coupon on the agency MBS runoff path), `fed_other_income_bil`, less
+  `fed_iorb_expense_bil` (IORB on reserve balances), `fed_on_rrp_expense_bil` (the ON RRP rate on all
+  reverse repos, foreign official included), `fed_operating_expenses_bil` and `fed_dividends_bil`;
+  they sum to `fed_net_income_bil`. Net income adds to `fed_earnings_remittances_due_bil`, the H.4.1
+  line of that name: negative values are the deferred asset (`fed_deferred_asset_bil`), positive
+  values are owed and paid on the next remittance day. The levels are end of day:
+  `fed_reserve_balances_bil` is the H.4.1 opening moved by the run's Treasury reserve effect,
+  currency growth, MBS runoff and the non-Treasury income lines; `fed_on_rrp_balances_bil`,
+  `fed_currency_bil`, `fed_mbs_holdings_bil` and `fed_other_liabilities_and_capital_bil` are the
+  other balance-sheet lines; `iorb_rate_pct` and `on_rrp_rate_pct` are the run's 3-month rate plus
+  their opening spreads.
 - `daily.csv`: one row per calendar day. `fedwire_open` marks the days cash can move: on the
   others nothing is paid, issued or settled, and fiscal flows are zero; a payment due then is
   made on the next open day at its contractual amount. Securities do not settle on Good
@@ -567,8 +604,7 @@ def main(argv: list[str] | None = None) -> int:
         "issues.csv": issues,
         "daily.csv": daily,
         "fiscal.csv": fiscal,
-        "fed_remittances.csv": results["CBORemittanceCashEffect"].rename("fed_to_tga_bil")
-        .reset_index().rename(columns={"Date": "date"}),
+        "fed_remittances.csv": build_fed_remittances(results),
     }
     for name, frame in outputs.items():
         frame.to_csv(args.out_dir / name, index=False, lineterminator="\n", date_format="%Y-%m-%d", float_format="%.9f")

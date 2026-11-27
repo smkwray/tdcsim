@@ -16,7 +16,13 @@ from forecast_bundle_builders import (
     build_primary_deficit_path_rows,
 )
 from sim_engine import run_simulation
-from test_cbo_engine_integration import _minimal_engine_params, _single_period, _write_csv, _write_fixture_remittance_path
+from test_cbo_engine_integration import (
+    _minimal_engine_params,
+    _single_period,
+    _write_csv,
+    _write_fixture_fed_income_path,
+    _write_fixture_remittance_path,
+)
 
 
 AUCTION_DATE = "2025-05-08"
@@ -55,6 +61,7 @@ def _auction_forecast_inputs(tmp_path: Path) -> dict[str, Path]:
             primary_rows,
         ),
         "fed_remittance_path_file": _write_fixture_remittance_path(tmp_path, primary_rows),
+        "fed_income_path_file": _write_fixture_fed_income_path(tmp_path, primary_rows),
         "operating_cash_path_file": _write_csv(
             tmp_path / "tdcsim_operating_cash_path.csv",
             build_operating_cash_path_rows(

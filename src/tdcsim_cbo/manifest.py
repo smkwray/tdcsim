@@ -318,7 +318,7 @@ def validation_from_boundary_checks(boundary_checks: Mapping[str, Any]) -> dict[
             "status": "pass" if boundary_checks.get("net_interest_role") == "diagnostic_nonbinding" else "fail",
         },
         {
-            "id": "exogenous_fed_remittance_modeled",
+            "id": "endogenous_fed_remittance_modeled",
             "status": "pass"
             if boundary_checks.get("remittance_role") == CBO_FED_REMITTANCE_ROLE
             else "fail",

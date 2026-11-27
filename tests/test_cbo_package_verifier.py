@@ -27,12 +27,30 @@ from tdc_shared import PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
     CBO_REMITTANCE_SOURCE_FILE,
+    FED_INCOME_SOURCE_FILE,
+    build_fed_income_path_rows,
     build_fed_remittance_path_rows,
     build_primary_deficit_path_rows,
     cbo_remittance_source_fixture,
+    fed_income_source_fixture,
     read_dts_fed_earnings,
 )
-from forecast_paths import CBO_FED_REMITTANCE_OPENING_STATUS, CBO_FED_REMITTANCE_STATUS, FED_REMITTANCE_PATH_FILE
+from fed_income import (
+    FED_INCOME_RESULT_COLUMNS,
+    INTEREST_EXPENSE_DAY_COUNT,
+    non_treasury_reserve_effect,
+    remittance_week,
+    settle_remittances,
+)
+from forecast_paths import (
+    CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
+    CBO_FED_REMITTANCE_OPENING_STATUS,
+    CBO_FED_REMITTANCE_ROLE,
+    CBO_FED_REMITTANCE_STATUS,
+    FED_INCOME_PATH_FILE,
+    FED_REMITTANCE_PATH_FILE,
+)
+from simulation_calendar import is_fedwire_business_day
 from forecast_input_builder import (
     build_cbo_fiscal_baseline_rows,
     build_cbo_macro_forecast_path_rows,
@@ -52,12 +70,17 @@ from test_issuance_rule import _fixture_auctions, _write_auctions
 RUN_ROWS = 3755
 BUDGET_WORKBOOK = PROJECT_ROOT_FOR_IMPORT.parent / "ratewall" / "data" / "raw" / "cbo" / "51118-2026-02-Budget-Projections.xlsx"
 ECONOMIC_WORKBOOK = PROJECT_ROOT_FOR_IMPORT.parent / "ratewall" / "data" / "raw" / "cbo" / "51135-2026-02-Economic-Projections.xlsx"
+FED_INCOME_SOURCES = PROJECT_ROOT_FOR_IMPORT / "data" / "fed_income_sources"
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _require_cbo_workbooks() -> None:
-    missing = [path for path in (BUDGET_WORKBOOK, ECONOMIC_WORKBOOK) if not path.is_file()]
+    missing = [path for path in (BUDGET_WORKBOOK, ECONOMIC_WORKBOOK) if not path.is_file()] + [
+        FED_INCOME_SOURCES / Path(document["file"]).name
+        for document in fed_income_source_fixture()["documents"].values()
+        if not (FED_INCOME_SOURCES / Path(document["file"]).name).is_file()
+    ]
     if missing:
         pytest.fail(
             "CBO package-verifier integration inputs are missing: "
@@ -127,6 +150,8 @@ RESULT_COLUMNS = [
     "CB_NetIncome",
     "CB_Remittance",
     "CB_DeferredAsset",
+    *FED_INCOME_RESULT_COLUMNS,
+    "Reserves",
     "CBONetInterestDiagnostic",
     "CBOTotalDeficitDiagnostic",
     "NetInterestDiagnosticStatus",
@@ -301,7 +326,8 @@ def test_cbo_package_verifier_rejects_remittance_overclaim_with_refreshed_hashes
     )
     _refresh_manifest_hashes(package)
 
-    with pytest.raises(ValueError, match="Fed remittance cash path differs from CB_Remittance"):
+    # The deferred asset forbids any remittance on the first day.
+    with pytest.raises(ValueError, match="CB_Remittance differs from its rebuild"):
         verify_package(package)
 
 
@@ -315,7 +341,7 @@ def test_cbo_package_verifier_requires_explicit_remittance_scope(tmp_path: Path)
         ({
             **boundary,
             "excluded_claims": [claim for claim in boundary["excluded_claims"]
-                                if claim != "does_not_model_fed_remittance_rate_response"],
+                                if claim != "does_not_model_fed_valuation_gains_and_losses"],
         }, "excluded_claims"),
     ]
     for invalid, field in invalid_boundaries:
@@ -497,7 +523,12 @@ def test_cbo_package_verifier_rejects_coherent_nominal_and_tips_yield_mutation(t
     _write_csv(frn_path, list(frn_rows[0]), frn_rows)
     _refresh_manifest_hashes(package)
 
-    with pytest.raises(ValueError, match="tdcsim_yield_curve_surface.csv row 1 nominal_rate|tdcsim_tips_real_yield_path.csv"):
+    # The Fed income path's IORB spread is set against this curve, so it catches the shift too.
+    with pytest.raises(
+        ValueError,
+        match="tdcsim_yield_curve_surface.csv row 1 nominal_rate|tdcsim_tips_real_yield_path.csv"
+        "|tdcsim_fed_income_path.csv row 1 iorb_spread_pct",
+    ):
         verify_package(package)
 
 
@@ -692,6 +723,7 @@ def _write_valid_package(package: Path) -> Path:
     source_package = _write_source_package(package)
     opening_manifest = _roll_fixture_opening_book(package)
     remittance_by_end = _write_fed_remittance_inputs(package)
+    fed_income = _write_fed_income_path(package)
     debt_rows = _read_csv(package / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
     run_summaries = {}
     run_rows = {}
@@ -699,9 +731,8 @@ def _write_valid_package(package: Path) -> Path:
     for run_id, run_dir in runs.items():
         rows = _result_rows(debt_rows, opening_cb_holdings=opening_cb_holdings)
         for row in rows:
-            remittance = remittance_by_end.get(row["Date"], 0.0)
-            row["CBORemittanceCashEffect"] = remittance
-            row["CB_Remittance"] = remittance
+            row["CBOTable43RemittanceInFiscalFlow"] = remittance_by_end.get(row["Date"], 0.0)
+        _apply_fed_income(rows, fed_income)
         run_rows[run_id] = rows
         _write_csv(package / run_dir / "results_compact.csv", RESULT_COLUMNS, rows)
         summary = _summary(rows)
@@ -807,7 +838,7 @@ def _claim_boundary() -> dict:
         "net_interest_role": "partial_interest_financing_diagnostic_only",
         "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
         "cash_role": "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path",
-        "remittance_role": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash",
+        "remittance_role": CBO_FED_REMITTANCE_ROLE,
         "excluded_claims": [
             "does_not_claim_exact_historical_replay",
             "does_not_claim_full_soma_transaction_replay",
@@ -816,9 +847,7 @@ def _claim_boundary() -> dict:
             "does_not_claim_receipts_outlays_decomposition",
             "does_not_use_cbo_net_interest_as_cash_or_issuance_plug",
             "does_not_claim_cbo_issuance_mix",
-            "does_not_model_fed_net_income",
-            "does_not_model_fed_deferred_asset",
-            "does_not_model_fed_remittance_rate_response",
+            *CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
         ],
     }
 
@@ -960,6 +989,66 @@ def _write_auxiliary_required_files(package: Path) -> None:
             _write_csv(path, ["col"], [{"col": "value"}])
         else:
             _write_json(path, {})
+
+
+def _write_fed_income_path(package: Path) -> list[dict]:
+    rows = build_fed_income_path_rows(
+        scenario_id="cbo_full_horizon_local_smoke_3m",
+        periods=build_simulation_calendar("2026-06-21", "2036-09-30", "daily"),
+        yield_rows=_read_csv(package / "forecast_inputs" / "tdcsim_yield_curve_surface.csv"),
+    )
+    _write_csv(package / "forecast_inputs" / FED_INCOME_PATH_FILE, list(rows[0]), rows)
+    return rows
+
+
+def _apply_fed_income(rows: list[dict], path: list[dict]) -> None:
+    """Fill the Fed columns the way the engine books them, for a Fed with no Treasury income."""
+
+    first = path[0]
+    reserves = first["h41_reserve_balances_bil"] - (float(rows[0]["TGA"]) - first["h41_tga_bil"]) + (
+        first["soma_mbs_start_bil"] - first["h41_soma_mbs_bil"]
+    ) - (first["currency_start_bil"] - first["h41_currency_bil"])
+    on_rrp = first["h41_on_rrp_bil"]
+    due = first["h41_earnings_remittances_due_bil"]
+    week = remittance_week(rows[0]["Date"])
+    short = 3.35
+    for index, row in enumerate(rows):
+        row.update({column: 0.0 for column in FED_INCOME_RESULT_COLUMNS if column != "CBOTable43RemittanceInFiscalFlow"})
+        row.update({"Reserves": 3_000.0, "CB_ShortRatePct": short, "CB_IORBRatePct": short + first["iorb_spread_pct"],
+                    "CB_ONRRPRatePct": short + first["on_rrp_spread_pct"], "CB_ONRRPBalances": on_rrp})
+        line = path[max(0, index - 1)]
+        if index == 0:
+            row.update({"CB_MBSHoldings": line["soma_mbs_start_bil"], "CB_Currency": line["currency_start_bil"],
+                        "CB_NetIncome": 0.0, "CB_Remittance": 0.0})
+        else:
+            accrual = 1.0 / INTEREST_EXPENSE_DAY_COUNT
+            iorb = row["CB_IORBRatePct"] / 100.0 * reserves * accrual
+            rrp = row["CB_ONRRPRatePct"] / 100.0 * on_rrp * accrual
+            net = line["soma_mbs_interest_bil"] + line["other_income_bil"] - iorb - rrp - line[
+                "operating_expenses_bil"] - line["dividends_bil"]
+            pay_day = is_fedwire_business_day(date.fromisoformat(row["Date"])) and remittance_week(row["Date"]) > week
+            if pay_day:
+                week = remittance_week(row["Date"])
+            due, paid = settle_remittances(due, net, pay_day)
+            reserves += non_treasury_reserve_effect(
+                mbs_start=line["soma_mbs_start_bil"], mbs_end=line["soma_mbs_end_bil"],
+                currency_start=line["currency_start_bil"], currency_end=line["currency_end_bil"],
+                mbs_income=line["soma_mbs_interest_bil"], other_income=line["other_income_bil"],
+                iorb_expense=iorb, on_rrp_expense=rrp, operating_expenses=line["operating_expenses_bil"],
+                dividends=line["dividends_bil"],
+            )
+            row.update({
+                "CB_MBSIncome": line["soma_mbs_interest_bil"], "CB_OtherIncome": line["other_income_bil"],
+                "CB_OperatingExpenses": line["operating_expenses_bil"], "CB_Dividends": line["dividends_bil"],
+                "CB_IORBExpense": iorb, "CB_ONRRPExpense": rrp, "CB_NetIncome": net, "CB_Remittance": paid,
+                "CB_MBSHoldings": line["soma_mbs_end_bil"], "CB_Currency": line["currency_end_bil"],
+            })
+        row.update({
+            "CB_ReserveBalances": reserves, "CB_EarningsRemittancesDue": due, "CB_DeferredAsset": max(0.0, -due),
+            "CB_OtherLiabilitiesAndCapital": first["h41_other_liabilities_and_capital_bil"] + due
+            - first["h41_earnings_remittances_due_bil"],
+            "CBORemittanceCashEffect": row["CB_Remittance"],
+        })
 
 
 def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:
@@ -1339,6 +1428,12 @@ def _write_source_package(package: Path) -> dict:
         columns=["record_date", *AUCTION_REQUIRED_COLUMNS, "cusip", *rollforward_fields],
     )
     _write_json(package / "sources" / CBO_REMITTANCE_SOURCE_FILE, cbo_remittance_source_fixture())
+    fed_sources = fed_income_source_fixture()
+    for document in fed_sources["documents"].values():
+        target = package / "sources" / document["file"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((FED_INCOME_SOURCES / Path(document["file"]).name).read_bytes())
+    _write_json(package / "sources" / FED_INCOME_SOURCE_FILE, fed_sources)
     for rel in (
         "opening/tdcsim_initial_portfolio_cohorts.csv",
         "opening/tdcsim_ratewall_input_manifest.json",
@@ -1355,6 +1450,8 @@ def _write_source_package(package: Path) -> dict:
         "treasury/debt_to_penny_public_debt_2026-05-29.csv",
         "treasury/base_curve_2026-06-16.json",
         CBO_REMITTANCE_SOURCE_FILE,
+        FED_INCOME_SOURCE_FILE,
+        *(document["file"] for document in fed_sources["documents"].values()),
     ):
         path = package / "sources" / rel
         source_entries[rel] = {

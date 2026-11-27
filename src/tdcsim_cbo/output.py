@@ -12,6 +12,7 @@ from typing import Any
 
 import pandas as pd
 
+from fed_income import FED_INCOME_RESULT_COLUMNS
 import holder_targets
 from tdc_shared import MMF_ADDED_TDC_COLUMNS, PRIVATE_SUBBUCKET_MMF, PRIVATE_SUBBUCKET_MMF_ADDED
 
@@ -76,6 +77,9 @@ SUMMARY_COLUMNS = [
     "CBORemittanceStatus",
     "CB_Remittance",
     "CB_DeferredAsset",
+    "CB_TreasuryInterestCashReceived",
+    "CB_NetIncome",
+    *FED_INCOME_RESULT_COLUMNS,
     "CBONetInterestDiagnostic",
     "CBOTotalDeficitDiagnostic",
     "CBONetInterestBridgeRows",

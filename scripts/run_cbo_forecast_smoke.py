@@ -63,6 +63,10 @@ from cbo_opening_actuals import (
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
     CBO_REMITTANCE_SOURCE_FILE,
+    FED_INCOME_DOCUMENTS,
+    FED_INCOME_SOURCE_FILE,
+    build_fed_income_path_rows,
+    fed_income_source_fixture,
     build_cash_reconciliation_residual_rows,
     MTS_TABLE_1_DEFICIT_SELECTOR,
     build_debt_stock_path_rows,
@@ -75,7 +79,13 @@ from forecast_bundle_builders import (
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
-from forecast_paths import CBO_FED_REMITTANCE_EXCLUDED_CLAIMS, CBO_FED_REMITTANCE_ROLE, FED_REMITTANCE_PATH_FILE
+from forecast_paths import (
+    CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
+    CBO_FED_REMITTANCE_ROLE,
+    FED_INCOME_PATH_FILE,
+    FED_REMITTANCE_PATH_FILE,
+)
+from fed_income import FED_INCOME_RESULT_COLUMNS
 from forecast_input_builder import (
     BUDGET_WORKBOOK_SHA256,
     ECONOMIC_WORKBOOK_SHA256,
@@ -130,6 +140,7 @@ DEFAULT_MSPD_TABLE_3_MARKET = (
 )
 DEFAULT_DEBT_OUTSTANDING = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "debt_outstanding.csv"
 DEFAULT_AUCTIONS_QUERY = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "auctions_query.csv"
+DEFAULT_FED_INCOME_SOURCES = PROJECT_ROOT / "data" / "fed_income_sources"
 
 SOURCE_PACKAGE_INPUTS = {
     "budget_workbook": "cbo/51118-2026-02-Budget-Projections.xlsx",
@@ -265,6 +276,8 @@ RESULT_COLUMNS = [
     "CB_NetIncome",
     "CB_Remittance",
     "CB_DeferredAsset",
+    *FED_INCOME_RESULT_COLUMNS,
+    "Reserves",
     "CBORemittanceStatus",
     "CBONetInterestDiagnostic",
     "CBOTotalDeficitDiagnostic",
@@ -314,6 +327,7 @@ def build_forecast_bundle(
     mts_table_9_net_interest: str | Path | None = None,
     debt_to_penny_public_debt: str | Path | None = None,
     treasury_base_curve: str | Path | None = None,
+    fed_income_sources: str | Path = DEFAULT_FED_INCOME_SOURCES,
     clean: bool = True,
 ) -> ForecastBundle:
     """Build source-backed forecast input CSVs and an exact local manifest."""
@@ -358,6 +372,7 @@ def build_forecast_bundle(
         debt_to_penny_public_debt=Path(debt_to_penny_public_debt) if debt_to_penny_public_debt else None,
         treasury_base_curve=Path(treasury_base_curve) if treasury_base_curve else None,
         base_curve_rows=base_curve_seed_rows,
+        fed_income_sources=Path(fed_income_sources),
     )
     packaged_sources = {name: out / "sources" / rel for name, rel in SOURCE_PACKAGE_INPUTS.items()}
     budget_path = packaged_sources["budget_workbook"]
@@ -475,6 +490,7 @@ def build_forecast_bundle(
         output_tenors=(1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0),
     )
     validate_yield_surface_rate_units(yield_rows)
+    fed_income_rows = build_fed_income_path_rows(scenario_id=SCENARIO_ID, periods=periods, yield_rows=yield_rows)
     frn_rate_rows = build_forward_frn_rate_path_rows(
         scenario_id=SCENARIO_ID,
         periods=periods,
@@ -510,6 +526,7 @@ def build_forecast_bundle(
     write_forecast_rows_csv(inputs / "tdcsim_debt_stock_path.csv", debt_rows)
     write_forecast_rows_csv(inputs / "tdcsim_primary_deficit_path.csv", primary_rows)
     write_forecast_rows_csv(inputs / FED_REMITTANCE_PATH_FILE, remittance_rows)
+    write_forecast_rows_csv(inputs / FED_INCOME_PATH_FILE, fed_income_rows)
     write_forecast_rows_csv(inputs / "tdcsim_operating_cash_path.csv", operating_cash_rows)
     write_forecast_rows_csv(inputs / "tdcsim_cash_reconciliation_residual.csv", zero_residual_rows)
     write_forecast_rows_csv(inputs / "tdcsim_macro_forecast_path.csv", macro_rows)
@@ -1715,6 +1732,7 @@ def _baseline_input_paths(inputs_dir: Path) -> dict[str, str]:
         "debt_stock_path_file": str(inputs_dir / "tdcsim_debt_stock_path.csv"),
         "primary_deficit_path_file": str(inputs_dir / "tdcsim_primary_deficit_path.csv"),
         "fed_remittance_path_file": str(inputs_dir / FED_REMITTANCE_PATH_FILE),
+        "fed_income_path_file": str(inputs_dir / FED_INCOME_PATH_FILE),
         "operating_cash_path_file": str(inputs_dir / "tdcsim_operating_cash_path.csv"),
         "cash_reconciliation_residual_file": str(inputs_dir / "tdcsim_cash_reconciliation_residual.csv"),
         "macro_forecast_path_file": str(inputs_dir / "tdcsim_macro_forecast_path.csv"),
@@ -1783,6 +1801,39 @@ def _frozen_base_curve_rows() -> list[dict[str, Any]]:
     ]
 
 
+def _package_fed_income_sources(
+    sources_dir: Path, source_dir: Path, source_entries: dict[str, dict[str, Any]]
+) -> None:
+    """Copy every Fed income source document, checking each against its transcribed hash."""
+
+    fixture = fed_income_source_fixture()
+    for key, document in fixture["documents"].items():
+        rel = document["file"]
+        source = source_dir / Path(rel).name
+        if not source.is_file():
+            raise FileNotFoundError(f"required Fed income source is missing: {rel} <- {source}")
+        if _sha256_file(source) != document["sha256"]:
+            raise ValueError(f"Fed income source {key} does not match its transcribed sha256")
+        target = sources_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        source_entries[rel] = {
+            "sha256": document["sha256"],
+            "bytes": target.stat().st_size,
+            "source_path": rel,
+            "origin_source_label": document["url"],
+        }
+    fixture_path = sources_dir / FED_INCOME_SOURCE_FILE
+    _write_json(fixture_path, fixture)
+    source_entries[FED_INCOME_SOURCE_FILE] = {
+        "sha256": _sha256_file(fixture_path),
+        "bytes": fixture_path.stat().st_size,
+        "source_path": FED_INCOME_SOURCE_FILE,
+        "origin_source_label": "fed_income_sources_transcription",
+    }
+
+
 def write_source_package(
     output_dir: Path,
     *,
@@ -1803,9 +1854,11 @@ def write_source_package(
     debt_to_penny_public_debt: Path | None,
     treasury_base_curve: Path | None,
     base_curve_rows: Sequence[Mapping[str, Any]],
+    fed_income_sources: Path,
 ) -> dict[str, Any]:
     sources_dir = output_dir / "sources"
     source_entries: dict[str, dict[str, Any]] = {}
+    _package_fed_income_sources(sources_dir, Path(fed_income_sources), source_entries)
     file_map = {
         "cbo/51118-2026-02-Budget-Projections.xlsx": budget_workbook,
         "cbo/51135-2026-02-Economic-Projections.xlsx": economic_workbook,
@@ -2334,6 +2387,10 @@ def resolve_source_package_inputs(source_package: str | Path) -> dict[str, Path]
         if expected_hash and actual_hash != expected_hash:
             raise ValueError(f"source package sha256 mismatch for {relative_path}")
         resolved[name] = path
+    for rel in FED_INCOME_DOCUMENTS.values():
+        if not isinstance(files.get(rel), Mapping) or not (sources_dir / rel).is_file():
+            raise ValueError(f"source package is missing required source file: {rel}")
+    resolved["fed_income_sources"] = sources_dir / "fed"
     return resolved
 
 
@@ -2412,6 +2469,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--debt-to-penny-public-debt")
     parser.add_argument("--treasury-base-curve")
     parser.add_argument(
+        "--fed-income-sources",
+        default=str(DEFAULT_FED_INCOME_SOURCES),
+        help="Directory holding the Fed income source documents named in the transcription.",
+    )
+    parser.add_argument(
         "--source-package",
         help="Resolve required source files from an extracted package root or sources/ directory.",
     )
@@ -2453,6 +2515,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "treasury_base_curve",
             Path(args.treasury_base_curve) if args.treasury_base_curve else None,
         ),
+        fed_income_sources=source_paths.get("fed_income_sources", Path(args.fed_income_sources)),
         clean=not args.no_clean,
     )
     if not args.build_inputs_only:

@@ -514,7 +514,7 @@ def test_fed_holdings_ramp_must_start_after_the_opening() -> None:
 def test_family_fed_interest_remittance_uses_cash_paid_and_fiscal_coverage():
     import pandas as pd
 
-    from tdcsim_cbo.scenario_family_export import _fed_interest_remittance_rows
+    from tdcsim_cbo.scenario_family_export import ScenarioFamilyExportError, _fed_interest_remittance_rows
 
     payments = pd.DataFrame({
         "holder_sector": ["CB", "CB", "CB", "Private", "CB", "CB"],
@@ -522,21 +522,32 @@ def test_family_fed_interest_remittance_uses_cash_paid_and_fiscal_coverage():
         "payment_type": ["fixed_coupon", "bill_discount", "tips_indexation", "fixed_coupon", "frn_interest", "tips_coupon"],
         "amount_bil": [5.0, 2.0, 4.0, 3.0, 7.0, 11.0],
     })
+    from fed_income import FED_INCOME_EXPORT_FLOWS, FED_INCOME_EXPORT_LEVELS
+
+    dates = ["2026-06-21", "2026-09-30", "2026-10-01"]
     results = pd.DataFrame(
-        {"CBORemittanceCashEffect": [0.0, 1.341, 8.6]}, index=["2026-06-21", "2026-09-30", "2026-10-01"]
+        {column: [0.0, 1.0, 2.0] for column in (*FED_INCOME_EXPORT_FLOWS, *FED_INCOME_EXPORT_LEVELS)}, index=dates
     )
+    # The TGA receives the modeled remittance; Table 4-3 is reported beside it, never mixed in.
+    results["CBORemittanceCashEffect"] = [0.0, 0.0, 8.6]
+    results["CBOTable43RemittanceInFiscalFlow"] = [0.0, 1.341, 0.03]
+    results["CB_DeferredAsset"] = [236.7, 230.0, 0.0]
     coverage = [
         {"coverage_start_exclusive": "2026-06-21", "coverage_end_inclusive": "2026-09-30"},
         {"coverage_start_exclusive": "2026-09-30", "coverage_end_inclusive": "2026-10-01"},
     ]
     rows = _fed_interest_remittance_rows(payments, results, coverage)
-    assert rows[0] == pytest.approx({
+    assert {key: rows[0][key] for key in list(rows[0])[:4]} == pytest.approx({
         "treasury_interest_paid_to_fed_bil": 7.0,
-        "fed_remittances_to_tga_bil": 1.341,
-        "treasury_interest_less_fed_remittances_bil": 5.659,
+        "fed_remittances_to_tga_bil": 0.0,
+        "treasury_interest_less_fed_remittances_bil": 7.0,
+        "cbo_table_4_3_remittance_in_fiscal_flow_bil": 1.341,
     })
-    assert rows[1] == pytest.approx({
-        "treasury_interest_paid_to_fed_bil": 7.0,
-        "fed_remittances_to_tga_bil": 8.6,
-        "treasury_interest_less_fed_remittances_bil": -1.6,
-    })
+    assert rows[0]["fed_net_income_bil"] == 1.0
+    assert rows[0]["fed_deferred_asset_end_bil"] == 230.0
+    assert rows[0]["iorb_rate_end_pct"] == 1.0
+    assert rows[1]["fed_remittances_to_tga_bil"] == pytest.approx(8.6)
+    assert rows[1]["treasury_interest_less_fed_remittances_bil"] == pytest.approx(-1.6)
+    assert rows[1]["fed_deferred_asset_end_bil"] == 0.0
+    with pytest.raises(ScenarioFamilyExportError, match="lack Fed income columns"):
+        _fed_interest_remittance_rows(payments, results.drop(columns="CB_IORBExpense"), coverage)

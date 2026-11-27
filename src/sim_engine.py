@@ -92,6 +92,7 @@ from forecast_paths import (
     load_debt_stock_path,
     load_fiscal_incidence_policy,
     load_fed_holdings_path,
+    load_fed_income_path,
     load_fed_remittance_path,
     load_frn_rate_path,
     load_yield_curve_surface as load_forecast_yield_curve_surface,
@@ -102,6 +103,16 @@ from forecast_paths import (
     load_tips_cpi_path,
     load_tips_real_yield_path,
     resolve_baseline_input_paths,
+)
+from fed_income import (
+    FED_INCOME_RESULT_COLUMNS,
+    INTEREST_EXPENSE_DAY_COUNT,
+    TREASURY_INCOME_COLUMNS,
+    FedIncomeError,
+    FedOpeningBalanceSheet,
+    non_treasury_reserve_effect,
+    remittance_week,
+    settle_remittances,
 )
 from funding_plan import (
     calculate_pre_issuance_controlled_debt,
@@ -304,6 +315,7 @@ def _load_cbo_engine_inputs(params, scenario_name):
         'debt_stock_path_file': paths.debt_stock_path_file,
         'primary_deficit_path_file': paths.primary_deficit_path_file,
         'fed_remittance_path_file': paths.fed_remittance_path_file,
+        'fed_income_path_file': paths.fed_income_path_file,
         'operating_cash_path_file': paths.operating_cash_path_file,
         'cash_reconciliation_residual_file': paths.cash_reconciliation_residual_file,
         'fiscal_incidence_policy_file': paths.fiscal_incidence_policy_file,
@@ -323,6 +335,11 @@ def _load_cbo_engine_inputs(params, scenario_name):
     )
     fed_remittance = load_fed_remittance_path(
         paths.fed_remittance_path_file,
+        actuals_available_as_of=actuals_available_as_of,
+        allow_lookahead=allow_lookahead,
+    )
+    fed_income = load_fed_income_path(
+        paths.fed_income_path_file,
         actuals_available_as_of=actuals_available_as_of,
         allow_lookahead=allow_lookahead,
     )
@@ -405,6 +422,8 @@ def _load_cbo_engine_inputs(params, scenario_name):
         'debt_stock': debt_stock,
         'primary_deficit': primary_deficit,
         'fed_remittance': fed_remittance,
+        'fed_income': fed_income,
+        'fed_income_lookup': _cbo_period_lookup(fed_income),
         'operating_cash': operating_cash,
         'cash_residual': cash_residual,
         'fiscal_incidence': fiscal_incidence,
@@ -531,6 +550,21 @@ def _lookup_cbo_period_row(lookup, frame, scenario_id, period_start, period_end,
         if row is not None:
             return row
     return _cbo_period_row(frame, scenario_id, period_start, period_end, dataset_name)
+
+
+def _fed_income_row(cbo_inputs, scenario_id, period_start, period_end):
+    return _lookup_cbo_period_row(
+        cbo_inputs['fed_income_lookup'], cbo_inputs['fed_income'], scenario_id, period_start, period_end,
+        'Fed income path',
+    )
+
+
+def _fed_on_rrp_balance(trc_ledger, opening):
+    """ON RRP balances the Fed pays interest on: the run's routed balances, else the H.4.1 level."""
+
+    if trc_ledger is None:
+        return opening.on_rrp
+    return trc_ledger.balances['ONRRP_MMF'] + trc_ledger.balances['ForeignOfficialFedRRP']
 
 
 def _subtract_business_days(date_value, business_days):
@@ -3862,6 +3896,9 @@ def run_simulation(
             *OPERATING_CASH_RESULT_COLUMNS, 'FedRolloverCashSizingDifference', 'FedRolloverCashEstimateRevision',
         ):
             results[numeric_col] = 0.0
+    if cbo_funding_mode:
+        for numeric_col in FED_INCOME_RESULT_COLUMNS:
+            results[numeric_col] = 0.0
     for status_col in [
         'CBOFedStockMode',
         'CBOFedSettlementScope',
@@ -4275,6 +4312,33 @@ def run_simulation(
         results.loc[t0, 'CBOFedSettlementScope'] = 'not_applicable_opening_row'
         results.loc[t0, 'CBORemittanceStatus'] = CBO_FED_REMITTANCE_OPENING_STATUS
         results.loc[t0, 'CBORemittanceCashEffect'] = 0.0
+        fed_first_row = _fed_income_row(cbo_inputs, cbo_scenario_id, t0, dates[1])
+        fed_opening = FedOpeningBalanceSheet.from_row(fed_first_row)
+        fed_on_rrp = _fed_on_rrp_balance(trc_ledger, fed_opening)
+        fed_reserves = fed_opening.rolled_reserves(
+            tga=float(results.loc[t0, 'TGA']),
+            on_rrp=fed_on_rrp,
+            soma_mbs=float(fed_first_row['soma_mbs_start_bil']),
+            currency=float(fed_first_row['currency_start_bil']),
+        )
+        fed_due = fed_opening.earnings_remittances_due
+        fed_last_remittance_week = remittance_week(t0)
+        fed_short_tenor = float(fed_first_row['short_rate_tenor_years'])
+        fed_iorb_spread = float(fed_first_row['iorb_spread_pct'])
+        fed_on_rrp_spread = float(fed_first_row['on_rrp_spread_pct'])
+        fed_opening_short = 100.0 * float(evaluate_nominal_yield(
+            fed_short_tenor, current_yield_curve_years, current_yield_curve_rates,
+            method=yield_interpolation_method, floor_zero=yield_floor_zero, shock=evaluated_nominal_shock,
+        ))
+        results.loc[t0, 'CB_ShortRatePct'] = fed_opening_short
+        results.loc[t0, 'CB_IORBRatePct'] = fed_opening_short + fed_iorb_spread
+        results.loc[t0, 'CB_ONRRPRatePct'] = fed_opening_short + fed_on_rrp_spread
+        results.loc[t0, 'CB_ReserveBalances'] = fed_reserves
+        results.loc[t0, 'CB_ONRRPBalances'] = fed_on_rrp
+        results.loc[t0, 'CB_Currency'] = float(fed_first_row['currency_start_bil'])
+        results.loc[t0, 'CB_MBSHoldings'] = float(fed_first_row['soma_mbs_start_bil'])
+        results.loc[t0, 'CB_EarningsRemittancesDue'] = fed_due
+        results.loc[t0, 'CB_OtherLiabilitiesAndCapital'] = fed_opening.other_liabilities_and_capital
     if not bond_portfolio.empty:
         active_bonds_initial = bond_portfolio[bond_portfolio['Status'] == 'Active'].copy()
         active_bonds_initial['DebtBase'] = np.where(active_bonds_initial['SecurityType'] == 'TIPS', active_bonds_initial['AdjustedPrincipal'].fillna(active_bonds_initial['FaceValue']), active_bonds_initial['FaceValue'])
@@ -4332,11 +4396,9 @@ def run_simulation(
     results.loc[t0, ['PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative']] = 0.0
     results.loc[t0, ['ReserveChange', 'TDC_Change', 'TGAChange']] = 0.0
     results.loc[t0, 'CB_TreasuryInterestCashReceived'] = 0.0
+    results.loc[t0, ['CB_NetIncome', 'CB_Remittance']] = 0.0
     if cbo_funding_mode:
-        results.loc[t0, ['CB_NetIncome', 'CB_DeferredAsset']] = np.nan
-        results.loc[t0, 'CB_Remittance'] = 0.0
-    else:
-        results.loc[t0, ['CB_NetIncome', 'CB_Remittance']] = 0.0
+        results.loc[t0, 'CB_DeferredAsset'] = max(0.0, -fed_due)
     max_existing_id = 0
     if not bond_portfolio.empty and bond_portfolio['BondID'].notna().any():
         numeric_bond_ids = pd.to_numeric(bond_portfolio['BondID'], errors='coerce')
@@ -4763,8 +4825,9 @@ def run_simulation(
         results.loc[current_date, 'PrimaryDeficit'] = gov_spending_period - taxes_period
         fiscal_reserve_change = gov_spending_period - taxes_period
         if cbo_funding_mode:
-            # Remove Fed remittance revenue from ordinary fiscal settlement.
+            # CBO counts Table 4-3 remittances as receipts; the ordinary fiscal flow excludes them.
             fiscal_reserve_change += cbo_period_remittance
+            results.loc[current_date, 'CBOTable43RemittanceInFiscalFlow'] = cbo_period_remittance
             fiscal_deposit_change = (
                 fiscal_reserve_change * float(cbo_incidence['du_share'])
                 if cbo_incidence is not None
@@ -4778,9 +4841,9 @@ def run_simulation(
                 - taxes_period * float(du_share_taxes)
             )
         fiscal_tga_change = -fiscal_reserve_change
-        # The two CBO fiscal legs net to -P. Use the original P for financing
-        # to preserve cash needs and their threshold decisions at float precision.
-        net_fiscal_tga_change = -cbo_period_primary_deficit if cbo_funding_mode else fiscal_tga_change
+        # Under CBO funding the TGA pays P + R_CBO here and receives the run's own Fed
+        # remittance below, so a remittance different from Table 4-3 changes financing.
+        net_fiscal_tga_change = fiscal_tga_change
         reserve_change_period += fiscal_reserve_change
         if trc_ledger is not None:
             trc_ledger.record_public_cash('FiscalFlow', fiscal_reserve_change, 'covered_deposit_settled')
@@ -5237,10 +5300,54 @@ def run_simulation(
         )
         cb_treasury_interest_cash_received_period = interest_paid_by_holder.get('CB', 0.0)
         if cbo_funding_mode:
-            cb_net_income_period = np.nan
-            cb_remittance_period = cbo_period_remittance
-            current_deferred_asset = np.nan
+            fed_row = _fed_income_row(cbo_inputs, cbo_scenario_id, prev_date, current_date)
+            fed_treasury_income = {
+                'CB_BillDiscountIncome': bill_discount_interest_paid_by_holder.get('CB', 0.0),
+                'CB_CouponIncome': coupon_interest_paid_by_holder.get('CB', 0.0),
+                'CB_FRNIncome': frn_interest_paid_by_holder.get('CB', 0.0),
+                'CB_TIPSCouponIncome': tips_coupon_interest_paid_by_holder.get('CB', 0.0),
+                'CB_TIPSInflationCompensationIncome': tips_inflation_compensation_paid_by_holder.get('CB', 0.0),
+            }
+            fed_short = 100.0 * float(evaluate_nominal_yield(
+                fed_short_tenor, current_yield_curve_years, current_yield_curve_rates,
+                method=yield_interpolation_method, floor_zero=yield_floor_zero, shock=evaluated_nominal_shock,
+            ))
+            fed_iorb_rate = fed_short + fed_iorb_spread
+            fed_on_rrp_rate = fed_short + fed_on_rrp_spread
+            fed_accrual = (current_date - prev_date).days / INTEREST_EXPENSE_DAY_COUNT
+            fed_iorb_expense = fed_iorb_rate / 100.0 * fed_reserves * fed_accrual
+            fed_on_rrp_expense = fed_on_rrp_rate / 100.0 * fed_on_rrp * fed_accrual
+            fed_lines = {
+                'CB_MBSIncome': float(fed_row['soma_mbs_interest_bil']),
+                'CB_OtherIncome': float(fed_row['other_income_bil']),
+                'CB_IORBExpense': fed_iorb_expense,
+                'CB_ONRRPExpense': fed_on_rrp_expense,
+                'CB_OperatingExpenses': float(fed_row['operating_expenses_bil']),
+                'CB_Dividends': float(fed_row['dividends_bil']),
+            }
+            fed_treasury_total = sum(fed_treasury_income[column] for column in TREASURY_INCOME_COLUMNS)
+            cb_net_income_period = (
+                fed_treasury_total + fed_lines['CB_MBSIncome'] + fed_lines['CB_OtherIncome']
+                - fed_iorb_expense - fed_on_rrp_expense
+                - fed_lines['CB_OperatingExpenses'] - fed_lines['CB_Dividends']
+            )
+            fed_week = remittance_week(current_date)
+            fed_pay_day = is_fedwire_business_day(current_date) and fed_week > fed_last_remittance_week
+            if fed_pay_day:
+                fed_last_remittance_week = fed_week
+            fed_due, cb_remittance_period = settle_remittances(fed_due, cb_net_income_period, fed_pay_day)
+            current_deferred_asset = max(0.0, -fed_due)
             cb_remit_tga_change = cb_remittance_period
+            for column, value in (*fed_treasury_income.items(), *fed_lines.items()):
+                results.loc[current_date, column] = value
+            results.loc[current_date, 'CB_TreasuryInterestIncome'] = fed_treasury_total
+            results.loc[current_date, 'CB_ShortRatePct'] = fed_short
+            results.loc[current_date, 'CB_IORBRatePct'] = fed_iorb_rate
+            results.loc[current_date, 'CB_ONRRPRatePct'] = fed_on_rrp_rate
+            results.loc[current_date, 'CB_EarningsRemittancesDue'] = fed_due
+            results.loc[current_date, 'CB_OtherLiabilitiesAndCapital'] = (
+                fed_opening.other_liabilities_and_capital + fed_due - fed_opening.earnings_remittances_due
+            )
             results.loc[current_date, 'CBORemittanceStatus'] = CBO_FED_REMITTANCE_STATUS
         else:
             prev_deferred_asset = results.loc[prev_date, 'CB_DeferredAsset']
@@ -5262,8 +5369,7 @@ def run_simulation(
         results.loc[current_date, 'CB_DeferredAsset'] = current_deferred_asset
         if cbo_funding_mode:
             results.loc[current_date, 'CBORemittanceCashEffect'] = cb_remit_tga_change
-        else:
-            tga_change_period += cb_remit_tga_change
+        tga_change_period += cb_remit_tga_change
         _handoff_append_journal(
             handoff_tables,
             prev_date,
@@ -5280,8 +5386,7 @@ def run_simulation(
         )
         prev_tga = results.loc[prev_date, 'TGA']
         tga_change_before_issuance = net_fiscal_tga_change + debt_service_tga_change + (tga_inflow_secondary_mkt - tga_drain_secondary_mkt)
-        if not cbo_funding_mode:
-            tga_change_before_issuance += cb_remit_tga_change
+        tga_change_before_issuance += cb_remit_tga_change
         tga_change_before_issuance = tga_change_before_issuance + reserve_transfer + money_minting_transfers
         projected_tga_pre_issuance = prev_tga + tga_change_before_issuance
         funding_needed = max(0, tga_target - projected_tga_pre_issuance)
@@ -6910,6 +7015,7 @@ def run_simulation(
         results.loc[current_date, 'TDC_Level'] = current_deposits
         results.loc[current_date, 'TGA'] = current_tga
         results.loc[current_date, 'ReserveChange'] = adjusted_reserve_change_period
+        treasury_reserve_effect = adjusted_reserve_change_period
         if trc_ledger is not None:
             trc_rows.append(
                 trc_ledger.close_period(
@@ -6918,6 +7024,30 @@ def run_simulation(
                     legacy_reserves=current_reserves,
                 )
             )
+            treasury_reserve_effect = trc_rows[-1]['TRC_Change']
+        if cbo_funding_mode:
+            fed_reserves += treasury_reserve_effect + non_treasury_reserve_effect(
+                mbs_start=float(fed_row['soma_mbs_start_bil']),
+                mbs_end=float(fed_row['soma_mbs_end_bil']),
+                currency_start=float(fed_row['currency_start_bil']),
+                currency_end=float(fed_row['currency_end_bil']),
+                mbs_income=fed_lines['CB_MBSIncome'],
+                other_income=fed_lines['CB_OtherIncome'],
+                iorb_expense=fed_iorb_expense,
+                on_rrp_expense=fed_on_rrp_expense,
+                operating_expenses=fed_lines['CB_OperatingExpenses'],
+                dividends=fed_lines['CB_Dividends'],
+            )
+            if fed_reserves < 0.0:
+                raise FedIncomeError(
+                    f'reserve balances fell below zero at {current_date.date()}: {fed_reserves!r}'
+                )
+            fed_on_rrp = _fed_on_rrp_balance(trc_ledger, fed_opening)
+            results.loc[current_date, 'CB_TreasuryReserveEffect'] = treasury_reserve_effect
+            results.loc[current_date, 'CB_ReserveBalances'] = fed_reserves
+            results.loc[current_date, 'CB_ONRRPBalances'] = fed_on_rrp
+            results.loc[current_date, 'CB_Currency'] = float(fed_row['currency_end_bil'])
+            results.loc[current_date, 'CB_MBSHoldings'] = float(fed_row['soma_mbs_end_bil'])
         results.loc[current_date, 'TDC_Change'] = adjusted_deposit_change_period
         results.loc[current_date, 'TGAChange'] = current_tga - prev_tga
         results.loc[current_date, 'TDC_FiscalFlow'] = fiscal_deposit_change

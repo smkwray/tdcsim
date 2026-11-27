@@ -21,6 +21,7 @@ from typing import Any
 
 import pandas as pd
 
+from fed_income import FED_INCOME_EXPORT_FLOWS, FED_INCOME_EXPORT_LEVELS
 from holder_targets import PARTICIPANT_LABELS, STOCK_COLUMNS
 
 from .open04_campaign import OPEN04_AGGREGATION_CLOCK_ID
@@ -29,7 +30,7 @@ from .trc_fy import read_output_csv, sha256_path, trc_fiscal_year_rows
 
 FAMILY_FY_SCHEMA_VERSION = "tdcsim_scenario_family_fy_v1"
 FAMILY_RECEIPT_SCHEMA_VERSION = "tdcsim_scenario_family_receipt_v1"
-FED_INTEREST_REMITTANCE_SCHEMA_VERSION = "tdcsim_scenario_family_fed_interest_remittances_fy_v1"
+FED_INTEREST_REMITTANCE_SCHEMA_VERSION = "tdcsim_scenario_family_fed_interest_remittances_fy_v2"
 PAYMENT_AGGREGATES_FILE = "tdcsim_period_payment_aggregates.csv.gz"
 RUN_MANIFEST_FILE = "tdcsim_cbo_run_manifest.json"
 CURVE_SURFACE = Path("compile/compiled/forecast_inputs/tdcsim_yield_curve_surface.csv")
@@ -73,9 +74,16 @@ def _fed_interest_remittance_rows(
     ]
     payment_dates = pd.to_datetime(fed_payments["period_end"], errors="raise")
     result_dates = pd.to_datetime(results.index, errors="raise")
-    remittances = pd.to_numeric(results["CBORemittanceCashEffect"], errors="raise")
-    if not remittances.map(math.isfinite).all():
-        raise ScenarioFamilyExportError("Fed remittance cash contains missing or nonfinite values")
+    flows = {"CBORemittanceCashEffect": "fed_remittances_to_tga_bil",
+             "CBOTable43RemittanceInFiscalFlow": "cbo_table_4_3_remittance_in_fiscal_flow_bil",
+             **FED_INCOME_EXPORT_FLOWS}
+    missing = [column for column in (*flows, *FED_INCOME_EXPORT_LEVELS) if column not in results.columns]
+    if missing:
+        raise ScenarioFamilyExportError(f"results lack Fed income columns {missing}")
+    series = {column: pd.to_numeric(results[column], errors="raise") for column in (*flows, *FED_INCOME_EXPORT_LEVELS)}
+    if not all(values.map(math.isfinite).all() for values in series.values()):
+        raise ScenarioFamilyExportError("Fed remittance or income series contain missing or nonfinite values")
+    remittances = series["CBORemittanceCashEffect"]
     cash = pd.to_numeric(fed_payments["amount_bil"], errors="raise")
     if not cash.map(math.isfinite).all():
         raise ScenarioFamilyExportError("Treasury interest paid to the Fed contains missing or nonfinite values")
@@ -84,12 +92,22 @@ def _fed_interest_remittance_rows(
         start = pd.Timestamp(period["coverage_start_exclusive"])
         end = pd.Timestamp(period["coverage_end_inclusive"])
         interest = float(cash[(payment_dates > start) & (payment_dates <= end)].sum())
-        remitted = float(remittances[(result_dates > start) & (result_dates <= end)].sum())
-        rows.append({
+        window = (result_dates > start) & (result_dates <= end)
+        remitted = float(remittances[window].sum())
+        row = {
             "treasury_interest_paid_to_fed_bil": interest,
             "fed_remittances_to_tga_bil": remitted,
             "treasury_interest_less_fed_remittances_bil": interest - remitted,
+        }
+        row.update({name: float(series[column][window].sum()) for column, name in flows.items() if name not in row})
+        at_end = result_dates == end
+        if at_end.sum() != 1:
+            raise ScenarioFamilyExportError(f"results lack a unique {end.date()} period end")
+        row.update({
+            name.replace("_bil", "_end_bil").replace("_pct", "_end_pct"): float(series[column][at_end].iloc[0])
+            for column, name in FED_INCOME_EXPORT_LEVELS.items()
         })
+        rows.append(row)
     return rows
 
 

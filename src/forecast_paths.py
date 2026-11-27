@@ -26,12 +26,22 @@ OPERATING_CASH_OPENING_STATE_ROLE = "opening_state_anchor"
 OPERATING_CASH_COMPARISON_ROLE = "nonbinding_comparison_target"
 FED_REMITTANCE_PATH_FILE = "tdcsim_fed_remittance_path.csv"
 FED_REMITTANCE_PATH_SCHEMA_VERSION = "tdcsim_fed_remittance_path_v1"
-CBO_FED_REMITTANCE_ROLE = "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
-CBO_UNSUPPORTED_FED_COMPONENTS = ("fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response")
+FED_INCOME_PATH_FILE = "tdcsim_fed_income_path.csv"
+FED_INCOME_PATH_SCHEMA_VERSION = "tdcsim_fed_income_path_v1"
+# The Table 4-3 path stays in the ordinary fiscal flow (CBO counts remittances as receipts);
+# the TGA receives the run's own remittance, built from the Fed's income statement.
+CBO_FED_REMITTANCE_ROLE = "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
+CBO_UNSUPPORTED_FED_COMPONENTS = (
+    "fed_accrual_basis_income",
+    "fed_remunerated_other_deposits",
+    "fed_valuation_gains_and_losses",
+    "mbs_prepayment_rate_response",
+    "reserve_bank_level_remittances_under_system_deferred_asset",
+)
 CBO_FED_REMITTANCE_EXCLUDED_CLAIMS = tuple(
     f"does_not_model_{component}" for component in CBO_UNSUPPORTED_FED_COMPONENTS
 )
-CBO_FED_REMITTANCE_STATUS = "fixed_cbo_path_fed_to_tga_no_reserve_or_deposit_effect"
+CBO_FED_REMITTANCE_STATUS = "modeled_fed_net_income_deferred_asset_rule_fed_to_tga_no_reserve_or_deposit_effect"
 CBO_FED_REMITTANCE_OPENING_STATUS = "not_applicable_opening_row"
 
 ALLOWED_RUNTIME_ROLES = frozenset(
@@ -65,6 +75,7 @@ BASELINE_INPUT_PATH_KEYS = (
     "debt_stock_path_file",
     "primary_deficit_path_file",
     "fed_remittance_path_file",
+    "fed_income_path_file",
     "operating_cash_path_file",
     "cash_reconciliation_residual_file",
     "macro_forecast_path_file",
@@ -86,6 +97,7 @@ COMPILED_FORECAST_INPUT_FILES = {
     "debt_stock_path_file": "tdcsim_debt_stock_path.csv",
     "primary_deficit_path_file": "tdcsim_primary_deficit_path.csv",
     "fed_remittance_path_file": FED_REMITTANCE_PATH_FILE,
+    "fed_income_path_file": FED_INCOME_PATH_FILE,
     "operating_cash_path_file": "tdcsim_operating_cash_path.csv",
     "cash_reconciliation_residual_file": "tdcsim_cash_reconciliation_residual.csv",
     "macro_forecast_path_file": "tdcsim_macro_forecast_path.csv",
@@ -122,6 +134,7 @@ class BaselineInputPaths:
     debt_stock_path_file: Path | None = None
     primary_deficit_path_file: Path | None = None
     fed_remittance_path_file: Path | None = None
+    fed_income_path_file: Path | None = None
     operating_cash_path_file: Path | None = None
     cash_reconciliation_residual_file: Path | None = None
     macro_forecast_path_file: Path | None = None
@@ -450,6 +463,38 @@ HOLDER_ABSORPTION_PATH_COLUMNS = frozenset(
     }
 )
 
+FED_INCOME_PATH_COLUMNS = frozenset(
+    {
+        "schema_version",
+        "scenario_id",
+        "period_start",
+        "period_end",
+        "soma_mbs_start_bil",
+        "soma_mbs_end_bil",
+        "soma_mbs_interest_bil",
+        "currency_start_bil",
+        "currency_end_bil",
+        "other_income_bil",
+        "operating_expenses_bil",
+        "dividends_bil",
+        "h41_as_of_date",
+        "h41_reserve_balances_bil",
+        "h41_tga_bil",
+        "h41_on_rrp_bil",
+        "h41_soma_mbs_bil",
+        "h41_currency_bil",
+        "h41_earnings_remittances_due_bil",
+        "h41_other_liabilities_and_capital_bil",
+        "short_rate_tenor_years",
+        "iorb_spread_pct",
+        "on_rrp_spread_pct",
+        "source_role",
+        "runtime_role",
+        "source_status",
+        "claim_boundary",
+    }
+)
+
 FED_HOLDINGS_PATH_COLUMNS = frozenset(
     {
         "schema_version",
@@ -561,6 +606,7 @@ FORECAST_CSV_SCHEMAS = {
         }),
         ("scenario_id", "period_start", "period_end"),
     ),
+    "fed_income_path_file": ForecastCsvSchema(FED_INCOME_PATH_COLUMNS, ("scenario_id", "period_start", "period_end")),
     "operating_cash_path_file": ForecastCsvSchema(
         OPERATING_CASH_PATH_COLUMNS,
         ("scenario_id", "period_end"),
@@ -860,30 +906,164 @@ def load_fed_remittance_path(path: str | os.PathLike[str], **kwargs) -> pd.DataF
     return frame
 
 
-def verify_fed_remittance_cash(results: pd.DataFrame, path: str | os.PathLike[str]) -> float:
-    """Match each simulated period to its compiled remittance input."""
+def load_fed_income_path(path: str | os.PathLike[str], **kwargs) -> pd.DataFrame:
+    frame = load_forecast_csv(path, schema_key="fed_income_path_file", dataset_name="Fed income path", **kwargs)
+    if not frame["schema_version"].eq(FED_INCOME_PATH_SCHEMA_VERSION).all():
+        raise ValueError("Fed income path has an unsupported schema version")
+    if not (pd.to_datetime(frame["period_start"]) < pd.to_datetime(frame["period_end"])).all():
+        raise ValueError("Fed income path periods must start before they end")
+    nonnegative = (
+        "soma_mbs_start_bil", "soma_mbs_end_bil", "soma_mbs_interest_bil", "currency_start_bil",
+        "currency_end_bil", "operating_expenses_bil", "dividends_bil", "h41_reserve_balances_bil",
+        "h41_tga_bil", "h41_on_rrp_bil", "h41_soma_mbs_bil", "h41_currency_bil", "short_rate_tenor_years",
+    )
+    for column in nonnegative:
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if not ((values >= 0) & (values < float("inf"))).all():
+            raise ValueError(f"Fed income path has invalid {column} values")
+    constants = [column for column in frame.columns if column.startswith("h41_")] + [
+        "short_rate_tenor_years", "iorb_spread_pct", "on_rrp_spread_pct",
+    ]
+    if frame[constants].nunique(dropna=False).gt(1).any():
+        raise ValueError("Fed income path opening balance sheet and rate spreads must be constant")
+    return frame
 
-    rows = load_fed_remittance_path(path)
+
+def _period_frame(rows: pd.DataFrame, periods: pd.MultiIndex, dataset: str) -> pd.DataFrame:
     if rows["scenario_id"].nunique(dropna=False) != 1:
-        raise ValueError("compiled Fed remittance path must have exactly one scenario")
-    dates = pd.to_datetime(results["Date"], errors="raise")
+        raise ValueError(f"compiled {dataset} must have exactly one scenario")
+    frame = rows.set_index([pd.to_datetime(rows["period_start"]), pd.to_datetime(rows["period_end"])])
+    frame = frame.reindex(periods)
+    if frame["scenario_id"].isna().any():
+        raise ValueError(f"compiled {dataset} does not cover every simulated period")
+    return frame
+
+
+def _close(actual, expected, label: str, tolerance: float = 1e-6) -> None:
+    actual = pd.Series(actual, dtype=float).to_numpy()
+    expected = pd.Series(expected, dtype=float).to_numpy()
+    gap = abs(actual - expected)
+    scale = 1.0 + abs(expected)
+    if not (gap <= tolerance * scale).all():
+        worst = int(gap.argmax())
+        raise ValueError(f"{label} differs from its rebuild at row {worst}: {actual[worst]!r} != {expected[worst]!r}")
+
+
+def verify_fed_remittances(
+    results: pd.DataFrame,
+    remittance_path: str | os.PathLike[str],
+    fed_income_path: str | os.PathLike[str],
+    *,
+    trc_results: pd.DataFrame | None = None,
+) -> float:
+    """Rebuild Fed net income, the deferred asset and remittances from a run's outputs.
+
+    The Table 4-3 path must sit in the ordinary fiscal flow; the TGA must receive the
+    remittance that the deferred-asset rule pays from the run's own income lines,
+    reserve balances and ON RRP balances. Returns the largest remittance payment.
+    """
+
+    from simulation_calendar import is_fedwire_business_day
+
+    dates = pd.to_datetime(results["Date"], errors="raise").reset_index(drop=True)
     periods = pd.MultiIndex.from_arrays([dates.iloc[:-1], dates.iloc[1:]])
-    expected = rows.set_index(
-        [pd.to_datetime(rows["period_start"]), pd.to_datetime(rows["period_end"])]
-    )["remittance_bil"].reindex(periods)
-    cash = pd.to_numeric(results["CBORemittanceCashEffect"], errors="raise")
-    expected_cash = [0.0, *expected.to_numpy(dtype=float)]
-    if not ((cash - expected_cash).abs() <= 1e-9).all():
-        raise ValueError("Fed remittance cash path differs from compiled input")
+    out = {column: pd.to_numeric(results[column], errors="raise").reset_index(drop=True) for column in (
+        "TGA", "CBOTable43RemittanceInFiscalFlow", "CBORemittanceCashEffect", "CB_Remittance",
+        "CB_NetIncome", "CB_DeferredAsset", "CB_EarningsRemittancesDue", "CB_TreasuryInterestIncome",
+        "CB_BillDiscountIncome", "CB_CouponIncome", "CB_FRNIncome", "CB_TIPSCouponIncome",
+        "CB_TIPSInflationCompensationIncome", "CB_MBSIncome", "CB_OtherIncome", "CB_IORBExpense",
+        "CB_ONRRPExpense", "CB_OperatingExpenses", "CB_Dividends", "CB_ShortRatePct", "CB_IORBRatePct",
+        "CB_ONRRPRatePct", "CB_TreasuryReserveEffect", "CB_ReserveBalances", "CB_ONRRPBalances",
+        "CB_Currency", "CB_MBSHoldings", "CB_OtherLiabilitiesAndCapital",
+    )}
+    table43 = _period_frame(load_fed_remittance_path(remittance_path), periods, "Fed remittance path")
+    _close(out["CBOTable43RemittanceInFiscalFlow"], [0.0, *table43["remittance_bil"]], "Table 4-3 remittance in the fiscal flow")
     statuses = [CBO_FED_REMITTANCE_OPENING_STATUS, *[CBO_FED_REMITTANCE_STATUS] * len(periods)]
     if results["CBORemittanceStatus"].tolist() != statuses:
         raise ValueError("Fed remittance cash path has unexpected status")
-    if not ((pd.to_numeric(results["CB_Remittance"], errors="raise") - cash).abs() <= 1e-9).all():
-        raise ValueError("Fed remittance cash path differs from CB_Remittance")
-    for column in ("CB_NetIncome", "CB_DeferredAsset"):
-        if column in results and results[column].notna().any():
-            raise ValueError(f"{column} must remain unsupported in CBO mode")
-    return float(cash.abs().max())
+    path = _period_frame(load_fed_income_path(fed_income_path), periods, "Fed income path")
+    first = path.iloc[0]
+    for column, output in (
+        ("soma_mbs_interest_bil", "CB_MBSIncome"),
+        ("other_income_bil", "CB_OtherIncome"),
+        ("operating_expenses_bil", "CB_OperatingExpenses"),
+        ("dividends_bil", "CB_Dividends"),
+    ):
+        _close(out[output], [0.0, *path[column]], output)
+    _close(out["CB_MBSHoldings"], [first["soma_mbs_start_bil"], *path["soma_mbs_end_bil"]], "CB_MBSHoldings")
+    _close(out["CB_Currency"], [first["currency_start_bil"], *path["currency_end_bil"]], "CB_Currency")
+    _close(out["CB_IORBRatePct"], out["CB_ShortRatePct"] + float(first["iorb_spread_pct"]), "IORB rate")
+    _close(out["CB_ONRRPRatePct"], out["CB_ShortRatePct"] + float(first["on_rrp_spread_pct"]), "ON RRP rate")
+    if trc_results is not None:
+        trc = trc_results.assign(Date=pd.to_datetime(trc_results["Date"])).set_index("Date").reindex(dates)
+        if trc.isna().any().any():
+            raise ValueError("TRC results do not cover every simulated date")
+        _close(out["CB_TreasuryReserveEffect"].iloc[1:], trc["TRC_Change"].iloc[1:], "Treasury reserve effect")
+        on_rrp = trc["ONRRP_MMF"] + trc["ForeignOfficialFedRRP"]
+    else:
+        legacy = pd.to_numeric(results["Reserves"], errors="raise").reset_index(drop=True)
+        _close(out["CB_TreasuryReserveEffect"].iloc[1:], legacy.diff().iloc[1:], "Treasury reserve effect")
+        on_rrp = pd.Series(float(first["h41_on_rrp_bil"]), index=dates)
+    _close(out["CB_ONRRPBalances"], on_rrp.to_numpy(), "ON RRP balances")
+    treasury = sum(out[column] for column in (
+        "CB_BillDiscountIncome", "CB_CouponIncome", "CB_FRNIncome", "CB_TIPSCouponIncome",
+        "CB_TIPSInflationCompensationIncome",
+    ))
+    _close(out["CB_TreasuryInterestIncome"], treasury, "Treasury interest income")
+    reserves = (
+        float(first["h41_reserve_balances_bil"])
+        - (out["TGA"].iloc[0] - float(first["h41_tga_bil"]))
+        - (on_rrp.iloc[0] - float(first["h41_on_rrp_bil"]))
+        + (float(first["soma_mbs_start_bil"]) - float(first["h41_soma_mbs_bil"]))
+        - (float(first["currency_start_bil"]) - float(first["h41_currency_bil"]))
+    )
+    due = float(first["h41_earnings_remittances_due_bil"])
+    week = dates.iloc[0] - pd.Timedelta(days=(dates.iloc[0].weekday() - 2) % 7)
+    expected = {name: [value] for name, value in (
+        ("CB_ReserveBalances", reserves), ("CB_EarningsRemittancesDue", due), ("CB_NetIncome", 0.0),
+        ("CB_Remittance", 0.0), ("CB_IORBExpense", 0.0), ("CB_ONRRPExpense", 0.0),
+    )}
+    for i in range(1, len(dates)):
+        row = path.iloc[i - 1]
+        days = (dates.iloc[i] - dates.iloc[i - 1]).days
+        iorb_expense = out["CB_IORBRatePct"].iloc[i] / 100.0 * reserves * days / 360.0
+        rrp_expense = out["CB_ONRRPRatePct"].iloc[i] / 100.0 * on_rrp.iloc[i - 1] * days / 360.0
+        other = float(row["other_income_bil"])
+        mbs = float(row["soma_mbs_interest_bil"])
+        costs = float(row["operating_expenses_bil"]) + float(row["dividends_bil"])
+        net_income = treasury.iloc[i] + mbs + other - iorb_expense - rrp_expense - costs
+        day_week = dates.iloc[i] - pd.Timedelta(days=(dates.iloc[i].weekday() - 2) % 7)
+        pay_day = is_fedwire_business_day(dates.iloc[i].date()) and day_week > week
+        if pay_day:
+            week = day_week
+        due += net_income
+        paid = due if pay_day and due > 0.0 else 0.0
+        due -= paid
+        reserves += (
+            out["CB_TreasuryReserveEffect"].iloc[i]
+            + float(row["soma_mbs_end_bil"]) - float(row["soma_mbs_start_bil"])
+            - (float(row["currency_end_bil"]) - float(row["currency_start_bil"]))
+            - (mbs + other) + (iorb_expense + rrp_expense + costs)
+        )
+        for name, value in (
+            ("CB_ReserveBalances", reserves), ("CB_EarningsRemittancesDue", due), ("CB_NetIncome", net_income),
+            ("CB_Remittance", paid), ("CB_IORBExpense", iorb_expense), ("CB_ONRRPExpense", rrp_expense),
+        ):
+            expected[name].append(value)
+    for name, values in expected.items():
+        _close(out[name], values, name)
+    _close(out["CBORemittanceCashEffect"], expected["CB_Remittance"], "Fed-to-TGA remittance cash")
+    deferred = [max(0.0, -value) for value in expected["CB_EarningsRemittancesDue"]]
+    _close(out["CB_DeferredAsset"], deferred, "CB_DeferredAsset")
+    _close(
+        out["CB_OtherLiabilitiesAndCapital"],
+        [float(first["h41_other_liabilities_and_capital_bil"]) + value - float(first["h41_earnings_remittances_due_bil"])
+         for value in expected["CB_EarningsRemittancesDue"]],
+        "CB_OtherLiabilitiesAndCapital",
+    )
+    if min(expected["CB_ReserveBalances"]) < 0.0:
+        raise ValueError("rebuilt reserve balances fall below zero")
+    return float(max(expected["CB_Remittance"]))
 
 
 def load_operating_cash_path(path: str | os.PathLike[str], **kwargs) -> pd.DataFrame:
@@ -1051,6 +1231,7 @@ def load_baseline_input_paths(
         "debt_stock_path_file": load_debt_stock_path,
         "primary_deficit_path_file": load_primary_deficit_path,
         "fed_remittance_path_file": load_fed_remittance_path,
+        "fed_income_path_file": load_fed_income_path,
         "operating_cash_path_file": load_operating_cash_path,
         "cash_reconciliation_residual_file": load_cash_reconciliation_residual,
         "macro_forecast_path_file": load_macro_forecast_path,
@@ -1093,6 +1274,7 @@ __all__ = [
     "load_forecast_csv",
     "load_holder_absorption_path",
     "load_fed_holdings_path",
+    "load_fed_income_path",
     "load_fed_remittance_path",
     "load_frn_rate_path",
     "load_tips_cpi_path",
