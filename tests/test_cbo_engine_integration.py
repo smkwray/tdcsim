@@ -2081,7 +2081,8 @@ def test_opening_frn_accrues_continuously_from_june_18_to_first_period_end(tmp_p
     opening = _opening_frn_portfolio(last_accrued="2026-06-18")
     opening.loc[0, ["IssueDate", "DatedDate", "OriginalDatedDate"]] = pd.Timestamp("2026-03-31")
     params["initial_bonds_df"] = opening
-    _, final = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+    results, final = run_simulation(params, start, end, freq="D", scenario_name="baseline")
+    assert results["FedRolloverFedOnlyClasses"].tolist() == ["", ""]
     lot = final.loc[final["BondID"].eq(1)].iloc[0]
     daily_rates = [0.04, 0.04, 0.04, 0.06]
     assert lot["AccruedInterest_FRN"] == pytest.approx(1 + sum((rate + 0.001) * 1000 / 360 for rate in daily_rates))

@@ -3864,6 +3864,7 @@ def run_simulation(
     for status_col in [
         'CBOFedStockMode',
         'CBOFedSettlementScope',
+        'FedRolloverFedOnlyClasses',
         'CBOFedAcquisitionChannel',
         'CBOFedSecondarySaleBuyerMix',
         'CBORemittanceStatus',
