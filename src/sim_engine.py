@@ -122,6 +122,7 @@ OPERATING_CASH_RESULT_COLUMNS = (
     'FiscalYearCloseSettlementProceeds',
     'FedRolloverFace',
     'FedRolloverProceeds',
+    'FedRolloverReallocatedStock',
     'FedRedeemedFace',
 )
 # The Fed's add-ons at auction: not operating-cash financing, and paid for by the Fed.
@@ -2621,46 +2622,37 @@ def _settlement_unit_prices(keys, *, issuance_profile, due_events, current_date,
     }
 
 
-def _fed_rollover_allocation(stock_by_class, *, due_events, pending, issuance_profile, unit_prices):
-    """Split the Fed's rollover across the securities settling today on the calendar.
+def _fed_rollover_allocation(stock_by_class, *, offering_face, issuance_profile, prices):
+    """Allocate each class's rollover stock in proportion to the public offering face.
 
-    The New York Fed rolls maturing bills into the bills auctioned on their maturity date
-    and maturing coupon securities into the coupon securities, in proportion to the
-    amounts offered. The face already pending for each security stands in for its offering
-    size (the calibrated shares when nothing is pending in that class). ``stock_by_class``
-    is the Fed's principal to roll, ``{'bills': ..., 'coupons': ...}``, in stock units
-    (adjusted principal for TIPS). Returns ``{supply_key: (face, cash per unit face, stock
-    per unit face)}``; a class with nothing settling today is redeemed.
+    TIPS count at adjusted principal against the class total. If a class has calendar
+    auctions but no public issuance today, use the calibrated shares for Fed-only
+    add-ons. A class with no calendar auctions today is redeemed.
     """
-
     allocation = {}
+    fed_only_classes = []
     for security_class, stock in stock_by_class.items():
         if stock <= TGA_FLOOR_TOLERANCE:
             continue
-        keys = sorted(key for key in due_events if (key[0] == 'bill') == (security_class == 'bills'))
+        keys = [key for key in sorted(prices) if (key[0] == 'bill') == (security_class == 'bills')]
         if not keys:
             continue
-        prices = unit_prices(keys)
-        weights = {key: float(pending[key][3]) / prices[key][0] if key in pending else 0.0 for key in keys}
+        weights = {key: offering_face.get(key, 0.0) for key in keys}
         if sum(weights.values()) <= TGA_FLOOR_TOLERANCE:
-            shares = {bill_supply_key(int(term['weeks'])): float(term['share']) for term in issuance_profile['bill_terms']}
-            shares.update(
-                {coupon_supply_key(term['security_type'], term['maturity_years']): float(term['share'])
-                 for term in issuance_profile['coupon_terms']}
-            )
+            fed_only_classes.append(security_class)
+            if security_class == 'bills':
+                shares = {bill_supply_key(int(term['weeks'])): float(term['share']) for term in issuance_profile['bill_terms']}
+            else:
+                shares = {
+                    coupon_supply_key(term['security_type'], term['maturity_years']): float(term['share'])
+                    for term in issuance_profile['coupon_terms']
+                }
             weights = {key: shares[key] for key in keys}
-        # Face in proportion to what is offered, scaled so the stock added is the stock
-        # to roll (a TIPS adds its index ratio of stock per unit face).
-        scale_base = sum(weights[key] * prices[key][1] for key in keys)
-        if scale_base <= TGA_FLOOR_TOLERANCE:
-            continue
+        scale = stock / sum(weights[key] * prices[key][1] for key in keys)
         for key in keys:
-            if weights[key] <= TGA_FLOOR_TOLERANCE:
-                continue
-            price, stock_per_face = prices[key]
-            allocation[key] = (stock * weights[key] / scale_base, price, stock_per_face)
-    return allocation
-
+            if weights[key] > 0.0:
+                allocation[key] = (scale * weights[key], *prices[key])
+    return allocation, fed_only_classes
 
 def _build_bill_share_supply_schedule(
     amount,
@@ -3759,7 +3751,7 @@ def run_simulation(
     if cbo_operating_cash_financing_mode:
         # Only this mode decides cash needs and settles them on a calendar; the debt-path
         # modes keep their result columns unchanged.
-        for numeric_col in OPERATING_CASH_RESULT_COLUMNS:
+        for numeric_col in (*OPERATING_CASH_RESULT_COLUMNS, 'FedRolloverCashSizingDifference'):
             results[numeric_col] = 0.0
     for status_col in [
         'CBOFedStockMode',
@@ -5424,6 +5416,12 @@ def run_simulation(
             primary_issuance_leg = 'ordinary_issuance'
         early_settlement_proceeds = 0.0
         fiscal_year_close_settlement_proceeds = 0.0
+        rollover_prices = {}
+        rollover_stock_by_class = {}
+        estimated_rollover = {}
+        fed_rollover_cash_estimate = 0.0
+        fed_rollover_reallocated_stock = 0.0
+        fed_only_rollover_classes = []
         if batched_settlement and cbo_fed_allocation_override_active:
             # The Fed rolls what matured today over at the day's auctions, bills into
             # bills and coupon securities into coupon securities, as far as its path needs
@@ -5436,16 +5434,17 @@ def run_simulation(
             )
             rollover_stock = min(cb_matured, max(0.0, cbo_fed_holdings_target - cb_stock))
             rolled_share = rollover_stock / cb_matured if cb_matured > TGA_FLOOR_TOLERANCE else 0.0
-            fed_rollover = _fed_rollover_allocation(
-                {
-                    'bills': cb_matured_bills * rolled_share,
-                    'coupons': (cb_matured - cb_matured_bills) * rolled_share,
-                },
-                due_events=due_events,
-                pending=pending_issuance,
-                issuance_profile=issuance_profile,
-                unit_prices=functools.partial(
-                    _settlement_unit_prices,
+            rollover_stock_by_class = {
+                'bills': cb_matured_bills * rolled_share,
+                'coupons': (cb_matured - cb_matured_bills) * rolled_share,
+            }
+            rollover_keys = sorted(
+                key for key in due_events
+                if rollover_stock_by_class['bills' if key[0] == 'bill' else 'coupons'] > TGA_FLOOR_TOLERANCE
+            )
+            if rollover_keys:
+                rollover_prices = _settlement_unit_prices(
+                    rollover_keys,
                     issuance_profile=issuance_profile,
                     due_events=due_events,
                     current_date=current_date,
@@ -5455,16 +5454,27 @@ def run_simulation(
                     bond_portfolio=bond_portfolio,
                     reference_cpi_on=lambda day: float(results.loc[pd.Timestamp(day).normalize(), 'Reference_CPI']),
                     frn_accrual_per_face=frn_accrual_per_face,
-                ),
+                )
+            # Settlement needs Fed cash before the public offer sizes exist. Pending face
+            # supplies a sizing estimate. After the public decision, its realized face
+            # determines the split. Same-day TGA cash gets the realized proceeds, including
+            # the difference from pricing a fixed amount of stock across different issues.
+            estimated_rollover, _ = _fed_rollover_allocation(
+                rollover_stock_by_class,
+                offering_face={key: pending_issuance[key][3] / rollover_prices[key][0]
+                               for key in rollover_keys if key in pending_issuance},
+                issuance_profile=issuance_profile,
+                prices=rollover_prices,
             )
-            fed_rollover_cash = sum(face * price for face, price, _stock in fed_rollover.values())
-            fed_rollover_stock = sum(face * stock for face, _price, stock in fed_rollover.values())
+            fed_rollover_cash_estimate = sum(face * price for face, price, _ in estimated_rollover.values())
+            fed_rollover_cash = fed_rollover_cash_estimate
+            fed_rollover_stock = sum(face * stock for face, _price, stock in estimated_rollover.values())
             fed_redeemed_face = cb_matured - fed_rollover_stock
             # The add-ons count as issued before the public decision, in debt and in bills.
             pre_issuance_position = (
                 pre_issuance_position[0] + fed_rollover_stock,
                 pre_issuance_position[1]
-                + sum(face * stock for key, (face, _price, stock) in fed_rollover.items() if key[0] == 'bill'),
+                + sum(face * stock for key, (face, _price, stock) in estimated_rollover.items() if key[0] == 'bill'),
             )
             if cbo_operating_cash_financing_mode:
                 total_issuance_target_period = max(
@@ -5512,6 +5522,17 @@ def run_simulation(
                 bond_portfolio=bond_portfolio,
                 reference_cpi_on=lambda day: float(results.loc[pd.Timestamp(day).normalize(), 'Reference_CPI']),
                 frn_accrual_per_face=frn_accrual_per_face,
+            )
+            fed_rollover, fed_only_rollover_classes = _fed_rollover_allocation(
+                rollover_stock_by_class,
+                offering_face={item['supply_key']: item['face_amount'] for item in issuance_supply_schedule},
+                issuance_profile=issuance_profile,
+                prices=rollover_prices,
+            )
+            fed_rollover_cash = sum(face * price for face, price, _ in fed_rollover.values())
+            fed_rollover_reallocated_stock = 0.5 * sum(
+                abs(fed_rollover.get(key, (0.0,))[0] - estimated_rollover.get(key, (0.0,))[0]) * stock_per_face
+                for key, (_, stock_per_face) in rollover_prices.items()
             )
             for key, (fed_face, fed_price, _fed_stock) in fed_rollover.items():
                 item = next((item for item in issuance_supply_schedule if item['supply_key'] == key), None)
@@ -5908,9 +5929,13 @@ def run_simulation(
             results.loc[current_date, 'FiscalYearCloseSettlementProceeds'] = fiscal_year_close_settlement_proceeds
             results.loc[current_date, 'FedRolloverFace'] = fed_rollover_face_issued
             results.loc[current_date, 'FedRolloverProceeds'] = fed_rollover_proceeds
+            results.loc[current_date, 'FedRolloverCashSizingDifference'] = fed_rollover_proceeds - fed_rollover_cash_estimate
+            results.loc[current_date, 'FedRolloverReallocatedStock'] = fed_rollover_reallocated_stock
+            if fed_only_rollover_classes:
+                results.loc[current_date, 'FedRolloverFedOnlyClasses'] = '|'.join(fed_only_rollover_classes)
             results.loc[current_date, 'FedRedeemedFace'] = fed_redeemed_face
             if abs(fed_rollover_proceeds - fed_rollover_cash) > target_tolerance:
-                raise RuntimeError(f'the Fed add-on cash at {current_date.date()} differs from what the cash rule counted')
+                raise RuntimeError(f'the Fed add-on cash at {current_date.date()} differs from what the allocation priced')
         if cbo_funding_mode:
             results.loc[current_date, 'IssuanceProceedsTarget'] = actual_auction_proceeds
             cbo_fed_auction_addons_current = float(total_issued_face_by_holder.get('CB', 0.0))
@@ -6604,6 +6629,7 @@ def run_simulation(
             # break this.
             shortfall = cbo_operating_cash_target - (
                 current_tga + results.loc[current_date, 'PendingIssuanceProceeds']
+                - results.loc[current_date, 'FedRolloverCashSizingDifference']
             )
             off_target = abs(shortfall) if total_issuance_target_period > target_tolerance else max(0.0, shortfall)
             if off_target > target_tolerance:

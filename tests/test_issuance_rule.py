@@ -978,6 +978,7 @@ def _closing(**values) -> dict:
         "IssuanceNeedProceeds": 20.0,
         "AuctionProceeds": 30.0,
         "FedRolloverProceeds": 0.0,
+        "FedRolloverCashSizingDifference": 0.0,
     }
     row.update(values)
     return row

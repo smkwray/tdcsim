@@ -1149,7 +1149,8 @@ def operating_cash_financing_checks(results: pd.DataFrame) -> dict[str, Any]:
     not yet settled never ends a day below the target, and on every day with a cash need
     it ends exactly on it: the need tops cash up to the target, and a day that opens
     above target decides nothing. Between settlement dates the TGA itself runs below
-    target by the pending amount, never below zero.
+    target by the pending amount, never below zero. The realized Fed rollover cash
+    price can differ from the amount Treasury used for sizing on that day.
     """
 
     running = results.iloc[1:]
@@ -1161,7 +1162,8 @@ def operating_cash_financing_checks(results: pd.DataFrame) -> dict[str, Any]:
     tga = _numeric_column(running, "TGA")
     target = _numeric_column(running, "CBOOperatingCashTarget")
     pending = _numeric_column(running, "PendingIssuanceProceeds")
-    excess = tga + pending - target
+    rollover_cash_difference = _numeric_column(running, "FedRolloverCashSizingDifference")
+    excess = tga + pending - target - rollover_cash_difference
     decided = _numeric_column(running, "IssuanceNeedProceeds") > CASH_CLOSURE_TOLERANCE
     below = int((excess < -CASH_CLOSURE_TOLERANCE).sum())
     off_on_issue = int((decided & (excess.abs() > CASH_CLOSURE_TOLERANCE)).sum())

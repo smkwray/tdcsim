@@ -706,6 +706,7 @@ def _compute_run_metrics(
         "IssuanceNeedProceeds",
         "PendingIssuanceProceeds",
         "EarlySettlementProceeds",
+        "FedRolloverCashSizingDifference",
         "FiscalYearCloseSettlementProceeds",
         "CashFinancingProceeds",
         "NewDebtIssued",
@@ -780,7 +781,8 @@ def _compute_run_metrics(
             raise ValueError(f"{run_id} row {row_index} reports a binding CBO debt target")
         tga = _float(row, "TGA")
         pending = _float(row, "PendingIssuanceProceeds")
-        excess = tga + pending - _float(row, "CBOOperatingCashTarget")
+        rollover_difference = _float(row, "FedRolloverCashSizingDifference")
+        excess = tga + pending - _float(row, "CBOOperatingCashTarget") - rollover_difference
         if tga < -NUMERIC_TOLERANCE or pending < -NUMERIC_TOLERANCE or excess < -NUMERIC_TOLERANCE:
             raise ValueError(f"{run_id} row {row_index} TGA is negative or below target beyond pending issuance")
         if _float(row, "IssuanceNeedProceeds") > NUMERIC_TOLERANCE and abs(excess) > NUMERIC_TOLERANCE:

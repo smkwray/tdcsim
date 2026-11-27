@@ -603,7 +603,7 @@ def test_a_holiday_shortened_13_week_bill_keeps_the_cbo_bill_quote(monkeypatch) 
 # --- The Fed rolls its maturing holdings at auction ----------------------------------------
 
 
-def _fed_run(tmp_path: Path, fy_end_target: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _fed_run(tmp_path: Path, fy_end_target: float, *, public_redemption: float = 0.0, handoff_sink=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """The Fed holds a 4-week bill maturing Tuesday 2026-07-07 (20) and a 13-week bill
     maturing Thursday 2026-07-09 (30), and follows a path from 50 to ``fy_end_target``
     by 2026-09-30."""
@@ -619,6 +619,11 @@ def _fed_run(tmp_path: Path, fy_end_target: float) -> tuple[pd.DataFrame, pd.Dat
             _portfolio_row(911, security_type="Fixed", years=91 / 365.25, maturity="2026-07-09", face=30.0, holder="CB"),
         ],
     )
+    if public_redemption:
+        params["initial_bonds_df"] = _portfolio([
+            *params["initial_bonds_df"].to_dict("records"),
+            _portfolio_row(912, security_type="Fixed", years=2.0, maturity="2026-07-07", face=public_redemption),
+        ])
     rows = build_fed_holdings_path_rows(
         scenario_id="baseline",
         periods=build_simulation_calendar(ENGINE_START, ENGINE_END, "daily"),
@@ -629,12 +634,16 @@ def _fed_run(tmp_path: Path, fy_end_target: float) -> tuple[pd.DataFrame, pd.Dat
         available_date=ENGINE_START,
     )
     params["baseline_input_paths"]["fed_holdings_path_file"] = str(_write_csv(tmp_path / "fed.csv", rows))
-    return run_simulation(params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline")
+    return run_simulation(
+        params, ENGINE_START, ENGINE_END, freq="D", scenario_name="baseline",
+        handoff_sink=handoff_sink, require_bounded_handoff=handoff_sink is not None,
+    )
 
 
 def _assert_cash_rule_closes(results: pd.DataFrame) -> None:
     running = results.iloc[1:]
     excess = running["TGA"] + running["PendingIssuanceProceeds"] - running["CBOOperatingCashTarget"]
+    excess -= running["FedRolloverCashSizingDifference"]
     decided = running["IssuanceNeedProceeds"] > 1e-9
     assert excess.min() > -1e-6 and excess[decided].abs().max() < 1e-6
 
@@ -659,7 +668,33 @@ def test_the_fed_rolls_maturing_holdings_into_the_days_auctions_not_the_secondar
     tuesday = add_ons[pd.to_datetime(add_ons["IssueDate"]) == pd.Timestamp("2026-07-07")]
     weeks = sorted({round(float(years) * 365.25 / 7) for years in tuesday["OriginalMaturityYears"]})
     assert weeks == [4, 8, 17]  # the bills that settle on Tuesdays
+    assert results.loc["2026-07-07", "FedRolloverFedOnlyClasses"] == "bills"
     assert (results["CBOFedAuctionRolloverAddons"] <= results["CBOFedMaturitiesAndRedemptions"] + 1e-9).all()
+    _assert_cash_rule_closes(results)
+
+
+def test_a_fed_rollover_uses_the_day_actual_public_offering_sizes(tmp_path: Path) -> None:
+    from tdcsim_cbo.bounded_output import BoundedResourceLimits, BoundedScenarioEvidenceSink
+
+    # A large redemption creates new public bill need after the rollover-cash estimate.
+    sink = BoundedScenarioEvidenceSink(
+        tmp_path / "bounded", limits=BoundedResourceLimits(minimum_available_bytes=0),
+    )
+    results, _ = _fed_run(tmp_path, 50.0, public_redemption=600.0, handoff_sink=sink)
+    _, portfolio = _fed_run(tmp_path, 50.0, public_redemption=600.0)
+    tuesday = portfolio[
+        (portfolio["HolderType"] == "CB") & (portfolio["IssueDate"] == pd.Timestamp("2026-07-07"))
+    ]
+    public = portfolio[
+        (portfolio["HolderType"] != "CB") & (portfolio["IssueDate"] == pd.Timestamp("2026-07-07"))
+        & (portfolio["OriginalMaturityYears"] <= 1.0)
+    ].groupby("OriginalMaturityYears")["FaceValue"].sum()
+    fed = tuesday.groupby("OriginalMaturityYears")["FaceValue"].sum()
+    assert len(public) == 3 and public.max() > public.min()
+    pd.testing.assert_index_equal(fed.index, public.index)
+    assert (fed / fed.sum()).tolist() == pytest.approx((public / public.sum()).tolist())
+    assert results.loc["2026-07-07", "FedRolloverReallocatedStock"] > 0.0
+    assert abs(results.loc["2026-07-07", "FedRolloverCashSizingDifference"]) > 0.0
     _assert_cash_rule_closes(results)
 
 
@@ -765,17 +800,14 @@ def test_a_tips_add_on_is_sized_in_adjusted_principal() -> None:
     from sim_engine import _fed_rollover_allocation
 
     profile = _profile()
-    due = {("TIPS", 10.0): object(), ("Fixed", 2.0): object()}
-    # Pending cash 55 at 1.1 per face and 50 at par: 50 face pending in each.
-    pending = {("TIPS", 10.0): ["TIPS", 10.0, None, 55.0], ("Fixed", 2.0): ["Fixed", 2.0, None, 50.0]}
-    allocation = _fed_rollover_allocation(
+    prices = {("TIPS", 10.0): (1.1, 1.1), ("Fixed", 2.0): (1.0, 1.0)}
+    allocation, fed_only = _fed_rollover_allocation(
         {"bills": 0.0, "coupons": 22.0},
-        due_events=due,
-        pending=pending,
+        offering_face={("TIPS", 10.0): 25.0, ("Fixed", 2.0): 75.0},
         issuance_profile=profile,
-        unit_prices=lambda keys: {("TIPS", 10.0): (1.1, 1.1), ("Fixed", 2.0): (1.0, 1.0)},
+        prices=prices,
     )
     stock = sum(face * per_face for face, _price, per_face in allocation.values())
     assert stock == pytest.approx(22.0)
-    # Equal face offered, so equal face taken, as the Desk's tenders are in face.
-    assert allocation[("TIPS", 10.0)][0] == pytest.approx(allocation[("Fixed", 2.0)][0])
+    assert allocation[("TIPS", 10.0)][0] * 3 == pytest.approx(allocation[("Fixed", 2.0)][0])
+    assert fed_only == []
