@@ -626,9 +626,11 @@ def materialize_portfolio(
         np.where(security_type.eq("FRN"), 4.0, np.where(fixed_coupon_mask, 2.0, np.nan)),
     )
 
+    issue_ids = _first_nonblank_text(merged, "cusip", _COHORT_ID_COL)
     materialized = pd.DataFrame(
         {
             "BondID": range(int(start_bond_id), int(start_bond_id) + len(merged.index)),
+            "IssueID": issue_ids,
             "SecurityType": security_type,
             "IssueDate": issue_dates,
             "MaturityDate": maturity_dates,
@@ -667,7 +669,7 @@ def materialize_portfolio(
             "DirtyPriceRatio": np.nan,
             _QUARTER_COL: quarter_values,
             _COHORT_ID_COL: merged[_COHORT_ID_COL],
-            "cusip": _first_nonblank_text(merged, "cusip", _COHORT_ID_COL),
+            "cusip": issue_ids,
             "series_cd": _first_nonblank_text(merged, "series_cd"),
             "native_sector": native_sector,
             "broad_holder_class": broad_holder_class,
