@@ -311,7 +311,7 @@ def test_run_cbo_scenario_net_interest_is_diagnostic_only(tmp_path: Path) -> Non
     assert set(ni_results["NetInterestDiagnosticStatus"].dropna()) == {"cbo_reported_check_only"}
 
 
-def test_run_cbo_scenario_fed_target_settles_with_fixed_remittance(tmp_path: Path) -> None:
+def test_run_cbo_scenario_fed_target_settles_with_modeled_remittance(tmp_path: Path) -> None:
     baseline, scenarios = _runner_baseline_and_scenarios(tmp_path, remittance_bil=1.0)
 
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
@@ -324,18 +324,25 @@ def test_run_cbo_scenario_fed_target_settles_with_fixed_remittance(tmp_path: Pat
     assert fed_results["CBOFedSecondaryPurchaseReserveEffect"].sum() == pytest.approx(
         fed_results["CBOFedSecondaryPurchaseCash"].sum()
     )
+    # Table 4-3 stays in the ordinary fiscal flow; the TGA gets the Fed's own remittance,
+    # which the fixture's deferred asset blocks.
+    assert fed_results["CBOTable43RemittanceInFiscalFlow"].sum() == pytest.approx(1.0)
     cash = fed_results["CBORemittanceCashEffect"]
-    assert cash.sum() == pytest.approx(1.0)
-    assert cash.tolist() == noop_results["CBORemittanceCashEffect"].tolist()
+    assert cash.abs().sum() == 0.0
     assert set(fed_results["CBORemittanceStatus"]) == {
         CBO_FED_REMITTANCE_OPENING_STATUS, CBO_FED_REMITTANCE_STATUS,
     }
     assert fed_results["CB_Remittance"].tolist() == cash.tolist()
-    assert fed_results["CB_DeferredAsset"].isna().all()
-    assert fed.run_manifest["claim_boundary"]["remittance_role"] == "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+    assert (fed_results["CB_DeferredAsset"] > 0.0).all()
+    # The Fed's secondary purchases add income, so it repays more deferred asset than the noop run.
+    assert fed_results["CB_DeferredAsset"].iloc[-1] < noop_results["CB_DeferredAsset"].iloc[-1]
+    assert fed.run_manifest["claim_boundary"]["remittance_role"] == (
+        "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
+    )
     assert fed.run_manifest["boundary_checks"]["remittance_role"] == fed.run_manifest["claim_boundary"]["remittance_role"]
     assert set(fed.run_manifest["unsupported_components"]) == {
-        "fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response",
+        "fed_accrual_basis_income", "fed_remunerated_other_deposits", "fed_valuation_gains_and_losses",
+        "mbs_prepayment_rate_response", "reserve_bank_level_remittances_under_system_deferred_asset",
         "complete_budgetary_net_interest_mapping",
     }
     assert verify_scenario_run(fed.output_dir)["status"] == "pass"
@@ -526,13 +533,14 @@ def test_verifier_rejects_wrong_remittance_even_with_fresh_hashes(tmp_path: Path
     run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
     assert verify_scenario_run(run.output_dir)["status"] == "pass"
     results = pd.read_csv(run.results_path)
-    results.loc[1, ["CBORemittanceCashEffect", "CB_Remittance"]] = 0.0
+    # Pay a remittance the deferred asset forbids, consistently in both columns.
+    results.loc[1, ["CBORemittanceCashEffect", "CB_Remittance"]] = 1.0
     results.to_csv(run.results_path, index=False)
     manifest = read_json(run.manifest_path)
     _refresh_result_hashes(run.output_dir, manifest)
     write_json(run.manifest_path, manifest)
 
-    with pytest.raises(VerificationError, match="Fed remittance cash path differs from compiled input"):
+    with pytest.raises(VerificationError, match="Fed remittance verification failed: CB_Remittance differs"):
         verify_scenario_run(run.output_dir)
 
 
@@ -1000,7 +1008,7 @@ def test_verifier_rejects_invalid_fed_remittance_claims(tmp_path: Path) -> None:
     manifest = read_json(run.manifest_path)
 
     unsupported = set(manifest["unsupported_components"])
-    for component in ("fed_net_income", "fed_deferred_asset", "fed_remittance_rate_response"):
+    for component in ("fed_accrual_basis_income", "reserve_bank_level_remittances_under_system_deferred_asset"):
         for replacement in (set(), {"fed_remittances"}):
             invalid = {**manifest, "unsupported_components": sorted((unsupported - {component}) | replacement)}
             write_json(run.manifest_path, invalid)

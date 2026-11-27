@@ -91,14 +91,18 @@ def test_fiscal_incidence_splits_ordinary_cash_excluding_fed_remittances(tmp_pat
     dates = pd.to_datetime(["2026-06-21", "2026-06-22"])
     (run / ledger.TRC).parent.mkdir(parents=True)
     pd.DataFrame({"Date": dates, "TRC_FiscalFlow": [0.0, 3.0]}).to_csv(run / ledger.TRC, index=False)
+    # The modeled Fed-to-TGA remittance (5.0) is not part of the ordinary fiscal flow;
+    # CBO's Table 4-3 remittance (1.0), counted as a receipt in P, is.
     results = pd.DataFrame(
-        {"PrimaryDeficit": [0.0, 2.0], "CBORemittanceCashEffect": [0.0, 1.0], "TDC_FiscalFlow": [0.0, 2.7]},
+        {"PrimaryDeficit": [0.0, 2.0], "CBOTable43RemittanceInFiscalFlow": [0.0, 1.0],
+         "CBORemittanceCashEffect": [0.0, 5.0], "TDC_FiscalFlow": [0.0, 2.7]},
         index=pd.Index(dates, name="Date"),
     )
 
     fiscal, checks = ledger.build_fiscal(run, results, "p")
     assert fiscal["fiscal_to_rs"].tolist() == pytest.approx([0.0, 0.3])
     assert fiscal["primary_deficit"].tolist() == [0.0, 2.0]
+    assert fiscal["cbo_table_4_3_remittance_bil"].tolist() == [0.0, 1.0]
     assert fiscal["trc_fiscal_flow"].tolist() == [0.0, 3.0]
     assert checks["gross_outlays_and_receipts_modeled"] is False
     with pytest.raises(SystemExit, match="not in the run"):

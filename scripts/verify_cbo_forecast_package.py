@@ -35,16 +35,24 @@ from forecast_input_builder import (  # noqa: E402
 )
 from forecast_bundle_builders import (  # noqa: E402
     CBO_REMITTANCE_SOURCE_FILE,
+    FED_INCOME_DOCUMENTS,
+    FED_INCOME_SOURCE_FILE,
+    build_fed_income_path_rows,
     build_fed_remittance_path_rows,
+    fed_income_source_fixture,
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
 from forecast_paths import (  # noqa: E402
     CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
     CBO_FED_REMITTANCE_ROLE,
+    FED_INCOME_PATH_FILE,
     FED_REMITTANCE_PATH_FILE,
-    verify_fed_remittance_cash,
+    verify_fed_remittances,
 )
+from fed_income import FED_INCOME_RESULT_COLUMNS  # noqa: E402
+from forecast_input_builder import _read_xlsx  # noqa: E402
+from simulation_calendar import build_simulation_calendar  # noqa: E402
 from cbo_opening_actuals import (  # noqa: E402
     ACTUALS_AVAILABLE_AS_OF,
     DTS_CASH_SOURCE,
@@ -95,6 +103,7 @@ REQUIRED_FILES = {
     "forecast_inputs/tdcsim_debt_stock_path.csv",
     "forecast_inputs/tdcsim_primary_deficit_path.csv",
     f"forecast_inputs/{FED_REMITTANCE_PATH_FILE}",
+    f"forecast_inputs/{FED_INCOME_PATH_FILE}",
     "forecast_inputs/tdcsim_operating_cash_path.csv",
     "forecast_inputs/tdcsim_cash_reconciliation_residual.csv",
     "forecast_inputs/tdcsim_macro_forecast_path.csv",
@@ -127,6 +136,8 @@ REQUIRED_FILES = {
     f"sources/{DTS_FLOWS_SOURCE}",
     f"sources/{SOMA_SOURCE}",
     f"sources/{CBO_REMITTANCE_SOURCE_FILE}",
+    f"sources/{FED_INCOME_SOURCE_FILE}",
+    *(f"sources/{rel}" for rel in FED_INCOME_DOCUMENTS.values()),
     "sources/fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "sources/fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "sources/treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -147,6 +158,8 @@ EXPECTED_SOURCE_PACKAGE_FILES = {
     DTS_FLOWS_SOURCE,
     SOMA_SOURCE,
     CBO_REMITTANCE_SOURCE_FILE,
+    FED_INCOME_SOURCE_FILE,
+    *FED_INCOME_DOCUMENTS.values(),
     "fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -654,8 +667,10 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
     calendar = _read_json(root / "forecast_inputs" / CALIBRATION_FILE)["settlement_calendar"]
     for run_id, run_dir in RUN_DIRS.items():
         results = _read_csv_dicts(root / run_dir / "results_compact.csv")
-        verify_fed_remittance_cash(
-            pd.read_csv(root / run_dir / "results_compact.csv"), root / "forecast_inputs" / FED_REMITTANCE_PATH_FILE
+        verify_fed_remittances(
+            pd.read_csv(root / run_dir / "results_compact.csv"),
+            root / "forecast_inputs" / FED_REMITTANCE_PATH_FILE,
+            root / "forecast_inputs" / FED_INCOME_PATH_FILE,
         )
         summary = _read_json(root / run_dir / "summary.json")
         if not isinstance(summary, Mapping):
@@ -786,6 +801,8 @@ def _compute_run_metrics(
         "CB_NetIncome",
         "CB_Remittance",
         "CB_DeferredAsset",
+        *FED_INCOME_RESULT_COLUMNS,
+        "Reserves",
         "DebtHeld_Banks",
         "DebtHeld_CentralBank",
         "DebtHeld_Foreign",
@@ -2195,11 +2212,68 @@ def _verify_source_selectors_and_frozen_rows(root: Path, manifest: Mapping[str, 
         raise ValueError("packaged Treasury base curve rows changed")
 
 
+def _verify_fed_income_sources(sources: Path) -> None:
+    """Bind each Fed source document to the transcription and re-derive what can be parsed."""
+
+    import re
+
+    fixture = fed_income_source_fixture()
+    if _read_json(sources / FED_INCOME_SOURCE_FILE) != fixture:
+        raise ValueError("Fed income source transcription changed")
+    for key, document in fixture["documents"].items():
+        if _sha256_file(sources / document["file"]) != document["sha256"]:
+            raise ValueError(f"Fed income source {key} differs from its transcribed sha256")
+    holdings = _read_json(sources / fixture["documents"]["soma_agency_holdings"]["file"])["soma"]["holdings"]
+    face = coupon_face = 0.0
+    for row in holdings:
+        if row["securityType"] not in {"MBS", "CMBS"}:
+            continue
+        coupons = re.findall(r"(\d+(?:\.\d+)?)%", row["securityDescription"])
+        if len(coupons) != 1:
+            raise ValueError(f"SOMA MBS row has no single coupon: {row['cusip']}")
+        face += float(row["currentFaceValue"])
+        coupon_face += float(row["currentFaceValue"]) * float(coupons[0])
+    mbs = fixture["soma_agency_mbs"]
+    _assert_close("SOMA MBS current face", face / 1e6, float(mbs["current_face_mil"]), 1e-6)
+    _assert_close("SOMA MBS coupon", coupon_face / face, float(mbs["weighted_average_coupon_pct"]), 1e-9)
+    _assert_close(
+        "H.4.1 MBS", float(mbs["current_face_mil"]),
+        float(fixture["h41_wednesday_levels_mil"]["mortgage_backed_securities"]), 1.0,
+    )
+    workbook = _read_xlsx(sources / fixture["documents"]["nyfed_soma_projection_data"]["file"])
+    projection = fixture["nyfed_soma_projection"]
+    for sheet, column, key in (
+        ("Chart 27", 3, "agency_mbs_year_end_bil"),
+        ("Chart 28", 2, "soma_net_income_baseline_bil"),
+        ("Chart 25", 2, "reserve_balances_year_end_bil"),
+    ):
+        values = {}
+        for row in workbook[sheet]:
+            label = row.values[1] if len(row.values) > column else ""
+            if not re.fullmatch(r"\d+", label or ""):
+                continue
+            year = int(label) if len(label) == 4 else (date(1899, 12, 30) + timedelta(days=int(label))).year
+            values[str(year)] = row.values[column]
+        for year, value in projection[key].items():
+            _assert_close(f"{sheet} {year}", float(values[year]), float(value), 1e-9)
+
+
 def _verify_fed_remittance_inputs(root: Path) -> None:
     inputs = root / "forecast_inputs"
     sources = root / "sources"
     if _read_json(sources / CBO_REMITTANCE_SOURCE_FILE) != cbo_remittance_source_fixture():
         raise ValueError("CBO Table 4-3 remittance transcription changed")
+    _verify_fed_income_sources(sources)
+    periods = build_simulation_calendar(SIMULATION_START_DATE, "2036-09-30", "daily")
+    _verify_csv_rows_match_expected(
+        FED_INCOME_PATH_FILE,
+        _read_csv_dicts(inputs / FED_INCOME_PATH_FILE),
+        build_fed_income_path_rows(
+            scenario_id="cbo_full_horizon_local_smoke_3m",
+            periods=periods,
+            yield_rows=_read_csv_dicts(inputs / "tdcsim_yield_curve_surface.csv"),
+        ),
+    )
     splice_rows = _read_csv_dicts(inputs / "tdcsim_current_fy_splice.csv")
     if len(splice_rows) != 1:
         raise ValueError("the current FY splice must contain exactly one row")

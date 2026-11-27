@@ -23,7 +23,12 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
-from forecast_paths import CBO_FED_REMITTANCE_ROLE, FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash
+from forecast_paths import (
+    CBO_FED_REMITTANCE_ROLE,
+    FED_INCOME_PATH_FILE,
+    FED_REMITTANCE_PATH_FILE,
+    verify_fed_remittances,
+)
 from mmf_eligibility import MmfEligibilityError, mmf_eligible_mask, mmf_may_acquire
 from issuance_calibration import CALIBRATION_FILE, verify_fiscal_close_cash
 from sim_engine import (
@@ -100,6 +105,7 @@ from .output import (
     write_scenario_outputs,
 )
 from .process_watchdog import THREAD_LIMIT_ENVIRONMENT_VARIABLES
+from fed_income import FED_INCOME_RESULT_COLUMNS
 from tdc_shared import INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF
 from .runtime_identity import (
     assert_loaded_distribution_modules,
@@ -132,6 +138,8 @@ REQUIRED_RESULT_COLUMNS = (
     "CBORemittanceStatus",
     "CB_Remittance",
     "CB_DeferredAsset",
+    "CB_NetIncome",
+    *FED_INCOME_RESULT_COLUMNS,
     "NetInterestDiagnosticStatus",
 )
 REQUIRED_SUMMARY_KEYS = (
@@ -345,7 +353,7 @@ def verify_scenario_run(
     if boundaries.get("net_interest_role") != "diagnostic_nonbinding":
         raise VerificationError("net interest role must remain diagnostic_nonbinding")
     if boundaries.get("remittance_role") != CBO_FED_REMITTANCE_ROLE:
-        raise VerificationError("run boundary checks must declare the fixed CBO Fed-to-TGA remittance path")
+        raise VerificationError("run boundary checks must declare the modeled Fed-to-TGA remittance")
     if boundaries.get("fed_auction_add_ons_roll_over_maturities") is not True:
         raise VerificationError("the Fed's auction add-ons exceed its maturing holdings")
     _verify_mmf_eligibility(root, manifest, compiled_manifest_path.parent / "forecast_inputs")
@@ -1722,8 +1730,15 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
     )
     fed_share = _max_abs(results, "CBOFedAuctionShare")
     fed_face = _max_abs(results, "CBOFedAuctionRolloverAddons")
+    trc_entry = (manifest.get("output_manifest") or {}).get("tdcsim_trc_results")
     try:
-        remittance_cash = verify_fed_remittance_cash(results, inputs_dir / FED_REMITTANCE_PATH_FILE)
+        trc_results = _read_results(root / "outputs" / str(trc_entry["path"])) if trc_entry else None
+        remittance_cash = verify_fed_remittances(
+            results,
+            inputs_dir / FED_REMITTANCE_PATH_FILE,
+            inputs_dir / FED_INCOME_PATH_FILE,
+            trc_results=trc_results,
+        )
     except (OSError, ValueError, KeyError) as exc:
         raise VerificationError(f"Fed remittance verification failed: {exc}") from exc
     target_tolerance = (

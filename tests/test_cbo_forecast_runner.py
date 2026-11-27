@@ -26,7 +26,7 @@ from scripts.run_cbo_forecast_smoke import (
     resolve_source_package_inputs,
     validate_yield_surface_rate_units,
 )
-from forecast_bundle_builders import build_current_fy_splice_row_from_fiscaldata
+from forecast_bundle_builders import FED_INCOME_DOCUMENTS, build_current_fy_splice_row_from_fiscaldata
 from forecast_paths import load_yield_curve_surface
 
 
@@ -130,13 +130,15 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         manifest["opening_portfolio_construction"]["claim_boundary"]
     )
     assert manifest["claim_boundary"]["package_role"] == "cbo_baseline_forecast_evidence_package"
-    assert manifest["claim_boundary"]["remittance_role"] == "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+    assert manifest["claim_boundary"]["remittance_role"] == "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
     assert {
         claim for claim in manifest["claim_boundary"]["excluded_claims"] if claim.startswith("does_not_model_")
     } == {
-        "does_not_model_fed_net_income",
-        "does_not_model_fed_deferred_asset",
-        "does_not_model_fed_remittance_rate_response",
+        "does_not_model_fed_accrual_basis_income",
+        "does_not_model_fed_remunerated_other_deposits",
+        "does_not_model_fed_valuation_gains_and_losses",
+        "does_not_model_mbs_prepayment_rate_response",
+        "does_not_model_reserve_bank_level_remittances_under_system_deferred_asset",
     }
     assert manifest["source_package"]["source_file_count"] >= len(SOURCE_PACKAGE_INPUTS)
     source_files = manifest["source_package"]["source_files"]
@@ -232,7 +234,7 @@ def test_runner_resolves_and_verifies_package_native_sources(tmp_path: Path) -> 
     sources = tmp_path / "pkg" / "sources"
     files = {
         rel_path: rel_path.encode("utf-8")
-        for rel_path in SOURCE_PACKAGE_INPUTS.values()
+        for rel_path in (*SOURCE_PACKAGE_INPUTS.values(), *FED_INCOME_DOCUMENTS.values())
     }
     manifest_files = {}
     for rel_path, payload in files.items():
@@ -250,6 +252,7 @@ def test_runner_resolves_and_verifies_package_native_sources(tmp_path: Path) -> 
     assert resolved["frn_daily_indexes"] == sources / "fiscaldata" / "frn_daily_indexes.csv"
     assert resolved["mspd_table_3_market"] == sources / "fiscaldata" / "mspd_table_3_market_2026-05-31.csv"
     assert resolved["treasury_base_curve"] == sources / "treasury" / "base_curve_2026-06-16.json"
+    assert resolved["fed_income_sources"] == sources / "fed"
 
     (sources / "fiscaldata" / "frn_daily_indexes.csv").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="sha256 mismatch"):

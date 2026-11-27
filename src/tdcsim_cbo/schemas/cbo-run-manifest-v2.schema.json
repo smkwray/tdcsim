@@ -64,7 +64,7 @@
       "required": ["remittance_role"],
       "properties": {
         "remittance_role": {
-          "const": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+          "const": "endogenous_fed_net_income_deferred_asset_fed_to_tga_cash"
         }
       }
     },
@@ -159,14 +159,16 @@
       "type": "array",
       "items": {
         "enum": [
-          "fed_net_income",
-          "fed_deferred_asset",
-          "fed_remittance_rate_response",
+          "fed_accrual_basis_income",
+          "fed_remunerated_other_deposits",
+          "fed_valuation_gains_and_losses",
+          "mbs_prepayment_rate_response",
+          "reserve_bank_level_remittances_under_system_deferred_asset",
           "complete_budgetary_net_interest_mapping"
         ]
       },
-      "minItems": 4,
-      "maxItems": 4,
+      "minItems": 6,
+      "maxItems": 6,
       "uniqueItems": true
     },
     "evidence_profile": {

@@ -145,6 +145,12 @@ def test_transformed_rollforward_export_carries_one_verified_world(tmp_path: Pat
         assert float(continued_results.iloc[0][output_column]) == pytest.approx(
             float(opening_state["initial_values"][state_key])
         )
+    # The Fed's balance sheet and deferred asset reopen where the rollforward closed them,
+    # not at the package's H.4.1 opening.
+    for column in ("CB_ReserveBalances", "CB_EarningsRemittancesDue", "CB_DeferredAsset", "CB_MBSHoldings",
+                   "CB_Currency", "CB_OtherLiabilitiesAndCapital"):
+        assert float(continued_results.iloc[0][column]) == pytest.approx(float(closing[column])), column
+    assert float(closing["CB_DeferredAsset"]) != pytest.approx(float(pd.read_csv(run.results_path).iloc[0]["CB_DeferredAsset"]))
 
     final_window = ForecastStateWindow(
         state_period=2031,

@@ -334,16 +334,34 @@ def test_cbo_run_with_trc_routing_keeps_legacy_outputs_byte_identical(tmp_path: 
     results_name = next(name for name in legacy_files if name.startswith("results_"))
     suffix = ".csv.gz" if results_name.endswith(".csv.gz") else ".csv"
     assert routed_files - legacy_files == {f"tdcsim_trc_results{suffix}", "tdcsim_trc_metadata.json"}
-    # Two otherwise identical runs differ only in resource telemetry.
+    # Two otherwise identical runs differ only in resource telemetry and in the Fed's
+    # balance sheet: the routed ledger's ON RRP balances (here 1,000,000 of fixture capacity)
+    # replace the H.4.1 level and come out of reserves, which moves the Fed's interest
+    # expense. The fixture's deferred asset blocks any remittance, so the Treasury's cash,
+    # debt and TDC paths must stay byte-identical.
     telemetry = {"tdcsim_resource_samples.csv.gz", "tdcsim_resource_samples.csv", "summary.json"}
-    for name in sorted(legacy_files - telemetry):
+    for name in sorted(legacy_files - telemetry - {results_name}):
         assert sha256_file(routed.output_dir / "outputs" / name) == sha256_file(
             legacy.output_dir / "outputs" / name
         ), name
+    fed_balance_sheet = [
+        "CB_ReserveBalances", "CB_ONRRPBalances", "CB_IORBExpense", "CB_ONRRPExpense", "CB_NetIncome",
+        "CB_EarningsRemittancesDue", "CB_DeferredAsset", "CB_OtherLiabilitiesAndCapital",
+    ]
+    legacy_results = pd.read_csv(legacy.output_dir / "outputs" / results_name)
+    routed_results = pd.read_csv(routed.output_dir / "outputs" / results_name)
+    pd.testing.assert_frame_equal(
+        routed_results.drop(columns=fed_balance_sheet), legacy_results.drop(columns=fed_balance_sheet), check_exact=True
+    )
+    on_rrp_gap = routed_results["CB_ONRRPBalances"] - legacy_results["CB_ONRRPBalances"]
+    assert on_rrp_gap.iloc[0] > 900_000.0
+    reserve_gap = routed_results["CB_ReserveBalances"] - legacy_results["CB_ReserveBalances"]
+    assert reserve_gap.iloc[0] == pytest.approx(-on_rrp_gap.iloc[0])
     legacy_summary = json.loads((legacy.output_dir / "outputs" / "summary.json").read_text())
     routed_summary = json.loads((routed.output_dir / "outputs" / "summary.json").read_text())
-    legacy_summary.pop("peak_rss_bytes")
-    routed_summary.pop("peak_rss_bytes")
+    for summary in (legacy_summary, routed_summary):
+        summary.pop("peak_rss_bytes")
+        summary.pop("final_state_sha256")  # hashes the final row, Fed balance sheet included
     assert routed_summary == legacy_summary
     metadata = json.loads((routed.output_dir / "outputs" / "tdcsim_trc_metadata.json").read_text())
     assert metadata["routing_source"]["sha256"] == sha256_file(routing_path)
