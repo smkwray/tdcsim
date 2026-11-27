@@ -239,8 +239,9 @@ def extract(
         columns=list(holdings.columns),
     )
     holdings = pd.concat([holdings, zeros], ignore_index=True).sort_values(["report_date", "security_class", "cusip"]).reset_index(drop=True)
-    holdings["report_date"] = holdings["report_date"].dt.date.astype(str)
-    holdings["maturity_date"] = holdings["maturity_date"].dt.date.astype("string").fillna("")
+    holdings = holdings.astype({"value_bil": float, "series_count": int})
+    holdings["report_date"] = pd.to_datetime(holdings["report_date"]).dt.date.astype(str)
+    holdings["maturity_date"] = pd.to_datetime(holdings["maturity_date"]).dt.date.astype("string").fillna("")
     by_month = direct.groupby(["month", "class_source"])["value_bil"].sum().unstack(fill_value=0.0)
     provenance = {
         "producer": "scripts/extract_sec_nmfp_mmf_holdings.py",

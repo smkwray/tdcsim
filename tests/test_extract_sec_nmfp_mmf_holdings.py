@@ -155,3 +155,17 @@ def test_extract_fails_on_a_month_without_filings_or_mspd(tmp_path):
         extract([archive, empty], mspd_table_3_market=_mspd(tmp_path), first_month="2026-04", last_month="2026-04", filed_through="2026-06-22")
     with pytest.raises(ValueError, match="no record date"):
         extract([archive], mspd_table_3_market=_mspd(tmp_path), first_month="2026-04", last_month="2026-05", filed_through="2026-06-22")
+
+
+def test_extract_keeps_numeric_columns_when_every_outstanding_frn_is_held(tmp_path):
+    # With no zero rows to add, the extract must still write numbers, not object reprs,
+    # so its bytes do not depend on whether some FRN went unheld.
+    archive = _zip(
+        tmp_path / "20260508-20260605_nmfp.zip",
+        [("A-1", "S1", "05-MAY-2026", "N", [("912828ZZ1", TSY, "FRN", 5e9), ("912828YY2", TSY, "FRN", 1e9)])],
+    )
+    holdings, provenance = extract(
+        [archive], mspd_table_3_market=_mspd(tmp_path), first_month="2026-04", last_month="2026-04", filed_through="2026-06-22"
+    )
+    assert provenance["frn_zero_rows_by_month"] == {"2026-04-30": 0}
+    assert holdings["value_bil"].dtype.kind == "f" and holdings["series_count"].dtype.kind == "i"
