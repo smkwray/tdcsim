@@ -209,3 +209,13 @@ def test_reopening_uses_opening_cusip_for_a_ten_year_note(tmp_path) -> None:
     assert opening["security_type"].item() == renamed["security_type"].item() == "note"
     assert set(opening["security_id"]) | set(renamed["security_id"]) == {cusip}
     pd.testing.assert_frame_equal(renamed.drop(columns="security_id"), issues.drop(columns="security_id"))
+    issues["security_id"] = cusip
+    issues["coupon_rate"] = 0.05
+    with pytest.raises(SystemExit, match="conflicts with the opening security terms"):
+        ledger.name_reopened_opening_securities(issues, opening)
+
+    path = tmp_path / ledger.OPENING_PORTFOLIO
+    book = pd.read_csv(path).assign(IssueID=" ")
+    book.to_csv(path, index=False)
+    with pytest.raises(SystemExit, match="complete issue IDs"):
+        ledger.build_opening(tmp_path)

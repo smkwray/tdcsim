@@ -152,14 +152,16 @@ def build_issues(flows: list[dict[str, Any]]) -> pd.DataFrame:
     frame["term"] = frame["weighted_original_term_years"].astype(float)
     frame["kind"] = [security_type(t, y) for t, y in zip(frame["instrument_type"], frame["term"])]
     frame["holder"] = [holder_column(h, s) for h, s in zip(frame["holder_sector"], frame["holder_subsector"])]
-    frame["security_id"] = frame["security_label"].astype(str)
+    frame["security_id"] = frame["security_label"].astype(str).str.strip()
+    if frame["security_id"].eq("").any():
+        raise SystemExit("issuance events require complete issue IDs")
     keys = ["security_id", "settlement_date", "kind", "term", "coupon_rate_decimal", "maturity_date", "dated_date",
             "is_reopening", "settlement_kind"]
     if frame[keys].isna().any().any():
         raise SystemExit("an issuance event lacks a date, term or coupon")
-    terms = frame.groupby("security_id")[["maturity_date", "coupon_rate_decimal"]].nunique()
+    terms = frame.groupby("security_id")[["kind", "maturity_date", "coupon_rate_decimal"]].nunique()
     if (terms > 1).any().any():
-        raise SystemExit("a security id carries more than one maturity or coupon")
+        raise SystemExit("a security id carries more than one type, maturity or coupon")
     grouped = frame.groupby(keys)
     out = frame.pivot_table(index=keys, columns="holder", values="face_issued_bil", aggfunc="sum", fill_value=0.0)
     for column in HOLDER_COLUMNS:
@@ -216,17 +218,21 @@ def name_reopened_opening_securities(issues: pd.DataFrame, opening: pd.DataFrame
     """Give a reopening of an opening-book security that security's CUSIP."""
 
     lookup = {}
+    opening_terms = {}
     for security_id, kind, maturity, coupon in opening[
         ["security_id", "security_type", "maturity_date", "coupon_rate"]
     ].itertuples(index=False, name=None):
         key = (kind, pd.Timestamp(maturity), round(float(coupon), 9))
+        opening_terms[security_id] = key
         lookup.setdefault(key, set()).add(security_id)
     out = issues.copy()
     identified = set(opening["security_id"]) | set(issues.loc[~issues["is_reopening"], "security_id"])
     for index, row in issues.loc[issues["is_reopening"]].iterrows():
+        key = (row["security_type"], pd.Timestamp(row["maturity_date"]), round(float(row["coupon_rate"]), 9))
+        if row["security_id"] in opening_terms and opening_terms[row["security_id"]] != key:
+            raise SystemExit(f"reopening {row['security_id']} conflicts with the opening security terms")
         if row["security_id"] in identified:
             continue
-        key = (row["security_type"], pd.Timestamp(row["maturity_date"]), round(float(row["coupon_rate"]), 9))
         matches = lookup.get(key)
         if not matches:
             continue
@@ -252,8 +258,10 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     )
     if not book["kind"].isin(("bill", "note", "bond", "TIPS", "FRN")).all():
         raise SystemExit("opening portfolio contains an unclassifiable security")
-    if "IssueID" in book and book["IssueID"].notna().all():
-        book["security_id"] = book["IssueID"]
+    if "IssueID" in book:
+        book["security_id"] = book["IssueID"].astype("string").str.strip()
+        if book["security_id"].isna().any() or book["security_id"].eq("").any():
+            raise SystemExit("opening portfolio requires complete issue IDs")
     else:
         rollforward = pd.read_csv(run_dir / ROLLFORWARD, low_memory=False)
         added = rollforward[rollforward["row_type"] == "replacement"].set_index("replacement_bond_id")["replacement_cusip"]
@@ -263,7 +271,7 @@ def build_opening(run_dir: Path) -> pd.DataFrame:
     book["holder"] = [holder_column(h, s) for h, s in zip(book["HolderType"], book["HolderSubBucket"])]
     book["debt_basis"] = book["AdjustedPrincipal"].where(book["SecurityType"].eq("TIPS"), book["FaceValue"])
     keys = ["security_id", "kind", "IssueDate", "MaturityDate", "CouponRate"]
-    if (book.groupby("security_id")[["kind", "IssueDate", "MaturityDate", "CouponRate"]].nunique() > 1).any().any():
+    if book[keys].isna().any().any() or (book.groupby("security_id")[keys[1:]].nunique() > 1).any().any():
         raise SystemExit("an opening security id carries more than one type, issue date, maturity or coupon")
     face = book.pivot_table(index=keys, columns="holder", values="FaceValue", aggfunc="sum", fill_value=0.0).reset_index()
     for column in HOLDER_COLUMNS:
@@ -481,16 +489,16 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
 ## Holder split
 Holders: `fed` (Federal Reserve), `banks`, `foreign`, `mmf` (money-market funds) and
 `other_domestic` (all other domestic holders, which pay from bank deposits).
-- Opening book: holders as of the opening. The Federal Reserve's holdings are its SOMA holdings
-  by CUSIP. The remainder is split uniformly within bills and within longer securities: banks,
-  foreign holders and money funds keep their measured sector holdings converted to par, and
-  other domestic holders take the rest.
+- Opening book: holdings at the observed Treasury close. The Federal Reserve's positions come
+  from SOMA by CUSIP and the next day's Treasury settlements. Non-Fed positions use measured
+  bill and nonbill holder shares. Money funds receive floating-rate notes and securities within
+  397 days of maturity. Other eligible holders take the shares of issues money funds cannot buy.
 - Issues: holders at issuance. The Federal Reserve rolls its maturing holdings over at auction
   as add-ons (`face_fed`), in the securities settling the day its holdings are paid, in
   proportion to the amounts sold to the public. Beyond that it follows its holdings path by
-  buying from or selling to other holders in the secondary market (domestic private holders
-  first, shortest maturity first), so holdings change after issuance. Label this split
-  "at issuance".
+  buying from or selling to other holders in the secondary market. Reserve-management purchases
+  follow bill and coupon maturity sectors and per-issue SOMA ownership limits. Eligible holders
+  of a purchased issue sell pro rata. The table shows allocations at issuance.
 """
 
 
