@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 import tdcsim_cbo.runner as runner_module
-from forecast_paths import compiled_forecast_input_paths
+from forecast_paths import CBO_FED_REMITTANCE_OPENING_STATUS, CBO_FED_REMITTANCE_STATUS, compiled_forecast_input_paths
 from sim_engine import _handoff_append_payment
 from tdcsim_cbo import CboBaselinePackage, CboScenarioSpec, run_cbo_scenario
 from tdcsim_cbo._json import read_json, sha256_file, write_json
@@ -298,8 +298,8 @@ def test_run_cbo_scenario_net_interest_is_diagnostic_only(tmp_path: Path) -> Non
     assert set(ni_results["NetInterestDiagnosticStatus"].dropna()) == {"cbo_reported_check_only"}
 
 
-def test_run_cbo_scenario_fed_target_settles_and_remittance_unsupported(tmp_path: Path) -> None:
-    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path)
+def test_run_cbo_scenario_fed_target_settles_with_fixed_remittance(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path, remittance_bil=1.0)
 
     noop = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run-noop")
     fed = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["fed"]), tmp_path / "run-fed")
@@ -311,11 +311,13 @@ def test_run_cbo_scenario_fed_target_settles_and_remittance_unsupported(tmp_path
     assert fed_results["CBOFedSecondaryPurchaseReserveEffect"].sum() == pytest.approx(
         fed_results["CBOFedSecondaryPurchaseCash"].sum()
     )
-    assert fed_results["CBORemittanceCashEffect"].fillna(0.0).abs().max() == pytest.approx(0.0)
+    cash = fed_results["CBORemittanceCashEffect"]
+    assert cash.sum() == pytest.approx(1.0)
+    assert cash.tolist() == noop_results["CBORemittanceCashEffect"].tolist()
     assert set(fed_results["CBORemittanceStatus"]) == {
-        "not_modeled_cbo_primary_deficit_embeds_baseline_revenues"
+        CBO_FED_REMITTANCE_OPENING_STATUS, CBO_FED_REMITTANCE_STATUS,
     }
-    assert fed_results["CB_Remittance"].isna().all()
+    assert fed_results["CB_Remittance"].tolist() == cash.tolist()
     assert fed_results["CB_DeferredAsset"].isna().all()
     assert fed_results["CBORequiredFaceIssuance"].tolist() == pytest.approx(
         noop_results["CBORequiredFaceIssuance"].tolist()
@@ -446,6 +448,21 @@ def test_verifier_rejects_coordinated_manifest_and_output_tamper(tmp_path: Path)
     write_json(run.manifest_path, manifest)
 
     with pytest.raises(VerificationError, match="controlled-debt target error"):
+        verify_scenario_run(run.output_dir)
+
+
+def test_verifier_rejects_wrong_remittance_even_with_fresh_hashes(tmp_path: Path) -> None:
+    baseline, scenarios = _runner_baseline_and_scenarios(tmp_path, remittance_bil=1.0)
+    run = run_cbo_scenario(baseline, CboScenarioSpec.from_file(scenarios["noop"]), tmp_path / "run")
+    assert verify_scenario_run(run.output_dir)["status"] == "pass"
+    results = pd.read_csv(run.results_path)
+    results.loc[1, ["CBORemittanceCashEffect", "CB_Remittance"]] = 0.0
+    results.to_csv(run.results_path, index=False)
+    manifest = read_json(run.manifest_path)
+    _refresh_result_hashes(run.output_dir, manifest)
+    write_json(run.manifest_path, manifest)
+
+    with pytest.raises(VerificationError, match="Fed remittance cash path differs from compiled input"):
         verify_scenario_run(run.output_dir)
 
 
@@ -1218,8 +1235,10 @@ def test_cli_validate_compile_and_verify(tmp_path: Path) -> None:
     ).stdout.strip() == b"pass"
 
 
-def _runner_baseline_and_scenarios(tmp_path: Path) -> tuple[CboBaselinePackage, dict[str, Path]]:
-    package, attestation = _write_runner_package(tmp_path)
+def _runner_baseline_and_scenarios(
+    tmp_path: Path, *, remittance_bil: float = 0.0
+) -> tuple[CboBaselinePackage, dict[str, Path]]:
+    package, attestation = _write_runner_package(tmp_path, remittance_bil=remittance_bil)
     baseline = CboBaselinePackage.open(package, attestation_path=attestation)
     cash_residual_override = _write_cash_residual_override(tmp_path / "cash_residual_override.csv")
     scenarios = {
@@ -1336,6 +1355,7 @@ def _write_runner_package(
     opening_portfolio: pd.DataFrame | None = None,
     cbo_public_debt_target_bil: float = 1_250.0,
     fed_holdings_target_bil: float = 100.0,
+    remittance_bil: float = 0.0,
 ) -> tuple[Path, Path]:
     package_dir = tmp_path / "runner_pkg"
     inputs = package_dir / "forecast_inputs"
@@ -1350,6 +1370,7 @@ def _write_runner_package(
         period_start="2026-09-20",
         period_end="2026-09-30",
         cbo_public_debt_target_bil=cbo_public_debt_target_bil,
+        remittance_bil=remittance_bil,
     )
     extra_paths = {
         "tdcsim_yield_curve_surface.csv": _dynamic_surface_path(tmp_path / "raw_inputs"),

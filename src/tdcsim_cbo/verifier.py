@@ -23,6 +23,7 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
+from forecast_paths import FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash
 from sim_engine import (
     CBO_FUNDING_MODE,
     CASH_FINANCING_ISSUANCE_LEGS,
@@ -123,6 +124,9 @@ REQUIRED_RESULT_COLUMNS = (
     "CBOFedAuctionRolloverAddons",
     "CBOFedMaturitiesAndRedemptions",
     "CBORemittanceCashEffect",
+    "CBORemittanceStatus",
+    "CB_Remittance",
+    "CB_DeferredAsset",
     "NetInterestDiagnosticStatus",
 )
 REQUIRED_SUMMARY_KEYS = (
@@ -336,7 +340,7 @@ def verify_scenario_run(
     if boundaries.get("net_interest_role") != "diagnostic_nonbinding":
         raise VerificationError("net interest role must remain diagnostic_nonbinding")
     if boundaries.get("remittance_deferred_asset_status") != "unsupported_in_cbo_scenario_lane":
-        raise VerificationError("remittance/deferred-asset status must remain unsupported")
+        raise VerificationError("Fed deferred-asset status must remain unsupported")
     if boundaries.get("fed_auction_add_ons_roll_over_maturities") is not True:
         raise VerificationError("the Fed's auction add-ons exceed its maturing holdings")
     recomputed = _verify_output_invariants(root, manifest)
@@ -1636,7 +1640,10 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
     )
     fed_share = _max_abs(results, "CBOFedAuctionShare")
     fed_face = _max_abs(results, "CBOFedAuctionRolloverAddons")
-    remittance_cash = _max_abs(results, "CBORemittanceCashEffect")
+    try:
+        remittance_cash = verify_fed_remittance_cash(results, inputs_dir / FED_REMITTANCE_PATH_FILE)
+    except (OSError, ValueError, KeyError) as exc:
+        raise VerificationError(f"Fed remittance verification failed: {exc}") from exc
     target_tolerance = (
         _BOUNDED_TARGET_TOLERANCE_BIL if bounded_limits else 1e-5
     )
@@ -1658,8 +1665,6 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
     )
     if fed_excess > 1e-9:
         raise VerificationError(f"the Fed's auction add-ons exceed its maturing holdings by {fed_excess}")
-    if remittance_cash > 1e-12:
-        raise VerificationError(f"remittance cash effect must remain zero: {remittance_cash}")
     statuses = set(str(value) for value in results["NetInterestDiagnosticStatus"].dropna().unique())
     if not statuses:
         raise VerificationError("NetInterestDiagnosticStatus must contain evidence")

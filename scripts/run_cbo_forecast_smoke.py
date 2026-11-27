@@ -44,15 +44,23 @@ from cbo_holder_preferences import (
 )
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
+    CBO_REMITTANCE_SOURCE_FILE,
+    DTS_REMITTANCE_SOURCE_FILE,
     build_cash_reconciliation_residual_rows,
     build_current_fy_splice_row,
     build_debt_stock_path_rows,
     build_fed_holdings_path_rows,
+    build_fed_remittance_path_rows,
     build_operating_cash_path_rows,
     build_primary_deficit_path_rows,
     calculate_public_debt_bridge_components,
+    cbo_remittance_source_fixture,
+    federal_fiscal_year,
+    read_dts_fed_earnings,
+    read_dts_fed_earnings_rows,
     tga_closing_balance_bil_from_dts_row,
 )
+from forecast_paths import FED_REMITTANCE_PATH_FILE
 from forecast_input_builder import (
     BUDGET_WORKBOOK_SHA256,
     ECONOMIC_WORKBOOK_SHA256,
@@ -101,6 +109,7 @@ DEFAULT_MTS_TABLE_1 = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fis
 DEFAULT_DTS_OPERATING_CASH_BALANCE = (
     PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "dts_operating_cash_balance.csv"
 )
+DEFAULT_DTS_FED_EARNINGS = DEFAULT_DTS_OPERATING_CASH_BALANCE.with_name("dts_deposits_withdrawals_operating_cash.csv")
 DEFAULT_MSPD_TABLE_1 = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mspd_table_1.csv"
 DEFAULT_MSPD_TABLE_3_MARKET = (
     PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mspd_table_3_market.csv"
@@ -120,6 +129,7 @@ SOURCE_PACKAGE_INPUTS = {
     "mts_table_1": "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "mts_table_9_net_interest": "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
     "dts_operating_cash_balance": "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+    "dts_fed_earnings": DTS_REMITTANCE_SOURCE_FILE,
     "mspd_table_1": "fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "mspd_table_3_market": "fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "debt_to_penny_public_debt": "treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -299,6 +309,7 @@ def build_forecast_bundle(
     auctions_query: str | Path = DEFAULT_AUCTIONS_QUERY,
     mts_table_1: str | Path = DEFAULT_MTS_TABLE_1,
     dts_operating_cash_balance: str | Path = DEFAULT_DTS_OPERATING_CASH_BALANCE,
+    dts_fed_earnings: str | Path = DEFAULT_DTS_FED_EARNINGS,
     mspd_table_1: str | Path = DEFAULT_MSPD_TABLE_1,
     mspd_table_3_market: str | Path = DEFAULT_MSPD_TABLE_3_MARKET,
     mts_table_9_net_interest: str | Path | None = None,
@@ -340,6 +351,7 @@ def build_forecast_bundle(
         auctions_query=Path(auctions_query),
         mts_table_1=mts_table_1_path,
         dts_operating_cash_balance=dts_operating_cash_balance_path,
+        dts_fed_earnings=Path(dts_fed_earnings),
         mspd_table_1=mspd_table_1_path,
         mspd_table_3_market=mspd_table_3_market_path,
         mts_table_9_net_interest=Path(mts_table_9_net_interest) if mts_table_9_net_interest else None,
@@ -424,6 +436,11 @@ def build_forecast_bundle(
         primary_deficit_by_fiscal_year_bil=primary_deficit_by_fy,
         source_status="remaining_fy2026_splice_then_cbo_fy2027_2036_primary_deficit",
     )
+    remittance_rows = build_fed_remittance_path_rows(
+        primary_rows,
+        current_fy_splice,
+        read_dts_fed_earnings(packaged_sources["dts_fed_earnings"], current_fy_splice),
+    )
 
     base_tga_bil = tga_closing_balance_bil_from_dts_row(dts_tga_closing_balance_row)
     cpi_by_period_end = _cpi_by_period_end(macro_rows, periods)
@@ -465,7 +482,10 @@ def build_forecast_bundle(
 
     incidence_rows = build_fiscal_incidence_policy_rows(
         scenario_id=SCENARIO_ID,
-        signed_net_primary_flow_bil=sum(float(row["primary_deficit_bil"]) for row in primary_rows),
+        signed_net_primary_flow_bil=(
+            sum(float(row["primary_deficit_bil"]) for row in primary_rows)
+            + sum(float(row["remittance_bil"]) for row in remittance_rows)
+        ),
     )
     incidence_result_rows = build_fiscal_incidence_sensitivity_results(incidence_rows)
     net_interest_rows: list[dict[str, Any]] = []
@@ -485,6 +505,7 @@ def build_forecast_bundle(
     write_forecast_rows_csv(inputs / "tdcsim_current_fy_splice.csv", [current_fy_splice])
     write_forecast_rows_csv(inputs / "tdcsim_debt_stock_path.csv", debt_rows)
     write_forecast_rows_csv(inputs / "tdcsim_primary_deficit_path.csv", primary_rows)
+    write_forecast_rows_csv(inputs / FED_REMITTANCE_PATH_FILE, remittance_rows)
     write_forecast_rows_csv(inputs / "tdcsim_operating_cash_path.csv", operating_cash_rows)
     write_forecast_rows_csv(inputs / "tdcsim_cash_reconciliation_residual.csv", zero_residual_rows)
     write_forecast_rows_csv(inputs / "tdcsim_macro_forecast_path.csv", macro_rows)
@@ -1769,6 +1790,7 @@ def _baseline_input_paths(inputs_dir: Path) -> dict[str, str]:
         "current_fy_splice_file": str(inputs_dir / "tdcsim_current_fy_splice.csv"),
         "debt_stock_path_file": str(inputs_dir / "tdcsim_debt_stock_path.csv"),
         "primary_deficit_path_file": str(inputs_dir / "tdcsim_primary_deficit_path.csv"),
+        "fed_remittance_path_file": str(inputs_dir / FED_REMITTANCE_PATH_FILE),
         "operating_cash_path_file": str(inputs_dir / "tdcsim_operating_cash_path.csv"),
         "cash_reconciliation_residual_file": str(inputs_dir / "tdcsim_cash_reconciliation_residual.csv"),
         "macro_forecast_path_file": str(inputs_dir / "tdcsim_macro_forecast_path.csv"),
@@ -1849,6 +1871,7 @@ def write_source_package(
     auctions_query: Path,
     mts_table_1: Path,
     dts_operating_cash_balance: Path,
+    dts_fed_earnings: Path,
     mspd_table_1: Path,
     mspd_table_3_market: Path,
     mts_table_9_net_interest: Path | None,
@@ -1998,6 +2021,24 @@ def write_source_package(
             "source_path": rel,
             **extra,
         }
+    dts_rows = read_dts_fed_earnings_rows(dts_fed_earnings, federal_fiscal_year(SIMULATION_START_DATE))
+    if not dts_rows:
+        raise ValueError("DTS Table II source has no Federal Reserve Earnings observations for the opening fiscal year")
+    _copy_or_write_canonical_csv(
+        sources_dir=sources_dir,
+        rel=DTS_REMITTANCE_SOURCE_FILE,
+        source=None,
+        rows=dts_rows,
+        source_entries=source_entries,
+    )
+    fixture_path = sources_dir / CBO_REMITTANCE_SOURCE_FILE
+    _write_json(fixture_path, cbo_remittance_source_fixture())
+    source_entries[CBO_REMITTANCE_SOURCE_FILE] = {
+        "sha256": _sha256_file(fixture_path),
+        "bytes": fixture_path.stat().st_size,
+        "source_path": CBO_REMITTANCE_SOURCE_FILE,
+        "origin_source_label": "cbo_table_4_3_federal_reserve_remittances_transcription",
+    }
     manifest = {
         "schema_version": "tdcsim_cbo_source_package_manifest_v1",
         "files": source_entries,
@@ -2465,6 +2506,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--mts-table-1", default=str(DEFAULT_MTS_TABLE_1))
     parser.add_argument("--dts-operating-cash-balance", default=str(DEFAULT_DTS_OPERATING_CASH_BALANCE))
+    parser.add_argument(
+        "--dts-fed-earnings",
+        default=str(DEFAULT_DTS_FED_EARNINGS),
+        help="FiscalData DTS Deposits and Withdrawals of Operating Cash CSV covering the fiscal splice cutoff.",
+    )
     parser.add_argument("--mspd-table-1", default=str(DEFAULT_MSPD_TABLE_1))
     parser.add_argument("--mspd-table-3-market", default=str(DEFAULT_MSPD_TABLE_3_MARKET))
     parser.add_argument("--mts-table-9-net-interest")
@@ -2496,6 +2542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dts_operating_cash_balance",
             Path(args.dts_operating_cash_balance),
         ),
+        dts_fed_earnings=source_paths.get("dts_fed_earnings", Path(args.dts_fed_earnings)),
         mspd_table_1=source_paths.get("mspd_table_1", Path(args.mspd_table_1)),
         mspd_table_3_market=source_paths.get("mspd_table_3_market", Path(args.mspd_table_3_market)),
         mts_table_9_net_interest=source_paths.get(

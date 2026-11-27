@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export a thin security ledger of one completed CBO scenario run for visualization.
 
-Writes opening_book.csv, issues.csv, daily.csv, fiscal.csv, README.md and receipt.json
+Writes opening_book.csv, issues.csv, daily.csv, fiscal.csv, fed_remittances.csv, README.md and receipt.json
 (USD billions).
 
 The opening book and the daily series come from the run tree. The bounded run outputs keep
@@ -264,9 +264,8 @@ def build_daily(run_dir: Path, results: pd.DataFrame, opening: pd.DataFrame, iss
 def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Daily net fiscal flow and its deposit, non-deposit and reserve incidence.
 
-    The run models the CBO primary deficit as one signed net flow (no separate gross outlays
-    and receipts); the active incidence policy splits it into a covered-deposit share and
-    shares settling outside covered deposits.
+    The active incidence policy splits the ordinary fiscal flow, equal to the
+    primary deficit plus Fed remittances, across the two recipient groups.
     """
 
     policies = pd.read_csv(run_dir / FISCAL_POLICY)
@@ -280,14 +279,18 @@ def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[
     trc = pd.read_csv(run_dir / TRC, parse_dates=["Date"]).set_index("Date")
     fiscal = pd.DataFrame(index=results.index)
     fiscal["primary_deficit"] = results["PrimaryDeficit"]
+    ordinary_fiscal_flow = results["PrimaryDeficit"] + results["CBORemittanceCashEffect"]
     fiscal["fiscal_to_du"] = results["TDC_FiscalFlow"]
-    fiscal["fiscal_to_rs"] = outside_share * results["PrimaryDeficit"]
+    fiscal["fiscal_to_rs"] = outside_share * ordinary_fiscal_flow
     fiscal["trc_fiscal_flow"] = trc["TRC_FiscalFlow"].reindex(results.index)
     if fiscal.isna().any().any():
         raise SystemExit("fiscal series has gaps")
-    identity_gap = float((fiscal["fiscal_to_du"] + fiscal["fiscal_to_rs"] - fiscal["primary_deficit"]).abs().max())
-    if identity_gap > TOLERANCE_BIL:
-        raise SystemExit(f"fiscal incidence does not add up to the primary deficit (gap {identity_gap})")
+    identity_gap = float((fiscal["fiscal_to_du"] + fiscal["fiscal_to_rs"] - ordinary_fiscal_flow).abs().max())
+    if ordinary_fiscal_flow.isna().any() or identity_gap > TOLERANCE_BIL:
+        raise SystemExit(f"fiscal incidence does not add up to the primary deficit plus Fed remittances (gap {identity_gap})")
+    reserve_gap = float((fiscal["trc_fiscal_flow"] - ordinary_fiscal_flow).abs().max())
+    if reserve_gap > TOLERANCE_BIL:
+        raise SystemExit(f"TRC fiscal flow differs from the ordinary fiscal flow by {reserve_gap}")
     checks = {
         "fiscal_incidence_policy_id": policy_id,
         "du_share": float(policy["du_share"]),
@@ -295,7 +298,7 @@ def build_fiscal(run_dir: Path, results: pd.DataFrame, policy_id: str) -> tuple[
         "gross_outlays_and_receipts_modeled": bool(
             pd.notna(policy["primary_outlays_bil"]) or pd.notna(policy["primary_receipts_bil"])
         ),
-        "max_gap_du_plus_rs_minus_primary_deficit_bil": identity_gap,
+        "max_gap_du_plus_rs_minus_ordinary_fiscal_flow_bil": identity_gap,
         "net_receipt_days": int((fiscal["primary_deficit"] < 0).sum()),
     }
     return fiscal.reset_index().rename(columns={"Date": "date"}), checks
@@ -394,11 +397,13 @@ Produced by `scripts/export_visual_ledger.py`; provenance and hashes are in `rec
   settles on the fiscal year's last business day); off-calendar settlements reopen each
   security's latest issue. `model_tranche_ids` lists the model's per-holder rows.
 - `fiscal.csv`: one row per day. `primary_deficit` is the net fiscal flow out of the TGA
-  ({fiscal_note}). `fiscal_to_du` is the part landing in covered deposits (TDC_FiscalFlow);
+  including remittance revenue ({fiscal_note}). `fiscal_to_du` is the part landing in covered deposits (TDC_FiscalFlow);
   `fiscal_to_rs` is the part settling outside covered deposits, here the reserve-settled share
   of the run's fiscal incidence policy ({rs_share:.0%}; foreign and other shares are zero), so
-  the two sum to `primary_deficit` every day. `trc_fiscal_flow` is the reserve effect
+  the two sum to `primary_deficit` plus the Fed-to-TGA remittance every day. `trc_fiscal_flow` is the reserve effect
   (TRC_FiscalFlow). Gross outlays and receipts are not modeled separately.
+- `fed_remittances.csv`: one row per day. `fed_to_tga_bil` is the transfer from the Fed to the
+  TGA on the fixed CBO path. It changes the TGA but has zero direct deposit and reserve effect.
 - `daily.csv`: one row per calendar day. `fedwire_open` marks the days cash can move: on the
   others nothing is paid, issued or settled, and fiscal flows are zero; a payment due then is
   made on the next open day at its contractual amount. Securities do not settle on Good
@@ -483,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
         "issues.csv": issues,
         "daily.csv": daily,
         "fiscal.csv": fiscal,
+        "fed_remittances.csv": results["CBORemittanceCashEffect"].rename("fed_to_tga_bil")
+        .reset_index().rename(columns={"Date": "date"}),
     }
     for name, frame in outputs.items():
         frame.to_csv(args.out_dir / name, index=False, lineterminator="\n", date_format="%Y-%m-%d", float_format="%.9f")
@@ -493,8 +500,8 @@ def main(argv: list[str] | None = None) -> int:
             record_date=json.loads((run_dir / OPENING_METADATA).read_text(encoding="utf-8"))["record_date"],
             rs_share=fiscal_checks["outside_covered_deposits_share"],
             fiscal_note=(
-                "CBO's primary deficit for each fiscal year spread evenly over its days, so it is"
-                " constant within a fiscal year and has no tax-date or payment-date seasonality"
+                "CBO's primary deficit spread evenly over the Fedwire business days within each"
+                " fiscal year, with zero flow on closed days"
                 if fiscal_checks["net_receipt_days"] == 0
                 else "negative on net-receipt days"
             ),
@@ -540,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         "outputs": {
             name: {"sha256": sha256(args.out_dir / name), "bytes": (args.out_dir / name).stat().st_size,
                    **({"rows": len(outputs[name])} if name in outputs else {})}
-            for name in ("opening_book.csv", "issues.csv", "daily.csv", "fiscal.csv", "README.md")
+            for name in (*outputs, "README.md")
         },
         "units": "USD billions",
     }

@@ -24,6 +24,10 @@ ALLOWED_SOURCE_ROLES = frozenset(
 
 OPERATING_CASH_OPENING_STATE_ROLE = "opening_state_anchor"
 OPERATING_CASH_COMPARISON_ROLE = "nonbinding_comparison_target"
+FED_REMITTANCE_PATH_FILE = "tdcsim_fed_remittance_path.csv"
+FED_REMITTANCE_PATH_SCHEMA_VERSION = "tdcsim_fed_remittance_path_v1"
+CBO_FED_REMITTANCE_STATUS = "fixed_cbo_path_fed_to_tga_no_reserve_or_deposit_effect"
+CBO_FED_REMITTANCE_OPENING_STATUS = "not_applicable_opening_row"
 
 ALLOWED_RUNTIME_ROLES = frozenset(
     {
@@ -55,6 +59,7 @@ BASELINE_INPUT_PATH_KEYS = (
     "current_fy_splice_file",
     "debt_stock_path_file",
     "primary_deficit_path_file",
+    "fed_remittance_path_file",
     "operating_cash_path_file",
     "cash_reconciliation_residual_file",
     "macro_forecast_path_file",
@@ -75,6 +80,7 @@ COMPILED_FORECAST_INPUT_FILES = {
     "current_fy_splice_file": "tdcsim_current_fy_splice.csv",
     "debt_stock_path_file": "tdcsim_debt_stock_path.csv",
     "primary_deficit_path_file": "tdcsim_primary_deficit_path.csv",
+    "fed_remittance_path_file": FED_REMITTANCE_PATH_FILE,
     "operating_cash_path_file": "tdcsim_operating_cash_path.csv",
     "cash_reconciliation_residual_file": "tdcsim_cash_reconciliation_residual.csv",
     "macro_forecast_path_file": "tdcsim_macro_forecast_path.csv",
@@ -110,6 +116,7 @@ class BaselineInputPaths:
     current_fy_splice_file: Path | None = None
     debt_stock_path_file: Path | None = None
     primary_deficit_path_file: Path | None = None
+    fed_remittance_path_file: Path | None = None
     operating_cash_path_file: Path | None = None
     cash_reconciliation_residual_file: Path | None = None
     macro_forecast_path_file: Path | None = None
@@ -541,6 +548,14 @@ FORECAST_CSV_SCHEMAS = {
         PRIMARY_DEFICIT_PATH_COLUMNS,
         ("scenario_id", "period_start", "period_end"),
     ),
+    "fed_remittance_path_file": ForecastCsvSchema(
+        frozenset({
+            "schema_version", "scenario_id", "period_start", "period_end", "source_fiscal_year",
+            "remittance_bil", "annual_or_remaining_remittance_bil", "source_role", "runtime_role",
+            "source_status", "claim_boundary",
+        }),
+        ("scenario_id", "period_start", "period_end"),
+    ),
     "operating_cash_path_file": ForecastCsvSchema(
         OPERATING_CASH_PATH_COLUMNS,
         ("scenario_id", "period_end"),
@@ -825,6 +840,47 @@ def load_primary_deficit_path(path: str | os.PathLike[str], **kwargs) -> pd.Data
     )
 
 
+def load_fed_remittance_path(path: str | os.PathLike[str], **kwargs) -> pd.DataFrame:
+    frame = load_forecast_csv(
+        path, schema_key="fed_remittance_path_file", dataset_name="Fed remittance path", **kwargs
+    )
+    if not frame["schema_version"].eq(FED_REMITTANCE_PATH_SCHEMA_VERSION).all():
+        raise ValueError("Fed remittance path has an unsupported schema version")
+    for column in ("remittance_bil", "annual_or_remaining_remittance_bil"):
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if not ((values >= 0) & (values < float("inf"))).all():
+            raise ValueError(f"Fed remittance path has invalid {column} values")
+    if not (pd.to_datetime(frame["period_start"]) < pd.to_datetime(frame["period_end"])).all():
+        raise ValueError("Fed remittance path periods must start before they end")
+    return frame
+
+
+def verify_fed_remittance_cash(results: pd.DataFrame, path: str | os.PathLike[str]) -> float:
+    """Match each simulated period to its compiled remittance input."""
+
+    rows = load_fed_remittance_path(path)
+    if rows["scenario_id"].nunique(dropna=False) != 1:
+        raise ValueError("compiled Fed remittance path must have exactly one scenario")
+    dates = pd.to_datetime(results["Date"], errors="raise")
+    periods = pd.MultiIndex.from_arrays([dates.iloc[:-1], dates.iloc[1:]])
+    expected = rows.set_index(
+        [pd.to_datetime(rows["period_start"]), pd.to_datetime(rows["period_end"])]
+    )["remittance_bil"].reindex(periods)
+    cash = pd.to_numeric(results["CBORemittanceCashEffect"], errors="raise")
+    expected_cash = [0.0, *expected.to_numpy(dtype=float)]
+    if not ((cash - expected_cash).abs() <= 1e-9).all():
+        raise ValueError("Fed remittance cash path differs from compiled input")
+    statuses = [CBO_FED_REMITTANCE_OPENING_STATUS, *[CBO_FED_REMITTANCE_STATUS] * len(periods)]
+    if results["CBORemittanceStatus"].tolist() != statuses:
+        raise ValueError("Fed remittance cash path has unexpected status")
+    if not ((pd.to_numeric(results["CB_Remittance"], errors="raise") - cash).abs() <= 1e-9).all():
+        raise ValueError("Fed remittance cash path differs from CB_Remittance")
+    for column in ("CB_NetIncome", "CB_DeferredAsset"):
+        if column in results and results[column].notna().any():
+            raise ValueError(f"{column} must remain unsupported in CBO mode")
+    return float(cash.abs().max())
+
+
 def load_operating_cash_path(path: str | os.PathLike[str], **kwargs) -> pd.DataFrame:
     return load_forecast_csv(
         path,
@@ -989,6 +1045,7 @@ def load_baseline_input_paths(
         "current_fy_splice_file": load_current_fy_splice,
         "debt_stock_path_file": load_debt_stock_path,
         "primary_deficit_path_file": load_primary_deficit_path,
+        "fed_remittance_path_file": load_fed_remittance_path,
         "operating_cash_path_file": load_operating_cash_path,
         "cash_reconciliation_residual_file": load_cash_reconciliation_residual,
         "macro_forecast_path_file": load_macro_forecast_path,
@@ -1031,6 +1088,7 @@ __all__ = [
     "load_forecast_csv",
     "load_holder_absorption_path",
     "load_fed_holdings_path",
+    "load_fed_remittance_path",
     "load_frn_rate_path",
     "load_tips_cpi_path",
     "load_tips_real_yield_path",

@@ -30,6 +30,14 @@ from forecast_input_builder import (  # noqa: E402
     parse_cbo_budget_source_contract,
     parse_cbo_economic_quarterly_source_contract,
 )
+from forecast_bundle_builders import (  # noqa: E402
+    CBO_REMITTANCE_SOURCE_FILE,
+    DTS_REMITTANCE_SOURCE_FILE,
+    build_fed_remittance_path_rows,
+    cbo_remittance_source_fixture,
+    read_dts_fed_earnings,
+)
+from forecast_paths import FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash  # noqa: E402
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import (  # noqa: E402
     CALIBRATION_FILE,
@@ -57,6 +65,7 @@ REQUIRED_FILES = {
     "forecast_inputs/tdcsim_current_fy_splice.csv",
     "forecast_inputs/tdcsim_debt_stock_path.csv",
     "forecast_inputs/tdcsim_primary_deficit_path.csv",
+    f"forecast_inputs/{FED_REMITTANCE_PATH_FILE}",
     "forecast_inputs/tdcsim_operating_cash_path.csv",
     "forecast_inputs/tdcsim_cash_reconciliation_residual.csv",
     "forecast_inputs/tdcsim_macro_forecast_path.csv",
@@ -86,6 +95,8 @@ REQUIRED_FILES = {
     "sources/fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "sources/fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
     "sources/fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+    f"sources/{CBO_REMITTANCE_SOURCE_FILE}",
+    f"sources/{DTS_REMITTANCE_SOURCE_FILE}",
     "sources/fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "sources/fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "sources/treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -103,6 +114,8 @@ EXPECTED_SOURCE_PACKAGE_FILES = {
     "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
     "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+    CBO_REMITTANCE_SOURCE_FILE,
+    DTS_REMITTANCE_SOURCE_FILE,
     "fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -476,6 +489,7 @@ def _verify_directory(root: Path, *, package_zip_sha256: str | None) -> dict[str
     _verify_source_package(root, manifest)
     _verify_issuance_calibration(root, manifest)
     _verify_cbo_source_fixtures_against_workbooks(root)
+    _verify_fed_remittance_inputs(root)
     _verify_package_file_allowlist(root, manifest)
     _verify_claim_boundary(manifest)
     _verify_manifest_contract(manifest)
@@ -609,6 +623,8 @@ def _verify_opening_counts_against_source_book(root: Path, manifest: Mapping[str
 
 
 def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
+    import pandas as pd
+
     run_metrics = {}
     manifest_summaries = manifest.get("run_summaries", {})
     if not isinstance(manifest_summaries, Mapping):
@@ -618,6 +634,9 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
     calendar = _read_json(root / "forecast_inputs" / CALIBRATION_FILE)["settlement_calendar"]
     for run_id, run_dir in RUN_DIRS.items():
         results = _read_csv_dicts(root / run_dir / "results_compact.csv")
+        verify_fed_remittance_cash(
+            pd.read_csv(root / run_dir / "results_compact.csv"), root / "forecast_inputs" / FED_REMITTANCE_PATH_FILE
+        )
         summary = _read_json(root / run_dir / "summary.json")
         if not isinstance(summary, Mapping):
             raise ValueError(f"{run_id} summary must be a JSON object")
@@ -1038,18 +1057,6 @@ def _verify_fed_stock_bridge(
             end_stock - begin_stock,
             NUMERIC_TOLERANCE,
         )
-        # Fed secondary purchase cash, reserve and deposit effects are no longer required to
-        # be zero: CB is a beneficial holder and its purchases settle at dirty market value,
-        # checked above. Remittances remain unmodelled in this lane, so their cash effect
-        # must still be zero.
-        for unsupported_column in ("CBORemittanceCashEffect",):
-            if abs(_float(row, unsupported_column)) > NUMERIC_TOLERANCE:
-                raise ValueError(f"{run_id} row {row_index} {unsupported_column} must remain zero in synthetic Fed mode")
-        if row["CBORemittanceStatus"] != "not_modeled_cbo_primary_deficit_embeds_baseline_revenues":
-            raise ValueError(f"{run_id} row {row_index} remittance status is not explicit non-modeled CBO status")
-        for nonmodeled_column in ("CB_NetIncome", "CB_Remittance", "CB_DeferredAsset"):
-            if not _is_blank_or_nan(row.get(nonmodeled_column)):
-                raise ValueError(f"{run_id} row {row_index} {nonmodeled_column} must remain blank/NaN in CBO mode")
 
 
 def _verify_run_summary(run_id: str, summary: Mapping[str, Any], metrics: Mapping[str, Any]) -> None:
@@ -2067,6 +2074,26 @@ def _verify_source_selectors_and_frozen_rows(root: Path, manifest: Mapping[str, 
         raise ValueError("packaged Treasury base curve rows changed")
 
 
+def _verify_fed_remittance_inputs(root: Path) -> None:
+    inputs = root / "forecast_inputs"
+    sources = root / "sources"
+    if _read_json(sources / CBO_REMITTANCE_SOURCE_FILE) != cbo_remittance_source_fixture():
+        raise ValueError("CBO Table 4-3 remittance transcription changed")
+    splice_rows = _read_csv_dicts(inputs / "tdcsim_current_fy_splice.csv")
+    if len(splice_rows) != 1:
+        raise ValueError("the current FY splice must contain exactly one row")
+    splice = splice_rows[0]
+    _verify_csv_rows_match_expected(
+        FED_REMITTANCE_PATH_FILE,
+        _read_csv_dicts(inputs / FED_REMITTANCE_PATH_FILE),
+        build_fed_remittance_path_rows(
+            _read_csv_dicts(inputs / "tdcsim_primary_deficit_path.csv"),
+            splice,
+            read_dts_fed_earnings(sources / DTS_REMITTANCE_SOURCE_FILE, splice),
+        ),
+    )
+
+
 def _verify_cbo_source_fixtures_against_workbooks(root: Path) -> None:
     fixture_rows = _read_csv_dicts(root / "forecast_inputs" / "source_fixtures.csv")
     if not fixture_rows:
@@ -2246,18 +2273,6 @@ def _manifest_float(mapping: Mapping[str, Any], key: str) -> float:
     if value in (None, ""):
         raise ValueError(f"missing manifest numeric value for {key}")
     return float(value)
-
-
-def _is_blank_or_nan(value: Any) -> bool:
-    if value is None:
-        return True
-    text = str(value).strip()
-    if text == "":
-        return True
-    try:
-        return math.isnan(float(text))
-    except ValueError:
-        return False
 
 
 def _sum(rows: list[dict[str, str]], column: str) -> float:
