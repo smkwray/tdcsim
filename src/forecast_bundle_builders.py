@@ -56,8 +56,10 @@ def build_current_fy_splice_row(
         raise ValueError("current-FY splice requires simulation_start_date inside the active fiscal year after Oct 1")
     if not fy_start <= actuals_through < sim_start:
         raise ValueError("fiscal_actuals_through must be inside the fiscal year and before simulation_start_date")
-    if not allow_lookahead and actuals_as_of > sim_start:
-        raise ValueError("actuals_available_as_of must be on or before simulation_start_date unless allow_lookahead")
+    # A retrospective opening can use pre-start observations released after the
+    # start. The availability gate is the information vintage, not the model clock.
+    if actuals_as_of < actuals_through:
+        raise ValueError("actuals_available_as_of must be on or after fiscal_actuals_through")
     if not allow_lookahead and available > actuals_as_of:
         raise ValueError("available_date must be on or before actuals_available_as_of unless allow_lookahead")
     if observed > available:

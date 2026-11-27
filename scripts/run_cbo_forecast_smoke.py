@@ -42,16 +42,32 @@ from cbo_holder_preferences import (
     holder_profile_from_opening_weights,
     validate_holder_preferences_non_degenerate,
 )
+from cbo_opening_actuals import (
+    ACTUALS_AVAILABLE_AS_OF,
+    DTS_CASH_SOURCE,
+    DTS_FLOWS_SOURCE,
+    DTS_TGA_CLOSING_ACCOUNT,
+    MTS_NET_INTEREST_SELECTOR,
+    OPENING_CLOSE_DATE,
+    OPENING_PORTFOLIO_CLAIM_BOUNDARY,
+    OPENING_PORTFOLIO_RECORD_DATE,
+    OPENING_ROLLFORWARD_STATUS,
+    SIMULATION_START_DATE,
+    SOMA_SNAPSHOT_DATE,
+    SOMA_SOURCE,
+    build_opening_fy_splice,
+    dts_fiscal_selectors,
+    opening_cash_reconciliation,
+)
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
     build_cash_reconciliation_residual_rows,
-    build_current_fy_splice_row,
+    MTS_TABLE_1_DEFICIT_SELECTOR,
     build_debt_stock_path_rows,
     build_fed_holdings_path_rows,
     build_operating_cash_path_rows,
     build_primary_deficit_path_rows,
     calculate_public_debt_bridge_components,
-    tga_closing_balance_bil_from_dts_row,
 )
 from forecast_input_builder import (
     BUDGET_WORKBOOK_SHA256,
@@ -74,8 +90,9 @@ from issuance_calibration import (
     prestart_rollforward,
     prestart_settlements,
 )
+from ratewall_input_builder import load_soma_cusip_holdings
 from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _fiscal_year_close_dates, run_simulation
-from simulation_calendar import SimulationPeriod, build_simulation_calendar
+from simulation_calendar import SimulationPeriod, build_simulation_calendar, previous_securities_business_day
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     PORTFOLIO_DTYPES,
@@ -101,13 +118,16 @@ DEFAULT_MTS_TABLE_1 = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fis
 DEFAULT_DTS_OPERATING_CASH_BALANCE = (
     PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "dts_operating_cash_balance.csv"
 )
+DEFAULT_DTS_DEPOSITS_WITHDRAWALS = (
+    PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "dts_deposits_withdrawals_operating_cash.csv"
+)
+DEFAULT_OPENING_SOMA = PROJECT_ROOT / "data" / "ratewall_inputs" / Path(SOMA_SOURCE).name
 DEFAULT_MSPD_TABLE_1 = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mspd_table_1.csv"
 DEFAULT_MSPD_TABLE_3_MARKET = (
     PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "mspd_table_3_market.csv"
 )
 DEFAULT_DEBT_OUTSTANDING = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "debt_outstanding.csv"
 DEFAULT_AUCTIONS_QUERY = PROJECT_ROOT / "data" / "historical_replay" / "raw" / "fiscaldata" / "auctions_query.csv"
-FRN_INDEX_SOURCE_AVAILABLE_AS_OF = "2026-06-17"
 
 SOURCE_PACKAGE_INPUTS = {
     "budget_workbook": "cbo/51118-2026-02-Budget-Projections.xlsx",
@@ -119,7 +139,9 @@ SOURCE_PACKAGE_INPUTS = {
     "auctions_query": "fiscaldata/auctions_query.csv",
     "mts_table_1": "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "mts_table_9_net_interest": "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
-    "dts_operating_cash_balance": "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+    "dts_operating_cash_balance": DTS_CASH_SOURCE,
+    "dts_deposits_withdrawals": DTS_FLOWS_SOURCE,
+    "opening_soma": SOMA_SOURCE,
     "mspd_table_1": "fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "mspd_table_3_market": "fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "debt_to_penny_public_debt": "treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -130,23 +152,11 @@ SCENARIO_ID = "cbo_full_horizon_local_smoke_3m"
 BASELINE_RUN_ID = "baseline"
 BASELINE_EXPORT_DIR = "exports_baseline"
 PACKAGE_CASH_ROLE = "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path"
-SIMULATION_START_DATE = "2026-06-21"
 SIMULATION_END_DATE = "2036-09-30"
-ACTUALS_AVAILABLE_AS_OF = "2026-06-17"
 BASE_CURVE_OBSERVATION_DATE = "2026-06-16"
-TGA_OBSERVATION_DATE = "2026-06-16"
-FISCAL_ACTUALS_THROUGH = "2026-05-31"
 OPENING_STATE_DATE = SIMULATION_START_DATE
-OPENING_PORTFOLIO_RECORD_DATE = "2026-05-31"
 CLAIM_BOUNDARY = "local_full_horizon_cbo_forecast_input_smoke_prebuilt_mspd_derived_opening_cohort_book"
 OPENING_PORTFOLIO_CB_SOURCE = "nyfed_soma_treasury_holdings_by_cusip"
-OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
-    "prebuilt_mspd_table3_market_derived_cohort_book; "
-    "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
-    "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
-    "securities_maturing_between_record_date_and_simulation_start_are_reinvested_in_the_treasury_issues_settling_on_their_payment_dates"
-)
-
 CBO_FULL_FY2026_PRIMARY_DEFICIT_BIL = 813.727
 OPENING_TREASURY_PUBLIC_DEBT_HELD_PUBLIC_BIL = 31_515.369918445198
 OPENING_CBO_DEFINITION_RESIDUAL_BIL = -105.36444077058
@@ -158,20 +168,15 @@ PUBLIC_NONMARKETABLE_TREASURY_BIL = 620.82177409502
 NON_TREASURY_AND_DEFINITION_RESIDUAL_BIL = OPENING_CBO_DEFINITION_RESIDUAL_BIL
 
 FROZEN_MTS_TABLE_1_DEFICIT_ROW = {
-    "record_date": FISCAL_ACTUALS_THROUGH,
+    "record_date": OPENING_PORTFOLIO_RECORD_DATE,
     "classification_desc": "Year-to-Date",
     "line_code_nbr": "280",
     "current_month_dfct_sur_amt": "1246203266386.93",
 }
 FROZEN_MTS_TABLE_9_NET_INTEREST_ROW = {
-    "record_date": FISCAL_ACTUALS_THROUGH,
+    "record_date": OPENING_PORTFOLIO_RECORD_DATE,
     "classification_desc": "Net Interest",
     "current_fytd_rcpt_outly_amt": "722706511243.20",
-}
-FROZEN_DTS_TGA_CLOSING_BALANCE_ROW = {
-    "record_date": TGA_OBSERVATION_DATE,
-    "account_type": "Treasury General Account (TGA) Closing Balance",
-    "open_today_bal": "981113",
 }
 FROZEN_DEBT_TO_PENNY_ROW = {
     "record_date": "2026-05-29",
@@ -179,23 +184,19 @@ FROZEN_DEBT_TO_PENNY_ROW = {
 }
 FROZEN_MSPD_ROWS = [
     {
-        "record_date": FISCAL_ACTUALS_THROUGH,
+        "record_date": OPENING_PORTFOLIO_RECORD_DATE,
         "security_type_desc": "Total Nonmarketable",
         "debt_held_public_mil_amt": f"{PUBLIC_NONMARKETABLE_TREASURY_BIL * 1_000:.8f}",
     },
     {
-        "record_date": FISCAL_ACTUALS_THROUGH,
+        "record_date": OPENING_PORTFOLIO_RECORD_DATE,
         "security_type_desc": "Total Public Debt Outstanding",
         "debt_held_public_mil_amt": f"{OPENING_TREASURY_PUBLIC_DEBT_HELD_PUBLIC_BIL * 1_000:.8f}",
     },
 ]
 
-RUNNER_MTS_TABLE_1_DEFICIT_SELECTOR = (
-    "classification_desc=Year-to-Date;line_code_nbr=280;column=current_month_dfct_sur_amt"
-)
-RUNNER_MTS_TABLE_9_NET_INTEREST_SELECTOR = (
-    "classification_desc=Net Interest;column=current_fytd_rcpt_outly_amt"
-)
+RUNNER_MTS_TABLE_1_DEFICIT_SELECTOR = MTS_TABLE_1_DEFICIT_SELECTOR
+RUNNER_MTS_TABLE_9_NET_INTEREST_SELECTOR = MTS_NET_INTEREST_SELECTOR
 RUNNER_DEBT_TO_PENNY_SELECTOR = "record_date=2026-05-29;column=debt_held_public_amt"
 
 RESULT_COLUMNS = [
@@ -299,6 +300,8 @@ def build_forecast_bundle(
     auctions_query: str | Path = DEFAULT_AUCTIONS_QUERY,
     mts_table_1: str | Path = DEFAULT_MTS_TABLE_1,
     dts_operating_cash_balance: str | Path = DEFAULT_DTS_OPERATING_CASH_BALANCE,
+    dts_deposits_withdrawals: str | Path = DEFAULT_DTS_DEPOSITS_WITHDRAWALS,
+    opening_soma: str | Path = DEFAULT_OPENING_SOMA,
     mspd_table_1: str | Path = DEFAULT_MSPD_TABLE_1,
     mspd_table_3_market: str | Path = DEFAULT_MSPD_TABLE_3_MARKET,
     mts_table_9_net_interest: str | Path | None = None,
@@ -340,6 +343,8 @@ def build_forecast_bundle(
         auctions_query=Path(auctions_query),
         mts_table_1=mts_table_1_path,
         dts_operating_cash_balance=dts_operating_cash_balance_path,
+        dts_deposits_withdrawals=Path(dts_deposits_withdrawals),
+        opening_soma=Path(opening_soma),
         mspd_table_1=mspd_table_1_path,
         mspd_table_3_market=mspd_table_3_market_path,
         mts_table_9_net_interest=Path(mts_table_9_net_interest) if mts_table_9_net_interest else None,
@@ -359,8 +364,8 @@ def build_forecast_bundle(
     economic_contract = parse_cbo_economic_quarterly_source_contract(economic_path)
     mts_table_1_row = parse_mts_table_1_deficit_row(packaged_sources["mts_table_1"])
     mts_table_9_row = parse_mts_table_9_net_interest_row(packaged_sources["mts_table_9_net_interest"])
-    dts_tga_closing_balance_row = parse_dts_tga_closing_balance_row(
-        packaged_sources["dts_operating_cash_balance"]
+    dts = opening_cash_reconciliation(
+        packaged_sources["dts_operating_cash_balance"], packaged_sources["dts_deposits_withdrawals"]
     )
     mspd_rows = parse_mspd_debt_bridge_rows(packaged_sources["mspd_table_1"])
     debt_to_penny_row = parse_debt_to_penny_public_debt_row(packaged_sources["debt_to_penny_public_debt"])
@@ -371,22 +376,12 @@ def build_forecast_bundle(
     source_fixture_rows = budget_contract.fixture_rows() + economic_contract.fixture_rows()
     periods = build_simulation_calendar(SIMULATION_START_DATE, SIMULATION_END_DATE, "daily")
 
-    current_fy_splice = build_current_fy_splice_row(
+    current_fy_splice = build_opening_fy_splice(
         scenario_id=SCENARIO_ID,
-        fiscal_year=2026,
-        simulation_start_date=SIMULATION_START_DATE,
-        fiscal_actuals_through=FISCAL_ACTUALS_THROUGH,
-        actuals_available_as_of=ACTUALS_AVAILABLE_AS_OF,
-        cbo_full_fy_primary_deficit_bil=CBO_FULL_FY2026_PRIMARY_DEFICIT_BIL,
-        actual_total_deficit_fytd_bil=_money_value(mts_table_1_row, "current_month_dfct_sur_amt") / 1_000_000_000.0,
-        actual_net_interest_fytd_bil=_money_value(mts_table_9_row, "current_fytd_rcpt_outly_amt") / 1_000_000_000.0,
-        mts_table_1_selector=RUNNER_MTS_TABLE_1_DEFICIT_SELECTOR,
-        mts_table_9_selector=RUNNER_MTS_TABLE_9_NET_INTEREST_SELECTOR,
-        observation_date=FISCAL_ACTUALS_THROUGH,
-        available_date=ACTUALS_AVAILABLE_AS_OF,
-    )
-    current_fy_splice["source_status"] = (
-        "mts_table_1_and_table_9_fytd_actuals_spliced_to_cbo_full_year_primary_deficit"
+        cbo_primary_deficit_bil=CBO_FULL_FY2026_PRIMARY_DEFICIT_BIL,
+        mts_deficit_bil=_money_value(mts_table_1_row, "current_month_dfct_sur_amt") / 1e9,
+        mts_interest_bil=_money_value(mts_table_9_row, "current_fytd_rcpt_outly_amt") / 1e9,
+        dts=dts,
     )
 
     bridge = calculate_public_debt_bridge_components(
@@ -395,11 +390,24 @@ def build_forecast_bundle(
         mspd_rows=mspd_rows,
     )
 
+    initial_portfolio, opening_portfolio_metadata = load_opening_portfolio(
+        opening_portfolio_path,
+        simulation_start_date=SIMULATION_START_DATE,
+        source_manifest=ratewall_manifest_path,
+        tips_cpi_detail=tips_cpi_detail_path,
+        frn_daily_indexes=frn_daily_indexes_path,
+        auctions_query=packaged_sources["auctions_query"],
+        soma_holdings=packaged_sources["opening_soma"],
+    )
+
     debt_rows = build_debt_stock_path_rows(
         scenario_id=SCENARIO_ID,
         periods=periods,
         opening_state_date=OPENING_STATE_DATE,
-        opening_cbo_federal_debt_held_public_bil=OPENING_CBO_FEDERAL_DEBT_HELD_PUBLIC_BIL,
+        opening_cbo_federal_debt_held_public_bil=(
+            OPENING_CBO_FEDERAL_DEBT_HELD_PUBLIC_BIL
+            + opening_portfolio_metadata["opening_rollforward_debt_base_delta_bil"]
+        ),
         cbo_fy_end_public_debt_targets_bil={
             int(row["fiscal_year"]): float(row["debt_held_public_end_bil"])
             for row in fiscal_rows
@@ -407,9 +415,9 @@ def build_forecast_bundle(
         },
         public_nonmarketable_treasury_bil=bridge["public_nonmarketable_treasury_bil"],
         non_treasury_and_definition_residual_bil=bridge["non_treasury_and_definition_residual_bil"],
-        observation_date=FISCAL_ACTUALS_THROUGH,
+        observation_date=OPENING_CLOSE_DATE,
         available_date=ACTUALS_AVAILABLE_AS_OF,
-        bridge_method="latest_actual_constant_nominal_by_component",
+        bridge_method="rolled_marketable_book_and_latest_mspd_nonmarketable_and_cbo_definition_residual",
     )
 
     primary_deficit_by_fy = {
@@ -425,18 +433,18 @@ def build_forecast_bundle(
         source_status="remaining_fy2026_splice_then_cbo_fy2027_2036_primary_deficit",
     )
 
-    base_tga_bil = tga_closing_balance_bil_from_dts_row(dts_tga_closing_balance_row)
+    base_tga_bil = float(dts["tga_close_bil"])
     cpi_by_period_end = _cpi_by_period_end(macro_rows, periods)
-    base_cpi_level = _macro_level_for_date(macro_rows, date.fromisoformat(TGA_OBSERVATION_DATE))
+    base_cpi_level = _macro_level_for_date(macro_rows, date.fromisoformat(OPENING_CLOSE_DATE))
     operating_cash_rows = build_operating_cash_path_rows(
         scenario_id=SCENARIO_ID,
         periods=periods,
-        base_date=TGA_OBSERVATION_DATE,
+        base_date=OPENING_CLOSE_DATE,
         base_balance_bil=base_tga_bil,
         base_inflation_index_level=base_cpi_level,
         inflation_index_by_period_end=cpi_by_period_end,
         inflation_scalar=1.0,
-        observation_date=TGA_OBSERVATION_DATE,
+        observation_date=OPENING_CLOSE_DATE,
         available_date=ACTUALS_AVAILABLE_AS_OF,
         source_status="dts_tga_opening_balance_indexed_by_cbo_cpi_u",
     )
@@ -494,14 +502,6 @@ def build_forecast_bundle(
     write_forecast_rows_csv(inputs / "tdcsim_fiscal_incidence_sensitivity_results.csv", incidence_result_rows)
     write_forecast_rows_csv(inputs / "tdcsim_net_interest_bridge.csv", net_interest_rows)
 
-    initial_portfolio, opening_portfolio_metadata = load_opening_portfolio(
-        opening_portfolio_path,
-        simulation_start_date=SIMULATION_START_DATE,
-        source_manifest=ratewall_manifest_path,
-        tips_cpi_detail=tips_cpi_detail_path,
-        frn_daily_indexes=frn_daily_indexes_path,
-        auctions_query=packaged_sources["auctions_query"],
-    )
     holder_preferences, private_subbucket_shares = holder_profile_from_opening_weights(
         opening_portfolio_metadata["noncb_weights"]
     )
@@ -535,7 +535,7 @@ def build_forecast_bundle(
             for row in fiscal_rows
             if int(row["fiscal_year"]) >= 2026
         },
-        observation_date=FISCAL_ACTUALS_THROUGH,
+        observation_date=OPENING_CLOSE_DATE,
         available_date=ACTUALS_AVAILABLE_AS_OF,
         source_status="cbo_table_1_3_fed_holdings_interpolated_to_daily_holder_target",
     )
@@ -555,7 +555,10 @@ def build_forecast_bundle(
     rollforward_diagnostics_path = inputs / "tdcsim_opening_rollforward_diagnostics.csv"
     write_rows_csv_union(
         rollforward_diagnostics_path,
-        opening_portfolio_metadata.pop("opening_rollforward_diagnostic_rows", []),
+        [
+            *opening_portfolio_metadata.pop("opening_rollforward_diagnostic_rows"),
+            {"row_type": "dts_cash_bridge", **dts},
+        ],
     )
     opening_portfolio_metadata["opening_rollforward_diagnostics_file"] = str(rollforward_diagnostics_path)
     write_forecast_rows_csv(inputs / "tdcsim_fed_holdings_path.csv", fed_holdings_rows)
@@ -739,8 +742,9 @@ def build_manifest(
             "simulation_end_date": SIMULATION_END_DATE,
             "opening_state_date": OPENING_STATE_DATE,
             "actuals_available_as_of": ACTUALS_AVAILABLE_AS_OF,
-            "fiscal_actuals_through": FISCAL_ACTUALS_THROUGH,
-            "lookahead_policy": "no_lookahead_for_treasury_actuals_cbo_forecast_vintage_allowed",
+            "opening_close_date": OPENING_CLOSE_DATE,
+            "fiscal_actuals_through": OPENING_CLOSE_DATE,
+            "lookahead_policy": "observations_through_opening_close_as_published_by_information_vintage",
         },
         "source_files": {
             "budget_workbook": f"sources/{SOURCE_PACKAGE_INPUTS['budget_workbook']}",
@@ -768,7 +772,8 @@ def build_manifest(
                 "security_type_desc=Total Nonmarketable",
                 "security_type_desc=Total Public Debt Outstanding",
             ],
-            "dts": "account_type=Treasury General Account (TGA) Closing Balance",
+            "dts": f"account_type={DTS_TGA_CLOSING_ACCOUNT}",
+            "dts_june_fiscal_stub": dts_fiscal_selectors(),
         },
         "source_values": {
             "fy2026_cbo": {
@@ -796,7 +801,7 @@ def build_manifest(
                 "non_treasury_and_definition_residual_bil": float(
                     bridge["non_treasury_and_definition_residual_bil"]
                 ),
-                "opening_marketable_public_portfolio_bil": OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL,
+                "opening_marketable_public_portfolio_bil": opening_portfolio_metadata["opening_rollforward_aligned_debt_base_bil"],
                 "record_date": bridge["record_date"],
                 "debt_to_penny_record_date": bridge["debt_to_penny_record_date"],
                 "mspd_record_date": bridge["mspd_record_date"],
@@ -844,6 +849,8 @@ def build_manifest(
             "source_manifest_original_sha256": opening_portfolio_metadata.get("source_manifest_original_sha256"),
             "source_manifest_portable_sha256": opening_portfolio_metadata.get("source_manifest_portable_sha256"),
             "record_date": opening_portfolio_metadata["record_date"],
+            "opening_close_date": OPENING_CLOSE_DATE,
+            "soma_snapshot_date": SOMA_SNAPSHOT_DATE,
             "simulation_start_date": SIMULATION_START_DATE,
             "row_count": opening_portfolio_metadata["row_count"],
             "source_rows_loaded": opening_portfolio_metadata["source_rows_loaded"],
@@ -1000,7 +1007,7 @@ def build_manifest(
             "operating_cash_definition": "tga_only",
             "reserve_settlement_component": "tga",
             "construction_mode": "constant_real_cbo_cpi_u",
-            "base_date": TGA_OBSERVATION_DATE,
+            "base_date": OPENING_CLOSE_DATE,
             "base_balance_source": "DTS Treasury General Account (TGA) Closing Balance",
             "inflation_index": "cbo_cpi_u",
         },
@@ -1302,12 +1309,13 @@ def load_opening_portfolio(
     tips_cpi_detail: str | Path = DEFAULT_TIPS_CPI_DETAIL,
     frn_daily_indexes: str | Path = DEFAULT_FRN_DAILY_INDEXES,
     auctions_query: str | Path = DEFAULT_AUCTIONS_QUERY,
+    soma_holdings: str | Path = DEFAULT_OPENING_SOMA,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load the tracked source-backed cohort book and align it to run start.
-
-    Securities maturing between the book's record date and the start are reinvested in the
-    Treasury issues settling on their payment dates (``prestart_rollforward``).
-    """
+    """Load the source-backed marketable book and roll it through the common close."""
+    if simulation_start_date != SIMULATION_START_DATE:
+        raise ValueError(f"opening package requires simulation_start_date={SIMULATION_START_DATE}")
+    if previous_securities_business_day(simulation_start_date).isoformat() != OPENING_CLOSE_DATE:
+        raise ValueError("opening close must be the last securities business day before the start")
 
     portfolio_path = Path(path)
     if not portfolio_path.exists():
@@ -1338,7 +1346,7 @@ def load_opening_portfolio(
         source_cusips = source["CUSIP"]
     else:
         source_cusips = pd.Series([""] * len(source), index=source.index)
-    portfolio["_SourceCUSIP"] = source_cusips.astype(str)
+    portfolio["_SourceCUSIP"] = source_cusips.astype("string").str.strip()
     for date_column in (
         "IssueDate",
         "MaturityDate",
@@ -1365,31 +1373,36 @@ def load_opening_portfolio(
     ):
         portfolio[numeric_column] = pd.to_numeric(portfolio[numeric_column], errors="coerce")
     portfolio["Status"] = portfolio["Status"].fillna("Active")
-    start = pd.Timestamp(simulation_start_date)
-    active = portfolio[portfolio["Status"].astype(str).eq("Active")].copy()
-    expired = active[active["MaturityDate"] <= start].copy()
+    if not portfolio["Status"].astype(str).eq("Active").all():
+        raise ValueError("opening source book contains non-active rows")
     settlements = prestart_settlements(
-        auctions_query, record_date=record_date, simulation_start_date=simulation_start_date
+        auctions_query, record_date=record_date, opening_close_date=OPENING_CLOSE_DATE
     )
-    kept, rollforward = prestart_rollforward(
-        active,
+    soma_date, soma = load_soma_cusip_holdings(Path(soma_holdings))
+    if soma_date != SOMA_SNAPSHOT_DATE:
+        raise ValueError(f"opening SOMA snapshot must be dated {SOMA_SNAPSHOT_DATE}, found {soma_date}")
+    aligned, rollforward, rollforward_diagnostics = prestart_rollforward(
+        portfolio,
         settlements,
-        simulation_start_date=simulation_start_date,
-        next_bond_id=_next_bond_id(portfolio),
+        opening_close_date=OPENING_CLOSE_DATE,
         cusip_column="_SourceCUSIP",
+        noncb_weights=manifest_initial["noncb_weights"],
+        soma=soma,
+        soma_as_of_date=soma_date,
     )
-    aligned = pd.concat([kept, rollforward.drop(columns=["_SourceBondID", "_PaymentDate"])], ignore_index=True)
-    source_active_debt_base = _portfolio_total_debt_base(active.drop(columns=["_SourceCUSIP"], errors="ignore"))
+    source_active_debt_base = _portfolio_total_debt_base(portfolio)
+    if abs(source_active_debt_base - OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL) > 1e-6:
+        raise ValueError("source opening book does not reconcile to May MSPD Table 1 Total Marketable")
     aligned, tips_metadata, tips_diagnostics = enrich_opening_tips_from_cpi_detail(
         aligned,
         cpi_detail_path=tips_cpi_detail,
-        index_date=simulation_start_date,
+        index_date=OPENING_CLOSE_DATE,
     )
     aligned, frn_metadata, frn_diagnostics = enrich_opening_frn_from_daily_indexes(
         aligned,
         frn_daily_indexes_path=frn_daily_indexes,
-        opening_date=simulation_start_date,
-        source_available_as_of=FRN_INDEX_SOURCE_AVAILABLE_AS_OF,
+        opening_date=OPENING_CLOSE_DATE,
+        source_available_as_of=ACTUALS_AVAILABLE_AS_OF,
     )
     aligned = _apply_opening_coupon_terms(aligned)
     aligned = aligned.drop(columns=["_SourceCUSIP"], errors="ignore")
@@ -1397,19 +1410,8 @@ def load_opening_portfolio(
     aligned = aligned.astype(PORTFOLIO_DTYPES, errors="ignore")
 
     debt_total = _portfolio_total_debt_base(aligned)
-    if abs(debt_total - OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL) > 1e-6:
-        raise ValueError(
-            "opening portfolio does not reconcile to MSPD Table 1 Total Marketable: "
-            f"{debt_total:.12f} vs {OPENING_MARKETABLE_PUBLIC_PORTFOLIO_BIL:.12f}"
-        )
-
-    rollforward_diagnostics = _opening_rollforward_diagnostic_rows(
-        expired,
-        rollforward,
-        source_record_date=record_date,
-        simulation_start_date=simulation_start_date,
-    )
-    rollforward_debt_delta = float(debt_total - source_active_debt_base)
+    if abs(debt_total - rollforward["opening_face_bil"]) > 1e-6:
+        raise ValueError("enrichment changed the opening marketable debt base")
 
     metadata = {
         "source_file": str(portfolio_path),
@@ -1419,22 +1421,22 @@ def load_opening_portfolio(
         "source_url_table_1": manifest_initial.get("source_url_table_1"),
         "source_url_table_3_market": manifest_initial.get("source_url_table_3_market"),
         "record_date": record_date,
+        "opening_close_date": OPENING_CLOSE_DATE,
         "simulation_start_date": simulation_start_date,
         "source_rows_loaded": source_rows_loaded,
         "row_count": int(len(aligned)),
-        "prestart_matured_rows": int(len(expired)),
-        "prestart_rollforward_rows": int(len(rollforward)),
-        "prestart_rollforward_face_bil": float(expired["FaceValue"].fillna(0.0).sum()),
-        "opening_rollforward_status": "mechanically_balanced_source_record_to_simulation_start",
+        "prestart_matured_rows": rollforward["matured_rows"],
+        "prestart_rollforward_rows": rollforward["settlement_lot_rows"],
+        "prestart_rollforward_face_bil": rollforward["matured_face_bil"],
+        "opening_rollforward_status": OPENING_ROLLFORWARD_STATUS,
         "opening_rollforward_policy": PRESTART_ROLLFORWARD_RULE,
         "opening_source_common_date_status": (
-            "no_same_day_cusip_level_mspd_table3_book_available_locally_for_simulation_start; "
-            "latest_local_mspd_table3_record_date_is_2026-05-31"
+            "may_mspd_marketables_rolled_to_june_close_with_observed_settlements_and_soma"
         ),
         "opening_source_latest_available_mspd_table3_record_date": OPENING_PORTFOLIO_RECORD_DATE,
         "opening_rollforward_source_debt_base_bil": source_active_debt_base,
         "opening_rollforward_aligned_debt_base_bil": debt_total,
-        "opening_rollforward_debt_base_delta_bil": rollforward_debt_delta,
+        "opening_rollforward_debt_base_delta_bil": debt_total - source_active_debt_base,
         "opening_rollforward_diagnostic_rows": rollforward_diagnostics,
         **tips_metadata,
         "tips_cpi_detail_source_sha256": _sha256_file(tips_cpi_detail),
@@ -1446,85 +1448,10 @@ def load_opening_portfolio(
         "holder_totals_bil": _portfolio_holder_totals(aligned),
         "noncb_weights": manifest_initial["noncb_weights"],
         "wamest_date": manifest_initial.get("wamest_date"),
-        "soma_as_of_date": manifest_initial.get("soma_as_of_date"),
+        "soma_as_of_date": soma_date,
         "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
     }
     return aligned, metadata
-
-
-def _opening_rollforward_diagnostic_rows(
-    expired: pd.DataFrame,
-    rollforward: pd.DataFrame,
-    *,
-    source_record_date: str,
-    simulation_start_date: str,
-) -> list[dict[str, Any]]:
-    source_total = float(expired["FaceValue"].fillna(0.0).sum()) if not expired.empty else 0.0
-    replacement_total = float(rollforward["FaceValue"].fillna(0.0).sum()) if not rollforward.empty else 0.0
-    claim = "rollforward_onto_treasury_auction_results_not_a_same_day_mspd_book"
-    rows: list[dict[str, Any]] = [
-        {
-            "row_type": "summary",
-            "source_record_date": source_record_date,
-            "simulation_start_date": simulation_start_date,
-            "source_rows_maturing_on_or_before_start": int(len(expired)),
-            "replacement_rows": int(len(rollforward)),
-            "source_face_bil": source_total,
-            "replacement_face_bil": replacement_total,
-            "face_delta_bil": replacement_total - source_total,
-            "status": "balanced" if abs(replacement_total - source_total) <= 1e-9 else "unbalanced",
-            "derivation": PRESTART_ROLLFORWARD_RULE,
-            "claim_boundary": claim,
-        }
-    ]
-    if expired.empty:
-        return rows
-    sources = expired.set_index("BondID")
-    reinvested = rollforward.groupby("_SourceBondID")["FaceValue"].sum()
-    for _, replacement in rollforward.iterrows():
-        source = sources.loc[replacement["_SourceBondID"]]
-        source_face = float(source["FaceValue"])
-        replacement_face = float(replacement["FaceValue"])
-        balanced = abs(float(reinvested[replacement["_SourceBondID"]]) - source_face) <= 1e-9
-        rows.append(
-            {
-                "row_type": "replacement",
-                "source_record_date": source_record_date,
-                "simulation_start_date": simulation_start_date,
-                "source_bond_id": replacement["_SourceBondID"],
-                "replacement_bond_id": replacement["BondID"],
-                "source_cusip": source.get("_SourceCUSIP", ""),
-                "replacement_cusip": replacement["_SourceCUSIP"],
-                "source_security_type": source.get("SecurityType", ""),
-                "replacement_security_type": replacement.get("SecurityType", ""),
-                "holder_type": source.get("HolderType", ""),
-                "holder_subbucket": source.get("HolderSubBucket", ""),
-                "source_maturity_date": _iso_date_or_empty(source.get("MaturityDate")),
-                "payment_date": _iso_date_or_empty(replacement["_PaymentDate"]),
-                "replacement_issue_date": _iso_date_or_empty(replacement.get("IssueDate")),
-                "replacement_maturity_date": _iso_date_or_empty(replacement.get("MaturityDate")),
-                "source_face_bil": source_face,
-                "replacement_face_bil": replacement_face,
-                "reinvestment_share": replacement_face / source_face if source_face else float("nan"),
-                "status": "balanced" if balanced else "unbalanced",
-                "derivation": PRESTART_ROLLFORWARD_RULE,
-                "claim_boundary": claim,
-            }
-        )
-    return rows
-
-
-def _iso_date_or_empty(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return ""
-    return pd.Timestamp(value).date().isoformat()
-
-
-def _next_bond_id(portfolio: pd.DataFrame) -> int:
-    bond_ids = pd.to_numeric(portfolio.get("BondID"), errors="coerce")
-    if bond_ids.dropna().empty:
-        return 1
-    return int(bond_ids.max()) + 1
 
 
 def _portfolio_total_debt_base(portfolio: pd.DataFrame) -> float:
@@ -1849,6 +1776,8 @@ def write_source_package(
     auctions_query: Path,
     mts_table_1: Path,
     dts_operating_cash_balance: Path,
+    dts_deposits_withdrawals: Path,
+    opening_soma: Path,
     mspd_table_1: Path,
     mspd_table_3_market: Path,
     mts_table_9_net_interest: Path | None,
@@ -1866,6 +1795,9 @@ def write_source_package(
         "fiscaldata/tips_cpi_data_detail.csv": tips_cpi_detail,
         "fiscaldata/frn_daily_indexes.csv": frn_daily_indexes,
         SOURCE_PACKAGE_INPUTS["auctions_query"]: auctions_query,
+        DTS_CASH_SOURCE: dts_operating_cash_balance,
+        DTS_FLOWS_SOURCE: dts_deposits_withdrawals,
+        SOMA_SOURCE: opening_soma,
     }
     for rel, source in file_map.items():
         source_path = Path(source)
@@ -1914,13 +1846,6 @@ def write_source_package(
                 "source_status": "canonical_exact_source_row_extract",
             }
         ],
-        source_entries=source_entries,
-    )
-    _copy_or_write_canonical_csv(
-        sources_dir=sources_dir,
-        rel=SOURCE_PACKAGE_INPUTS["dts_operating_cash_balance"],
-        source=None,
-        rows=[parse_dts_tga_closing_balance_row(dts_operating_cash_balance)],
         source_entries=source_entries,
     )
     _copy_or_write_canonical_csv(
@@ -2085,7 +2010,7 @@ def parse_mts_table_1_deficit_row(path: str | Path) -> dict[str, Any]:
         path,
         selector=RUNNER_MTS_TABLE_1_DEFICIT_SELECTOR,
         predicate=lambda item: (
-            str(item.get("record_date")) == FISCAL_ACTUALS_THROUGH
+            str(item.get("record_date")) == OPENING_PORTFOLIO_RECORD_DATE
             and str(item.get("classification_desc")) == "Year-to-Date"
             and str(item.get("line_code_nbr")) == "280"
         ),
@@ -2099,24 +2024,11 @@ def parse_mts_table_9_net_interest_row(path: str | Path) -> dict[str, Any]:
         path,
         selector=RUNNER_MTS_TABLE_9_NET_INTEREST_SELECTOR,
         predicate=lambda item: (
-            str(item.get("record_date")) == FISCAL_ACTUALS_THROUGH
+            str(item.get("record_date")) == OPENING_PORTFOLIO_RECORD_DATE
             and str(item.get("classification_desc")) == "Net Interest"
         ),
     )
     _require_money(row, "current_fytd_rcpt_outly_amt", expected=722_706_511_243.20)
-    return row
-
-
-def parse_dts_tga_closing_balance_row(path: str | Path) -> dict[str, Any]:
-    row = _single_csv_row(
-        path,
-        selector="record_date=2026-06-16;account_type=Treasury General Account (TGA) Closing Balance",
-        predicate=lambda item: (
-            str(item.get("record_date")) == TGA_OBSERVATION_DATE
-            and str(item.get("account_type")) == "Treasury General Account (TGA) Closing Balance"
-        ),
-    )
-    _require_money(row, "open_today_bal", expected=981_113.0)
     return row
 
 
@@ -2131,7 +2043,7 @@ def parse_mspd_debt_bridge_rows(path: str | Path) -> list[dict[str, Any]]:
             path,
             selector=f"record_date=2026-05-31;security_type_desc={selector}",
             predicate=lambda item, selector=selector: (
-                str(item.get("record_date")) == FISCAL_ACTUALS_THROUGH
+                str(item.get("record_date")) == OPENING_PORTFOLIO_RECORD_DATE
                 and str(item.get("security_type_desc")) == selector
             ),
         )
@@ -2465,6 +2377,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--mts-table-1", default=str(DEFAULT_MTS_TABLE_1))
     parser.add_argument("--dts-operating-cash-balance", default=str(DEFAULT_DTS_OPERATING_CASH_BALANCE))
+    parser.add_argument("--dts-deposits-withdrawals", default=str(DEFAULT_DTS_DEPOSITS_WITHDRAWALS))
+    parser.add_argument("--opening-soma", default=str(DEFAULT_OPENING_SOMA))
     parser.add_argument("--mspd-table-1", default=str(DEFAULT_MSPD_TABLE_1))
     parser.add_argument("--mspd-table-3-market", default=str(DEFAULT_MSPD_TABLE_3_MARKET))
     parser.add_argument("--mts-table-9-net-interest")
@@ -2496,6 +2410,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dts_operating_cash_balance",
             Path(args.dts_operating_cash_balance),
         ),
+        dts_deposits_withdrawals=source_paths.get("dts_deposits_withdrawals", Path(args.dts_deposits_withdrawals)),
+        opening_soma=source_paths.get("opening_soma", Path(args.opening_soma)),
         mspd_table_1=source_paths.get("mspd_table_1", Path(args.mspd_table_1)),
         mspd_table_3_market=source_paths.get("mspd_table_3_market", Path(args.mspd_table_3_market)),
         mts_table_9_net_interest=source_paths.get(

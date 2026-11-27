@@ -1247,7 +1247,7 @@ def _ensure_opening_fed_target_identity(
         metadata = read_json(metadata_path)
         if isinstance(metadata, Mapping):
             observation_date = str(
-                metadata.get("record_date") or opening_state_date
+                metadata.get("opening_close_date") or metadata.get("record_date") or opening_state_date
             )
     opening_row.update(
         {

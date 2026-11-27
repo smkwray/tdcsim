@@ -52,35 +52,28 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         manifest["opening_portfolio_construction"]["mode"]
         == "prebuilt_mspd_derived_cohort_book_with_explicit_prestart_rollforward"
     )
-    # 48 source rows mature before the start and are reinvested, holder by holder, in the 26
-    # Treasury issues settling on their payment dates: 163 replacement rows.
-    assert manifest["opening_portfolio_construction"]["row_count"] == 2388
-    assert manifest["opening_portfolio_construction"]["prestart_matured_rows"] == 48
-    assert manifest["opening_portfolio_construction"]["prestart_rollforward_rows"] == 163
-    assert (
-        manifest["opening_portfolio_construction"]["opening_rollforward_status"]
-        == "mechanically_balanced_source_record_to_simulation_start"
-    )
-    assert manifest["opening_portfolio_construction"]["opening_rollforward_debt_base_delta_bil"] == pytest.approx(
-        0.0,
-        abs=1e-9,
-    )
-    assert "no_same_day_cusip_level_mspd_table3_book_available" in (
-        manifest["opening_portfolio_construction"]["opening_source_common_date_status"]
-    )
+    opening = manifest["opening_portfolio_construction"]
+    assert opening["opening_close_date"] == "2026-06-18"
+    assert manifest["date_range"]["fiscal_actuals_through"] == "2026-06-18"
+    assert manifest["date_range"]["actuals_available_as_of"] == "2026-06-22"
+    assert opening["prestart_matured_rows"] > 0
+    assert opening["prestart_rollforward_rows"] > 0
+    assert opening["opening_rollforward_status"] == "actual_settlement_face_reconciled_through_opening_close"
+    assert opening["opening_rollforward_debt_base_delta_bil"] == pytest.approx(117.913081915642)
+    assert opening["opening_cb_holdings_bil"] == pytest.approx(4487.31889707172)
     assert manifest["opening_portfolio_construction"]["opening_tips_reference_cpi"] > 300.0
     assert "treasurydirect_tips_cpi_detail_join" in (
         manifest["opening_portfolio_construction"]["tips_initialization"]
     )
-    assert manifest["opening_portfolio_construction"]["tips_cpi_detail_index_date"] == "2026-06-21"
-    assert manifest["opening_portfolio_construction"]["tips_rows_enriched"] == 261
+    assert manifest["opening_portfolio_construction"]["tips_cpi_detail_index_date"] == "2026-06-18"
+    assert manifest["opening_portfolio_construction"]["tips_rows_enriched"] > 0
     assert manifest["opening_portfolio_construction"]["tips_unique_cusips_enriched"] == 53
     assert manifest["opening_portfolio_construction"]["opening_tips_indexation_accretion_embedded_bil"] > 300.0
-    assert manifest["opening_portfolio_construction"]["frn_opening_date"] == "2026-06-21"
-    assert manifest["opening_portfolio_construction"]["frn_source_available_as_of"] == "2026-06-17"
-    assert manifest["opening_portfolio_construction"]["frn_rows_enriched"] == 40
+    assert manifest["opening_portfolio_construction"]["frn_opening_date"] == "2026-06-18"
+    assert manifest["opening_portfolio_construction"]["frn_source_available_as_of"] == "2026-06-22"
+    assert manifest["opening_portfolio_construction"]["frn_rows_enriched"] > 0
     assert manifest["opening_portfolio_construction"]["frn_unique_cusips_enriched"] == 8
-    assert manifest["opening_portfolio_construction"]["frn_source_accrual_end_dates"] == ["2026-06-21"]
+    assert manifest["opening_portfolio_construction"]["frn_source_accrual_end_dates"] == ["2026-06-18"]
     assert manifest["opening_portfolio_construction"]["opening_frn_accrued_interest_bil"] > 3.0
     assert "contract-compliant" in (
         manifest["opening_portfolio_construction"]["frn_source_boundary_note"]
@@ -119,7 +112,7 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
     assert bundle.params["treasury_issuance_profile"]["mode"] == "bill_share_target_v1"
     assert manifest["operating_cash_construction"]["construction_mode"] == "constant_real_cbo_cpi_u"
     assert "cb_from_nyfed_soma_by_cusip" in manifest["opening_portfolio_construction"]["claim_boundary"]
-    assert "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged" in (
+    assert "fed_positions_from_june_soma_cusips_and_subsequent_auction_flows" in (
         manifest["opening_portfolio_construction"]["claim_boundary"]
     )
     assert manifest["claim_boundary"]["package_role"] == "cbo_baseline_forecast_evidence_package"

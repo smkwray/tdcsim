@@ -32,8 +32,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from cbo_holder_preferences import holder_profile_from_opening_weights
+from mmf_eligibility import mmf_may_acquire
 from simulation_calendar import next_securities_business_day, previous_securities_business_day
-from tdc_shared import DAYS_PER_YEAR_ACTUAL, INTRAGOV_HOLDERS, TGA_FLOOR_TOLERANCE
+from tdc_shared import DAYS_PER_YEAR_ACTUAL, INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF, TGA_FLOOR_TOLERANCE
 
 ISSUANCE_RULE_MODE = "bill_share_target_v1"
 CALIBRATION_SCHEMA_VERSION = "tdcsim_issuance_calibration_v2"
@@ -1226,8 +1228,11 @@ def load_calibration(path: str | Path) -> dict[str, Any]:
 # --- Pre-start rollforward of the opening book ------------------------------------------
 
 PRESTART_ROLLFORWARD_RULE = (
-    "each_security_maturing_between_the_record_date_and_the_start_is_reinvested_holder_by_holder_"
-    "in_the_treasury_issues_settling_on_its_payment_date_pro_rata_to_their_accepted_amounts"
+    "auction_accepted_face_less_paid_maturities; non-Fed maturities reinvest by holder in same-day issues "
+    "by non-Fed accepted amount; if no eligible issue settles that day, money funds reinvest in the "
+    "next bill settlement; signed net issuance follows eligible auction holder shares; "
+    "paydown debits are capped at each holder's reinvestment with any balance reallocated "
+    "among holders with available face; SOMA comes from its CUSIP snapshot and subsequent settlement flows"
 )
 _AUCTION_SECURITY_CATEGORY = {"Bill": "bills", "Note": "notes", "Bond": "bonds"}
 # Row fields that describe the holder and the amount, not the security.
@@ -1260,9 +1265,9 @@ def prestart_settlements(
     auctions_csv: str | Path,
     *,
     record_date: str,
-    simulation_start_date: str,
+    opening_close_date: str,
 ) -> pd.DataFrame:
-    """Treasury issues settling after the opening book's record date, up to the start.
+    """Treasury issues settling after the opening book's record date, through the opening close.
 
     One row per security and settlement date, with the CUSIP's original issue date (a
     reopening carries it), maturity, coupon rate, the auction's accepted amount including
@@ -1271,14 +1276,16 @@ def prestart_settlements(
     """
 
     record = date.fromisoformat(record_date)
-    start = date.fromisoformat(simulation_start_date)
+    close = date.fromisoformat(opening_close_date)
+    latest = record
     path = Path(auctions_csv)
     with path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     out: list[dict[str, Any]] = []
     for line, row in enumerate(rows, start=2):
         issue = _date(row, "issue_date", line=line)
-        if not (record < issue <= start):
+        latest = max(latest, issue)
+        if not (record < issue <= close):
             continue
         security_type = str(row.get("security_type", "")).strip()
         if security_type not in _AUCTION_SECURITY_CATEGORY:
@@ -1290,6 +1297,8 @@ def prestart_settlements(
             )
         original_text = str(row.get("original_issue_date", "")).strip()
         bill = security_type == "Bill"
+        accepted = _dollars(row, "total_accepted", line=line) / 1e9
+        soma = _dollars(row, "soma_accepted", line=line) / 1e9
         out.append(
             {
                 "cusip": str(row.get("cusip", "")).strip(),
@@ -1299,144 +1308,301 @@ def prestart_settlements(
                     issue if original_text in {"", "null"} else _date(row, "original_issue_date", line=line)
                 ),
                 "maturity_date": pd.Timestamp(_date(row, "maturity_date", line=line)),
-                "accepted_bil": _dollars(row, "total_accepted", line=line) / 1.0e9,
+                "accepted_bil": accepted,
+                "soma_bil": soma,
+                "public_bil": accepted - soma,
                 "coupon_rate": 0.0 if bill else _percent(row, "int_rate", line=line),
                 "issue_price_ratio": _percent(row, "price_per100", line=line),
                 "issue_yield": _percent(row, "high_investment_rate" if bill else "high_yield", line=line),
             }
         )
-    if not out:
-        raise IssuanceCalibrationError(f"no Treasury issue settles in ({record}, {start}]")
+    if not out or latest <= close or max(row["settlement_date"].date() for row in out) != close:
+        raise IssuanceCalibrationError(f"auction source must cover and extend beyond ({record}, {close}]")
     frame = pd.DataFrame(out)
     if frame.duplicated(["cusip", "settlement_date"]).any():
         raise IssuanceCalibrationError("an auction file lists one CUSIP twice on one settlement date")
-    if (frame["accepted_bil"] <= TGA_FLOOR_TOLERANCE).any():
-        raise IssuanceCalibrationError("a pre-start issue has no accepted amount")
+    if frame["cusip"].eq("").any() or (frame["public_bil"] <= TGA_FLOOR_TOLERANCE).any():
+        raise IssuanceCalibrationError("a pre-start issue lacks a CUSIP or positive non-Fed accepted face")
     return frame.sort_values(["settlement_date", "maturity_date", "cusip"]).reset_index(drop=True)
+
+
+def _opening_route_shares(noncb_weights: Mapping[str, Mapping[str, float]]) -> dict:
+    preferences, private = holder_profile_from_opening_weights(noncb_weights)
+    return {
+        category: {
+            ("Banks", ""): preferences["Banks"][f"{category}_pct"],
+            ("Foreign", ""): preferences["Foreign"][f"{category}_pct"],
+            **{
+                ("Private", route): preferences["Private"][f"{category}_pct"] * share
+                for route, share in private[category].items()
+            },
+        }
+        for category in _AUCTION_SECURITY_CATEGORY.values()
+    }
+
+
+def _eligible_route_shares(shares: dict, eligible: bool) -> dict:
+    if eligible:
+        return shares
+    eligible_shares = {route: share for route, share in shares.items() if route[1] != PRIVATE_SUBBUCKET_MMF}
+    total = sum(eligible_shares.values())
+    if total <= 0:
+        raise IssuanceCalibrationError("an ineligible issue has no eligible non-Fed holder shares")
+    return {route: share / total for route, share in eligible_shares.items()}
+
+
+def _opening_auction_allocations(reinvestment: dict, net: float, shares: dict) -> dict:
+    if net >= 0:
+        return {route: reinvestment.get(route, 0.0) + net * share for route, share in shares.items()}
+    # Use the auction weights for the paydown. A route can surrender only what
+    # it would otherwise reinvest, so distribute any unassigned debit again.
+    retained = {route: reinvestment.get(route, 0.0) for route in shares}
+    remaining = -net
+    while remaining > 1e-9:
+        available = {route: shares[route] for route, face in retained.items() if face > 1e-9}
+        weight = sum(available.values())
+        if not available:
+            raise IssuanceCalibrationError("paydown exceeds reinvesting face")
+        debits = {
+            route: min(retained[route], remaining * (share / weight if weight else 1 / len(available)))
+            for route, share in available.items()
+        }
+        for route, debit in debits.items():
+            retained[route] -= debit
+        remaining -= sum(debits.values())
+    return retained
+
+
+def _opening_issue_terms(issue, template: Mapping | None, security_fields: list[str]) -> dict:
+    if template is None and issue.original_issue_date < issue.settlement_date:
+        raise IssuanceCalibrationError(
+            f"{issue.cusip} reopens on {issue.settlement_date.date()} without an original issue in the book"
+        )
+    if template is not None:
+        if (
+            template["MaturityDate"] != issue.maturity_date
+            or template["IssueDate"] != issue.original_issue_date
+            or abs(float(template["CouponRate"]) - issue.coupon_rate) > 1e-9
+        ):
+            raise IssuanceCalibrationError(f"the opening book and auction disagree on the terms of {issue.cusip}")
+        return {column: template[column] for column in security_fields}
+    return {
+        **dict.fromkeys(security_fields, pd.NA),
+        "SecurityType": "Fixed",
+        "IssueDate": issue.original_issue_date,
+        "MaturityDate": issue.maturity_date,
+        "OriginalMaturityYears": (issue.maturity_date - issue.original_issue_date).days / DAYS_PER_YEAR_ACTUAL,
+        "CouponRate": issue.coupon_rate,
+        "MaturityCategory": _AUCTION_SECURITY_CATEGORY[issue.security_type],
+        **dict.fromkeys(
+            ("OriginalPrincipal", "AdjustedPrincipal", "ReferenceCPI_Issue", "IndexRatio",
+             "FixedSpread", "AccruedInterest_FRN", "BenchmarkRate_FRN"),
+            0.0,
+        ),
+    }
 
 
 def prestart_rollforward(
     book: pd.DataFrame,
     settlements: pd.DataFrame,
     *,
-    simulation_start_date: str,
-    next_bond_id: int,
+    opening_close_date: str,
     cusip_column: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split an active opening book at the start and roll its matured rows forward.
+    noncb_weights: Mapping[str, Mapping[str, float]],
+    soma: pd.DataFrame,
+    soma_as_of_date: str,
+) -> tuple[pd.DataFrame, dict[str, Any], list[dict[str, Any]]]:
+    """Rebuild the marketable book at the observed close, on the source's debt basis.
 
-    A row maturing on or before the start is paid on the first settlement date on or after
-    its maturity, and its face is reinvested, for the same holder, in every Treasury issue
-    settling that day in proportion to the issue's accepted amount. A replacement in a
-    CUSIP the book already holds takes that CUSIP's terms from the book. Returns the
-    surviving rows and the replacement rows; the replacements carry ``_SourceBondID`` and
-    ``_PaymentDate`` for diagnostics. Raises unless face and holder totals are unchanged,
-    every replacement matures after the start, and no maturity date receives more
-    replacement face than the largest amount that matured on any one date before the start.
+    SOMA comes from the latest weekly CUSIP snapshot and the auction add-ons and
+    redemptions after it. Auction reinvestment is modeled for non-Fed holders only.
     """
+    close = pd.Timestamp(opening_close_date)
+    as_of = pd.Timestamp(soma_as_of_date)
+    if as_of >= close:
+        raise IssuanceCalibrationError("the SOMA snapshot must precede the opening close")
+    face = pd.to_numeric(book["FaceValue"])
+    ids = pd.to_numeric(book["BondID"])
+    if (
+        not np.isfinite(face).all() or (face <= 0).any() or book["MaturityDate"].isna().any()
+        or book["IssueDate"].isna().any() or book[cusip_column].isna().any()
+        or book[cusip_column].eq("").any() or not np.isfinite(ids).all() or ids.duplicated().any()
+    ):
+        raise IssuanceCalibrationError("opening book contains an invalid face, date, CUSIP or bond ID")
+    payment_dates = {
+        maturity: pd.Timestamp(next_securities_business_day(pd.Timestamp(maturity).date()))
+        for maturity in book["MaturityDate"].unique()
+    }
+    paid = book["MaturityDate"].map(payment_dates) <= close
+    matured, kept = book.loc[paid], book.loc[~paid]
+    issue_rows = list(settlements.itertuples(index=False))
+    issues_by_date = {day: list(group.index) for day, group in settlements.groupby("settlement_date")}
+    eligible = [mmf_may_acquire("Fixed", issue.maturity_date, issue.settlement_date) for issue in issue_rows]
+    shares = _opening_route_shares(noncb_weights)
+    maturity_allocations: list[dict[tuple[str, str], float]] = [{} for _ in issue_rows]
+    deferred_face = 0.0
+    for row in matured.loc[matured["HolderType"] != "CB"].to_dict("records"):
+        date_paid = payment_dates[row["MaturityDate"]]
+        route = (row["HolderType"], "" if pd.isna(row["HolderSubBucket"]) else row["HolderSubBucket"])
+        candidates = issues_by_date.get(date_paid, [])
+        if route[1] == PRIVATE_SUBBUCKET_MMF:
+            candidates = [index for index in candidates if eligible[index]]
+            if not candidates:
+                bills = [
+                    index for index, issue in enumerate(issue_rows)
+                    if issue.settlement_date > date_paid and issue.security_type == "Bill" and eligible[index]
+                ]
+                if not bills:
+                    raise IssuanceCalibrationError(f"no eligible bill settlement by the close after {date_paid.date()}")
+                next_bill_date = issue_rows[bills[0]].settlement_date
+                candidates = [index for index in bills if issue_rows[index].settlement_date == next_bill_date]
+                deferred_face += float(row["FaceValue"])
+        if not candidates:
+            # A maturity paid on a date with no issuance is entirely a paydown.
+            continue
+        total_accepted = sum(issue_rows[index].public_bil for index in candidates)
+        for index in candidates:
+            allocations = maturity_allocations[index]
+            amount = float(row["FaceValue"]) * issue_rows[index].public_bil / total_accepted
+            allocations[route] = allocations.get(route, 0.0) + amount
 
-    start = pd.Timestamp(simulation_start_date)
-    matured = book[book["MaturityDate"] <= start]
-    kept = book[book["MaturityDate"] > start]
-    if matured.empty:
-        return kept, pd.DataFrame(columns=[*book.columns, "_SourceBondID", "_PaymentDate"])
-    templates = kept.drop_duplicates(cusip_column).set_index(cusip_column)
-    security_fields = [c for c in book.columns if c not in _HOLDER_FIELDS and c != cusip_column]
-    terms: dict[tuple[str, pd.Timestamp], dict[str, Any]] = {}
-    for issue in settlements.itertuples(index=False):
-        if issue.cusip in templates.index:
-            template = templates.loc[issue.cusip]
-            if (
-                pd.Timestamp(template["MaturityDate"]) != issue.maturity_date
-                or pd.Timestamp(template["IssueDate"]) != issue.original_issue_date
-                or abs(float(template["CouponRate"]) - issue.coupon_rate) > 1e-9
-            ):
-                raise IssuanceCalibrationError(
-                    f"the opening book and the auction file disagree on the terms of {issue.cusip}"
-                )
-            fields = {column: template[column] for column in security_fields}
-        elif issue.original_issue_date < issue.settlement_date:
-            raise IssuanceCalibrationError(
-                f"{issue.cusip} is reopened on {issue.settlement_date.date()} but is not in the opening book"
-            )
+    templates = kept.drop_duplicates(cusip_column).set_index(cusip_column).to_dict("index")
+    security_fields = [column for column in book if column not in _HOLDER_FIELDS and column != cusip_column]
+    original_max_bond_id = int(ids.max())
+    bond_id = original_max_bond_id
+
+    def lot(terms: Mapping, cusip: str, route: tuple[str, str], amount: float, price: Any) -> dict:
+        nonlocal bond_id
+        bond_id += 1
+        return {
+            **dict.fromkeys(book.columns, pd.NA),
+            **terms,
+            "BondID": bond_id,
+            "FaceValue": amount,
+            "HolderType": route[0],
+            "HolderSubBucket": route[1] or pd.NA,
+            "Status": "Active",
+            "IssuePriceRatio": price,
+            "IssueProceeds": amount * float(price) if pd.notna(price) else pd.NA,
+            cusip_column: cusip,
+        }
+
+    new_lots = []
+    diagnostics = []
+    for index, issue in enumerate(issue_rows):
+        if issue.maturity_date <= close:
+            raise IssuanceCalibrationError(f"{issue.cusip} both issues and matures within the opening roll")
+        terms = _opening_issue_terms(issue, templates.get(issue.cusip), security_fields)
+        templates[issue.cusip] = terms
+        terms["IssueYieldAtIssue"] = issue.issue_yield
+        reinvestment = maturity_allocations[index]
+        reinvested = sum(reinvestment.values())
+        net = issue.public_bil - reinvested
+        weights = _eligible_route_shares(shares[_AUCTION_SECURITY_CATEGORY[issue.security_type]], eligible[index])
+        if set(reinvestment) - set(weights):
+            raise IssuanceCalibrationError(f"auction reinvestment has an unrecognized or ineligible holder for {issue.cusip}")
+        allocations = _opening_auction_allocations(reinvestment, net, weights)
+        for route, amount in allocations.items():
+            if amount > 0:
+                new_lots.append(lot(terms, issue.cusip, route, amount, issue.issue_price_ratio))
+        if issue.soma_bil > 0:
+            new_lots.append(lot(terms, issue.cusip, ("CB", ""), issue.soma_bil, issue.issue_price_ratio))
+        diagnostics.append({
+            "row_type": "settlement", "cusip": issue.cusip, "settlement_date": issue.settlement_date.date().isoformat(),
+            "accepted_face_bil": issue.accepted_bil, "soma_addon_face_bil": issue.soma_bil,
+            "nonfed_accepted_face_bil": issue.public_bil, "reinvesting_face_bil": reinvested,
+            "nonfed_net_issuance_bil": net,
+        })
+
+    fed_paid = 0.0
+    fed = {}
+    for row in soma.itertuples(index=False):
+        maturity = pd.Timestamp(next_securities_business_day(row.maturity_date))
+        if maturity <= as_of:
+            raise IssuanceCalibrationError(f"SOMA snapshot includes already redeemed CUSIP {row.cusip}")
+        if maturity <= close:
+            fed_paid += row.amount_mil / 1000.0
         else:
-            fields = {column: pd.NA for column in security_fields}
-            fields.update(
-                {
-                    "SecurityType": "Fixed",
-                    "IssueDate": issue.original_issue_date,
-                    "MaturityDate": issue.maturity_date,
-                    "OriginalMaturityYears": (issue.maturity_date - issue.original_issue_date).days
-                    / DAYS_PER_YEAR_ACTUAL,
-                    "CouponRate": issue.coupon_rate,
-                    "MaturityCategory": _AUCTION_SECURITY_CATEGORY[issue.security_type],
-                    "OriginalPrincipal": 0.0,
-                    "AdjustedPrincipal": 0.0,
-                    "ReferenceCPI_Issue": 0.0,
-                    "IndexRatio": 0.0,
-                    "FixedSpread": 0.0,
-                    "AccruedInterest_FRN": 0.0,
-                    "BenchmarkRate_FRN": 0.0,
-                    "IssuePriceRatio": issue.issue_price_ratio,
-                    "IssueYieldAtIssue": issue.issue_yield,
-                }
-            )
-        if issue.maturity_date <= start:
-            raise IssuanceCalibrationError(f"{issue.cusip} issued before the start also matures before it")
-        terms[(issue.cusip, issue.settlement_date)] = fields
+            fed[row.cusip] = row.amount_mil / 1000.0
+    fed_addons = sum(issue.soma_bil for issue in issue_rows if issue.settlement_date > as_of)
+    for issue in issue_rows:
+        if issue.settlement_date > as_of and issue.soma_bil > 0:
+            fed[issue.cusip] = fed.get(issue.cusip, 0.0) + issue.soma_bil
+    rolled = pd.DataFrame.from_records(kept.to_dict("records") + new_lots, columns=book.columns)
+    missing_cusips = sorted(set(fed) - set(rolled[cusip_column]))
+    if missing_cusips:
+        raise IssuanceCalibrationError(f"live SOMA CUSIPs are absent from the rolled marketable book: {missing_cusips}")
 
-    dates = settlements["settlement_date"].drop_duplicates().sort_values().reset_index(drop=True)
-    rows: list[dict[str, Any]] = []
-    bond_id = int(next_bond_id)
-    for _, source in matured.iterrows():
-        later = dates[dates >= pd.Timestamp(source["MaturityDate"])]
-        if later.empty:
-            raise IssuanceCalibrationError(
-                f"no Treasury issue settles between {pd.Timestamp(source['MaturityDate']).date()} and the start"
-            )
-        payment = later.iloc[0]
-        issues = settlements[settlements["settlement_date"] == payment]
-        weights = issues["accepted_bil"] / issues["accepted_bil"].sum()
-        face = float(source["FaceValue"])
-        for issue, weight in zip(issues.itertuples(index=False), weights):
-            row = {column: pd.NA for column in book.columns}
-            row.update(terms[(issue.cusip, payment)])
-            share = face * float(weight)
-            price = row.get("IssuePriceRatio")
-            row.update(
-                {
-                    "BondID": bond_id,
-                    "FaceValue": share,
-                    "HolderType": source["HolderType"],
-                    "HolderSubBucket": source["HolderSubBucket"],
-                    "Status": "Active",
-                    "IssueProceeds": share * float(price) if pd.notna(price) else pd.NA,
-                    cusip_column: issue.cusip,
-                    "_SourceBondID": source["BondID"],
-                    "_PaymentDate": payment,
-                }
-            )
-            rows.append(row)
-            bond_id += 1
-    replacements = pd.DataFrame(rows)
-    _check_prestart_rollforward(matured, replacements, start)
-    return kept, replacements
+    result = []
+    for cusip, group in rolled.groupby(cusip_column, sort=False):
+        template = group.iloc[0]
+        terms = {column: template[column] for column in security_fields}
+        target_fed = fed.get(cusip, 0.0)
+        group_fed = group["HolderType"].eq("CB")
+        group_mmf = group["HolderSubBucket"].eq(PRIVATE_SUBBUCKET_MMF).fillna(False)
+        eligible_at_close = mmf_may_acquire(template["SecurityType"], template["MaturityDate"], close)
+        ineligible = group_mmf & (not eligible_at_close)
+        total = float(group["FaceValue"].sum())
+        fed_gap = target_fed - float(group.loc[group_fed, "FaceValue"].sum())
+        # Reassign Fed differences against this CUSIP's non-Fed holders only.
+        # When the source book pays a money fund ineligible face, redistribute that
+        # stock among other holders of the CUSIP in proportion to their current face.
+        public = group.loc[~(group_fed | ineligible)]
+        public_face = float(public["FaceValue"].sum())
+        target_public = total - target_fed
+        if target_public < -1e-9:
+            raise IssuanceCalibrationError(f"SOMA holds more {cusip} than the rolled public debt")
+        if abs(fed_gap) <= 1e-9 and not ineligible.any():
+            result.extend(group.to_dict("records"))
+            continue
+        if public_face == 0 and target_public > 1e-9:
+            category = str(template["MaturityCategory"])
+            if category not in shares:
+                category = "notes"  # all nonbill categories use the same opening shares
+            weights = _eligible_route_shares(shares[category], eligible_at_close)
+            for route, weight in weights.items():
+                if weight > 0:
+                    public_lot = lot(terms, cusip, route, target_public * weight, template["IssuePriceRatio"])
+                    if template["SecurityType"] == "TIPS":
+                        public_lot["AdjustedPrincipal"] = public_lot["FaceValue"]
+                    result.append(public_lot)
+        elif target_public > 0:
+            for row in public.to_dict("records"):
+                scale = target_public / public_face
+                for column in ("FaceValue", "IssueProceeds", "OriginalPrincipal", "AdjustedPrincipal"):
+                    if pd.notna(row.get(column)):
+                        row[column] *= scale
+                result.append(row)
+        if target_fed > 0:
+            fed_lot = lot(terms, cusip, ("CB", ""), target_fed, template["IssuePriceRatio"])
+            if template["SecurityType"] == "TIPS":
+                fed_lot["AdjustedPrincipal"] = target_fed
+            result.append(fed_lot)
 
-
-def _check_prestart_rollforward(matured: pd.DataFrame, replacements: pd.DataFrame, start: pd.Timestamp) -> None:
-    def holder_totals(frame: pd.DataFrame) -> pd.Series:
-        keys = [frame["HolderType"].astype(str), frame["HolderSubBucket"].fillna("").astype(str)]
-        return frame["FaceValue"].astype(float).groupby(keys).sum()
-
-    gap = holder_totals(replacements).subtract(holder_totals(matured), fill_value=0.0).abs()
-    if gap.max() > 1e-9:
-        raise IssuanceCalibrationError(f"the pre-start rollforward changes a holder's face by {gap.max()}")
-    if (pd.to_datetime(replacements["MaturityDate"]) <= start).any():
-        raise IssuanceCalibrationError("a pre-start replacement matures on or before the start")
-    largest_paid = matured["FaceValue"].astype(float).groupby(pd.to_datetime(matured["MaturityDate"])).sum().max()
-    by_maturity = replacements["FaceValue"].astype(float).groupby(pd.to_datetime(replacements["MaturityDate"])).sum()
-    if by_maturity.max() > largest_paid + 1e-9:
-        raise IssuanceCalibrationError(
-            f"the pre-start rollforward puts {by_maturity.max():.1f} billion on {by_maturity.idxmax().date()}, "
-            f"more than the {largest_paid:.1f} billion that matured on any one day before the start"
-        )
+    aligned = pd.DataFrame.from_records(result, columns=book.columns)
+    opening_face = float(aligned["FaceValue"].sum())
+    initial_face = float(face.sum())
+    matured_face = float(matured["FaceValue"].sum())
+    issued_face = float(settlements["accepted_bil"].sum())
+    soma_face = float(aligned.loc[aligned["HolderType"].eq("CB"), "FaceValue"].sum())
+    expected_soma = float(soma["amount_mil"].sum()) / 1000.0 - fed_paid + fed_addons
+    if abs(opening_face - (initial_face + issued_face - matured_face)) > 1e-8:
+        raise IssuanceCalibrationError("opening marketable face does not reconcile to book + issues - maturities")
+    if abs(soma_face - expected_soma) > 1e-8:
+        raise IssuanceCalibrationError("opening SOMA face does not reconcile to snapshot + add-ons - redemptions")
+    summary = {
+        "row_type": "summary", "opening_close_date": opening_close_date,
+        "matured_rows": len(matured), "settlement_lot_rows": len(new_lots),
+        "source_face_bil": initial_face, "matured_face_bil": matured_face, "accepted_face_bil": issued_face,
+        "opening_face_bil": opening_face, "face_delta_bil": opening_face - initial_face,
+        "mmf_reinvestment_deferred_bil": deferred_face, "soma_close_bil": soma_face,
+        "soma_snapshot_bil": float(soma["amount_mil"].sum()) / 1000.0,
+        "soma_redemptions_bil": fed_paid, "soma_addon_face_bil": fed_addons,
+        "derivation": PRESTART_ROLLFORWARD_RULE,
+    }
+    lot_ids = aligned.loc[aligned["BondID"] > original_max_bond_id, ["BondID", cusip_column]]
+    diagnostics.extend(
+        {"row_type": "replacement", "replacement_bond_id": bond_id, "replacement_cusip": cusip}
+        for bond_id, cusip in lot_ids.itertuples(index=False, name=None)
+    )
+    return aligned, summary, [summary, *diagnostics]

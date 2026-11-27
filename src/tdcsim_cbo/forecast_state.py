@@ -255,6 +255,8 @@ def export_forecast_state_package(
         if not isinstance(manifest, dict):
             raise ForecastStateExportError("parent manifest must be an object")
         date_range = dict(manifest.get("date_range", {}))
+        if "opening_close_date" in date_range:
+            date_range["opening_close_date"] = state_window.opening_state_date
         date_range["opening_state_date"] = state_window.opening_state_date
         date_range["simulation_start_date"] = state_window.opening_state_date
         manifest["date_range"] = date_range
@@ -887,6 +889,7 @@ def _write_opening_metadata(
 ) -> None:
     metadata = {
         "schema_version": "tdcsim_opening_portfolio_metadata_v1",
+        "opening_close_date": state_window.opening_state_date,
         "opening_state_date": state_window.opening_state_date,
         "simulation_start_date": state_window.opening_state_date,
         "state_id": state_window.state_id,
