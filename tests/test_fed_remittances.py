@@ -318,6 +318,20 @@ def test_the_fed_meets_cbos_published_stock_on_a_closed_fiscal_year_end(tmp_path
 
     friday = _simulate(copy.deepcopy(params), start, "2028-09-29")
     assert friday.loc["2028-09-29", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
+    # A holdings path compiled only through that Friday keeps the Saturday year-end anchor the
+    # Fed positions for, so a run on it closes Friday at CBO's stock too.
+    short = copy.deepcopy(params)
+    short["baseline_input_paths"]["fed_holdings_path_file"] = str(_write_csv(
+        tmp_path / "fed_to_friday.csv",
+        build_fed_holdings_path_rows(
+            scenario_id="baseline", periods=build_simulation_calendar(start, "2028-09-29", "daily"),
+            opening_state_date=start, opening_cb_holdings_bil=100.0, cbo_fy_end_fed_holdings_bil={2028: 150.0, 2029: 200.0},
+            observation_date=start, available_date=start,
+        ),
+    ))
+    assert pd.read_csv(tmp_path / "fed_to_friday.csv")["period_end"].iloc[-1] == "2028-09-30"
+    to_friday = _simulate(short, start, "2028-09-29")
+    assert to_friday.loc["2028-09-29", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
 
 
 def test_the_year_end_trade_allows_for_the_tips_it_buys_or_sells():

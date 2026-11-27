@@ -17,7 +17,9 @@ from forecast_paths import (
     FED_REMITTANCE_PATH_SCHEMA_VERSION,
     operating_cash_runtime_role,
 )
-from simulation_calendar import SimulationPeriod, is_fedwire_business_day, next_fedwire_business_day
+from simulation_calendar import (
+    SimulationPeriod, is_fedwire_business_day, is_securities_business_day, next_fedwire_business_day,
+)
 
 
 DATE_TOLERANCE_BIL = 0.000001
@@ -1102,6 +1104,29 @@ def build_fed_holdings_path_rows(
                 "claim_boundary": claim_boundary,
             }
         )
+    # A path that ends on the last market day before a closed fiscal-year end keeps that year
+    # end's anchor: the Fed positions for it on that day.
+    last = periods[-1].period_end
+    year_end = date(last.year, 9, 30)
+    closed_through = all(
+        not is_securities_business_day(last + timedelta(days=offset)) for offset in range(1, (year_end - last).days + 1)
+    )
+    if last < year_end and year_end in anchors and closed_through:
+        rows.append({
+            "schema_version": FED_HOLDINGS_PATH_SCHEMA_VERSION,
+            "scenario_id": scenario_id,
+            "period_end": year_end.isoformat(),
+            "holder_type": "CB",
+            "cbo_fed_holdings_target_bil": anchors[year_end],
+            "interpolation_method": "fiscal_year_end_anchor",
+            "source_fiscal_year": federal_fiscal_year(year_end),
+            "source_role": "scenario_assumption",
+            "runtime_role": "hard_target",
+            "observation_date": observed.isoformat(),
+            "available_date": available.isoformat(),
+            "source_status": "cbo_fiscal_year_end_anchor_after_the_last_period",
+            "claim_boundary": claim_boundary,
+        })
     return rows
 
 
