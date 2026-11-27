@@ -311,6 +311,12 @@ def test_the_fed_meets_cbos_published_stock_on_a_closed_fiscal_year_end(tmp_path
     assert results.loc["2028-09-30", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
     assert path["2028-09-29"] < 150.0 - 0.01  # Friday's point on the path falls short of the year end
     assert results.loc["2028-09-29", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
+    # A run that stops on Friday positions the same way, so a continuation from its close (which
+    # cannot trade on the weekend) still opens the year end at CBO's stock.
+    import copy
+
+    friday = _simulate(copy.deepcopy(params), start, "2028-09-29")
+    assert friday.loc["2028-09-29", "DebtHeld_CentralBank"] == pytest.approx(150.0, abs=1e-6)
 
 
 def test_the_opening_lot_check_reads_each_lot_by_its_id_not_its_row():

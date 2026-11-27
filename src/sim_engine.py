@@ -630,16 +630,16 @@ def _register_new_fed_lots(bond_portfolio, fed_basis, day):
         )
 
 
-def _fed_closed_fiscal_year_end(day, last_day):
+def _fed_closed_fiscal_year_end(day):
     """The September 30 after ``day`` when the securities market is closed from ``day`` through it.
 
     The Fed cannot trade on the fiscal-year end itself then, so ``day`` is its last chance to
-    position for CBO's published stock at that date.
+    position for CBO's published stock at that date, whether or not the run reaches it.
     """
 
     day = pd.Timestamp(day).normalize()
     fiscal_year_end = pd.Timestamp(year=day.year, month=9, day=30)
-    if not day < fiscal_year_end <= pd.Timestamp(last_day).normalize():
+    if not day < fiscal_year_end:
         return None
     between = pd.date_range(day + pd.Timedelta(days=1), fiscal_year_end, freq='D')
     if any(is_securities_business_day(other.date()) for other in between):
@@ -4384,7 +4384,9 @@ def run_simulation(
     cbo_cpi_lookup = {}
     cbo_reference_cpi_lookup = {}
     if cbo_funding_mode:
-        cpi_evaluation_dates = pd.date_range(t0, end_date_pd, freq='D')
+        # Through the next fiscal-year end, which positioning may look to past the run's end.
+        cpi_evaluation_dates = pd.date_range(t0, max(end_date_pd, pd.Timestamp(year=end_date_pd.year, month=9, day=30)),
+                                             freq='D')
         tips_cpi_path = cbo_inputs.get('tips_cpi_path') if isinstance(cbo_inputs, dict) else pd.DataFrame()
         if isinstance(tips_cpi_path, pd.DataFrame) and not tips_cpi_path.empty:
             cbo_cpi_lookup, cbo_reference_cpi_lookup = build_tips_daily_cpi_lookups_from_monthly_path(
@@ -6544,7 +6546,7 @@ def run_simulation(
                 ].sum()
             else:
                 current_cb_after_issuance = 0.0
-            fed_year_end = _fed_closed_fiscal_year_end(current_date, dates[-1]) if market_open else None
+            fed_year_end = _fed_closed_fiscal_year_end(current_date) if market_open else None
             fed_year_end_row = (
                 _cbo_optional_exact_date_row(
                     cbo_inputs.get('fed_holdings'), cbo_scenario_id, fed_year_end, 'period_end', 'CBO Fed holdings path',
