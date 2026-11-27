@@ -73,6 +73,11 @@ from cbo_opening_actuals import (  # noqa: E402
     roll_opening_marketables,
 )
 from tdc_shared import BOND_PORTFOLIO_COLS  # noqa: E402
+from ratewall_input_builder import (  # noqa: E402
+    NMFP_HOLDINGS_FILENAME,
+    NMFP_PROVENANCE_FILENAME,
+    verify_opening_book_against_nmfp,
+)
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import (  # noqa: E402
     CALIBRATION_FILE,
@@ -130,6 +135,8 @@ REQUIRED_FILES = {
     "sources/cbo/51135-2026-02-Economic-Projections.xlsx",
     "sources/opening/tdcsim_initial_portfolio_cohorts.csv",
     "sources/opening/tdcsim_ratewall_input_manifest.json",
+    f"sources/opening/{NMFP_HOLDINGS_FILENAME}",
+    f"sources/opening/{NMFP_PROVENANCE_FILENAME}",
     "sources/fiscaldata/tips_cpi_data_detail.csv",
     "sources/fiscaldata/frn_daily_indexes.csv",
     "sources/fiscaldata/auctions_query.csv",
@@ -152,6 +159,8 @@ EXPECTED_SOURCE_PACKAGE_FILES = {
     "cbo/51135-2026-02-Economic-Projections.xlsx",
     "opening/tdcsim_initial_portfolio_cohorts.csv",
     "opening/tdcsim_ratewall_input_manifest.json",
+    f"opening/{NMFP_HOLDINGS_FILENAME}",
+    f"opening/{NMFP_PROVENANCE_FILENAME}",
     "fiscaldata/tips_cpi_data_detail.csv",
     "fiscaldata/frn_daily_indexes.csv",
     "fiscaldata/auctions_query.csv",
@@ -658,6 +667,18 @@ def _verify_opening_counts_against_source_book(
     return summary, diagnostics
 
 
+def _verify_opening_nmfp(root: Path) -> None:
+    """Rebuild the opening book's N-MFP money-fund FRNs, mix check and FRN auction share from the package."""
+    opening = root / "sources" / "opening"
+    verify_opening_book_against_nmfp(
+        _read_json(opening / "tdcsim_ratewall_input_manifest.json"),
+        book_path=opening / "tdcsim_initial_portfolio_cohorts.csv",
+        nmfp_holdings_path=opening / NMFP_HOLDINGS_FILENAME,
+        auctions_path=root / "sources" / "fiscaldata" / "auctions_query.csv",
+        information_date=ACTUALS_AVAILABLE_AS_OF,
+    )
+
+
 def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
     import pandas as pd
 
@@ -692,6 +713,7 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
 
     _verify_partial_interest_financing_diagnostic(root, run_metrics["baseline"])
     summary, diagnostics = _verify_opening_counts_against_source_book(root, manifest)
+    _verify_opening_nmfp(root)
     _verify_opening_portfolio(root, manifest)
     _verify_tips_forward_paths(root, manifest)
     _verify_frn_rate_path(root, manifest)

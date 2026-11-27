@@ -6,8 +6,10 @@ holdings, plus a provenance JSON naming every source file with its sha256.
 
 Rules:
 - Filings: N-MFP submissions (amendments included) whose report date falls in a month
-  of the requested range. Per series and month one filing is kept: a complete schedule
-  first, then the latest filing date, then the latest zip, then the accession number.
+  of the requested range and that were filed by the information date (--filed-through);
+  later filings are dropped before ranking. Per series and month one filing is kept: a
+  complete schedule first, then the latest filing date, then the latest zip, then the
+  accession number. The provenance lists every selected accession and filing date.
 - Feeder funds (FEEDERFUNDFLAG=Y) are dropped, so a master's holdings count once. The
   Treasury value of dropped feeders is recorded.
 - A portfolio row is a Treasury when its CUSIP is a marketable Treasury in MSPD Table 3
@@ -19,11 +21,15 @@ Rules:
   excluding field is blank). N-MFP reports value, not par; its principal field is a
   legacy field that N-MFP3 filings leave blank.
 - Maturity: the MSPD maturity date, else the filing's final legal maturity.
+- Coverage: every selected filing must carry a complete schedule. Each floating-rate note
+  outstanding in MSPD at a report month-end that no fund holds gets an explicit zero row
+  (class source "mspd_outstanding_not_held"), so a missing row means missing coverage,
+  never zero holdings.
 
 Usage:
   python -I scripts/extract_sec_nmfp_mmf_holdings.py \
       --mspd-table-3-market data/historical_replay/raw/fiscaldata/mspd_table_3_market.csv \
-      --first-month 2025-05 --last-month 2026-05 \
+      --first-month 2025-05 --last-month 2026-05 --filed-through 2026-06-22 \
       --output data/ratewall_inputs/sec_nmfp_mmf_treasury_holdings.csv \
       <N-MFP zip> [<N-MFP zip> ...]
 """
@@ -82,7 +88,9 @@ def _tsv(archive: zipfile.ZipFile, name: str, columns: list[str]) -> pd.DataFram
     return pd.read_csv(archive.open(name), sep="\t", dtype=str, usecols=columns, low_memory=False)
 
 
-def _mspd_cusips(path: Path, month_ends: list[pd.Timestamp]) -> pd.DataFrame:
+def _mspd_cusips(path: Path, month_ends: list[pd.Timestamp]) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Return MSPD class and maturity by CUSIP, and the FRNs outstanding at each month-end."""
+
     mspd = pd.read_csv(path, dtype=str)
     record = pd.to_datetime(mspd["record_date"])
     missing = [day.date().isoformat() for day in month_ends if day not in set(record)]
@@ -104,16 +112,25 @@ def _mspd_cusips(path: Path, month_ends: list[pd.Timestamp]) -> pd.DataFrame:
     ).drop_duplicates()
     if cusips["cusip"].duplicated().any():
         raise ValueError(f"{path.name} gives a CUSIP two classes or maturities")
-    return cusips.set_index("cusip")
+    outstanding = mspd.loc[
+        mspd["security_class1_desc"].eq("Floating Rate Notes") & pd.to_numeric(mspd["outstanding_amt"], errors="coerce").gt(0)
+    ]
+    frns = {
+        day.date().isoformat(): sorted(set(outstanding.loc[pd.to_datetime(outstanding["record_date"]).eq(day), "security_class2_desc"]))
+        for day in month_ends
+    }
+    return cusips.set_index("cusip"), frns
 
 
-def _read_filings(zips: list[Path], months: set[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _read_filings(zips: list[Path], months: set[str], filed_through: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
     submissions, series, securities = [], [], []
     for order, path in enumerate(zips):
         with zipfile.ZipFile(path) as archive:
             sub = _tsv(archive, "NMFP_SUBMISSION.tsv", SUBMISSION_COLUMNS)
             sub["month"] = pd.to_datetime(sub["REPORTDATE"], format="%d-%b-%Y").dt.strftime("%Y-%m")
-            sub = sub.loc[sub["SUBMISSIONTYPE"].str.startswith("N-MFP") & sub["month"].isin(months)]
+            sub["filed"] = pd.to_datetime(sub["FILING_DATE"], format="%d-%b-%Y")
+            # A filing made after the information date was not known then, so it never competes.
+            sub = sub.loc[sub["SUBMISSIONTYPE"].str.startswith("N-MFP") & sub["month"].isin(months) & sub["filed"].le(filed_through)]
             if sub.empty:
                 continue
             accessions = set(sub["ACCESSION_NUMBER"])
@@ -131,7 +148,6 @@ def _read_filings(zips: list[Path], months: set[str]) -> tuple[pd.DataFrame, pd.
     sub = sub.merge(level, on=["ACCESSION_NUMBER", "zip"], how="left").join(rows, on=["ACCESSION_NUMBER", "zip"])
     sub["schedule_rows"] = sub["schedule_rows"].fillna(0).astype(int)
     sub["complete"] = sub["schedule_rows"].gt(0) & pd.to_numeric(sub["NETASSETOFSERIES"], errors="coerce").notna()
-    sub["filed"] = pd.to_datetime(sub["FILING_DATE"], format="%d-%b-%Y")
     sub["fund_id"] = sub["SERIESID"].fillna(sub["ACCESSION_NUMBER"])
     sub = sub.sort_values(["fund_id", "month", "complete", "filed", "zip_order", "ACCESSION_NUMBER"])
     sub["selected"] = ~sub.duplicated(["fund_id", "month"], keep="last")
@@ -173,18 +189,23 @@ def _classify(schedule: pd.DataFrame, cusips: pd.DataFrame) -> pd.DataFrame:
     return rows
 
 
-def extract(zips: list[Path], *, mspd_table_3_market: Path, first_month: str, last_month: str) -> tuple[pd.DataFrame, dict]:
+def extract(
+    zips: list[Path], *, mspd_table_3_market: Path, first_month: str, last_month: str, filed_through: str
+) -> tuple[pd.DataFrame, dict]:
     month_index = pd.period_range(first_month, last_month, freq="M")
     if month_index.empty:
         raise ValueError(f"empty month range {first_month}..{last_month}")
     months = {period.strftime("%Y-%m") for period in month_index}
     month_ends = [period.to_timestamp(how="end").normalize() for period in month_index]
-    cusips = _mspd_cusips(mspd_table_3_market, month_ends)
-    sub, schedule = _read_filings(sorted(zips, key=lambda path: path.name), months)
+    cusips, outstanding_frns = _mspd_cusips(mspd_table_3_market, month_ends)
+    sub, schedule = _read_filings(sorted(zips, key=lambda path: path.name), months, pd.Timestamp(filed_through))
     absent = sorted(months - set(sub["month"]))
     if absent:
         raise ValueError(f"the zips hold no N-MFP filing for report months {absent}")
     chosen = sub.loc[sub["selected"], ["ACCESSION_NUMBER", "zip", "fund_id", "month", "feeder", "complete"]]
+    incomplete = chosen.loc[~chosen["complete"]]
+    if not incomplete.empty:
+        raise ValueError(f"selected filings without a complete schedule: {sorted(incomplete['ACCESSION_NUMBER'])}")
     held = schedule.merge(chosen, on=["ACCESSION_NUMBER", "zip"], how="inner")
     treasury = _classify(held, cusips)
     feeders = treasury.loc[treasury["feeder"]]
@@ -199,13 +220,33 @@ def extract(zips: list[Path], *, mspd_table_3_market: Path, first_month: str, la
     ).reset_index()
     if holdings.duplicated(["report_date", "cusip"]).any():
         raise ValueError("one CUSIP is typed as two security classes in one report month")
-    holdings = holdings.sort_values(["report_date", "security_class", "cusip"]).reset_index(drop=True)
-    holdings["report_date"] = holdings["report_date"].dt.date.astype(str)
-    holdings["maturity_date"] = holdings["maturity_date"].dt.date.astype("string").fillna("")
+    held_pairs = set(zip(holdings["report_date"].dt.date.astype(str), holdings["cusip"]))
+    zeros = pd.DataFrame(
+        [
+            {
+                "report_date": pd.Timestamp(day),
+                "cusip": cusip,
+                "security_class": "frn",
+                "maturity_date": cusips.loc[cusip, "maturity_date"],
+                "value_bil": 0.0,
+                "class_source": "mspd_outstanding_not_held",
+                "series_count": 0,
+            }
+            for day, frns in outstanding_frns.items()
+            for cusip in frns
+            if (day, cusip) not in held_pairs
+        ],
+        columns=list(holdings.columns),
+    )
+    holdings = pd.concat([holdings, zeros], ignore_index=True).sort_values(["report_date", "security_class", "cusip"]).reset_index(drop=True)
+    holdings = holdings.astype({"value_bil": float, "series_count": int})
+    holdings["report_date"] = pd.to_datetime(holdings["report_date"]).dt.date.astype(str)
+    holdings["maturity_date"] = pd.to_datetime(holdings["maturity_date"]).dt.date.astype("string").fillna("")
     by_month = direct.groupby(["month", "class_source"])["value_bil"].sum().unstack(fill_value=0.0)
     provenance = {
         "producer": "scripts/extract_sec_nmfp_mmf_holdings.py",
         "report_months": [first_month, last_month],
+        "filed_through": filed_through,
         "value_basis": VALUE_BASIS,
         "zips": {path.name: {"sha256": _sha256(path), "bytes": path.stat().st_size} for path in sorted(zips)},
         "mspd_table_3_market": {"file": mspd_table_3_market.name, "sha256": _sha256(mspd_table_3_market)},
@@ -222,6 +263,14 @@ def extract(zips: list[Path], *, mspd_table_3_market: Path, first_month: str, la
         "treasury_value_bil_by_class_source": {
             month: {source: round(float(value), 6) for source, value in row.items()} for month, row in by_month.iterrows()
         },
+        "selected_filings": {
+            month: [
+                [row.fund_id, row.ACCESSION_NUMBER, row.filed.date().isoformat(), row.zip]
+                for row in group.sort_values(["fund_id", "ACCESSION_NUMBER"]).itertuples(index=False)
+            ]
+            for month, group in sub.loc[sub["selected"]].groupby("month")
+        },
+        "frn_zero_rows_by_month": {day: int(zeros["report_date"].eq(pd.Timestamp(day)).sum()) for day in outstanding_frns},
         "rows": int(len(holdings)),
     }
     return holdings[OUTPUT_COLUMNS], provenance
@@ -233,10 +282,15 @@ def main() -> None:
     parser.add_argument("--mspd-table-3-market", type=Path, required=True)
     parser.add_argument("--first-month", required=True, help="first report month, YYYY-MM")
     parser.add_argument("--last-month", required=True, help="last report month, YYYY-MM")
+    parser.add_argument("--filed-through", required=True, help="information date, YYYY-MM-DD: later filings are ignored")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     holdings, provenance = extract(
-        args.zips, mspd_table_3_market=args.mspd_table_3_market, first_month=args.first_month, last_month=args.last_month
+        args.zips,
+        mspd_table_3_market=args.mspd_table_3_market,
+        first_month=args.first_month,
+        last_month=args.last_month,
+        filed_through=args.filed_through,
     )
     holdings.to_csv(args.output, index=False, float_format="%.9f")
     provenance["output"] = {"file": args.output.name, "sha256": _sha256(args.output), "bytes": args.output.stat().st_size}

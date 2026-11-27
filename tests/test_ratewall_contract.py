@@ -1151,18 +1151,7 @@ def _opening_book_inputs(
         for issue, cusip, amount, tips, ratio in (_OPENING_AUCTIONS if auction_rows is None else auction_rows)
     ]
     if auction_rows is None:
-        auctions += [
-            {
-                "issue_date": issue,
-                "cusip": cusip,
-                "soma_accepted": soma,
-                "inflation_index_security": "No",
-                "index_ratio_on_issue_date": "",
-                "floating_rate": "Yes",
-                "total_accepted": total,
-            }
-            for issue, cusip, soma, total in _CALIBRATION_FRN_AUCTIONS
-        ]
+        auctions += _frn_auction_rows(_CALIBRATION_FRN_AUCTIONS)
     pd.DataFrame(auctions).to_csv(auctions_path, index=False)
     return {
         "record_date": "2026-04-30",
@@ -1182,13 +1171,40 @@ def _opening_book_inputs(
 # to the public (the Fed adds 2 bn at the new issue). A month after its last tranche money
 # funds hold 60.2 bn of the first and 51.6 bn of the second: shares 0.70 and 0.60, 0.65 in all.
 _CALIBRATION_FRN_AUCTIONS = [
-    ("2025-04-30", "FAKEFRNA1", "2000000000", "32000000000"),
-    ("2025-05-30", "FAKEFRNA1", "0", "28000000000"),
-    ("2025-06-27", "FAKEFRNA1", "0", "28000000000"),
-    ("2025-07-31", "FAKEFRNB1", "0", "30000000000"),
-    ("2025-08-29", "FAKEFRNB1", "0", "28000000000"),
-    ("2025-09-26", "FAKEFRNB1", "0", "28000000000"),
+    # issue date, CUSIP, reopening, SOMA accepted, total accepted (dollars)
+    ("2025-04-30", "FAKEFRNA1", "No", "2000000000", "32000000000"),
+    ("2025-05-30", "FAKEFRNA1", "Yes", "0", "28000000000"),
+    ("2025-06-27", "FAKEFRNA1", "Yes", "0", "28000000000"),
+    ("2025-07-31", "FAKEFRNB1", "No", "0", "30000000000"),
+    ("2025-08-29", "FAKEFRNB1", "Yes", "0", "28000000000"),
+    ("2025-09-26", "FAKEFRNB1", "Yes", "0", "28000000000"),
 ]
+_CALIBRATION_FRN_MATURITY = {"FAKEFRNA1": "2027-04-30", "FAKEFRNB1": "2027-07-31", "FAKEFRNZ1": "2026-04-30"}
+
+
+def _frn_auction_rows(tranches) -> list[dict]:
+    """Auction-file rows for FRN tranches: a reopening names its new issue's date."""
+
+    first_issue = {}
+    rows = []
+    for issue, cusip, reopening, soma, total in tranches:
+        first_issue.setdefault(cusip, issue)
+        rows.append(
+            {
+                "issue_date": issue,
+                "cusip": cusip,
+                "soma_accepted": soma,
+                "inflation_index_security": "No",
+                "index_ratio_on_issue_date": "",
+                "floating_rate": "Yes",
+                "total_accepted": total,
+                "reopening": reopening,
+                "original_issue_date": first_issue[cusip] if reopening == "Yes" else "",
+                "maturity_date": _CALIBRATION_FRN_MATURITY[cusip],
+                "security_term": "2-Year" if reopening == "No" else "1-Year 11-Month",
+            }
+        )
+    return rows
 _CALIBRATION_NMFP_ROWS = [
     # Before the last tranche settles; not the measurement.
     ("2025-06-30", "FAKEFRNA1", "frn", "2027-04-30", 50.0),
@@ -1228,6 +1244,8 @@ def _write_nmfp(path: Path, rows) -> Path:
     provenance = {
         "producer": "scripts/extract_sec_nmfp_mmf_holdings.py",
         "zips": {"fake_nmfp.zip": {"sha256": "0" * 64, "bytes": 1}},
+        "filed_through": "2026-06-22",
+        "selected_filings": {"2026-04": [["S1", "0000000000-26-000001", "2026-05-06", "fake_nmfp.zip"]]},
         "output": {"file": path.name, "sha256": rib._sha256(path)},
     }
     path.with_suffix(".provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
@@ -1549,7 +1567,8 @@ def test_money_funds_hold_their_filed_frns_for_bills_drawing_domestic_nonbanks_f
         ((("FAKEFRN01", "1000000"),), {"FAKEFRN01": 600.0}, "bills to give"),
         # The override only moves notes to money funds; a filing below the split is not handled silently.
         (_FRN_FIXTURE, {"FAKEFRN01": 60.0, "FAKEFRN02": 1.0}, "less than"),
-        (_FRN_FIXTURE, {"FAKEFRN01": 60.0}, "less than"),
+        # A book FRN the filings do not cover is missing input, not a zero holding.
+        (_FRN_FIXTURE, {"FAKEFRN01": 60.0}, "do not cover FRN FAKEFRN02"),
         (_FRN_FIXTURE, {"FAKEFRN01": 60.0, "FAKEFRN02": 10.0, "FAKEFRN09": 1.0}, "not FRNs in the opening book"),
     ],
 )
@@ -1581,6 +1600,15 @@ def test_opening_book_rejects_a_money_fund_mix_outside_the_filings_tolerance(tmp
 def test_opening_book_rejects_n_mfp_holdings_without_matching_provenance(tmp_path):
     inputs = _opening_book_inputs(tmp_path)
     path = inputs["nmfp_holdings_path"]
+    # A filing made after the declared information date was not known on it.
+    sidecar = path.with_suffix(".provenance.json")
+    provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+    provenance["selected_filings"]["2026-04"].append(["S2", "0000000000-26-000002", "2026-06-23", "fake_nmfp.zip"])
+    sidecar.write_text(json.dumps(provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="declared information date"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+    inputs = _opening_book_inputs(tmp_path)
+    path = inputs["nmfp_holdings_path"]
     path.write_text(path.read_text(encoding="utf-8").replace("480.0", "481.0"), encoding="utf-8")
     with pytest.raises(ValueError, match="does not describe"):
         rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
@@ -1610,27 +1638,119 @@ def test_opening_book_calibrates_the_money_fund_share_of_new_frns_from_n_mfp(tmp
     assert preferences["Private"]["frn_pct"] * routes["frn"]["mmf_cash_fund_route"] == pytest.approx(share)
 
 
+_TRANCHES = _CALIBRATION_FRN_AUCTIONS
+_NOT_THREE_TRANCHES = "not a 2-Year new issue and two reopenings"
+
+
+def _calibrate(tmp_path, auctions, nmfp):
+    auctions_path = tmp_path / "auctions.csv"
+    pd.DataFrame(_frn_auction_rows(auctions)).to_csv(auctions_path, index=False)
+    holdings, _ = rib.load_nmfp_mmf_holdings(_write_nmfp(tmp_path / rib.NMFP_HOLDINGS_FILENAME, nmfp))
+    return rib.calibrate_mmf_frn_auction_share(holdings, auctions_path)
+
+
 @pytest.mark.parametrize(
     ("auctions", "nmfp", "message"),
     [
         # An FRN with a tranche outside the window would be measured with unpaired holdings.
-        (_CALIBRATION_FRN_AUCTIONS + [("2026-04-30", "FAKEFRNB1", "0", "28000000000")], _CALIBRATION_NMFP_ROWS, "outside the calibration window"),
-        (_CALIBRATION_FRN_AUCTIONS, _CALIBRATION_NMFP_ROWS[:2], "no report at 2025-10-31"),
-        ([*_CALIBRATION_FRN_AUCTIONS[:5], ("2025-09-26", "FAKEFRNB1", "0", "")], _CALIBRATION_NMFP_ROWS, "lacks accepted amounts"),
-        ([("2024-04-30", "FAKEFRNZ1", "0", "30000000000")], _CALIBRATION_NMFP_ROWS, "no FRN auction settling"),
+        (_TRANCHES + [("2026-04-30", "FAKEFRNB1", "Yes", "0", "28000000000")], _CALIBRATION_NMFP_ROWS, "outside the calibration window"),
+        (_TRANCHES, _CALIBRATION_NMFP_ROWS[:2], "no report at 2025-10-31"),
+        # A dropped reopening would cut the denominator and move the measurement month; a
+        # duplicate would inflate it; a missing new issue leaves only reopenings.
+        ([row for row in _TRANCHES if row[0] != "2025-08-29"], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
+        ([row for row in _TRANCHES if row[0] != "2025-09-26"], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
+        (_TRANCHES + [_TRANCHES[1]], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
+        (_TRANCHES[1:], _CALIBRATION_NMFP_ROWS, _NOT_THREE_TRANCHES),
+        ([*_TRANCHES[:5], ("2025-09-26", "FAKEFRNB1", "Yes", "0", "")], _CALIBRATION_NMFP_ROWS, "positive public amount"),
+        # The month is reported but the FRN is absent: missing coverage, not zero holdings.
+        (_TRANCHES, [*_CALIBRATION_NMFP_ROWS[:2], ("2025-10-31", "FAKEFRNA1", "frn", "2027-04-30", 60.0)], "do not cover FRN FAKEFRNB1"),
+        ([("2024-04-30", "FAKEFRNZ1", "No", "0", "30000000000")], _CALIBRATION_NMFP_ROWS, "no FRN auction settling"),
     ],
 )
 def test_frn_auction_share_calibration_fails_loudly_on_incomplete_inputs(tmp_path, auctions, nmfp, message):
-    auctions_path = tmp_path / "auctions.csv"
-    pd.DataFrame(
-        [
-            {"issue_date": issue, "cusip": cusip, "floating_rate": "Yes", "soma_accepted": soma, "total_accepted": total}
-            for issue, cusip, soma, total in auctions
-        ]
-    ).to_csv(auctions_path, index=False)
-    holdings, _ = rib.load_nmfp_mmf_holdings(_write_nmfp(tmp_path / rib.NMFP_HOLDINGS_FILENAME, nmfp))
     with pytest.raises(ValueError, match=message):
-        rib.calibrate_mmf_frn_auction_share(holdings, auctions_path)
+        _calibrate(tmp_path, auctions, nmfp)
+
+
+def test_frn_auction_share_counts_a_verified_zero_holding(tmp_path):
+    # The extract writes a zero row for an outstanding FRN no fund holds; that is evidence
+    # of no money-fund holdings, so it enters the share as zero.
+    nmfp = [*_CALIBRATION_NMFP_ROWS[:2], ("2025-10-31", "FAKEFRNB1", "frn", "2027-07-31", 0.0)]
+    calibration = _calibrate(tmp_path, _TRANCHES, nmfp)
+    assert calibration["share"] == pytest.approx(60.2 / 172.0)
+    assert calibration["range"] == pytest.approx([0.0, 0.70])
+
+
+def _rebuilt_input_dir(tmp_path, name, **overrides):
+    """Rebuild an opening book into its own input directory, as the governed build does."""
+
+    sources = tmp_path / f"{name}_sources"
+    sources.mkdir()
+    inputs = _opening_book_inputs(sources, **overrides)
+    out = tmp_path / name
+    out.mkdir()
+    tables = {}
+    for key, rows in (("mspd_table_1", inputs["table1_rows"]), ("mspd_table_3_market", inputs["table3_rows"])):
+        tables[key] = tmp_path / f"{name}_{key}.csv"
+        pd.DataFrame([{**row, "record_date": "2026-04-30"} for row in rows]).to_csv(tables[key], index=False)
+    curve = out / rib.YIELD_CURVE_SURFACE_FILENAME
+    curve.write_bytes(inputs["yield_curve_path"].read_bytes())
+    nmfp = inputs["nmfp_holdings_path"]
+    for path in (nmfp, nmfp.with_suffix(".provenance.json")):
+        (out / path.name).write_bytes(path.read_bytes())
+    (out / "tdcsim_ratewall_input_manifest.json").write_text(
+        json.dumps({"artifacts": {}, "files": {curve.name: {"sha256": rib._sha256(curve)}}, "source_hierarchy": {}}),
+        encoding="utf-8",
+    )
+    manifest = rib.rebuild_opening_book(
+        out,
+        record_date="2026-04-30",
+        soma_holdings=inputs["soma_path"],
+        wamest_canonical=inputs["wamest_path"],
+        auctions_query=inputs["auctions_path"],
+        **tables,
+    )
+    return out, manifest, inputs["auctions_path"]
+
+
+def test_package_rederives_the_n_mfp_book_and_share_and_rejects_an_older_book(tmp_path):
+    # A package carries the book, its manifest and the N-MFP extract. Everything the
+    # manifest claims from the filings must rebuild from those exact files, so a book from
+    # before the filings were applied cannot ride along with the newer manifest.
+    out, manifest, auctions = _rebuilt_input_dir(tmp_path, "new", frns=_FRN_FIXTURE, nmfp_rows=_FRN_NMFP_ROWS)
+    book = out / rib.OPENING_BOOK_FILENAME
+    check = {
+        "book_path": book,
+        "nmfp_holdings_path": out / rib.NMFP_HOLDINGS_FILENAME,
+        "auctions_path": auctions,
+        "information_date": "2026-06-22",
+    }
+    result = rib.verify_opening_book_against_nmfp(manifest, **check)
+    assert result["frn_cusips"] == 2
+    assert result["frn_mmf_auction_share"] == pytest.approx((60.2 + 51.6) / 172.0)
+
+    # The older book: money funds filed 50 bn of the first FRN, not 60.
+    older_rows = [_FRN_NMFP_ROWS[0], *_FRN_NMFP_ROWS[1:2], ("2026-04-30", "FAKEFRN01", "frn", "2027-04-30", 50.0), _FRN_NMFP_ROWS[3]]
+    older, _, _ = _rebuilt_input_dir(tmp_path, "older", frns=_FRN_FIXTURE, nmfp_rows=older_rows)
+    book.write_bytes((older / rib.OPENING_BOOK_FILENAME).read_bytes())
+    with pytest.raises(ValueError, match="is not the file the opening-book manifest hashes"):
+        rib.verify_opening_book_against_nmfp(manifest, **check)
+    # Re-hashing the manifest to the older book still fails on the money funds' FRNs.
+    rehashed = json.loads(json.dumps(manifest))
+    rehashed["files"][rib.OPENING_BOOK_FILENAME]["sha256"] = rib._sha256(book)
+    with pytest.raises(ValueError, match=r"differ from the N-MFP filings: \['FAKEFRN01'\]"):
+        rib.verify_opening_book_against_nmfp(rehashed, **check)
+
+    out, manifest, auctions = _rebuilt_input_dir(tmp_path, "again", frns=_FRN_FIXTURE, nmfp_rows=_FRN_NMFP_ROWS)
+    check = {**check, "book_path": out / rib.OPENING_BOOK_FILENAME, "nmfp_holdings_path": out / rib.NMFP_HOLDINGS_FILENAME}
+    # An edited auction share no longer matches the calibration it claims.
+    edited = json.loads(json.dumps(manifest))
+    edited["artifacts"]["initial_portfolio"]["noncb_weights"]["frn_mmf_auction_share"] = 0.054
+    with pytest.raises(ValueError, match="auction share does not rebuild"):
+        rib.verify_opening_book_against_nmfp(edited, **check)
+    # Filings selected after the package's information date were not known on it.
+    with pytest.raises(ValueError, match="after the information date 2026-06-21"):
+        rib.verify_opening_book_against_nmfp(manifest, **{**check, "information_date": "2026-06-21"})
 
 
 def test_soma_loader_rejects_files_without_required_columns(tmp_path):

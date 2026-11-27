@@ -81,6 +81,8 @@ MMF_OPENING_ROUTE = ("Private", PRIVATE_SUBBUCKET_MMF)
 # SEC Form N-MFP money-fund Treasury holdings by report month-end and CUSIP, written by
 # scripts/extract_sec_nmfp_mmf_holdings.py beside a provenance file naming its sources.
 NMFP_HOLDINGS_FILENAME = "sec_nmfp_mmf_treasury_holdings.csv"
+NMFP_PROVENANCE_FILENAME = "sec_nmfp_mmf_treasury_holdings.provenance.json"
+OPENING_BOOK_FILENAME = "tdcsim_initial_portfolio_cohorts.csv"
 NMFP_HOLDINGS_COLUMNS = ("report_date", "cusip", "security_class", "maturity_date", "value_bil", "class_source", "series_count")
 NMFP_SECURITY_CLASSES = frozenset({"bill", "frn", "fixed_coupon", "tips", "unresolved"})
 # Money funds hold their filed floating-rate notes by CUSIP. N-MFP reports value; an FRN
@@ -100,6 +102,9 @@ NMFP_MIX_BUCKETS = ("total", "bills", "frn", "coupon_le397")
 # supply: four two-year FRNs, each a new issue and two reopenings, measured on N-MFP
 # month-ends through April 2026.
 FRN_AUCTION_SHARE_WINDOW = ("2025-04-01", "2026-03-31")
+# Each two-year FRN is a new issue and two monthly reopenings, in this order.
+FRN_TRANCHE_REOPENING_FLAGS = ("No", "Yes", "Yes")
+FRN_NEW_ISSUE_TERM = "2-Year"
 OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
 # WAMEST records each sector's Financial Accounts level basis. A market value (an LM series,
 # as for foreign holders) converts to par with its group's factor. Any other level (the FL
@@ -443,7 +448,8 @@ def load_nmfp_mmf_holdings(path: Path) -> tuple[pd.DataFrame, dict]:
     """Return the N-MFP money-fund Treasury holdings and the provenance its producer wrote.
 
     The provenance file must describe these exact bytes, so the book never binds to an
-    extract whose sources are unrecorded.
+    extract whose sources are unrecorded, and must declare the information date that
+    bounds every filing it selected.
     """
 
     provenance_path = path.with_suffix(".provenance.json")
@@ -452,6 +458,15 @@ def load_nmfp_mmf_holdings(path: Path) -> tuple[pd.DataFrame, dict]:
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     if provenance.get("output", {}).get("sha256") != _sha256(path) or not provenance.get("zips"):
         raise ValueError(f"{provenance_path.name} does not describe {path.name} and its source zips")
+    filed_through = provenance.get("filed_through")
+    selected = provenance.get("selected_filings")
+    if (
+        not isinstance(filed_through, str)
+        or not isinstance(selected, dict)
+        or not selected
+        or any(not rows or any(str(row[2]) > filed_through for row in rows) for rows in selected.values())
+    ):
+        raise ValueError(f"{provenance_path.name} does not list selected filings all made by a declared information date")
     frame = pd.read_csv(path, dtype={"report_date": str, "cusip": str, "security_class": str, "maturity_date": str})
     missing = [column for column in NMFP_HOLDINGS_COLUMNS if column not in frame.columns]
     if missing or frame.empty:
@@ -487,10 +502,20 @@ def calibrate_mmf_frn_auction_share(holdings: pd.DataFrame, auctions_path: Path)
     therefore one observation: money-fund holdings at the month-end one month after its
     last tranche, over the public amount accepted (total less SOMA) across its tranches.
     The share is the amount-weighted mean of the observations.
+
+    An FRN must show exactly that tranche structure with positive public amounts, so a
+    dropped or duplicated tranche cannot move its denominator or measurement month. The
+    extract must cover the FRN in the measurement month: a zero there is a verified zero
+    (the producer writes one for every outstanding FRN no fund holds), and a missing row
+    is missing coverage.
     """
 
     auctions = pd.read_csv(auctions_path, dtype=str)
-    missing = [column for column in ("cusip", "issue_date", "floating_rate", "total_accepted", "soma_accepted") if column not in auctions]
+    columns = (
+        "cusip", "issue_date", "maturity_date", "floating_rate", "reopening", "original_issue_date",
+        "security_term", "total_accepted", "soma_accepted",
+    )
+    missing = [column for column in columns if column not in auctions]
     if missing:
         raise ValueError(f"{auctions_path.name} lacks FRN auction columns {missing}")
     frns = auctions.loc[auctions["floating_rate"].eq("Yes")].assign(issue=pd.to_datetime(auctions["issue_date"], errors="coerce"))
@@ -505,15 +530,30 @@ def calibrate_mmf_frn_auction_share(holdings: pd.DataFrame, auctions_path: Path)
         tranches = frns.loc[frns["cusip"].eq(cusip)].sort_values("issue")
         if not tranches["issue"].between(start, end).all():
             raise ValueError(f"FRN {cusip} has tranches outside the calibration window {FRN_AUCTION_SHARE_WINDOW}")
+        new_issue = tranches["issue"].iloc[0]
+        if (
+            tuple(tranches["reopening"]) != FRN_TRANCHE_REOPENING_FLAGS
+            or tranches["issue"].duplicated().any()
+            or tranches["maturity_date"].nunique() != 1
+            or tranches["security_term"].iloc[0] != FRN_NEW_ISSUE_TERM
+            or not pd.to_datetime(tranches["original_issue_date"].iloc[1:], errors="coerce").eq(new_issue).all()
+        ):
+            raise ValueError(
+                f"FRN {cusip} is not a {FRN_NEW_ISSUE_TERM} new issue and two reopenings of it: "
+                f"{list(zip(tranches['issue_date'], tranches['reopening']))}"
+            )
         accepted = pd.to_numeric(tranches["total_accepted"], errors="coerce")
         soma = pd.to_numeric(tranches["soma_accepted"], errors="coerce")
-        if accepted.isna().any() or soma.isna().any():
-            raise ValueError(f"{auctions_path.name} lacks accepted amounts for a tranche of FRN {cusip}")
-        public = float((accepted - soma).sum()) / 1e9
+        public_by_tranche = (accepted - soma) / 1e9
+        if not (public_by_tranche > 0.0).all():
+            raise ValueError(f"{auctions_path.name} lacks a positive public amount for a tranche of FRN {cusip}")
+        public = float(public_by_tranche.sum())
         measured = (tranches["issue"].iloc[-1] + pd.offsets.MonthEnd(0) + pd.offsets.MonthEnd(1)).date().isoformat()
         if measured not in report_dates:
             raise ValueError(f"N-MFP holdings have no report at {measured}, a month after FRN {cusip}'s last tranche")
-        held = float(filed.get((measured, cusip), 0.0))
+        if (measured, cusip) not in filed.index:
+            raise ValueError(f"N-MFP holdings at {measured} do not cover FRN {cusip}; a missing row is not a zero")
+        held = float(filed[(measured, cusip)])
         observations.append(
             {
                 "cusip": cusip,
@@ -563,7 +603,9 @@ def _apply_mmf_frn_holdings(candidate_rows: list[dict], targets: dict[str, float
     by_cusip = {}
     for cusip, items in sorted(frn_items.items()):
         before = held(items, MMF_OPENING_ROUTE)
-        target = targets.get(cusip, 0.0)
+        if cusip not in targets:
+            raise ValueError(f"N-MFP money-fund holdings do not cover FRN {cusip}; a missing row is not a zero")
+        target = targets[cusip]
         noncb = sum(held(items, route) for route in NONCB_OPENING_ROUTES)
         if target > noncb + tolerance:
             raise ValueError(f"money funds filed {target:.6f} bn of {cusip}, more than its non-Fed outstanding {noncb:.6f} bn")
@@ -617,13 +659,18 @@ def _apply_mmf_frn_holdings(candidate_rows: list[dict], targets: dict[str, float
     }
 
 
-def _check_mmf_mix(candidate_rows: list[dict], filed: pd.DataFrame, *, record_date: str) -> dict:
-    """Compare the opening money-fund book with the N-MFP filings; raise outside the tolerance."""
+def _mmf_rows(book: pd.DataFrame) -> pd.DataFrame:
+    subbucket = book["HolderSubBucket"].fillna("").astype(str)
+    return book.loc[book["HolderType"].eq(MMF_OPENING_ROUTE[0]) & subbucket.eq(MMF_OPENING_ROUTE[1])]
+
+
+def _check_mmf_mix(book: pd.DataFrame, filed: pd.DataFrame, *, record_date: str) -> dict:
+    """Compare the money-fund rows of an opening book with the N-MFP filings; raise outside the tolerance."""
 
     model = {"bills": 0.0, "frn": 0.0, "coupon_le397": 0.0, "coupon_gt397": 0.0}
-    for item in candidate_rows:
-        security_class = "frn" if item["security_type"] == "FRN" else "bill" if item["class_key"] == "Bills" else "coupon"
-        model[_nmfp_bucket(security_class, item["maturity_date"], record_date)] += item["route_faces"][MMF_OPENING_ROUTE]
+    for row in _mmf_rows(book).itertuples(index=False):
+        security_class = "frn" if row.SecurityType == "FRN" else "bill" if row.MaturityCategory == "bills" else "coupon"
+        model[_nmfp_bucket(security_class, row.MaturityDate, record_date)] += float(row.FaceValue)
     filings = {bucket: 0.0 for bucket in (*model, "unresolved")}
     for row in filed.itertuples(index=False):
         filings[_nmfp_bucket(row.security_class, row.maturity_date, record_date)] += row.value_bil
@@ -652,6 +699,84 @@ def _check_mmf_mix(candidate_rows: list[dict], filed: pd.DataFrame, *, record_da
         "filed_unresolved_value_bil": filings["unresolved"],
         "status": "pass",
     }
+
+
+def verify_opening_book_against_nmfp(
+    governed_manifest: dict,
+    *,
+    book_path: Path,
+    nmfp_holdings_path: Path,
+    auctions_path: Path,
+    information_date: str,
+) -> dict:
+    """Rederive the N-MFP facts an opening-book manifest records, from the exact files it names.
+
+    The book and the extract must be the bytes the manifest hashes; the extract's filings
+    must all be made by ``information_date``. From them this rebuilds the money-fund FRN
+    holdings by CUSIP, the mix check and the calibrated FRN auction share with its
+    observations, and raises unless the book and the manifest agree with every one, so an
+    older book paired with a newer manifest, or edited weights, cannot pass.
+    """
+
+    files = governed_manifest.get("files", {})
+    provenance_path = nmfp_holdings_path.with_suffix(".provenance.json")
+    for path in (book_path, nmfp_holdings_path, provenance_path):
+        if files.get(path.name, {}).get("sha256") != _sha256(path):
+            raise ValueError(f"{path.name} is not the file the opening-book manifest hashes")
+    holdings, provenance = load_nmfp_mmf_holdings(nmfp_holdings_path)
+    if provenance["filed_through"] > information_date:
+        raise ValueError(
+            f"N-MFP filings were selected through {provenance['filed_through']}, after the information date {information_date}"
+        )
+    initial = governed_manifest["artifacts"]["initial_portfolio"]
+    record_date = initial["mspd_record_date"]
+    filed = holdings.loc[holdings["report_date"].eq(record_date)]
+    if filed.empty:
+        raise ValueError(f"{nmfp_holdings_path.name} has no money-fund holdings reported at {record_date}")
+    book = pd.read_csv(book_path, dtype={"cusip_or_synthetic_id": str, "HolderSubBucket": str}, low_memory=False)
+    filed_frn = filed.loc[filed["security_class"].eq("frn")].set_index("cusip")["value_bil"]
+    book_frns = set(book.loc[book["SecurityType"].eq("FRN"), "cusip_or_synthetic_id"])
+    uncovered = sorted(book_frns - set(filed_frn.index))
+    if uncovered:
+        raise ValueError(f"N-MFP money-fund holdings do not cover the book's FRNs {uncovered}")
+    mmf = _mmf_rows(book)
+    held_frn = mmf.loc[mmf["SecurityType"].eq("FRN")].groupby("cusip_or_synthetic_id")["FaceValue"].sum()
+    override = initial["opening_allocation"]["money_fund_frn_holdings_override"]
+    recorded = {cusip: row["filed_bil"] for cusip, row in override["by_cusip"].items()}
+    mismatched = sorted(
+        cusip
+        for cusip in book_frns | set(filed_frn.index[filed_frn > 0.0]) | set(recorded)
+        if abs(float(held_frn.get(cusip, 0.0)) - float(filed_frn.get(cusip, 0.0))) > 1e-6
+        or abs(float(recorded.get(cusip, math.nan)) - float(filed_frn.get(cusip, 0.0))) > 1e-9
+    )
+    if mismatched or override["source"]["sha256"] != _sha256(nmfp_holdings_path):
+        raise ValueError(f"the book's money-fund FRNs or the manifest's override differ from the N-MFP filings: {mismatched}")
+    mix = _check_mmf_mix(book, filed, record_date=record_date)
+    recorded_mix = initial["nmfp_mix_check"]["buckets"]
+    for bucket, values in mix["buckets"].items():
+        for key in ("model_par_bil", "filed_value_bil"):
+            if abs(values[key] - float(recorded_mix[bucket][key])) > 1e-6:
+                raise ValueError(f"the manifest's N-MFP mix check {bucket} {key} does not rebuild from the book and extract")
+    calibration = calibrate_mmf_frn_auction_share(holdings, auctions_path)
+    recorded_calibration = initial["frn_mmf_auction_share_calibration"]
+    share = initial["noncb_weights"][FRN_MMF_AUCTION_SHARE_KEY]
+    observed = [
+        (row["cusip"], row["tranche_issue_dates"], row["measured_at"], round(row["public_accepted_bil"], 9), round(row["mmf_holdings_bil"], 9))
+        for row in calibration["observations"]
+    ]
+    recorded_observed = [
+        (row["cusip"], row["tranche_issue_dates"], row["measured_at"], round(row["public_accepted_bil"], 9), round(row["mmf_holdings_bil"], 9))
+        for row in recorded_calibration["observations"]
+    ]
+    if (
+        abs(share - calibration["share"]) > 1e-12
+        or abs(recorded_calibration["share"] - calibration["share"]) > 1e-12
+        or observed != recorded_observed
+        or recorded_calibration["auctions_source"] != calibration["auctions_source"]
+        or recorded_calibration["nmfp_source"]["sha256"] != _sha256(nmfp_holdings_path)
+    ):
+        raise ValueError("the manifest's money-fund FRN auction share does not rebuild from the extract and auctions")
+    return {"frn_cusips": len(book_frns), "mix_check": mix, "frn_mmf_auction_share": calibration["share"]}
 
 
 def load_soma_auction_add_ons(path: Path, *, after: str, through: str) -> tuple[int, dict[str, float]]:
@@ -1521,10 +1646,10 @@ def build_initial_portfolio(
         "sha256": _sha256(nmfp_holdings_path),
         "report_date": record_date,
         "producer": nmfp_provenance.get("producer"),
+        "filed_through": nmfp_provenance["filed_through"],
         "value_basis": nmfp_provenance.get("value_basis"),
         "zips": nmfp_provenance["zips"],
     }
-    mix_check = _check_mmf_mix(candidate_rows, filed, record_date=record_date)
     frn_auction_share = calibrate_mmf_frn_auction_share(nmfp, auctions_path)
     frn_auction_share["nmfp_source"] = {"file": nmfp_holdings_path.name, "sha256": _sha256(nmfp_holdings_path)}
 
@@ -1649,6 +1774,7 @@ def build_initial_portfolio(
             bond_id += 1
 
     frame = pd.DataFrame(output_rows)
+    mix_check = _check_mmf_mix(frame, filed, record_date=record_date)
     frame.to_csv(output_path, index=False)
     holder_totals: dict[str, float] = {}
     for row in output_rows:

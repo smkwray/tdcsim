@@ -109,6 +109,7 @@ from issuance_calibration import (
     engine_rule_profile,
 )
 from fed_purchase_policy import issue_ids, validate_issue_terms
+from ratewall_input_builder import NMFP_HOLDINGS_FILENAME, NMFP_PROVENANCE_FILENAME, verify_opening_book_against_nmfp
 from sim_engine import CBO_OPERATING_CASH_TARGET_FINANCING_MODE, _fiscal_year_close_dates, run_simulation
 from simulation_calendar import SimulationPeriod, build_simulation_calendar, previous_securities_business_day
 from tdc_shared import (
@@ -149,6 +150,8 @@ SOURCE_PACKAGE_INPUTS = {
     "economic_workbook": "cbo/51135-2026-02-Economic-Projections.xlsx",
     "opening_portfolio": "opening/tdcsim_initial_portfolio_cohorts.csv",
     "ratewall_input_manifest": "opening/tdcsim_ratewall_input_manifest.json",
+    "nmfp_mmf_holdings": f"opening/{NMFP_HOLDINGS_FILENAME}",
+    "nmfp_mmf_holdings_provenance": f"opening/{NMFP_PROVENANCE_FILENAME}",
     "tips_cpi_detail": "fiscaldata/tips_cpi_data_detail.csv",
     "frn_daily_indexes": "fiscaldata/frn_daily_indexes.csv",
     "auctions_query": "fiscaldata/auctions_query.csv",
@@ -414,6 +417,14 @@ def build_forecast_bundle(
         mspd_rows=mspd_rows,
     )
 
+    # The packaged book and manifest must rebuild from the packaged N-MFP extract and auctions.
+    verify_opening_book_against_nmfp(
+        json.loads(ratewall_manifest_path.read_text(encoding="utf-8")),
+        book_path=opening_portfolio_path,
+        nmfp_holdings_path=packaged_sources["nmfp_mmf_holdings"],
+        auctions_path=packaged_sources["auctions_query"],
+        information_date=ACTUALS_AVAILABLE_AS_OF,
+    )
     initial_portfolio, opening_portfolio_metadata = load_opening_portfolio(
         opening_portfolio_path,
         simulation_start_date=SIMULATION_START_DATE,
@@ -1874,6 +1885,9 @@ def write_source_package(
         "cbo/51135-2026-02-Economic-Projections.xlsx": economic_workbook,
         "opening/tdcsim_initial_portfolio_cohorts.csv": opening_portfolio,
         "opening/tdcsim_ratewall_input_manifest.json": ratewall_input_manifest,
+        # The N-MFP extract and its provenance sit beside the governed manifest that hashes them.
+        SOURCE_PACKAGE_INPUTS["nmfp_mmf_holdings"]: Path(ratewall_input_manifest).parent / NMFP_HOLDINGS_FILENAME,
+        SOURCE_PACKAGE_INPUTS["nmfp_mmf_holdings_provenance"]: Path(ratewall_input_manifest).parent / NMFP_PROVENANCE_FILENAME,
         "fiscaldata/tips_cpi_data_detail.csv": tips_cpi_detail,
         "fiscaldata/frn_daily_indexes.csv": frn_daily_indexes,
         SOURCE_PACKAGE_INPUTS["auctions_query"]: auctions_query,
