@@ -26,7 +26,6 @@ MSPD_TOTAL_NONMARKETABLE_SELECTOR = "security_type_desc=Total Nonmarketable"
 MSPD_TOTAL_PUBLIC_DEBT_SELECTOR = "security_type_desc=Total Public Debt Outstanding"
 DTS_TGA_CLOSING_BALANCE_SELECTOR = "account_type=Treasury General Account (TGA) Closing Balance"
 CBO_REMITTANCE_SOURCE_FILE = "cbo/fed_remittances_table_4_3.json"
-DTS_REMITTANCE_SOURCE_FILE = "fiscaldata/dts_federal_reserve_earnings.csv"
 CBO_REMITTANCE_PDF_SHA256 = "e101aa05f85c93f5c37667015bf8e15a17f618611a8942c58650efe2a4c4ba84"
 
 
@@ -161,8 +160,10 @@ def build_current_fy_splice_row(
         raise ValueError("current-FY splice requires simulation_start_date inside the active fiscal year after Oct 1")
     if not fy_start <= actuals_through < sim_start:
         raise ValueError("fiscal_actuals_through must be inside the fiscal year and before simulation_start_date")
-    if not allow_lookahead and actuals_as_of > sim_start:
-        raise ValueError("actuals_available_as_of must be on or before simulation_start_date unless allow_lookahead")
+    # A retrospective opening can use pre-start observations released after the
+    # start. The availability gate is the information vintage, not the model clock.
+    if actuals_as_of < actuals_through:
+        raise ValueError("actuals_available_as_of must be on or after fiscal_actuals_through")
     if not allow_lookahead and available > actuals_as_of:
         raise ValueError("available_date must be on or before actuals_available_as_of unless allow_lookahead")
     if observed > available:

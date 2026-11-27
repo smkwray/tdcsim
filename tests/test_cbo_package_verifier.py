@@ -17,10 +17,17 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from scripts.verify_cbo_forecast_package import REQUIRED_FILES, create_package_zip, verify_package
+from cbo_opening_actuals import (
+    ACTUALS_AVAILABLE_AS_OF, DTS_CASH_SOURCE, DTS_FISCAL_LINES, DTS_FLOWS_SOURCE,
+    DTS_TGA_CLOSING_ACCOUNT, DTS_TGA_OPENING_ACCOUNT, OPENING_CLOSE_DATE,
+    OPENING_PORTFOLIO_CLAIM_BOUNDARY, OPENING_ROLLFORWARD_STATUS, SOMA_SNAPSHOT_DATE, SOMA_SOURCE,
+    build_opening_fy_splice, dts_fiscal_selectors, opening_cash_reconciliation,
+)
+from ratewall_input_builder import load_soma_cusip_holdings
+from tdc_shared import PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
 from cbo_yield_curve_surface import build_yield_curve_surface_rows
 from forecast_bundle_builders import (
     CBO_REMITTANCE_SOURCE_FILE,
-    DTS_REMITTANCE_SOURCE_FILE,
     build_fed_remittance_path_rows,
     build_primary_deficit_path_rows,
     cbo_remittance_source_fixture,
@@ -34,7 +41,9 @@ from forecast_input_builder import (
     parse_cbo_economic_quarterly_source_contract,
 )
 from tips_indexation import build_monthly_tips_cpi_path_rows, build_tips_real_yield_path_rows
-from issuance_calibration import SETTLEMENT_CALENDAR, build_issuance_calibration
+from issuance_calibration import (
+    SETTLEMENT_CALENDAR, build_issuance_calibration, prestart_rollforward, prestart_settlements,
+)
 from sim_engine import _fiscal_year_close_dates
 from simulation_calendar import build_simulation_calendar
 from issuance_calibration import AUCTION_REQUIRED_COLUMNS
@@ -661,13 +670,12 @@ def _write_valid_package(package: Path) -> Path:
     _write_opening_files(package)
     _write_auxiliary_required_files(package)
     source_package = _write_source_package(package)
+    opening_manifest = _roll_fixture_opening_book(package)
     remittance_by_end = _write_fed_remittance_inputs(package)
     debt_rows = _read_csv(package / "forecast_inputs" / "tdcsim_debt_stock_path.csv")
     run_summaries = {}
     run_rows = {}
-    opening_cb_holdings = _opening_manifest(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")[
-        "holder_totals_bil"
-    ]["CB"]
+    opening_cb_holdings = opening_manifest["opening_cb_holdings_bil"]
     for run_id, run_dir in runs.items():
         rows = _result_rows(debt_rows, opening_cb_holdings=opening_cb_holdings)
         for row in rows:
@@ -692,12 +700,14 @@ def _write_valid_package(package: Path) -> Path:
     )
     _write_json(package / "forecast_inputs" / "tdcsim_issuance_calibration.json", calibration)
 
-    opening_manifest = _opening_manifest(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")
     manifest = {
         "scenario_id": "cbo_full_horizon_local_smoke_3m",
         "date_range": {
             "simulation_start_date": "2026-06-21",
             "simulation_end_date": "2036-09-30",
+            "opening_close_date": OPENING_CLOSE_DATE,
+            "actuals_available_as_of": ACTUALS_AVAILABLE_AS_OF,
+            "fiscal_actuals_through": OPENING_CLOSE_DATE,
         },
         "opening_portfolio_construction": opening_manifest,
         "source_values": {
@@ -765,7 +775,8 @@ def _source_row_selectors() -> dict:
             "security_type_desc=Total Nonmarketable",
             "security_type_desc=Total Public Debt Outstanding",
         ],
-        "dts": "account_type=Treasury General Account (TGA) Closing Balance",
+        "dts": f"account_type={DTS_TGA_CLOSING_ACCOUNT}",
+        "dts_june_fiscal_stub": dts_fiscal_selectors(),
     }
 
 
@@ -824,7 +835,11 @@ def _write_source_opening_book(package: Path) -> None:
         cusip = {"TIPS": f"TIPS{number % 53:03d}", "FRN": f"FRN{number % 8:03d}"}.get(security_type, f"FIX{number:04d}")
         source_row = {**row, "cusip_or_synthetic_id": cusip}
         if security_type == "Fixed" and number < FIXTURE_PRESTART_ROLLFORWARD_ROWS:
-            source_row["MaturityDate"] = "2026-06-10"
+            source_row["MaturityDate"] = "2026-06-18"
+        if security_type == "TIPS":
+            source_row["FaceValue"] = source_row["AdjustedPrincipal"]
+        if source_row["HolderType"] == "Private":
+            source_row["HolderSubBucket"] = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
         rows.append(source_row)
     _write_csv(package / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv", list(rows[0]), rows)
 
@@ -905,50 +920,6 @@ def _write_opening_files(package: Path) -> None:
     ]
     _write_csv(package / "forecast_inputs" / "tdcsim_opening_frn_indexation_diagnostics.csv", list(frn_diag[0]), frn_diag)
 
-    rollforward = [
-        {
-            "row_type": "summary",
-            "source_record_date": "2026-05-31",
-            "simulation_start_date": "2026-06-21",
-            "source_rows_maturing_on_or_before_start": "35",
-            "replacement_rows": "35",
-            "source_face_bil": "35.0",
-            "replacement_face_bil": "35.0",
-            "face_delta_bil": "0.0",
-            "status": "balanced",
-            "derivation": "source_rows_are_reinvested_in_the_pre_start_auction",
-            "claim_boundary": "mechanical_rollforward",
-            "source_bond_id": "",
-            "replacement_bond_id": "",
-            "source_cusip": "",
-            "source_security_type": "",
-            "replacement_security_type": "",
-            "holder_type": "",
-            "holder_subbucket": "",
-            "source_maturity_date": "",
-            "replacement_issue_date": "",
-            "replacement_maturity_date": "",
-        }
-    ]
-    for index in range(35):
-        rollforward.append(
-            {
-                **{key: "" for key in rollforward[0]},
-                "row_type": "replacement",
-                "source_record_date": "2026-05-31",
-                "simulation_start_date": "2026-06-21",
-                "source_face_bil": "1.0",
-                "replacement_face_bil": "1.0",
-                "face_delta_bil": "0.0",
-                "status": "balanced",
-                "source_bond_id": str(index + 1),
-                "replacement_bond_id": str(index + 2291),
-                "source_security_type": "Fixed",
-                "replacement_security_type": "Fixed",
-                "holder_type": holders[index % len(holders)],
-            }
-        )
-    _write_csv(package / "forecast_inputs" / "tdcsim_opening_rollforward_diagnostics.csv", list(rollforward[0]), rollforward)
     _write_json(package / "forecast_inputs" / "tdcsim_opening_portfolio_metadata.json", {"source_file": "sources/opening.csv"})
 
 
@@ -969,7 +940,7 @@ def _write_auxiliary_required_files(package: Path) -> None:
 
 def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:
     inputs = package / "forecast_inputs"
-    splice = {"fiscal_actuals_through": "2026-05-31", "fiscal_year": 2026}
+    splice, = _read_csv(inputs / "tdcsim_current_fy_splice.csv")
     periods = build_simulation_calendar("2026-06-21", "2036-09-30", "daily")
     primary = build_primary_deficit_path_rows(
         scenario_id="cbo_full_horizon_local_smoke_3m",
@@ -977,9 +948,8 @@ def _write_fed_remittance_inputs(package: Path) -> dict[str, float]:
         primary_deficit_by_fiscal_year_bil={year: 0.5 for year in range(2026, 2037)},
     )
     remittance = build_fed_remittance_path_rows(
-        primary, splice, read_dts_fed_earnings(package / "sources" / DTS_REMITTANCE_SOURCE_FILE, splice),
+        primary, splice, read_dts_fed_earnings(package / "sources" / DTS_FLOWS_SOURCE, splice),
     )
-    _write_csv(inputs / "tdcsim_current_fy_splice.csv", list(splice), [splice])
     _write_csv(inputs / "tdcsim_primary_deficit_path.csv", list(primary[0]), primary)
     _write_csv(inputs / FED_REMITTANCE_PATH_FILE, list(remittance[0]), remittance)
     return {row["period_end"]: row["remittance_bil"] for row in remittance}
@@ -1112,7 +1082,7 @@ def _write_yield_and_frn_rate_paths(package: Path) -> None:
     yield_rows = build_yield_curve_surface_rows(
         macro_forecast_rows=macro_rows,
         base_curve_rows=base_curve_rows,
-        actuals_available_as_of="2026-06-17",
+        actuals_available_as_of=ACTUALS_AVAILABLE_AS_OF,
         output_tenors=(0.25, 10.0),
     )
     frn_rows = []
@@ -1220,14 +1190,28 @@ def _write_source_package(package: Path) -> dict:
         ],
     )
     _write_csv(
-        package / "sources" / "fiscaldata" / "dts_tga_closing_balance_2026-06-16.csv",
-        ["record_date", "account_type", "open_today_bal"],
+        package / "sources" / DTS_CASH_SOURCE, ["record_date", "account_type", "open_today_bal"],
         [
-            {
-                "record_date": "2026-06-16",
-                "account_type": "Treasury General Account (TGA) Closing Balance",
-                "open_today_bal": "981113",
-            }
+            {"record_date": "2026-06-01", "account_type": DTS_TGA_OPENING_ACCOUNT, "open_today_bal": "980113"},
+            {"record_date": OPENING_CLOSE_DATE, "account_type": DTS_TGA_CLOSING_ACCOUNT, "open_today_bal": "981113"},
+        ],
+    )
+    _write_csv(
+        package / "sources" / DTS_FLOWS_SOURCE,
+        ["record_date", "table_nbr", "account_type", "transaction_type", "transaction_catg", "transaction_mtd_amt",
+         "transaction_fytd_amt"],
+        [
+            *(
+                {"record_date": OPENING_CLOSE_DATE, "table_nbr": "II", "account_type": account,
+                 "transaction_type": kind, "transaction_catg": category, "transaction_mtd_amt": str(amount),
+                 "transaction_fytd_amt": ""}
+                for (kind, account, category), amount in zip(
+                    DTS_FISCAL_LINES.values(), (50000, 49000, 25000, 21000, 2000)
+                )
+            ),
+            {"record_date": OPENING_CLOSE_DATE, "table_nbr": "II", "account_type": "Treasury General Account (TGA)",
+             "transaction_type": "Deposits", "transaction_catg": "Federal Reserve Earnings",
+             "transaction_mtd_amt": "997", "transaction_fytd_amt": "6559"},
         ],
     )
     _write_csv(
@@ -1260,9 +1244,29 @@ def _write_source_package(package: Path) -> dict:
         [{"record_date": "2026-05-29", "debt_held_public_amt": "31515369798622.98"}],
     )
     _write_source_opening_book(package)
+    source_book = _read_csv(package / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv")
+    fed_by_cusip = {}
+    for row in source_book:
+        if row["HolderType"] == "CB" and row["MaturityDate"] > OPENING_CLOSE_DATE:
+            cusip = row["cusip_or_synthetic_id"]
+            prior, _, _ = fed_by_cusip.get(cusip, (0, "", ""))
+            fed_by_cusip[cusip] = (prior + float(row["FaceValue"]), row["SecurityType"], row["MaturityDate"])
+    _write_csv(
+        package / "sources" / SOMA_SOURCE,
+        ["As Of Date", "CUSIP", "Security Type", "Maturity Date", "Par Value", "Inflation Compensation"],
+        [
+            {"As Of Date": SOMA_SNAPSHOT_DATE, "CUSIP": cusip, "Security Type": kind, "Maturity Date": maturity,
+             "Par Value": str(amount * 1e9), "Inflation Compensation": "0"}
+            for cusip, (amount, kind, maturity) in fed_by_cusip.items()
+        ],
+    )
+    shares = {
+        "Banks": 0.25, "Foreign": 0.25, f"Private/{PRIVATE_SUBBUCKET_DOMESTIC_NONBANK}": 0.5,
+        f"Private/{PRIVATE_SUBBUCKET_MMF}": 0.0,
+    }
     _write_json(
         package / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json",
-        {"status": "package_fixture"},
+        {"artifacts": {"initial_portfolio": {"noncb_weights": {"bills": shares, "nonbills": shares}}}},
     )
     _write_csv(
         package / "sources" / "fiscaldata" / "tips_cpi_data_detail.csv",
@@ -1282,21 +1286,17 @@ def _write_source_package(package: Path) -> dict:
     # and rates; the fixture's one bill settling before the start takes the matured rows.
     rollforward_fields = {"original_issue_date": "null", "int_rate": "null", "price_per100": "99.0",
                           "high_investment_rate": "4.0", "high_yield": "null"}
+    auction_rows = [
+        {**row, "record_date": OPENING_CLOSE_DATE, "issue_date": OPENING_CLOSE_DATE, "maturity_date": "2026-09-17"}
+        if row["issue_date"] == "2026-06-16" else row
+        for row in _fixture_auctions()
+    ]
     _write_auctions(
         package / "sources" / "fiscaldata" / "auctions_query.csv",
-        [{"cusip": f"AUC{index:03d}", **rollforward_fields, **row} for index, row in enumerate(_fixture_auctions())],
+        [{"cusip": f"AUC{index:03d}", **rollforward_fields, **row} for index, row in enumerate(auction_rows)],
         columns=["record_date", *AUCTION_REQUIRED_COLUMNS, "cusip", *rollforward_fields],
     )
     _write_json(package / "sources" / CBO_REMITTANCE_SOURCE_FILE, cbo_remittance_source_fixture())
-    dts_fed_earnings = {
-        "record_date": "2026-05-29",
-        "table_nbr": "II",
-        "account_type": "Treasury General Account (TGA)",
-        "transaction_type": "Deposits",
-        "transaction_catg": "Federal Reserve Earnings",
-        "transaction_fytd_amt": "5562",
-    }
-    _write_csv(package / "sources" / DTS_REMITTANCE_SOURCE_FILE, list(dts_fed_earnings), [dts_fed_earnings])
     for rel in (
         "opening/tdcsim_initial_portfolio_cohorts.csv",
         "opening/tdcsim_ratewall_input_manifest.json",
@@ -1305,13 +1305,14 @@ def _write_source_package(package: Path) -> dict:
         "fiscaldata/auctions_query.csv",
         "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
         "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
-        "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+        DTS_CASH_SOURCE,
+        DTS_FLOWS_SOURCE,
+        SOMA_SOURCE,
         "fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
         "fiscaldata/mspd_table_3_market_2026-05-31.csv",
         "treasury/debt_to_penny_public_debt_2026-05-29.csv",
         "treasury/base_curve_2026-06-16.json",
         CBO_REMITTANCE_SOURCE_FILE,
-        DTS_REMITTANCE_SOURCE_FILE,
     ):
         path = package / "sources" / rel
         source_entries[rel] = {
@@ -1357,11 +1358,6 @@ def _frozen_treasury_observations() -> dict:
             "record_date": "2026-05-31",
             "classification_desc": "Net Interest",
             "current_fytd_rcpt_outly_amt": "722706511243.20",
-        },
-        "dts_tga_closing_balance_row": {
-            "record_date": "2026-06-16",
-            "account_type": "Treasury General Account (TGA) Closing Balance",
-            "open_today_bal": "981113",
         },
         "debt_to_penny_row": {
             "record_date": "2026-05-29",
@@ -1596,7 +1592,43 @@ def _opening_row(
     }
 
 
-def _opening_manifest(opening_path: Path) -> dict:
+def _roll_fixture_opening_book(package: Path) -> dict:
+    inputs = package / "forecast_inputs"
+    sources = package / "sources"
+    opening_path = inputs / "tdcsim_opening_portfolio.csv"
+    opening_fields = list(_read_csv(opening_path)[0])
+    source_path = sources / "opening" / "tdcsim_initial_portfolio_cohorts.csv"
+    book = pd.read_csv(source_path, parse_dates=["IssueDate", "MaturityDate"])
+    governed = json.loads((sources / "opening" / "tdcsim_ratewall_input_manifest.json").read_text())
+    settlements = prestart_settlements(
+        sources / "fiscaldata" / "auctions_query.csv",
+        record_date="2026-05-31", opening_close_date=OPENING_CLOSE_DATE,
+    )
+    soma_date, soma = load_soma_cusip_holdings(sources / SOMA_SOURCE)
+    rolled, summary, diagnostics = prestart_rollforward(
+        book, settlements, opening_close_date=OPENING_CLOSE_DATE, cusip_column="cusip_or_synthetic_id",
+        noncb_weights=governed["artifacts"]["initial_portfolio"]["noncb_weights"],
+        soma=soma, soma_as_of_date=soma_date,
+    )
+    rolled.loc[rolled["SecurityType"].eq("TIPS"), "FaceValue"] = 0.0
+    rolled[opening_fields].to_csv(opening_path, index=False)
+
+    dts = opening_cash_reconciliation(sources / DTS_CASH_SOURCE, sources / DTS_FLOWS_SOURCE)
+    diagnostics.append({"row_type": "dts_cash_bridge", **dts})
+    fields = list(dict.fromkeys(key for row in diagnostics for key in row))
+    _write_csv(inputs / "tdcsim_opening_rollforward_diagnostics.csv", fields, diagnostics)
+    cash_row = {
+        "base_date": OPENING_CLOSE_DATE, "observation_date": OPENING_CLOSE_DATE,
+        "available_date": ACTUALS_AVAILABLE_AS_OF, "base_balance_bil": OPERATING_CASH_TARGET,
+    }
+    _write_csv(inputs / "tdcsim_operating_cash_path.csv", list(cash_row), [cash_row])
+    fy2026, = [row for row in _read_csv(inputs / "tdcsim_cbo_fiscal_baseline.csv") if row["fiscal_year"] == "2026"]
+    splice = build_opening_fy_splice(
+        scenario_id="cbo_full_horizon_local_smoke_3m", cbo_primary_deficit_bil=float(fy2026["primary_deficit_bil"]),
+        mts_deficit_bil=1246.20326638693, mts_interest_bil=722.70651124320, dts=dts,
+    )
+    _write_csv(inputs / "tdcsim_current_fy_splice.csv", list(splice), [splice])
+
     rows = _read_csv(opening_path)
     security_totals = {}
     holder_totals = {}
@@ -1606,13 +1638,17 @@ def _opening_manifest(opening_path: Path) -> dict:
         holder_totals[row["HolderType"]] = holder_totals.get(row["HolderType"], 0.0) + debt
     return {
         "record_date": "2026-05-31",
-        "row_count": 2290,
-        "source_rows_loaded": 2290,
-        "prestart_matured_rows": 35,
-        "prestart_rollforward_rows": 35,
-        "prestart_rollforward_face_bil": 35.0,
-        "opening_rollforward_debt_base_delta_bil": 0.0,
-        "opening_source_common_date_status": "no_same_day_cusip_level_mspd_table3_book_available_locally",
+        "opening_close_date": OPENING_CLOSE_DATE,
+        "soma_snapshot_date": SOMA_SNAPSHOT_DATE,
+        "row_count": len(rolled),
+        "source_rows_loaded": len(book),
+        "prestart_matured_rows": summary["matured_rows"],
+        "prestart_rollforward_rows": summary["settlement_lot_rows"],
+        "prestart_rollforward_face_bil": summary["matured_face_bil"],
+        "opening_rollforward_status": OPENING_ROLLFORWARD_STATUS,
+        "opening_rollforward_source_debt_base_bil": summary["source_face_bil"],
+        "opening_rollforward_aligned_debt_base_bil": summary["opening_face_bil"],
+        "opening_rollforward_debt_base_delta_bil": summary["face_delta_bil"],
         "frn_source_boundary_note": "contract-compliant FRN opening accrual source",
         "tips_rows_enriched": 265,
         "tips_unique_cusips_enriched": 53,
@@ -1627,12 +1663,7 @@ def _opening_manifest(opening_path: Path) -> dict:
         "security_type_totals_bil": security_totals,
         "holder_totals_bil": holder_totals,
         "opening_cb_holdings_bil": holder_totals["CB"],
-        "claim_boundary": (
-            "prebuilt_mspd_table3_market_derived_cohort_book; "
-            "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
-            "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
-            "securities_maturing_between_record_date_and_simulation_start_are_reinvested_in_the_treasury_issues_settling_on_their_payment_dates"
-        ),
+        "claim_boundary": OPENING_PORTFOLIO_CLAIM_BOUNDARY,
     }
 
 

@@ -1,10 +1,4 @@
-"""Rolling the opening book from its record date to the simulation start.
-
-The source book is Treasury's month-end statement; securities that mature before the
-simulation starts must be replaced the way Treasury actually refinanced them. If the
-rollforward piled the whole window's maturities onto one security or one date, the opening
-book and the first months of every run would show a payment spike no Treasury calendar has.
-"""
+"""Opening auction terms and coverage must agree with the source book."""
 
 from __future__ import annotations
 
@@ -15,12 +9,13 @@ import pandas as pd
 import pytest
 
 from issuance_calibration import IssuanceCalibrationError, prestart_rollforward, prestart_settlements
+from tdc_shared import PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, PRIVATE_SUBBUCKET_MMF
 
 RECORD = "2026-05-31"
-START = "2026-06-21"
+CLOSE = "2026-06-18"
 AUCTION_COLUMNS = (
     "cusip", "security_type", "security_term", "issue_date", "original_issue_date", "maturity_date",
-    "total_accepted", "int_rate", "price_per100", "high_investment_rate", "high_yield",
+    "total_accepted", "soma_accepted", "int_rate", "price_per100", "high_investment_rate", "high_yield",
     "floating_rate", "inflation_index_security",
 )
 
@@ -29,7 +24,7 @@ def _auction(cusip, kind, issue, maturity, accepted_bil, *, original="null", cou
     return {
         "cusip": cusip, "security_type": kind, "security_term": "", "issue_date": issue,
         "original_issue_date": original, "maturity_date": maturity, "total_accepted": str(accepted_bil * 1e9),
-        "int_rate": coupon_pct, "price_per100": "99.0", "high_investment_rate": "4.0", "high_yield": "4.1",
+        "soma_accepted": "0", "int_rate": coupon_pct, "price_per100": "99.0", "high_investment_rate": "4.0", "high_yield": "4.1",
         "floating_rate": "No", "inflation_index_security": tips,
     }
 
@@ -55,10 +50,10 @@ def _row(bond_id, cusip, issue, maturity, face, holder, subbucket="", coupon=0.0
 BOOK = pd.DataFrame([
     _row(1, "RB", "2026-03-03", "2026-06-30", 10.0, "Banks"),  # reopened in the window
     _row(2, "M1", "2026-02-03", "2026-06-02", 30.0, "Banks"),
-    _row(3, "M1", "2026-02-03", "2026-06-02", 50.0, "Private", "mmf_cash_fund_route"),
+    _row(3, "M1", "2026-02-03", "2026-06-02", 50.0, "Private", PRIVATE_SUBBUCKET_MMF),
     _row(4, "M2", "2025-12-04", "2026-06-04", 60.0, "Foreign"),
     _row(5, "N1", "2023-05-31", "2026-05-31", 40.0, "CB", coupon=0.03),  # Sunday maturity, paid 6/1
-    _row(6, "N1", "2023-05-31", "2026-05-31", 20.0, "Private", "domestic_nonbank_deposit_funded", coupon=0.03),
+    _row(6, "N1", "2023-05-31", "2026-05-31", 20.0, "Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, coupon=0.03),
 ])
 WINDOW = [
     _auction("OLD", "Bill", "2026-05-28", "2026-08-27", 90),  # settles before the record date
@@ -68,58 +63,51 @@ WINDOW = [
     _auction("B17", "Bill", "2026-06-02", "2026-09-29", 50),
     _auction("B13", "Bill", "2026-06-04", "2026-09-03", 60),
     _auction("B26", "Bill", "2026-06-04", "2026-12-03", 40),
+    _auction("CLOSE", "Bill", "2026-06-18", "2026-07-16", 28),
+    _auction("NEXT", "Bill", "2026-06-22", "2026-07-20", 28),
 ]
 
 
-def _roll(tmp_path: Path, auctions: list[dict[str, str]], book: pd.DataFrame = BOOK):
-    settlements = prestart_settlements(_write_auctions(tmp_path / "auctions.csv", auctions), record_date=RECORD,
-                                       simulation_start_date=START)
-    return prestart_rollforward(book, settlements, simulation_start_date=START, next_bond_id=100, cusip_column="_cusip")
+def _roll(tmp_path: Path, auctions: list[dict[str, str]]):
+    settlements = prestart_settlements(
+        _write_auctions(tmp_path / "auctions.csv", auctions), record_date=RECORD, opening_close_date=CLOSE,
+    )
+    shares = {
+        "Banks": 0.25, "Foreign": 0.25, f"Private/{PRIVATE_SUBBUCKET_DOMESTIC_NONBANK}": 0.25,
+        f"Private/{PRIVATE_SUBBUCKET_MMF}": 0.25,
+    }
+    return prestart_rollforward(
+        BOOK, settlements, opening_close_date=CLOSE, cusip_column="_cusip",
+        noncb_weights={"bills": shares, "nonbills": shares},
+        soma=pd.DataFrame(columns=["cusip", "amount_mil", "maturity_date"]), soma_as_of_date="2026-06-17",
+    )
 
 
-def test_matured_securities_are_reinvested_in_what_treasury_issued_on_their_payment_date(tmp_path) -> None:
-    kept, added = _roll(tmp_path, WINDOW)
-    assert kept["BondID"].tolist() == [1]
-    # Each matured row is paid on the first settlement on or after its maturity and spread
-    # over that day's issues by accepted amount: the Sunday note maturity is paid Monday.
-    paid = added.groupby("_SourceBondID")["_PaymentDate"].first().dt.strftime("%Y-%m-%d").to_dict()
-    assert paid == {2: "2026-06-02", 3: "2026-06-02", 4: "2026-06-04", 5: "2026-06-01", 6: "2026-06-01"}
-    banks_m1 = added[added["_SourceBondID"] == 2].set_index("_cusip")["FaceValue"]
-    assert banks_m1.to_dict() == pytest.approx({"RB": 15.0, "B17": 15.0})
-    # Face and each holder's face are unchanged, and holders stay with their own securities.
-    assert added["FaceValue"].sum() == pytest.approx(BOOK.loc[BOOK["BondID"] > 1, "FaceValue"].sum())
-    assert added.groupby("HolderType")["FaceValue"].sum().to_dict() == pytest.approx(
-        {"Banks": 30.0, "Private": 70.0, "Foreign": 60.0, "CB": 40.0})
-    # A reopened CUSIP takes the book's own terms; a new issue takes the auction's.
+def test_actual_issue_terms_and_face_are_preserved(tmp_path) -> None:
+    opening, summary, diagnostics = _roll(tmp_path, WINDOW)
+    assert opening.groupby("_cusip")["FaceValue"].sum().to_dict() == pytest.approx(
+        {"RB": 60, "C2": 70, "C5": 30, "B17": 50, "B13": 60, "B26": 40, "CLOSE": 28}
+    )
+    assert summary["opening_face_bil"] == pytest.approx(338)
+    assert summary["matured_face_bil"] == pytest.approx(200)
+    added = opening[opening["BondID"] > 6]
     reopened = added[added["_cusip"] == "RB"].iloc[0]
-    assert reopened["IssueDate"] == pd.Timestamp("2026-03-03") and reopened["IssuePriceRatio"] == 0.988
+    assert reopened["IssueDate"] == pd.Timestamp("2026-03-03")
+    assert reopened["IssuePriceRatio"] == pytest.approx(0.99)
     new_note = added[added["_cusip"] == "C2"].iloc[0]
     assert new_note["CouponRate"] == pytest.approx(0.04) and new_note["MaturityCategory"] == "notes"
     six_month = added[added["_cusip"] == "B26"].iloc[0]
     assert six_month["OriginalMaturityYears"] == pytest.approx(182 / 365.25)
-    assert sorted(added["BondID"]) == list(range(100, 100 + len(added)))
-
-
-def test_the_rollforward_never_concentrates_more_than_one_days_maturities_on_a_date(tmp_path) -> None:
-    # Here every pre-start issue matures on one date, which would put the whole window's
-    # maturities, 200 billion, where the largest single day that matured was 80 billion.
-    piled = [
-        _auction("X1", "Bill", "2026-06-01", "2026-09-21", 10),
-        _auction("X2", "Bill", "2026-06-02", "2026-09-21", 10),
-        _auction("X3", "Bill", "2026-06-04", "2026-09-21", 10),
-    ]
-    with pytest.raises(IssuanceCalibrationError, match="more than the 80.0 billion"):
-        _roll(tmp_path, piled)
-    # Treasury's own spread of issues stays within that bound.
-    _, added = _roll(tmp_path, WINDOW)
-    assert added.groupby("MaturityDate")["FaceValue"].sum().max() <= 80.0 + 1e-9
+    # The June 2 bank lot receives half its maturity and half the bank's net issuance allotment.
+    bank_reopening, = added.loc[added["_cusip"].eq("RB") & added["HolderType"].eq("Banks"), "FaceValue"]
+    assert bank_reopening == pytest.approx(15 + 20 * 0.5 * 0.25)
+    replacement_ids = {row["replacement_bond_id"] for row in diagnostics if row["row_type"] == "replacement"}
+    assert replacement_ids == set(added["BondID"])
 
 
 def test_unreconstructable_windows_raise(tmp_path) -> None:
-    # A maturity with no settlement after it, an indexed issue, or an auction that
-    # contradicts the book's terms for a CUSIP is a gap, not something to guess around.
-    with pytest.raises(IssuanceCalibrationError, match="no Treasury issue settles between 2026-06-04"):
-        _roll(tmp_path, WINDOW[:5])
+    with pytest.raises(IssuanceCalibrationError, match="must cover and extend beyond"):
+        _roll(tmp_path, WINDOW[:-1])
     with pytest.raises(IssuanceCalibrationError, match="indexed security"):
         _roll(tmp_path, [*WINDOW, _auction("T5", "Note", "2026-06-15", "2031-04-15", 20, coupon_pct="1.5", tips="Yes")])
     wrong = [*WINDOW[:3], _auction("RB", "Bill", "2026-06-02", "2026-07-07", 50, original="2026-03-03"), *WINDOW[4:]]

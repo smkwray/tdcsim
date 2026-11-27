@@ -32,12 +32,29 @@ from forecast_input_builder import (  # noqa: E402
 )
 from forecast_bundle_builders import (  # noqa: E402
     CBO_REMITTANCE_SOURCE_FILE,
-    DTS_REMITTANCE_SOURCE_FILE,
     build_fed_remittance_path_rows,
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
 from forecast_paths import FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash  # noqa: E402
+from cbo_opening_actuals import (  # noqa: E402
+    ACTUALS_AVAILABLE_AS_OF,
+    DTS_CASH_SOURCE,
+    DTS_FLOWS_SOURCE,
+    DTS_TGA_CLOSING_ACCOUNT,
+    OPENING_CLOSE_DATE,
+    OPENING_PORTFOLIO_CLAIM_BOUNDARY,
+    OPENING_PORTFOLIO_RECORD_DATE,
+    OPENING_ROLLFORWARD_STATUS,
+    SIMULATION_START_DATE,
+    SOMA_SNAPSHOT_DATE,
+    SOMA_SOURCE,
+    build_opening_fy_splice,
+    dts_fiscal_selectors,
+    opening_cash_reconciliation,
+)
+from ratewall_input_builder import load_soma_cusip_holdings  # noqa: E402
+from tdc_shared import BOND_PORTFOLIO_COLS  # noqa: E402
 from cbo_yield_curve_surface import build_yield_curve_surface_rows  # noqa: E402
 from issuance_calibration import (  # noqa: E402
     CALIBRATION_FILE,
@@ -94,9 +111,10 @@ REQUIRED_FILES = {
     "sources/fiscaldata/auctions_query.csv",
     "sources/fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "sources/fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
-    "sources/fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+    f"sources/{DTS_CASH_SOURCE}",
+    f"sources/{DTS_FLOWS_SOURCE}",
+    f"sources/{SOMA_SOURCE}",
     f"sources/{CBO_REMITTANCE_SOURCE_FILE}",
-    f"sources/{DTS_REMITTANCE_SOURCE_FILE}",
     "sources/fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "sources/fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "sources/treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -113,9 +131,10 @@ EXPECTED_SOURCE_PACKAGE_FILES = {
     "fiscaldata/auctions_query.csv",
     "fiscaldata/mts_table_1_deficit_2026-05-31.csv",
     "fiscaldata/mts_table_9_net_interest_2026-05-31.csv",
-    "fiscaldata/dts_tga_closing_balance_2026-06-16.csv",
+    DTS_CASH_SOURCE,
+    DTS_FLOWS_SOURCE,
+    SOMA_SOURCE,
     CBO_REMITTANCE_SOURCE_FILE,
-    DTS_REMITTANCE_SOURCE_FILE,
     "fiscaldata/mspd_table_1_debt_bridge_2026-05-31.csv",
     "fiscaldata/mspd_table_3_market_2026-05-31.csv",
     "treasury/debt_to_penny_public_debt_2026-05-29.csv",
@@ -179,7 +198,8 @@ EXPECTED_SOURCE_ROW_SELECTORS = {
     "mts_table_1": "classification_desc=Year-to-Date;line_code_nbr=280;column=current_month_dfct_sur_amt",
     "mts_table_9": "classification_desc=Net Interest;column=current_fytd_rcpt_outly_amt",
     "debt_to_the_penny": "record_date=2026-05-29;column=debt_held_public_amt",
-    "dts": "account_type=Treasury General Account (TGA) Closing Balance",
+    "dts": f"account_type={DTS_TGA_CLOSING_ACCOUNT}",
+    "dts_june_fiscal_stub": dts_fiscal_selectors(),
 }
 EXPECTED_MSPD_SELECTORS = {
     "security_type_desc=Total Nonmarketable",
@@ -196,11 +216,6 @@ EXPECTED_SOURCE_EXTRACT_ROWS = {
         "record_date": "2026-05-31",
         "classification_desc": "Net Interest",
         "current_fytd_rcpt_outly_amt": "722706511243.20",
-    },
-    "dts_tga_closing_balance_row": {
-        "record_date": "2026-06-16",
-        "account_type": "Treasury General Account (TGA) Closing Balance",
-        "open_today_bal": "981113",
     },
     "debt_to_penny_row": {
         "record_date": "2026-05-29",
@@ -242,12 +257,6 @@ CLAIM_BOUNDARY_EXCLUSIONS = {
     "does_not_claim_cbo_issuance_mix",
     "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
 }
-APPROVED_OPENING_PORTFOLIO_CLAIM_BOUNDARY = (
-    "prebuilt_mspd_table3_market_derived_cohort_book; "
-    "cb_from_nyfed_soma_by_cusip_noncb_split_by_wamest_sector_bill_nonbill_holdings; "
-    "soma_and_wamest_inputs_hashed_in_source_manifest_not_packaged; "
-    "securities_maturing_between_record_date_and_simulation_start_are_reinvested_in_the_treasury_issues_settling_on_their_payment_dates"
-)
 APPROVED_TOP_LEVEL_MANIFEST_KEYS = {
     "schema_version",
     "status",
@@ -300,6 +309,8 @@ APPROVED_OPENING_PORTFOLIO_KEYS = {
     "holder_totals_bil",
     "mode",
     "opening_cb_holdings_bil",
+    "opening_close_date",
+    "soma_snapshot_date",
     "opening_frn_accrued_interest_bil",
     "opening_frn_benchmark_rate_decimal_max",
     "opening_frn_benchmark_rate_decimal_min",
@@ -533,21 +544,25 @@ def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:
     if manifest.get("scenario_id") != "cbo_full_horizon_local_smoke_3m":
         raise ValueError("unexpected scenario_id")
     dates = manifest.get("date_range", {})
-    if dates.get("simulation_start_date") != "2026-06-21":
+    if dates.get("simulation_start_date") != SIMULATION_START_DATE:
         raise ValueError("unexpected simulation_start_date")
     if dates.get("simulation_end_date") != "2036-09-30":
         raise ValueError("unexpected simulation_end_date")
 
     opening = manifest.get("opening_portfolio_construction", {})
-    if abs(float(opening.get("opening_rollforward_debt_base_delta_bil", 1.0))) > 1e-9:
-        raise ValueError("opening rollforward debt base delta is not zero")
-    if "no_same_day_cusip_level_mspd_table3_book_available" not in str(
-        opening.get("opening_source_common_date_status", "")
+    if (
+        dates.get("opening_close_date") != OPENING_CLOSE_DATE
+        or dates.get("fiscal_actuals_through") != OPENING_CLOSE_DATE
+        or opening.get("opening_close_date") != OPENING_CLOSE_DATE
     ):
-        raise ValueError("opening source common-date status is missing expected boundary wording")
+        raise ValueError("opening book and fiscal splice must share the June 18 close")
+    if dates.get("actuals_available_as_of") != ACTUALS_AVAILABLE_AS_OF:
+        raise ValueError("opening information vintage differs from the June DTS release")
+    if opening.get("opening_rollforward_status") != OPENING_ROLLFORWARD_STATUS:
+        raise ValueError("opening rollforward status does not establish settlement reconciliation")
     if "contract-compliant" not in str(opening.get("frn_source_boundary_note", "")):
         raise ValueError("FRN source boundary note is missing contract-compliant wording")
-    if opening.get("claim_boundary") != APPROVED_OPENING_PORTFOLIO_CLAIM_BOUNDARY:
+    if opening.get("claim_boundary") != OPENING_PORTFOLIO_CLAIM_BOUNDARY:
         raise ValueError("opening_portfolio_construction.claim_boundary changed")
 
     run_summaries = manifest.get("run_summaries", {})
@@ -563,63 +578,64 @@ def _verify_manifest_contract(manifest: Mapping[str, Any]) -> None:
             raise ValueError(f"{run_id} final Fed holdings error exceeds tolerance")
 
 
-def _verify_opening_counts_against_source_book(root: Path, manifest: Mapping[str, Any]) -> None:
-    """Rebuild the opening book's counts from the packaged source book and auctions.
-
-    Every source row is loaded; rows maturing on or before the simulation start are rolled
-    forward onto the packaged auction results by the build's own rule; TIPS and FRN rows
-    (and their CUSIPs) are the source's surviving TIPS and FRN rows. Comparing the manifest
-    with these catches a truncated or partially enriched book for any correctly sourced
-    book, without pinning one book's counts.
-    """
-
+def _verify_opening_counts_against_source_book(
+    root: Path, manifest: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Rebuild counts and stock-flow diagnostics from the packaged source book."""
     import pandas as pd
 
-    opening = manifest.get("opening_portfolio_construction", {})
+    opening = manifest["opening_portfolio_construction"]
     source_path = root / "sources" / "opening" / "tdcsim_initial_portfolio_cohorts.csv"
-    source = _read_csv_dicts(source_path)
-    if not source:
-        raise ValueError("packaged opening source book has no rows")
-    start = str(manifest.get("date_range", {}).get("simulation_start_date") or "")
-    inactive = [row for row in source if (row.get("Status") or "Active") != "Active"]
-    if inactive:
-        raise ValueError("packaged opening source book contains non-active rows")
-    book = pd.read_csv(source_path, low_memory=False)
+    book = pd.read_csv(source_path, low_memory=False).reindex(columns=[*BOND_PORTFOLIO_COLS, "cusip_or_synthetic_id"])
+    if book.empty or not book["Status"].fillna("Active").eq("Active").all():
+        raise ValueError("packaged opening source book must have active rows only")
     for column in ("IssueDate", "MaturityDate"):
-        book[column] = pd.to_datetime(book[column], errors="coerce")
+        book[column] = pd.to_datetime(book[column], errors="raise")
+    if opening["record_date"] != OPENING_PORTFOLIO_RECORD_DATE:
+        raise ValueError("packaged opening book record date differs from the declared May source")
     settlements = prestart_settlements(
         root / "sources" / "fiscaldata" / "auctions_query.csv",
-        record_date=str(opening.get("record_date") or ""),
-        simulation_start_date=start,
+        record_date=opening["record_date"],
+        opening_close_date=OPENING_CLOSE_DATE,
     )
-    kept_book, replacements = prestart_rollforward(
+    source_manifest = _read_json(root / "sources" / "opening" / "tdcsim_ratewall_input_manifest.json")
+    soma_date, soma = load_soma_cusip_holdings(root / "sources" / SOMA_SOURCE)
+    if soma_date != SOMA_SNAPSHOT_DATE or opening.get("soma_snapshot_date") != soma_date:
+        raise ValueError("packaged SOMA snapshot date differs from the opening roll source")
+    rolled, summary, diagnostics = prestart_rollforward(
         book,
         settlements,
-        simulation_start_date=start,
-        next_bond_id=int(pd.to_numeric(book["BondID"]).max()) + 1,
+        opening_close_date=OPENING_CLOSE_DATE,
         cusip_column="cusip_or_synthetic_id",
+        noncb_weights=source_manifest["artifacts"]["initial_portfolio"]["noncb_weights"],
+        soma=soma,
+        soma_as_of_date=soma_date,
     )
-    kept = [row for row in source if row["MaturityDate"][:10] > start]
-
-    def cusips(security_type: str) -> set[str]:
-        return {row["cusip_or_synthetic_id"] for row in kept if row["SecurityType"] == security_type}
-
     expected = {
-        "source_rows_loaded": len(source),
-        "prestart_matured_rows": len(source) - len(kept_book),
-        "prestart_rollforward_rows": len(replacements),
-        "row_count": len(kept) + len(replacements),
-        "tips_rows_enriched": sum(1 for row in kept if row["SecurityType"] == "TIPS"),
-        "tips_unique_cusips_enriched": len(cusips("TIPS")),
-        "frn_rows_enriched": sum(1 for row in kept if row["SecurityType"] == "FRN"),
-        "frn_unique_cusips_enriched": len(cusips("FRN")),
+        "source_rows_loaded": len(book),
+        "prestart_matured_rows": summary["matured_rows"],
+        "prestart_rollforward_rows": summary["settlement_lot_rows"],
+        "row_count": len(rolled),
     }
+    for prefix, security_type in (("tips", "TIPS"), ("frn", "FRN")):
+        positions = rolled.loc[rolled["SecurityType"].eq(security_type), "cusip_or_synthetic_id"]
+        expected[f"{prefix}_rows_enriched"] = len(positions)
+        expected[f"{prefix}_unique_cusips_enriched"] = positions.nunique()
     for key, value in expected.items():
         if int(opening.get(key, -1)) != value:
             raise ValueError(
                 f"opening_portfolio_construction.{key} is {opening.get(key)}, "
                 f"but the packaged source book gives {value}"
             )
+    for key, value in (
+        ("prestart_rollforward_face_bil", summary["matured_face_bil"]),
+        ("opening_rollforward_source_debt_base_bil", summary["source_face_bil"]),
+        ("opening_rollforward_aligned_debt_base_bil", summary["opening_face_bil"]),
+        ("opening_rollforward_debt_base_delta_bil", summary["face_delta_bil"]),
+        ("opening_cb_holdings_bil", summary["soma_close_bil"]),
+    ):
+        _assert_close(key, float(opening.get(key, math.nan)), value, NUMERIC_TOLERANCE)
+    return summary, diagnostics
 
 
 def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
@@ -657,13 +673,13 @@ def _verify_semantic_contract(root: Path, manifest: Mapping[str, Any]) -> None:
         run_metrics[run_id] = metrics
 
     _verify_partial_interest_financing_diagnostic(root, run_metrics["baseline"])
-    _verify_opening_counts_against_source_book(root, manifest)
+    summary, diagnostics = _verify_opening_counts_against_source_book(root, manifest)
     _verify_opening_portfolio(root, manifest)
     _verify_tips_forward_paths(root, manifest)
     _verify_frn_rate_path(root, manifest)
     _verify_yield_surface_against_sources(root)
-    _verify_rollforward(root, manifest)
     _verify_source_selectors_and_frozen_rows(root, manifest)
+    _verify_opening_cash_and_rollforward(root, manifest, summary, diagnostics)
 
 
 def _verify_manifest_schema(manifest: Mapping[str, Any]) -> None:
@@ -1621,7 +1637,7 @@ def _verify_yield_surface_against_sources(root: Path) -> None:
     expected_rows = build_yield_curve_surface_rows(
         macro_forecast_rows=_read_csv_dicts(root / "forecast_inputs" / "tdcsim_macro_forecast_path.csv"),
         base_curve_rows=_packaged_base_curve_rows(root),
-        actuals_available_as_of="2026-06-17",
+        actuals_available_as_of=ACTUALS_AVAILABLE_AS_OF,
         output_tenors=tenors,
     )
     _verify_csv_rows_match_expected("tdcsim_yield_curve_surface.csv", actual_rows, expected_rows)
@@ -1655,52 +1671,50 @@ def _packaged_base_curve_rows(root: Path) -> list[dict[str, Any]]:
     ]
 
 
-def _verify_rollforward(root: Path, manifest: Mapping[str, Any]) -> None:
-    opening_manifest = manifest.get("opening_portfolio_construction", {})
-    rows = _read_csv_dicts(root / "forecast_inputs" / "tdcsim_opening_rollforward_diagnostics.csv")
-    summary_rows = [row for row in rows if row.get("row_type") == "summary"]
-    replacement_rows = [row for row in rows if row.get("row_type") == "replacement"]
-    if len(summary_rows) != 1:
-        raise ValueError("roll-forward diagnostics must contain exactly one summary row")
-    summary = summary_rows[0]
-    if len(replacement_rows) != int(opening_manifest.get("prestart_rollforward_rows", -1)):
-        raise ValueError("roll-forward replacement count does not match manifest")
-    if int(float(summary.get("replacement_rows", "-1"))) != len(replacement_rows):
-        raise ValueError("roll-forward summary replacement_rows does not match parsed CSV")
-    source_face_by_row: dict[str, float] = {}
-    reinvested_by_row: dict[str, float] = {}
-    for row in replacement_rows:
-        source_id = row["source_bond_id"]
-        source_face = _csv_float(row, "source_face_bil")
-        if source_face_by_row.setdefault(source_id, source_face) != source_face:
-            raise ValueError(f"roll-forward rows disagree on the face of source row {source_id}")
-        reinvested_by_row[source_id] = reinvested_by_row.get(source_id, 0.0) + _csv_float(row, "replacement_face_bil")
-    matured_rows = int(opening_manifest.get("prestart_matured_rows", -1))
-    if len(source_face_by_row) != matured_rows or int(float(summary.get("source_rows_maturing_on_or_before_start", "-1"))) != matured_rows:
-        raise ValueError("roll-forward source row count does not match manifest")
-    for source_id, face in source_face_by_row.items():
-        _assert_close(f"roll-forward reinvestment of source row {source_id}", reinvested_by_row[source_id], face, NUMERIC_TOLERANCE)
-    source_face = sum(source_face_by_row.values())
-    replacement_face = sum(reinvested_by_row.values())
-    _assert_close("roll-forward source face", source_face, _csv_float(summary, "source_face_bil"), NUMERIC_TOLERANCE)
+def _verify_opening_cash_and_rollforward(
+    root: Path, manifest: Mapping[str, Any], summary: Mapping[str, Any], diagnostics: list[dict[str, Any]]
+) -> None:
+    inputs = root / "forecast_inputs"
+    dts = opening_cash_reconciliation(root / "sources" / DTS_CASH_SOURCE, root / "sources" / DTS_FLOWS_SOURCE)
+    rows = _read_csv_dicts(inputs / "tdcsim_opening_rollforward_diagnostics.csv")
+    expected = [*diagnostics, {"row_type": "dts_cash_bridge", **dts}]
+    columns = dict.fromkeys((key for row in expected for key in row), "")
+    _verify_csv_rows_match_expected(
+        "tdcsim_opening_rollforward_diagnostics.csv", rows, [{**columns, **row} for row in expected]
+    )
+    portfolio = _read_csv_dicts(inputs / "tdcsim_opening_portfolio.csv")
     _assert_close(
-        "roll-forward replacement face",
-        replacement_face,
-        _csv_float(summary, "replacement_face_bil"),
-        NUMERIC_TOLERANCE,
+        "opening marketable book", sum(map(_opening_debt_base, portfolio)),
+        summary["opening_face_bil"], NUMERIC_TOLERANCE,
     )
     _assert_close(
-        "roll-forward manifest face",
-        replacement_face,
-        float(opening_manifest.get("prestart_rollforward_face_bil", math.nan)),
-        NUMERIC_TOLERANCE,
+        "opening SOMA book", sum(_opening_debt_base(row) for row in portfolio if row["HolderType"] == "CB"),
+        summary["soma_close_bil"], NUMERIC_TOLERANCE,
     )
-    _assert_close("roll-forward face delta", replacement_face - source_face, _csv_float(summary, "face_delta_bil"), NUMERIC_TOLERANCE)
-    _assert_close(
-        "roll-forward debt-base delta",
-        float(opening_manifest.get("opening_rollforward_debt_base_delta_bil", math.nan)),
-        0.0,
-        NUMERIC_TOLERANCE,
+    cash_path = _read_csv_dicts(inputs / "tdcsim_operating_cash_path.csv")
+    if not cash_path or any(
+        row["base_date"] != OPENING_CLOSE_DATE or row["observation_date"] != OPENING_CLOSE_DATE
+        or row["available_date"] != ACTUALS_AVAILABLE_AS_OF
+        for row in cash_path
+    ):
+        raise ValueError("TGA anchor must use the common opening close and information vintage")
+    _assert_close("DTS opening TGA", _csv_float(cash_path[0], "base_balance_bil"), dts["tga_close_bil"], NUMERIC_TOLERANCE)
+    mts_deficit = _read_csv_dicts(root / "sources" / "fiscaldata" / "mts_table_1_deficit_2026-05-31.csv")[0]
+    mts_interest = _read_csv_dicts(root / "sources" / "fiscaldata" / "mts_table_9_net_interest_2026-05-31.csv")[0]
+    fy2026, = [
+        row for row in _read_csv_dicts(inputs / "tdcsim_cbo_fiscal_baseline.csv") if row["fiscal_year"] == "2026"
+    ]
+    expected_splice = build_opening_fy_splice(
+        scenario_id=str(manifest["scenario_id"]),
+        cbo_primary_deficit_bil=_csv_float(fy2026, "primary_deficit_bil"),
+        mts_deficit_bil=_csv_float(mts_deficit, "current_month_dfct_sur_amt") / 1e9,
+        mts_interest_bil=_csv_float(mts_interest, "current_fytd_rcpt_outly_amt") / 1e9,
+        dts=dts,
+    )
+    _verify_csv_rows_match_expected(
+        "tdcsim_current_fy_splice.csv",
+        _read_csv_dicts(inputs / "tdcsim_current_fy_splice.csv"),
+        [expected_splice],
     )
 
 
@@ -2025,11 +2039,6 @@ def _verify_source_selectors_and_frozen_rows(root: Path, manifest: Mapping[str, 
         money_fields={"current_fytd_rcpt_outly_amt": 722_706_511_243.20},
     )
     _verify_single_source_extract(
-        root / "sources" / "fiscaldata" / "dts_tga_closing_balance_2026-06-16.csv",
-        EXPECTED_SOURCE_EXTRACT_ROWS["dts_tga_closing_balance_row"],
-        money_fields={"open_today_bal": 981_113.0},
-    )
-    _verify_single_source_extract(
         root / "sources" / "treasury" / "debt_to_penny_public_debt_2026-05-29.csv",
         EXPECTED_SOURCE_EXTRACT_ROWS["debt_to_penny_row"],
         money_fields={"debt_held_public_amt": 31_515_369_798_622.98},
@@ -2089,7 +2098,7 @@ def _verify_fed_remittance_inputs(root: Path) -> None:
         build_fed_remittance_path_rows(
             _read_csv_dicts(inputs / "tdcsim_primary_deficit_path.csv"),
             splice,
-            read_dts_fed_earnings(sources / DTS_REMITTANCE_SOURCE_FILE, splice),
+            read_dts_fed_earnings(sources / DTS_FLOWS_SOURCE, splice),
         ),
     )
 
