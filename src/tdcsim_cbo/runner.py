@@ -1390,10 +1390,16 @@ def _source_metadata(baseline: CboBaselinePackage, inputs_dir: Path) -> dict[str
         raise RunnerError("could not determine actuals_available_as_of from baseline package or compiled inputs")
     if not opening:
         raise RunnerError("could not determine opening_state_date from baseline package or compiled inputs")
+    close = date_range.get("opening_close_date")
+    if isinstance(baseline.manifest.get("derived_forecast_state"), Mapping):
+        # Earlier exports put the modeled state's date in date_range. The
+        # inherited source construction still records the observed close.
+        construction = baseline.manifest.get("opening_portfolio_construction", {})
+        close = construction.get("opening_close_date", close)
     return {
         "actuals_available_as_of": actuals,
         "opening_state_date": opening,
-        "opening_close_date": str(date_range.get("opening_close_date") or ""),
+        "opening_close_date": str(close or ""),
         "source_vintage": str(baseline.manifest.get("forecast_publication_date") or baseline.package_id),
     }
 

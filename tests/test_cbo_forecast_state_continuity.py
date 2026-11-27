@@ -105,7 +105,11 @@ def test_transformed_rollforward_export_carries_one_verified_world(tmp_path: Pat
         )
     )
 
-    derived = read_json(package_dir / "manifest.json")["derived_forecast_state"]
+    derived_manifest = read_json(package_dir / "manifest.json")
+    derived = derived_manifest["derived_forecast_state"]
+    assert derived_manifest["date_range"]["opening_close_date"] == "2026-09-18"
+    assert derived_manifest["date_range"]["actuals_available_as_of"] == "2026-09-20"
+    assert derived["opening_state_date"] == "2026-09-25"
     assert derived["construction_kind"] == "transformed_scenario"
     assert derived["compiled_controls_digest"] == run.compiled.compiled_inputs_digest
 
@@ -274,9 +278,11 @@ def _baseline_with_dates(tmp_path: Path) -> CboBaselinePackage:
     manifest["forecast_publication_date"] = "2026-09-20"
     manifest["date_range"] = {
         "actuals_available_as_of": "2026-09-20",
+        "opening_close_date": "2026-09-18",
         "opening_state_date": "2026-09-20",
         "simulation_start_date": "2026-09-20",
     }
+    manifest["opening_portfolio_construction"] = {"opening_close_date": "2026-09-18"}
     write_json(manifest_path, manifest)
     write_json(package_dir / "forecast_inputs" / "source_contract_smoke.json", manifest)
     package.unlink()

@@ -234,10 +234,20 @@ def export_forecast_state_package(
         )
         opening_anchor_adjustments_digest = canonical_json_sha256(opening_anchor_adjustments)
         exported_controls_digest = digest_exported_controls(inputs)
+        manifest_path = package_dir / "manifest.json"
+        manifest = read_json(manifest_path)
+        if not isinstance(manifest, dict):
+            raise ForecastStateExportError("parent manifest must be an object")
+        date_range = dict(manifest.get("date_range", {}))
+        construction = manifest.get("opening_portfolio_construction", {})
+        parent_close = construction.get("opening_close_date") or date_range.get("opening_close_date")
+        if parent_close:
+            date_range["opening_close_date"] = parent_close
         _write_opening_metadata(
             parent_baseline,
             inputs,
             state_window,
+            parent_observed_close=parent_close,
             source=source,
             closing_state_digest=closing_state_digest,
             exported_controls_digest=exported_controls_digest,
@@ -250,13 +260,6 @@ def export_forecast_state_package(
             closing_state_digest=closing_state_digest,
         )
 
-        manifest_path = package_dir / "manifest.json"
-        manifest = read_json(manifest_path)
-        if not isinstance(manifest, dict):
-            raise ForecastStateExportError("parent manifest must be an object")
-        date_range = dict(manifest.get("date_range", {}))
-        if "opening_close_date" in date_range:
-            date_range["opening_close_date"] = state_window.opening_state_date
         date_range["opening_state_date"] = state_window.opening_state_date
         date_range["simulation_start_date"] = state_window.opening_state_date
         manifest["date_range"] = date_range
@@ -882,6 +885,7 @@ def _write_opening_metadata(
     inputs: Path,
     state_window: ForecastStateWindow,
     *,
+    parent_observed_close: str | None,
     source: _VerifiedRollforward,
     closing_state_digest: str,
     exported_controls_digest: str,
@@ -889,7 +893,6 @@ def _write_opening_metadata(
 ) -> None:
     metadata = {
         "schema_version": "tdcsim_opening_portfolio_metadata_v1",
-        "opening_close_date": state_window.opening_state_date,
         "opening_state_date": state_window.opening_state_date,
         "simulation_start_date": state_window.opening_state_date,
         "state_id": state_window.state_id,
@@ -911,6 +914,8 @@ def _write_opening_metadata(
         "closing_portfolio_sha256": source.final_portfolio_sha256,
         "claim_boundary": claim_boundary,
     }
+    if parent_observed_close:
+        metadata["opening_close_date"] = parent_observed_close
     write_json(inputs / "tdcsim_opening_portfolio_metadata.json", metadata)
 
 
