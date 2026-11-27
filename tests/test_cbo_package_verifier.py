@@ -306,6 +306,26 @@ def test_cbo_package_verifier_rejects_remittance_overclaim_with_refreshed_hashes
         verify_package(package)
 
 
+def test_cbo_package_verifier_requires_explicit_remittance_scope(tmp_path: Path) -> None:
+    package = _write_valid_package(tmp_path / "pkg")
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    boundary = manifest["claim_boundary"]
+    invalid_boundaries = [
+        ({**boundary, "remittance_role": "not_modeled_in_cbo_lane"}, "remittance_role"),
+        ({
+            **boundary,
+            "excluded_claims": [claim for claim in boundary["excluded_claims"]
+                                if claim != "does_not_model_fed_remittance_rate_response"],
+        }, "excluded_claims"),
+    ]
+    for invalid, field in invalid_boundaries:
+        _write_json(manifest_path, {**manifest, "claim_boundary": invalid})
+        _refresh_manifest_hashes(package)
+        with pytest.raises(ValueError, match=rf"claim_boundary\.{field}"):
+            verify_package(package)
+
+
 def test_cbo_package_verifier_rejects_deprecated_net_interest_file_with_refreshed_hashes(tmp_path: Path) -> None:
     package = _write_valid_package(tmp_path / "pkg")
     (package / "tdcsim_modeled_net_interest_diagnostic.csv").write_text("overclaim\n", encoding="utf-8")
@@ -788,6 +808,7 @@ def _claim_boundary() -> dict:
         "net_interest_role": "partial_interest_financing_diagnostic_only",
         "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
         "cash_role": "operating_cash_path_sizes_issuance_debt_drift_reported_against_cbo_path",
+        "remittance_role": "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash",
         "excluded_claims": [
             "does_not_claim_exact_historical_replay",
             "does_not_claim_full_soma_transaction_replay",
@@ -796,7 +817,9 @@ def _claim_boundary() -> dict:
             "does_not_claim_receipts_outlays_decomposition",
             "does_not_use_cbo_net_interest_as_cash_or_issuance_plug",
             "does_not_claim_cbo_issuance_mix",
-            "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
+            "does_not_model_fed_net_income",
+            "does_not_model_fed_deferred_asset",
+            "does_not_model_fed_remittance_rate_response",
         ],
     }
 

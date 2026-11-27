@@ -73,7 +73,7 @@ from forecast_bundle_builders import (
     cbo_remittance_source_fixture,
     read_dts_fed_earnings,
 )
-from forecast_paths import FED_REMITTANCE_PATH_FILE
+from forecast_paths import CBO_FED_REMITTANCE_EXCLUDED_CLAIMS, CBO_FED_REMITTANCE_ROLE, FED_REMITTANCE_PATH_FILE
 from forecast_input_builder import (
     BUDGET_WORKBOOK_SHA256,
     ECONOMIC_WORKBOOK_SHA256,
@@ -1037,6 +1037,7 @@ def build_manifest(
             "net_interest_role": "partial_interest_financing_diagnostic_only",
             "issuance_mix_role": "tdcsim_assumption_not_cbo_prescription",
             "cash_role": PACKAGE_CASH_ROLE,
+            "remittance_role": CBO_FED_REMITTANCE_ROLE,
             "excluded_claims": sorted(
                 [
                     "does_not_claim_exact_historical_replay",
@@ -1046,7 +1047,7 @@ def build_manifest(
                     "does_not_claim_receipts_outlays_decomposition",
                     "does_not_use_cbo_net_interest_as_cash_or_issuance_plug",
                     "does_not_claim_cbo_issuance_mix",
-                    "does_not_model_cb_net_income_remittances_or_deferred_assets_in_cbo_lane",
+                    *CBO_FED_REMITTANCE_EXCLUDED_CLAIMS,
                 ]
             ),
         },

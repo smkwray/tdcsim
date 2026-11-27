@@ -23,7 +23,7 @@ from evaluated_nominal_curve import (
     OPEN04_FIXED_COUPLING,
     normalize_open04_override,
 )
-from forecast_paths import FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash
+from forecast_paths import CBO_FED_REMITTANCE_ROLE, FED_REMITTANCE_PATH_FILE, verify_fed_remittance_cash
 from mmf_eligibility import MmfEligibilityError, mmf_eligible_mask, mmf_may_acquire
 from issuance_calibration import CALIBRATION_FILE, verify_fiscal_close_cash
 from sim_engine import (
@@ -344,8 +344,8 @@ def verify_scenario_run(
         raise VerificationError("run manifest boundary_checks must be an object")
     if boundaries.get("net_interest_role") != "diagnostic_nonbinding":
         raise VerificationError("net interest role must remain diagnostic_nonbinding")
-    if boundaries.get("remittance_deferred_asset_status") != "unsupported_in_cbo_scenario_lane":
-        raise VerificationError("Fed deferred-asset status must remain unsupported")
+    if boundaries.get("remittance_role") != CBO_FED_REMITTANCE_ROLE:
+        raise VerificationError("run boundary checks must declare the fixed CBO Fed-to-TGA remittance path")
     if boundaries.get("fed_auction_add_ons_roll_over_maturities") is not True:
         raise VerificationError("the Fed's auction add-ons exceed its maturing holdings")
     _verify_mmf_eligibility(root, manifest, compiled_manifest_path.parent / "forecast_inputs")

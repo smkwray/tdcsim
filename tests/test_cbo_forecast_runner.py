@@ -116,6 +116,14 @@ def test_runner_builds_exact_manifest_and_inputs_without_engine_loop(tmp_path: P
         manifest["opening_portfolio_construction"]["claim_boundary"]
     )
     assert manifest["claim_boundary"]["package_role"] == "cbo_baseline_forecast_evidence_package"
+    assert manifest["claim_boundary"]["remittance_role"] == "fixed_exogenous_cbo_table_4_3_fed_to_tga_cash"
+    assert {
+        claim for claim in manifest["claim_boundary"]["excluded_claims"] if claim.startswith("does_not_model_")
+    } == {
+        "does_not_model_fed_net_income",
+        "does_not_model_fed_deferred_asset",
+        "does_not_model_fed_remittance_rate_response",
+    }
     assert manifest["source_package"]["source_file_count"] >= len(SOURCE_PACKAGE_INPUTS)
     source_files = manifest["source_package"]["source_files"]
     for rel_path in SOURCE_PACKAGE_INPUTS.values():

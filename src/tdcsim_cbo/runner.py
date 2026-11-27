@@ -24,6 +24,7 @@ import pandas as pd
 
 from evaluated_nominal_curve import OPEN04_OUTPUT_CONTRACT
 from forecast_paths import (
+    CBO_FED_REMITTANCE_ROLE,
     compiled_forecast_input_paths,
     load_cbo_fiscal_baseline,
     load_frn_rate_path,
@@ -1140,7 +1141,7 @@ def validate_run_boundaries(
         "max_fed_add_on_excess_over_maturities": fed_add_on_excess,
         "fed_auction_add_ons_roll_over_maturities": fed_boundary_pass,
         "net_interest_role": "diagnostic_nonbinding",
-        "remittance_deferred_asset_status": "unsupported_in_cbo_scenario_lane",
+        "remittance_role": CBO_FED_REMITTANCE_ROLE,
         **cash_closure,
         **omf,
         **funding_mode_cash_checks(results, funding_closure_mode),
