@@ -1071,17 +1071,26 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
     carry a 0.01 discount; the Treasury's other cash flows settle through reserves.
     """
 
+    from forecast_paths import _rebuild_fed_receivable
+
     policy = load_policy_rate_path(package / "forecast_inputs" / POLICY_RATE_PATH_FILE)
     opening_day = rows[0]["Date"]
-    opening = pd.read_csv(package / "forecast_inputs" / "tdcsim_opening_portfolio.csv")
+    inputs = package / "forecast_inputs"
+    opening = pd.read_csv(inputs / "tdcsim_opening_portfolio.csv")
     fed_lots = opening.loc[opening["HolderType"].eq("CB") & opening["Status"].eq("Active")]
+    # The receivable the opening lots' terms imply; the fixture holds it until the close. The
+    # fixture book's TIPS are indexed at the start date already.
+    valued = opening
+    first_day, last_day = pd.Timestamp(opening_day), pd.Timestamp(rows[-1]["Date"])
+    receivable = {**dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                  "coupon": _rebuild_fed_receivable(valued, first_day, opening_day=first_day, inputs=inputs)}
     book = FedBook(
         FedOpening.from_row(path[0]),
         opening_day=opening_day,
         tga=float(rows[0]["TGA"]),
         treasury_book={
             "premiums": opening_premiums(fed_lots, opening_day, float(path[0]["h41_treasury_net_premium_bil"])),
-            "accrued": dict.fromkeys(ACCRUAL_TYPES, 0.0), "stock": float(rows[0]["DebtHeld_CentralBank"]),
+            "accrued": dict(receivable), "stock": float(rows[0]["DebtHeld_CentralBank"]),
         },
         path_row=path[0],
         route_balances=None,
@@ -1092,6 +1101,21 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
                     "CB_ONRRPRatePct": rates["on_rrp"], "CB_NetIncome": 0.0, "CB_Remittance": 0.0,
                     "CBORemittanceCashEffect": 0.0, "CBOTable43RemittanceInFiscalFlow": 0.0, "Reserves": 3_000.0})
     legacy = 3_000.0
+    # The lots left at the close: the surviving opening lots, caught up through the close, and
+    # the fixture's purchases (zero-coupon), whose terms set the closing receivable.
+    survivors = valued.loc[valued["HolderType"].eq("CB") & valued["Status"].eq("Active")
+                           & pd.to_datetime(valued["MaturityDate"]).gt(last_day)].copy()
+    survivors["LastAccrualDate"], survivors["AccruedInterest_FRN"] = last_day.date().isoformat(), 0.0
+    purchases = pd.DataFrame([
+        {"BondID": 10**6 + index, "HolderType": "CB", "Status": "Active", "SecurityType": "Fixed", "CouponRate": 0.0,
+         "IssueDate": rows[index]["Date"], "DatedDate": rows[index]["Date"], "MaturityDate": "2040-01-02",
+         "FaceValue": float(rows[index]["CBOFedSecondaryPurchaseFace"]),
+         "AdjustedPrincipal": float(rows[index]["CBOFedSecondaryPurchaseFace"]), "AccruedInterest_FRN": 0.0}
+        for index in range(1, len(rows)) if float(rows[index]["CBOFedSecondaryPurchaseFace"]) > 0.0
+    ])
+    final = pd.concat([survivors, purchases], ignore_index=True)
+    closing = {**dict.fromkeys(ACCRUAL_TYPES, 0.0),
+               "coupon": _rebuild_fed_receivable(final, last_day, opening_day=first_day, inputs=inputs)}
     for index in range(1, len(rows)):
         row, prev = rows[index], rows[index - 1]
         paid = book.remittance(row["Date"])
@@ -1103,7 +1127,8 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
         values = book.close_day(
             prev["Date"], row["Date"], tga=float(row["TGA"]), remitted=paid, treasury_reserve_effect=effect,
             treasury={
-                "cash": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_end": dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                "cash": dict.fromkeys(ACCRUAL_TYPES, 0.0),
+                "accrued_end": dict(closing if index == len(rows) - 1 else receivable),
                 "accrued_purchased": dict.fromkeys(ACCRUAL_TYPES, 0.0), "accrued_sold": dict.fromkeys(ACCRUAL_TYPES, 0.0),
                 "tips_indexation": 0.0, "floor_topup": 0.0, "realized_gains": 0.0,
                 "premium_acquired": bought, "premium_sold": 0.0, "stock": float(row["DebtHeld_CentralBank"]),
@@ -1116,11 +1141,7 @@ def _apply_fed_income(rows: list[dict], path: list[dict], package: Path) -> None
     exports = package / "exports_baseline"
     exports.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(book.lots.journal, columns=FED_LOT_JOURNAL_COLUMNS).to_csv(exports / "fed_lot_journal.csv", index=False)
-    final = pd.DataFrame(
-        [{"BondID": key, "HolderType": "CB", "Status": "Active", "MaturityDate": lot.maturity.date().isoformat()}
-         for key, lot in book.lots.lots.items()],
-        columns=["BondID", "HolderType", "Status", "MaturityDate"],
-    )
+    assert set(final["BondID"].astype(int)) == set(book.lots.lots)
     final.to_csv(exports / "final_portfolio_active.csv", index=False)
 
 
