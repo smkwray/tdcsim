@@ -272,11 +272,9 @@ class MmfAddedPosition:
 class TrcRoutingPolicy:
     """Holder-to-route shares and opening Fed nonreserve balances.
 
-    Money-fund route flows keep the deposit pass-through as their covered-deposit
-    share, because that parameter describes deposit incidence. The share settled
-    through the money-fund ON RRP account is declared separately with a source;
-    the pass-through only bounds it, and the remainder settles through bank
-    accounts. Reserve incidence therefore never follows from the pass-through.
+    Ordinary money-fund cash settles through covered deposits. An explicit
+    money-fund ON RRP share can replace part or all of that route. The two
+    declared shares account for all money-fund settlement.
     """
 
     foreign_mix: Mapping[str, float]
@@ -304,11 +302,9 @@ class TrcRoutingPolicy:
                     raise TrcRoutingError("added money-fund holdings require a declared settlement route")
                 return ((self.mmf_added_position.settlement_route, 1.0),)
             if private_route == PRIVATE_SUBBUCKET_MMF:
-                bank_settled = 1.0 - self.mmf_deposit_pass_through - self.mmf_on_rrp_share
                 routes = (
                     ("covered_deposit_settled", self.mmf_deposit_pass_through),
                     ("on_rrp_mmf", self.mmf_on_rrp_share),
-                    ("bank_reserve_settled", max(bank_settled, 0.0)),
                 )
                 return tuple((route_id, share) for route_id, share in routes if share > 0.0)
             if private_route in (PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, None):
@@ -396,9 +392,9 @@ def parse_trc_routing(
     mmf_on_rrp_source = str(mmf_cfg["source"] or "").strip()
     if not mmf_on_rrp_source:
         raise TrcRoutingError("mmf_cash_fund_route.on_rrp_share requires a named source")
-    if mmf_on_rrp_share > 1.0 - pass_through + 1.0e-12:
+    if pass_through + mmf_on_rrp_share != 1.0:
         raise TrcRoutingError(
-            "mmf_cash_fund_route.on_rrp_share cannot exceed the non-deposit share one minus the pass-through"
+            "money-fund covered-deposit and ON RRP shares must sum to one"
         )
     if mmf_added_position is not None and (pass_through != 1.0 or mmf_on_rrp_share != 0.0):
         raise TrcRoutingError("the added money-fund position requires ordinary money funds to settle through deposits")

@@ -47,6 +47,7 @@ from tdc_shared import (
     HOLDER_TYPES,
     MARKETABLE_PREFERENCE_CATEGORIES,
     MATURITY_CATEGORIES,
+    MMF_DEPOSIT_PASS_THROUGH_STATUS,
     PORTFOLIO_DTYPES,
     PRIVATE_AUCTION_SUBBUCKETS,
     PRIVATE_SUBBUCKET_MMF_ADDED,
@@ -438,9 +439,11 @@ def run_cbo_scenario(
             trc_metadata = results.attrs.get("trc_metadata")
             if not isinstance(trc_metadata, Mapping):
                 raise RunnerError("TRC routing was supplied but the engine returned no TRC metadata")
-            results.attrs["trc_metadata"] = {**dict(trc_metadata), "routing_source": trc_routing_source}
-            if PRIVATE_SUBBUCKET_MMF_ADDED in engine_params:
-                results.attrs["trc_metadata"]["routing_input"] = engine_params["trc_routing"]
+            results.attrs["trc_metadata"] = {
+                **dict(trc_metadata),
+                "routing_source": trc_routing_source,
+                "routing_config": engine_params["trc_routing"],
+            }
         boundaries = validate_run_boundaries(
             results, inputs, funding_closure_mode=funding_closure_mode
         )
@@ -1920,6 +1923,7 @@ def _runtime_assumptions(inputs: Path) -> Mapping[str, Any]:
     _assumption_status(
         payload["mmf_deposit_pass_through_status"],
         label="mmf_deposit_pass_through_status",
+        default=MMF_DEPOSIT_PASS_THROUGH_STATUS,
     )
     return payload
 
@@ -1952,9 +1956,9 @@ def _issuance_assumptions(inputs: Path) -> Mapping[str, Any]:
     return payload
 
 
-def _assumption_status(value: Any, *, label: str) -> str:
-    if value not in {"configured_default", "scenario_override"}:
-        raise RunnerError(f"{label} must be configured_default or scenario_override")
+def _assumption_status(value: Any, *, label: str, default: str = "configured_default") -> str:
+    if value not in {default, "scenario_override"}:
+        raise RunnerError(f"{label} must be {default} or scenario_override")
     return str(value)
 
 
@@ -1969,6 +1973,7 @@ def _adapter_assumption_statuses(inputs: Path) -> dict[str, str]:
         "mmf_deposit_pass_through_status": _assumption_status(
             runtime["mmf_deposit_pass_through_status"],
             label="mmf_deposit_pass_through_status",
+            default=MMF_DEPOSIT_PASS_THROUGH_STATUS,
         ),
         "issuance_profile_status": _assumption_status(
             issuance["selection_status"],

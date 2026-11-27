@@ -704,6 +704,24 @@ def tdc_component_amount(row: Mapping[str, Any] | pd.Series, spec: Mapping[str, 
     return amount
 
 
+MMF_ACQUISITIONS_OUTPUT = "tdcsim_mmf_acquisition_maturities"
+MMF_ACQUISITIONS_COLUMNS = ("acquisition_date", "security_type", "latest_maturity_date")
+
+
+def _write_mmf_acquisitions(
+    results: pd.DataFrame, out: Path, outputs: dict[str, Any], *, suffix: str, compression: str,
+) -> None:
+    if "mmf_acquisition_maturities" not in results.attrs:
+        return
+    rows = [
+        (day, security_type, latest)
+        for (day, security_type), latest in sorted(results.attrs["mmf_acquisition_maturities"].items())
+    ]
+    path = out / f"{MMF_ACQUISITIONS_OUTPUT}{suffix}"
+    _write_frame(pd.DataFrame(rows, columns=MMF_ACQUISITIONS_COLUMNS), path, compression=compression)
+    outputs[MMF_ACQUISITIONS_OUTPUT] = _artifact_record(out, path)
+
+
 def _write_trc_outputs(
     results: pd.DataFrame,
     out: Path,
@@ -785,6 +803,7 @@ def write_scenario_outputs(
         outputs[logical_name]["row_count"] = int(len(frame))
 
     _write_trc_outputs(results, out, outputs, suffix=suffix, compression=compression)
+    _write_mmf_acquisitions(results, out, outputs, suffix=suffix, compression=compression)
     if catalog_sqlite:
         catalog_path = out / "catalog.sqlite"
         _write_catalog(catalog_path, outputs)
@@ -886,6 +905,7 @@ def write_bounded_scenario_outputs(
         outputs[logical_name] = actual
     outputs["deterministic_evidence_artifacts"] = dict(deterministic)
     _write_trc_outputs(results, out, outputs, suffix=suffix, compression=compression)
+    _write_mmf_acquisitions(results, out, outputs, suffix=suffix, compression=compression)
     return outputs
 
 

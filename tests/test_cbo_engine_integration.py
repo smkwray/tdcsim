@@ -1764,7 +1764,8 @@ def test_cbo_fed_secondary_purchase_fails_closed_when_security_cannot_be_priced(
         )
 
 
-def test_cbo_fed_secondary_sale_defaults_to_contemporaneous_public_holder_mix(tmp_path: Path) -> None:
+@pytest.mark.parametrize("money_fund_present", [False, True])
+def test_cbo_fed_secondary_sale_defaults_to_eligible_public_holder_mix(tmp_path: Path, money_fund_present) -> None:
     paths = _build_temp_forecast_inputs(
         tmp_path,
         cbo_public_debt_target_bil=1_125.0,
@@ -1781,16 +1782,24 @@ def test_cbo_fed_secondary_sale_defaults_to_contemporaneous_public_holder_mix(tm
     )
     paths["fed_holdings_path_file"] = _write_csv(tmp_path / "tdcsim_fed_holdings_path.csv", fed_rows)
     rows = []
-    for bond_id, holder, face in (
+    holdings = [
         (1, "CB", 200.0),
         (2, "Banks", 300.0),
-        (3, "Private", 400.0),
+        (3, "Private", 200.0 if money_fund_present else 400.0),
         (4, "Foreign", 100.0),
-    ):
+    ]
+    if money_fund_present:
+        holdings.append((5, "Private", 200.0))
+    for bond_id, holder, face in holdings:
         row = _opening_controlled_portfolio(face).iloc[0].copy()
         row["BondID"] = bond_id
         row["HolderType"] = holder
         row["HolderSubBucket"] = "domestic_nonbank_deposit_funded" if holder == "Private" else ""
+        if bond_id == 1:
+            row["MaturityDate"] = pd.Timestamp("2028-09-30")
+            row["OriginalMaturityYears"] = 3.0
+        if bond_id == 5:
+            row["HolderSubBucket"] = "mmf_cash_fund_route"
         row["TDCPrincipalHolderType"] = holder
         row["TDCPrincipalHolderSubBucket"] = row["HolderSubBucket"]
         rows.append(row)
@@ -1799,7 +1808,7 @@ def test_cbo_fed_secondary_sale_defaults_to_contemporaneous_public_holder_mix(tm
         drop=True
     ).astype(PORTFOLIO_DTYPES, errors="ignore")
 
-    results, _ = run_simulation(
+    results, portfolio = run_simulation(
         params,
         "2026-09-20",
         "2026-09-30",
@@ -1813,6 +1822,16 @@ def test_cbo_fed_secondary_sale_defaults_to_contemporaneous_public_holder_mix(tm
     assert period["CBOFedSecondarySaleReserveEffect"] == pytest.approx(
         -period["CBOFedSecondarySaleCash"]
     )
+    if money_fund_present:
+        # The long Fed note is divided across the three eligible buyers in stock-share
+        # proportions. The existing money fund still holds its original lot and face.
+        fund = portfolio.loc[portfolio["HolderSubBucket"].eq("mmf_cash_fund_route")]
+        assert fund["BondID"].tolist() == [5]
+        assert fund["FaceValue"].item() == pytest.approx(200.0)
+        assert period["CBOFedSecondarySaleDepositEffect"] == pytest.approx(
+            -(200.0 / 600.0) * period["CBOFedSecondarySaleCash"]
+        )
+        return
     assert period["CBOFedSecondarySaleDepositEffect"] == pytest.approx(
         -0.5 * period["CBOFedSecondarySaleCash"]
     )

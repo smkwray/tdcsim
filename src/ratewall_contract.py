@@ -371,7 +371,7 @@ def _source_registry_rows(config: dict | None = None) -> list[dict[str, str]]:
             "source_family": "tdcsim_private_subbucket",
             "source_key": PRIVATE_SUBBUCKET_MMF,
             "source_status": MMF_DEPOSIT_PASS_THROUGH_STATUS,
-            "ratewall_role": "mmf_cash_fund_route_pass_through_0_97_residual_plumbing",
+            "ratewall_role": "ordinary_money_fund_cash_settles_through_covered_deposits",
             "central_default_eligible": "true",
             "sensitivity_only": "false",
             "binding_blocker": "",

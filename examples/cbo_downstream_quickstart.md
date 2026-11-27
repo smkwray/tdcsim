@@ -159,7 +159,7 @@ The CBO scenario interface supports the main downstream controls:
 - `replace_shares` instead fixes each security type's share of gross issuance. Bills then run off as they mature, so the outstanding bill share falls well below its opening level within a year; the empirical examples (15–22) use this mode.
 - The funding closure: `{"funding_closure": {"mode": "..."}}` with `cbo_operating_cash_target_financing_v1` (default), `cbo_public_debt_target` or `cbo_debt_reference_plus_tga_floor_financing_v1`.
 - Future-dated holder preference changes for newly issued marketable debt, by security category: bills, notes, bonds, TIPS, and FRNs.
-- MMF deposit pass-through, defaulting to `0.97`.
+- MMF deposit pass-through, defaulting to `1.0`. Any lower share requires an explicit ON RRP share for the balance.
 - Holder position targets (`holder_position_target`, mode `baseline_relative_stock_v1`): each public holder's Treasury holdings (par, adjusted principal for TIPS) are held at a completed baseline run's daily closing holdings plus a dated increment. One buyer's increment rises linearly to a stated size and then holds; named donors give it up in fixed proportions to their bill holdings at the start, and the remaining routes stay at baseline. The scenario references a target file built from the baseline run (`scripts/write_scenario_family.py --phase positions`) and must declare a simulation interval ending on the last hold date.
 - Primary deficit, debt target, operating cash, Fed stock target, cash residual, and fiscal incidence assumptions.
 - Operating cash can be constant nominal, constant real, explicit path-based, or `inflation_beta` where `0.0` means constant nominal and `1.0` means fully inflation-scaled.

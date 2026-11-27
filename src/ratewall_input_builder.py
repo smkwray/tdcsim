@@ -29,6 +29,7 @@ import yaml
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_rate_to_investment_rate
 from cbo_yield_curve_surface import INTERPOLATION_METHOD
+from mmf_eligibility import mmf_eligible_mask
 from sim_pricing import evaluate_nominal_yield, value_treasury_security
 from tdc_shared import (
     DAYS_PER_YEAR_ACTUAL,
@@ -59,7 +60,8 @@ BOND_HISTORY_SOURCE = (
     "FiscalData MSPD security cohorts scaled to MSPD Table 1 class totals; "
     "CB from NY Fed SOMA by CUSIP plus SOMA auction add-ons settling by the record date; "
     "banks, foreign and money funds at WAMEST bill and nonbill holdings converted to par, "
-    "domestic nonbanks take the rest of the non-Fed remainder"
+    "domestic nonbanks take the rest of the non-Fed remainder; "
+    "money funds exchange ineligible holdings with domestic nonbanks at equal par"
 )
 WAMEST_CANONICAL_RELATIVE_PATH = "wamest/outputs/full_coverage_release/canonical_sector_maturity.csv"
 # Opening-book holder routes for non-Fed holders: (HolderType, HolderSubBucket).
@@ -72,6 +74,7 @@ NONCB_OPENING_ROUTES = (
 # Domestic nonbanks are the Financial Accounts' residual sector, so in the opening book
 # they take whatever non-Fed par the measured routes do not hold.
 NONCB_RESIDUAL_ROUTE = ("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK)
+MMF_OPENING_ROUTE = ("Private", PRIVATE_SUBBUCKET_MMF)
 OPENING_ALLOCATION_RULE = "measured_holdings_at_par_domestic_nonbank_residual"
 # WAMEST records each sector's Financial Accounts level basis. A market value (an LM series,
 # as for foreign holders) converts to par with its group's factor. Any other level (the FL
@@ -1011,8 +1014,12 @@ def build_initial_portfolio(
     (``WAMEST_LEVEL_BASES``) with the group's par-to-market factor on the governed
     baseline curve; domestic nonbanks,
     the Financial Accounts' residual sector, take the remaining non-Fed par. The split
-    is uniform within bills and within nonbills; no public source gives other holders
-    by CUSIP.
+    is initially uniform within bills and within nonbills. WAMEST has a dedicated
+    money_market_funds sector, from which this builder uses the level and bill
+    share. The uniform CUSIP split does not use that sector's detailed maturity
+    profile. Money funds exchange every ineligible lot for an equal amount of
+    eligible domestic nonbank paper, pro rata across the eligible lots. The
+    exchange uses book par (inflation-adjusted outstanding for TIPS).
     """
 
     soma_as_of, soma = load_soma_cusip_holdings(soma_path)
@@ -1181,6 +1188,46 @@ def build_initial_portfolio(
     route_weights = {
         group: {route: route_par[group][route] / noncb_par[group] for route in NONCB_OPENING_ROUTES} for group in groups
     }
+    for item in candidate_rows:
+        item["route_faces"] = {
+            route: item["remainder"] * share for route, share in route_weights[item["group"]].items()
+        }
+    eligibility = mmf_eligible_mask(
+        pd.DataFrame(
+            {"SecurityType": item["security_type"], "MaturityDate": item["maturity_date"]}
+            for item in candidate_rows
+        ),
+        record_date,
+    )
+    mmf_offered = sum(
+        item["route_faces"][MMF_OPENING_ROUTE] for item, eligible in zip(candidate_rows, eligibility) if not eligible
+    )
+    nonbank_available = sum(
+        item["route_faces"][NONCB_RESIDUAL_ROUTE] for item, eligible in zip(candidate_rows, eligibility) if eligible
+    )
+    if mmf_offered > nonbank_available:
+        raise ValueError(
+            f"opening money-fund swap needs {mmf_offered:.6f} billion of eligible domestic nonbank paper, "
+            f"but only {nonbank_available:.6f} billion is available"
+        )
+    swap_share = mmf_offered / nonbank_available if mmf_offered else 0.0
+    swap_by_class: dict[str, dict[str, float]] = {"from_mmf": {}, "to_mmf": {}}
+    for item, eligible in zip(candidate_rows, eligibility):
+        faces = item["route_faces"]
+        class_name = item["class_key"]
+        if eligible:
+            amount = faces[NONCB_RESIDUAL_ROUTE] * swap_share
+            faces[MMF_OPENING_ROUTE] += amount
+            faces[NONCB_RESIDUAL_ROUTE] -= amount
+            direction = "to_mmf"
+        else:
+            amount = faces[MMF_OPENING_ROUTE]
+            faces[MMF_OPENING_ROUTE] = 0.0
+            faces[NONCB_RESIDUAL_ROUTE] += amount
+            direction = "from_mmf"
+        if amount > 0.0:
+            totals = swap_by_class[direction]
+            totals[class_name] = totals.get(class_name, 0.0) + amount
 
     output_rows: list[dict] = []
     bond_id = 1
@@ -1201,8 +1248,7 @@ def build_initial_portfolio(
         group = item["group"]
         has_add_on = soma_add_ons.get(cusip, 0.0) > 0.0
         routes = [
-            (holder, subbucket, item["remainder"] * route_weights[group][(holder, subbucket)])
-            for holder, subbucket in NONCB_OPENING_ROUTES
+            (holder, subbucket, face) for (holder, subbucket), face in item["route_faces"].items()
         ]
         routes.insert(1, ("CB", "", item["cb_face"]))
         for holder, holder_subbucket, face_value in routes:
@@ -1280,6 +1326,11 @@ def build_initial_portfolio(
                             if is_cb
                             else f"noncb_remainder_split_by_wamest_{noncb['wamest_date']}_{group}_holdings_at_par_"
                             "domestic_nonbank_residual_not_cusip_holder_evidence"
+                            + (
+                                ";mmf_eligibility_swap"
+                                if (holder, holder_subbucket) in (MMF_OPENING_ROUTE, NONCB_RESIDUAL_ROUTE)
+                                else ""
+                            )
                         )
                     ),
                     "claim_boundary": RATEWALL_CLAIM_BOUNDARY,
@@ -1326,7 +1377,7 @@ def build_initial_portfolio(
         "noncb_source_sha256": _sha256(wamest_path),
         "wamest_date": noncb["wamest_date"],
         # New-issuance holder shares read these measured shares; the opening book's own
-        # split is opening_allocation.groups.*.route_weights.
+        # pre-swap split is opening_allocation.groups.*.route_weights.
         "noncb_weights": {
             group: {_route_key(route): share for route, share in shares.items()}
             for group, shares in noncb["weights"].items()
@@ -1350,6 +1401,13 @@ def build_initial_portfolio(
             "matured_unpaid_treatment": "valued_at_par",
             "tips_treatment": "excluded_from_factor_sample_no_governed_real_curve_take_group_factor",
             "tips_par_basis": "mspd_outstanding_including_inflation_adjustment",
+            "money_fund_eligibility_swap": {
+                "wamest_sector": "money_market_funds",
+                "wamest_inputs": "sector level and bill share; the pre-swap CUSIP split is uniform within bills and nonbills",
+                "rule": "exchange every ineligible money-fund lot for eligible domestic nonbank lots pro rata at book par",
+                "as_of_date": record_date,
+                "face_bil_by_class": swap_by_class,
+            },
             "groups": {
                 group: {
                     "par_to_market_factor": factors[group],

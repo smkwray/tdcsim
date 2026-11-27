@@ -30,7 +30,7 @@ from issuance_calibration import (
     IssuanceCalibrationError,
     load_calibration,
 )
-from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT
+from tdc_shared import MMF_DEPOSIT_PASS_THROUGH_DEFAULT, MMF_DEPOSIT_PASS_THROUGH_STATUS
 
 from ._json import canonical_json_sha256, read_json, sha256_file, write_json
 from .baseline import CboBaselinePackage
@@ -971,7 +971,7 @@ def _materialize_required_adapter_assumptions(
                 forecast_inputs_dir
             ),
             mmf_deposit_pass_through=MMF_DEPOSIT_PASS_THROUGH_DEFAULT,
-            mmf_deposit_pass_through_status="configured_default",
+            mmf_deposit_pass_through_status=MMF_DEPOSIT_PASS_THROUGH_STATUS,
             fiscal_incidence_policy_status="configured_default",
         )
         materialized.add(RUNTIME_ASSUMPTIONS_FILE)
@@ -1095,10 +1095,13 @@ def _read_runtime_assumptions_for_merge(path: Path) -> dict[str, Any]:
         payload["fiscal_incidence_policy_id"]
     ).strip():
         raise CompilerError("compiled runtime assumptions fiscal_incidence_policy_id is invalid")
-    for key in ("fiscal_incidence_policy_status", "mmf_deposit_pass_through_status"):
-        if payload[key] not in {"configured_default", "scenario_override"}:
+    for key, default in (
+        ("fiscal_incidence_policy_status", "configured_default"),
+        ("mmf_deposit_pass_through_status", MMF_DEPOSIT_PASS_THROUGH_STATUS),
+    ):
+        if payload[key] not in {default, "scenario_override"}:
             raise CompilerError(
-                f"compiled runtime assumptions {key} must be configured_default or scenario_override"
+                f"compiled runtime assumptions {key} must be {default} or scenario_override"
             )
     try:
         mmf_value = float(payload["mmf_deposit_pass_through"])

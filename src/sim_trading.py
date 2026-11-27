@@ -6,6 +6,8 @@ import traceback
 import numpy as np
 import pandas as pd
 
+from mmf_eligibility import mmf_may_acquire
+
 from tdc_shared import (
     BOND_PORTFOLIO_COLS,
     DAYS_PER_YEAR_ACTUAL,
@@ -195,6 +197,7 @@ def execute_preference_trades(
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
     trc_ledger=None,
+    record_mmf_acquisition=None,
 ):
     """
     Executes secondary market trades between holders based on deviations from their target portfolio preferences.
@@ -342,6 +345,15 @@ def execute_preference_trades(
         for _fld in _proportional_fields:
             _v = modified_portfolio.loc[original_tranche_idx, _fld]
             _seller_orig_vals[_fld] = 0.0 if pd.isna(_v) else float(_v)
+        buyer_tranche_mask = (modified_portfolio['BondID'] == bond_id_to_trade) & (modified_portfolio['HolderType'] == buyer) & (modified_portfolio['Status'] == 'Active')
+        existing_buyer_tranche = modified_portfolio[buyer_tranche_mask]
+        buyer_private_route = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
+        if buyer == 'Private' and not existing_buyer_tranche.empty:
+            buyer_private_route = _private_subbucket(existing_buyer_tranche.iloc[0])
+        if buyer_private_route == PRIVATE_SUBBUCKET_MMF and not mmf_may_acquire(
+            bond_to_trade_priced['SecurityType'], bond_to_trade_priced['MaturityDate'], current_date
+        ):
+            continue
         _transfer_ratio = face_value_to_trade / seller_tranche_face_value
         try:
             modified_portfolio.loc[original_tranche_idx, 'FaceValue'] -= face_value_to_trade
@@ -352,11 +364,6 @@ def execute_preference_trades(
                 _orig = _seller_orig_vals[_fld]
                 if abs(_orig) > TGA_FLOOR_TOLERANCE:
                     modified_portfolio.loc[original_tranche_idx, _fld] = _orig * (1.0 - _transfer_ratio)
-            buyer_tranche_mask = (modified_portfolio['BondID'] == bond_id_to_trade) & (modified_portfolio['HolderType'] == buyer) & (modified_portfolio['Status'] == 'Active')
-            existing_buyer_tranche = modified_portfolio[buyer_tranche_mask]
-            buyer_private_route = PRIVATE_SUBBUCKET_DOMESTIC_NONBANK
-            if buyer == 'Private' and not existing_buyer_tranche.empty:
-                buyer_private_route = _private_subbucket(existing_buyer_tranche.iloc[0])
             if not existing_buyer_tranche.empty:
                 buyer_idx = existing_buyer_tranche.index[0]
                 modified_portfolio.loc[buyer_idx, 'FaceValue'] += face_value_to_trade
@@ -391,6 +398,8 @@ def execute_preference_trades(
                 new_row_df = new_row_df.astype(PORTFOLIO_DTYPES, errors='ignore')
                 modified_portfolio = pd.concat([modified_portfolio, new_row_df], ignore_index=True)
             trade_count += 1
+            if buyer_private_route == PRIVATE_SUBBUCKET_MMF and record_mmf_acquisition is not None:
+                record_mmf_acquisition(current_date, bond_to_trade_priced['SecurityType'], bond_to_trade_priced['MaturityDate'])
             buyer_is_gov = buyer in INTRAGOV_HOLDERS
             seller_is_gov = seller in INTRAGOV_HOLDERS
             if buyer_is_gov and seller_is_gov:

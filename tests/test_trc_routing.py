@@ -152,27 +152,27 @@ def test_soma_secondary_trades_and_holder_trades() -> None:
 def test_registry_reproduces_tdcsim_deposit_routing() -> None:
     """The route registry's deposit membership matches the engine's TDC routing."""
 
-    policy = parse_trc_routing(_routing(), mmf_deposit_pass_through=0.97)
+    policy = parse_trc_routing(_routing(), mmf_deposit_pass_through=1.0)
     assert policy.covered_deposit_share("Private", PRIVATE_SUBBUCKET_DOMESTIC_NONBANK) == 1.0
-    assert policy.covered_deposit_share("Private", PRIVATE_SUBBUCKET_MMF) == pytest.approx(0.97)
+    assert policy.routes_for("Private", PRIVATE_SUBBUCKET_MMF) == (("covered_deposit_settled", 1.0),)
     for holder in ("Banks", "Foreign", "CB", "FedInternal", "TrustFunds"):
         assert policy.covered_deposit_share(holder) == 0.0
     assert SETTLEMENT_ROUTES["tt_and_l"].reserve_settled_member == 1.0
     assert SETTLEMENT_ROUTES["tt_and_l"].covered_deposit_member == 0.0
 
 
-@pytest.mark.parametrize("on_rrp_share", [0.0, 0.02])
-def test_money_fund_reserve_incidence_does_not_follow_the_deposit_pass_through(on_rrp_share) -> None:
-    """The pass-through is deposit incidence; it cannot decide which claim funds a purchase."""
-
-    reserve_shares = set()
-    for pass_through in (0.5, 0.9, 0.97):
-        policy = parse_trc_routing(_routing(on_rrp_share=on_rrp_share), mmf_deposit_pass_through=pass_through)
-        assert policy.covered_deposit_share("Private", PRIVATE_SUBBUCKET_MMF) == pytest.approx(pass_through)
-        reserve_shares.add(round(policy.reserve_share("Private", PRIVATE_SUBBUCKET_MMF), 12))
-    assert reserve_shares == {round(1.0 - on_rrp_share, 12)}
-    with pytest.raises(TrcRoutingError, match="non-deposit"):
-        parse_trc_routing(_routing(on_rrp_share=0.05), mmf_deposit_pass_through=0.97)
+@pytest.mark.parametrize("pass_through", [0.5, 0.9, 0.97])
+def test_money_fund_cash_uses_exactly_the_two_declared_routes(pass_through) -> None:
+    on_rrp_share = 1.0 - pass_through
+    policy = parse_trc_routing(_routing(on_rrp_share=on_rrp_share), mmf_deposit_pass_through=pass_through)
+    assert policy.routes_for("Private", PRIVATE_SUBBUCKET_MMF) == (
+        ("covered_deposit_settled", pass_through),
+        ("on_rrp_mmf", on_rrp_share),
+    )
+    assert policy.reserve_share("Private", PRIVATE_SUBBUCKET_MMF) == pass_through
+    for bad_share in (on_rrp_share / 2, on_rrp_share * 1.01):
+        with pytest.raises(TrcRoutingError, match="must sum to one"):
+            parse_trc_routing(_routing(on_rrp_share=bad_share), mmf_deposit_pass_through=pass_through)
 
 
 # --- Policy validation fails closed. ---
@@ -235,8 +235,8 @@ def _run(tmp_path: Path, *, p: float, routing: dict | None):
 
 
 def test_trc_mode_leaves_every_legacy_output_identical(tmp_path: Path) -> None:
-    legacy, legacy_portfolio = _run(tmp_path / "a", p=0.97, routing=None)
-    routed, routed_portfolio = _run(tmp_path / "b", p=0.97, routing=_routing())
+    legacy, legacy_portfolio = _run(tmp_path / "a", p=1.0, routing=None)
+    routed, routed_portfolio = _run(tmp_path / "b", p=1.0, routing=_routing())
     pd.testing.assert_frame_equal(routed, legacy, check_exact=True)
     pd.testing.assert_frame_equal(routed_portfolio, legacy_portfolio, check_exact=True)
     assert "trc_results" not in legacy.attrs
@@ -294,7 +294,7 @@ def test_trc_outputs_are_written_only_when_present(tmp_path: Path) -> None:
     _write_trc_outputs(plain, tmp_path, outputs, suffix=".csv.gz", compression="gzip")
     assert outputs == {} and not list(tmp_path.iterdir())
 
-    results, _ = _run(tmp_path / "run", p=0.97, routing=_routing())
+    results, _ = _run(tmp_path / "run", p=1.0, routing=_routing())
     out = tmp_path / "out"
     out.mkdir()
     _write_trc_outputs(results, out, outputs, suffix=".csv.gz", compression="gzip")
@@ -361,5 +361,5 @@ def test_committed_onrrp_available_policy_requires_zero_deposit_pass_through() -
     assert policy.routes_for("Private", PRIVATE_SUBBUCKET_MMF) == (("on_rrp_mmf", 1.0),)
     assert policy.reserve_share("Private", PRIVATE_SUBBUCKET_MMF) == 0.0
     assert policy.opening_balances["ONRRP_MMF"] > 0.0
-    with pytest.raises(TrcRoutingError, match="cannot exceed the non-deposit share"):
+    with pytest.raises(TrcRoutingError, match="must sum to one"):
         parse_trc_routing(config, mmf_deposit_pass_through=0.97)

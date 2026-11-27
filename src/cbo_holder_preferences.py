@@ -3,14 +3,19 @@
 New issuance is divided among non-Fed holders in proportion to their holdings in the
 opening book: bills by holdings of bills, every other security type by holdings of
 longer securities. Those weights come from WAMEST and are recorded in the opening-book
-manifest. The Federal Reserve receives no allocation; it follows its own stock path.
+manifest. The money-fund share of ineligible issuance is redistributed to the other
+non-Fed holders. The Federal Reserve follows its own stock path.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import date, timedelta
 from typing import Any
 
+from issuance_calibration import BILL_TERM_WEEKS, COUPON_KIND_SECURITY_TYPE, COUPON_TENORS
+from mmf_eligibility import mmf_may_acquire
+from sim_pricing import get_security_category_for_prefs
 from tdc_shared import (
     HOLDER_TYPES,
     MARKETABLE_PREFERENCE_CATEGORIES,
@@ -22,6 +27,21 @@ SCHEMA_VERSION = "tdcsim_cbo_holder_profile_v2"
 _DOMESTIC_NONBANK_KEY = f"Private/{PRIVATE_SUBBUCKET_DOMESTIC_NONBANK}"
 _MMF_KEY = f"Private/{PRIVATE_SUBBUCKET_MMF}"
 _WEIGHT_KEYS = ("Banks", "Foreign", _DOMESTIC_NONBANK_KEY, _MMF_KEY)
+
+
+def _eligible_auction_categories() -> set[str]:
+    # The baseline profile applies one share per category across the registered original
+    # terms. Actual settlement-to-maturity dates are checked again when each lot issues.
+    issue = date(2000, 1, 1)
+    category_eligibility = {"bills": [mmf_may_acquire("Fixed", issue + timedelta(weeks=max(BILL_TERM_WEEKS)), issue)]}
+    for kind, tenors in COUPON_TENORS.items():
+        security_type = COUPON_KIND_SECURITY_TYPE[kind]
+        for tenor in tenors:
+            category = get_security_category_for_prefs(security_type, tenor, {})
+            category_eligibility.setdefault(category, []).append(
+                mmf_may_acquire(security_type, issue.replace(year=issue.year + tenor), issue)
+            )
+    return {category for category, eligible in category_eligibility.items() if all(eligible)}
 
 
 def holder_profile_from_opening_weights(
@@ -49,8 +69,14 @@ def holder_profile_from_opening_weights(
         for holder in HOLDER_TYPES
     }
     private_subbucket_shares: dict[str, dict[str, float]] = {}
+    eligible_categories = _eligible_auction_categories()
     for category in MARKETABLE_PREFERENCE_CATEGORIES:
         shares = groups["bills" if category == "bills" else "nonbills"]
+        if category not in eligible_categories:
+            eligible_weight = sum(shares[key] for key in _WEIGHT_KEYS if key != _MMF_KEY)
+            if eligible_weight <= 0.0:
+                raise ValueError(f"opening-book noncb_weights give {category} no eligible holders")
+            shares = {key: (0.0 if key == _MMF_KEY else value / eligible_weight) for key, value in shares.items()}
         private = shares[_DOMESTIC_NONBANK_KEY] + shares[_MMF_KEY]
         if private <= 0.0:
             raise ValueError(f"opening-book noncb_weights give private holders no {category} share")
@@ -82,7 +108,7 @@ def build_holder_profile_rows(
             "holder_subbucket": "",
             "source_role": "opening_book_stock_shares",
             "runtime_role": "new_issuance_holder_shares",
-            "claim_boundary": "new issuance follows opening non-Fed holdings of bills or longer securities",
+            "claim_boundary": "new issuance follows WAMEST bill or nonbill shares among eligible non-Fed holders",
         }
         for category in MARKETABLE_PREFERENCE_CATEGORIES:
             row[f"{category}_pct"] = float(holder_prefs.get(f"{category}_pct", 0.0) or 0.0)
@@ -95,7 +121,7 @@ def build_holder_profile_rows(
             "holder_subbucket": subbucket,
             "source_role": "opening_book_stock_shares",
             "runtime_role": "new_issuance_private_route_shares",
-            "claim_boundary": "private route split follows opening MMF and domestic nonbank holdings",
+            "claim_boundary": "private route split follows WAMEST holdings among eligible private routes",
         }
         for category in MARKETABLE_PREFERENCE_CATEGORIES:
             row[f"{category}_route_share"] = float(private_subbucket_shares.get(category, {}).get(subbucket, 0.0) or 0.0)

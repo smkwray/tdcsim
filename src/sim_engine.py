@@ -11,6 +11,8 @@ from datetime import timedelta
 
 import numpy as np
 import pandas as pd
+
+from mmf_eligibility import mmf_may_acquire
 from dateutil.relativedelta import relativedelta
 
 from bill_quote_basis import CBO_3M_BILL_DAYS, discount_price_ratio
@@ -1885,6 +1887,7 @@ def _transfer_cb_marketable_debt_to_public(
     tips_real_curve_years=None,
     tips_real_curve_rates=None,
     portfolio_row_budget=None,
+    record_mmf_acquisition=None,
 ):
     """Move CB marketable holdings to the declared public buyer vector at dirty value."""
     if bond_portfolio is None or bond_portfolio.empty:
@@ -1896,6 +1899,8 @@ def _transfer_cb_marketable_debt_to_public(
     bought_by_private_route = _zero_private_routes()
     next_bond_id = None
     new_rows = []
+    non_mmf_buyers = [item for item in buyer_mix if item['holder_subbucket'] != PRIVATE_SUBBUCKET_MMF]
+    non_mmf_share = sum(float(item['share']) for item in non_mmf_buyers)
     while remaining > TGA_FLOOR_TOLERANCE:
         cb_mask = (
             (bond_portfolio['Status'] == 'Active')
@@ -1939,10 +1944,20 @@ def _transfer_cb_marketable_debt_to_public(
         _cache_fed_transfer_price(bond_portfolio, idx, full_pricing)
         row = bond_portfolio.loc[idx].copy()
         fraction_sold = sale_amount / debt_base
+        lot_buyers = buyer_mix
+        if len(non_mmf_buyers) < len(buyer_mix) and not mmf_may_acquire(
+            row['SecurityType'], row['MaturityDate'], current_date
+        ):
+            if non_mmf_share <= 0.0:
+                raise ValueError('Fed secondary sale has no eligible buyers for the selected lot.')
+            lot_buyers = [
+                {**item, 'share': float(item['share']) / non_mmf_share}
+                for item in non_mmf_buyers
+            ]
         allocations = []
         allocated_face = 0.0
-        for mix_index, item in enumerate(buyer_mix):
-            allocation = sale_amount - allocated_face if mix_index == len(buyer_mix) - 1 else sale_amount * float(item['share'])
+        for mix_index, item in enumerate(lot_buyers):
+            allocation = sale_amount - allocated_face if mix_index == len(lot_buyers) - 1 else sale_amount * float(item['share'])
             allocated_face += allocation
             if allocation <= TGA_FLOOR_TOLERANCE:
                 continue
@@ -1985,6 +2000,8 @@ def _transfer_cb_marketable_debt_to_public(
             bought_by_holder[holder] = bought_by_holder.get(holder, 0.0) + allocation_cash
             if holder == 'Private':
                 bought_by_private_route[item['holder_subbucket']] += allocation_cash
+                if item['holder_subbucket'] == PRIVATE_SUBBUCKET_MMF and record_mmf_acquisition is not None:
+                    record_mmf_acquisition(current_date, row['SecurityType'], row['MaturityDate'])
         sold_total += sale_amount
         sale_cash += pricing['dirty_value']
         remaining -= sale_amount
@@ -3147,13 +3164,10 @@ def _private_subbucket_split(preferences: dict, category: str) -> dict[str, floa
 def _effective_private_amount(
     route_totals: dict[str, float],
     mmf_pass_through: float,
-    legacy_total: float | None = None,
     *,
     mmf_added_deposit_share: float = 0.0,
 ) -> float:
     added = route_totals.get(PRIVATE_SUBBUCKET_MMF_ADDED, 0.0)
-    if mmf_pass_through >= 1.0 and legacy_total is not None:
-        return float(legacy_total) - (1.0 - mmf_added_deposit_share) * added
     return (
         route_totals.get(PRIVATE_SUBBUCKET_DOMESTIC_NONBANK, 0.0)
         + mmf_pass_through * route_totals.get(PRIVATE_SUBBUCKET_MMF, 0.0)
@@ -3658,6 +3672,15 @@ def run_simulation(
     print(f'--- Starting Simulation: {scenario_name} ---')
     results_cols = ['GovSpending', 'Taxes', 'PrimaryDeficit', 'InterestPaid_Bonds', 'PrincipalPaid_Bonds', 'InterestOutlay_Period', 'InterestOutlay_Cumulative', 'PrincipalRollover_Period', 'PrincipalRollover_Cumulative', 'NewDebtIssued', 'AuctionProceeds', 'IssuanceProceedsTarget', 'IssuePriceCashGap', 'IssueDiscountCost_Period', 'IssueDiscountCost_Cumulative', 'FinancingCost_Period', 'FinancingCost_Cumulative', 'NonMarketableInterestCapitalized_Period', 'NonMarketableInterestCapitalized_Cumulative', 'TIPSInflationAccretion_Period', 'TIPSInflationAccretion_Cumulative', 'AuctionDemandShift_AvgAbs', 'AuctionDemandShift_MaxAbs', 'SecondaryDemandShift_AvgAbs', 'SecondaryDemandShift_MaxAbs', 'DebtServiceOutlay_Period', 'DebtServiceOutlay_Cumulative', 'TotalDebt_Agg', 'DebtHeld_Banks', 'DebtHeld_Private', 'DebtHeld_CB', 'DebtHeld_Foreign', 'DebtHeld_FedInternal', 'DebtHeld_TrustFunds', 'TGA', 'Reserves', 'TDC_Level', 'ReserveChange', 'TDC_Change', 'TGAChange', 'TDC_FiscalFlow', 'TDC_DebtService', 'TDC_AuctionAbsorption', 'TDC_SecondaryTrades', 'TDC_Other', 'TDC_PrincipalToDU', 'TDC_PrincipalCashToDU', 'TDC_InterestToDU', 'TDC_BillDiscountInterestToDU', 'TDC_CouponInterestToDU', 'TDC_FRNInterestToDU', 'TDC_TIPSCouponInterestToDU', 'TDC_TIPSInflationCompensationToDU', 'TDC_GrossIssuanceProceedsAbsorbedByDU', 'TDC_NetPrincipalIssuanceCashflowToDU', 'TDC_SecondaryDUToRU', 'TDC_SecondaryRUToDU', 'TDC_AuctionAbsorption_DomesticNonbank', 'TDC_AuctionAbsorption_MMF', 'TDC_AuctionAbsorption_MMFPlumbing', 'TDC_PrincipalToDU_DomesticNonbank', 'TDC_PrincipalToDU_MMF', 'TDC_PrincipalToDU_MMFPlumbing', 'TDC_PrincipalCashToDU_DomesticNonbank', 'TDC_PrincipalCashToDU_MMF', 'TDC_PrincipalCashToDU_MMFPlumbing', 'TDC_BillDiscountInterestToDU_DomesticNonbank', 'TDC_BillDiscountInterestToDU_MMF', 'TDC_CouponInterestToDU_DomesticNonbank', 'TDC_CouponInterestToDU_MMF', 'TDC_FRNInterestToDU_DomesticNonbank', 'TDC_FRNInterestToDU_MMF', 'TDC_TIPSCouponInterestToDU_DomesticNonbank', 'TDC_TIPSCouponInterestToDU_MMF', 'TDC_TIPSInflationCompensationToDU_DomesticNonbank', 'TDC_TIPSInflationCompensationToDU_MMF', 'TDC_InterestToDU_DomesticNonbank', 'TDC_InterestToDU_MMF', 'TDC_DebtService_MMFPlumbing', 'TDC_GrossIssuanceProceedsAbsorbedByDU_DomesticNonbank', 'TDC_GrossIssuanceProceedsAbsorbedByDU_MMF', 'TDC_SecondaryTrades_DomesticNonbank', 'TDC_SecondaryTrades_MMF', 'TDC_SecondaryTrades_MMFPlumbing', 'CB_TreasuryInterestCashReceived', 'CB_NetIncome', 'CB_Remittance', 'CB_DeferredAsset', 'WAM', 'DebtHeldByType_Fixed', 'DebtHeldByType_TIPS', 'DebtHeldByType_FRN', 'DebtHeldByType_NonMarketable', 'CPI_Level', 'Reference_CPI', 'CBOFundingModeActive', 'CBOPrimaryDeficitFlow', 'CBOControlledDebtTarget', 'CBOControlledDebtReference', 'ScenarioControlledDebt', 'DebtDriftFromReference', 'CashFinancingFaceIssued', 'CashFinancingProceeds', 'CBOControlledDebtPreIssuance', 'CBOControlledDebtPostIssuance', 'CBOControlledDebtTargetError', 'CBORequiredFaceIssuance', 'CBOBuybackFaceRetired', 'CBOBuybackCashPaid', 'CBOOperatingCashTarget', 'CBOCashResidual', 'CBOCashReconciliationResidual', 'CBOFiscalIncidencePolicyPresent', 'CBORemittanceCashEffect', 'CBOFedHoldingsTarget', 'CBOFedHoldingsTargetError', 'CBOFedAuctionShare', 'CBOFedSecondaryPurchaseFace', 'CBOFedSecondaryPurchaseCash', 'CBOFedSecondaryPurchaseReserveEffect', 'CBOFedSecondaryPurchaseDepositEffect', 'CBOFedSecondarySaleCash', 'CBOFedSecondarySaleReserveEffect', 'CBOFedSecondarySaleDepositEffect', 'CBOFedPrivateMaturityTDC', 'CBONetInterestDiagnostic', 'CBOTotalDeficitDiagnostic', 'CBONetInterestBridgeRows']
     results = pd.DataFrame(index=dates, columns=results_cols, dtype=float).fillna(0.0)
+    mmf_acquisition_maturities = {}
+
+    def record_mmf_acquisition(day, security_type, maturity_date):
+        """Keep the latest maturity acquired by a money fund per date and type."""
+        day = pd.Timestamp(day).date()
+        maturity = pd.Timestamp(maturity_date).date()
+        key = (day, security_type)
+        mmf_acquisition_maturities[key] = max(maturity, mmf_acquisition_maturities.get(key, maturity))
+
     if require_bounded_handoff and handoff_sink is None:
         raise ValueError(
             'Production CBO execution requires a bounded handoff sink; '
@@ -4047,6 +4070,8 @@ def run_simulation(
             opening_reserves=opening_reserves,
         )
         trc_rows.append(trc_ledger.opening_row(t0))
+    elif mmf_deposit_pass_through != 1.0:
+        raise ValueError('money-fund covered-deposit and ON RRP shares must sum to one; declare TRC routing for ON RRP')
     # TDC starts from its Treasury contribution anchor. The opening deposit
     # exchange for money-fund shares is recorded in the routing policy.
     results.loc[t0, 'TDC_Level'] = init_vals.get('tdc_level', init_vals.get('deposits', 0.0))
@@ -4995,16 +5020,12 @@ def run_simulation(
         for holder in ['Banks', 'Private', 'Foreign']:
             debt_service_reserve_change += principal_paid_by_holder.get(holder, 0.0)
             debt_service_reserve_change += interest_paid_by_holder.get(holder, 0.0)
-        debt_service_deposit_change = 0.0
-        for holder in ['Private']:
-            debt_service_deposit_change += principal_paid_by_holder.get(holder, 0.0) + interest_paid_by_holder.get(holder, 0.0)
         debt_service_deposit_change = _effective_private_amount(
             {
                 route: principal_paid_by_private_route[route] + interest_paid_by_private_route[route]
                 for route in PRIVATE_SUBBUCKETS
             },
             mmf_deposit_pass_through,
-            legacy_total=principal_paid_by_holder.get('Private', 0.0) + interest_paid_by_holder.get('Private', 0.0),
             mmf_added_deposit_share=mmf_added_deposit_share,
         )
         reserve_change_period += debt_service_reserve_change
@@ -5203,7 +5224,6 @@ def run_simulation(
                 buyback_deposit_change = _effective_private_amount(
                     retired_by_private_route,
                     mmf_deposit_pass_through,
-                    legacy_total=retired_by_holder.get('Private', 0.0),
                     mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 debt_service_deposit_change += buyback_deposit_change
@@ -5624,6 +5644,18 @@ def run_simulation(
                     )
                     holder_share_weights[holder] = max(0.0, base_pref_pct * multiplier)
                 total_weight = sum(holder_share_weights.values())
+                split = _private_subbucket_split(effective_auction_prefs_for_period, pref_category_key)
+                if split[PRIVATE_SUBBUCKET_MMF] > 0.0 and (
+                    item_type == 'NonMarketable'
+                    or not mmf_may_acquire(item_type, supply_item['maturity_date'], current_date)
+                ):
+                    holder_share_weights['Private'] *= split[PRIVATE_SUBBUCKET_DOMESTIC_NONBANK]
+                    split = {PRIVATE_SUBBUCKET_DOMESTIC_NONBANK: 1.0}
+                    eligible_weight = sum(holder_share_weights.values())
+                    if total_weight > TGA_FLOOR_TOLERANCE and eligible_weight <= TGA_FLOOR_TOLERANCE:
+                        raise ValueError(f'No eligible auction buyers for {item_type} maturing {supply_item["maturity_date"]}')
+                    total_weight = eligible_weight
+                supply_item['private_route_split'] = split
                 if total_weight > TGA_FLOOR_TOLERANCE:
                     effective_holder_prefs = {
                         holder: {f'{pref_category_key}_pct': adjusted_weight / total_weight}
@@ -5689,21 +5721,16 @@ def run_simulation(
                     mat_yrs = details['maturity']
                     route_face_values = [('', face_value_issued_to_holder)]
                     if holder == 'Private':
-                        pref_category_for_split = get_security_category_for_prefs(
-                            sec_type, mat_yrs, issuance_profile
-                        )
-                        split = _private_subbucket_split(
-                            effective_auction_prefs_for_period,
-                            pref_category_for_split,
-                        )
                         route_face_values = [
                             (route, face_value_issued_to_holder * share)
-                            for route, share in split.items()
+                            for route, share in details['private_route_split'].items()
                         ]
                     for holder_subbucket, route_face_value in route_face_values:
                         if route_face_value < TGA_FLOOR_TOLERANCE:
                             continue
                         maturity_date = details['maturity_date']
+                        if holder_subbucket == PRIVATE_SUBBUCKET_MMF:
+                            record_mmf_acquisition(current_date, sec_type, maturity_date)
                         coupon_rate_val = details.get('coupon', 0.0)
                         fixed_spread_val = details.get('spread', 0.0) if sec_type == 'FRN' else 0.0
                         issue_price_ratio_val = details.get('issue_price_ratio', 1.0)
@@ -5917,7 +5944,6 @@ def run_simulation(
         issuance_deposit_change = -_effective_private_amount(
             total_issued_proceeds_by_private_route,
             mmf_deposit_pass_through,
-            legacy_total=total_issued_proceeds_by_holder.get('Private', 0.0),
         )
         _handoff_append_journal(
             handoff_tables,
@@ -6030,7 +6056,6 @@ def run_simulation(
                 fed_secondary_deposit_effect = _effective_private_amount(
                     fed_secondary_private_routes,
                     mmf_deposit_pass_through,
-                    legacy_total=fed_secondary_sellers.get('Private', 0.0),
                     mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 for route in PRIVATE_SUBBUCKETS:
@@ -6087,6 +6112,7 @@ def run_simulation(
                     current_yield_curve_years,
                     current_yield_curve_rates,
                     fed_secondary_sale_buyer_mix,
+                    record_mmf_acquisition=record_mmf_acquisition,
                     interpolation_method=yield_interpolation_method,
                     floor_zero=yield_floor_zero,
                     nominal_shock=evaluated_nominal_shock,
@@ -6120,7 +6146,6 @@ def run_simulation(
                 fed_secondary_deposit_effect = -_effective_private_amount(
                     fed_secondary_buyer_private_routes,
                     mmf_deposit_pass_through,
-                    legacy_total=fed_secondary_buyers.get('Private', 0.0),
                     mmf_added_deposit_share=mmf_added_deposit_share,
                 )
                 for route in PRIVATE_SUBBUCKETS:
@@ -6216,6 +6241,7 @@ def run_simulation(
                         tips_real_curve_rates=tips_real_curve_rates,
                     ),
                     row_budget=handoff_tables.portfolio_row_budget if bounded_handoff else None,
+                    record_mmf_acquisition=record_mmf_acquisition,
                 )
                 _handoff_append_transfer_changes(
                     handoff_tables,
@@ -6314,6 +6340,7 @@ def run_simulation(
                     tips_real_curve_years=tips_real_curve_years,
                     tips_real_curve_rates=tips_real_curve_rates,
                     trc_ledger=trc_ledger,
+                    record_mmf_acquisition=record_mmf_acquisition,
                 )
                 bond_portfolio = bond_portfolio_temp
                 _handoff_append_transfer_changes(
@@ -6852,6 +6879,7 @@ def run_simulation(
         results.attrs['bounded_handoff_summary'] = handoff_tables.finalize()
     else:
         results.attrs['handoff_tables'] = handoff_tables
+    results.attrs['mmf_acquisition_maturities'] = mmf_acquisition_maturities
     results.attrs['run_metadata'] = {
         'scenario_name': scenario_name,
         'start_date': str(start_date),

@@ -505,7 +505,7 @@ def test_ratewall_source_registry_exports_domestic_nonbank_route_contract(tmp_pa
     ].iloc[0]
     assert mmf_route["central_default_eligible"]
     assert not mmf_route["sensitivity_only"]
-    assert "tdcest_2025q4_source_of_funds_anchor_0_986_rounded_0_97" in mmf_route[
+    assert "non_deposit_settlement_requires_an_explicit_on_rrp_share" in mmf_route[
         "binding_blocker"
     ]
     assert "does_not_identify_final_deposit_recipient" in mmf_route["binding_blocker"]
@@ -1186,9 +1186,18 @@ def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path
     assert allocation["groups"]["bills"]["par_to_market_factor"] == pytest.approx(bill_factor)
     assert bills["Banks"] == pytest.approx(100.0 * bill_factor)
     assert bills["Foreign"] == pytest.approx(200.0 * bill_factor)
-    assert bills[mmf] == pytest.approx(400.0 * bill_factor)
-    assert bills[dn] == pytest.approx(895.0 - 700.0 * bill_factor)
-    assert allocation["groups"]["bills"]["domestic_nonbank_residual_bil"] == pytest.approx(bills[dn])
+    swaps = allocation["money_fund_eligibility_swap"]["face_bil_by_class"]
+    assert sum(swaps["from_mmf"].values()) == pytest.approx(sum(swaps["to_mmf"].values()))
+    assert swaps["from_mmf"]["Notes"] > 0.0
+    assert swaps["from_mmf"]["Treasury Inflation-Protected Securities"] > 0.0
+    assert swaps["to_mmf"]["Bills"] > 0.0
+    bills_to_mmf = swaps["to_mmf"]["Bills"]
+    assert bills[mmf] == pytest.approx(400.0 * bill_factor + bills_to_mmf)
+    assert bills[dn] == pytest.approx(895.0 - 700.0 * bill_factor - bills_to_mmf)
+    assert allocation["groups"]["bills"]["domestic_nonbank_residual_bil"] == pytest.approx(bills[dn] + bills_to_mmf)
+    from mmf_eligibility import mmf_eligible_mask
+
+    assert mmf_eligible_mask(book.loc[route.eq(mmf)], "2026-04-30").all()
     # Spreading the unmeasured remainder in proportion to measured holdings, the old
     # rule, would hand foreign holders par that no source says they hold.
     assert abs(bills["Foreign"] - 895.0 * 200.0 / 850.0) > 5.0
@@ -1209,8 +1218,8 @@ def test_opening_book_pins_cb_to_soma_and_keeps_measured_holders_at_par(tmp_path
     # discount-bond factor would hand them par no source says they hold.
     assert nonbills["Foreign"] == pytest.approx(800.0 * factor)
     assert nonbills["Banks"] == pytest.approx(100.0)
-    assert nonbills[mmf] == pytest.approx(100.0)
-    assert nonbills[dn] == pytest.approx(note_noncb + matured_noncb + 228.0 - 800.0 * factor - 200.0)
+    assert bills[mmf] + nonbills[mmf] == pytest.approx(400.0 * bill_factor + 100.0)
+    assert nonbills[dn] == pytest.approx(note_noncb + matured_noncb + 228.0 - 800.0 * factor - 200.0 + bills_to_mmf)
     assert group["measured_bil_by_basis"]["Banks"] == {"book_value": pytest.approx(100.0), "market_value": 0.0}
     # The split stays uniform within a group, so each TIPS holder takes the group weight.
     tips_noncb = 300.0 - 72.0
@@ -1254,6 +1263,13 @@ def test_opening_book_fails_when_measured_holdings_exceed_non_fed_par(tmp_path):
     levels = {**_OPENING_WAMEST_LEVELS, "foreigners_total": (5_000_000.0, 0.2)}
     inputs = _opening_book_inputs(tmp_path, wamest_levels=levels)
     with pytest.raises(ValueError, match="bills par holdings would be negative"):
+        rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
+
+
+def test_opening_book_fails_if_the_swap_cannot_replace_ineligible_money_fund_paper(tmp_path):
+    levels = {**_OPENING_WAMEST_LEVELS, "money_market_funds": (675_000.0, 570.0 / 675.0)}
+    inputs = _opening_book_inputs(tmp_path, wamest_levels=levels)
+    with pytest.raises(ValueError, match="eligible domestic nonbank paper"):
         rib.build_initial_portfolio(tmp_path / "cohorts.csv", **inputs)
 
 
