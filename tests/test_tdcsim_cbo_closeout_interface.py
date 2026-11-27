@@ -467,9 +467,14 @@ def test_verifier_rejects_tampered_output_bytes(tmp_path: Path) -> None:
 def test_verifier_rejects_a_run_with_an_ineligible_opening_money_fund_lot(tmp_path: Path) -> None:
     from test_cbo_engine_integration import _opening_controlled_portfolio
 
-    opening = _opening_controlled_portfolio()
-    opening["HolderSubBucket"] = "mmf_cash_fund_route"
-    opening["MaturityDate"] = pd.Timestamp("2028-09-30")
+    # Keep the fixture's ordinary lot so the Fed's purchases still find eligible paper, and
+    # add one money-fund note with more than 397 days left at the opening.
+    ordinary = _opening_controlled_portfolio()
+    ineligible = _opening_controlled_portfolio(face_value=10.0)
+    ineligible["BondID"] = 2
+    ineligible["HolderSubBucket"] = "mmf_cash_fund_route"
+    ineligible["MaturityDate"] = pd.Timestamp("2028-09-30")
+    opening = pd.concat([ordinary, ineligible], ignore_index=True)
     package, attestation = _write_runner_package(tmp_path, opening_portfolio=opening)
     baseline = CboBaselinePackage.open(package, attestation_path=attestation)
     scenario = _write_scenario(tmp_path / "opening-ineligible.json", baseline, overrides={})
