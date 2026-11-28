@@ -1812,6 +1812,10 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
                     _manifest_funding_closure_mode(manifest) == "cbo_operating_cash_target_financing_v1"
                     and runner_module._issuance_assumptions(inputs_dir).get("mode") == runner_module.ISSUANCE_RULE_MODE
                 ),
+                principal=pd.read_csv(
+                    _output_artifact_path(root, manifest, "tdcsim_period_principal_aggregates"),
+                    keep_default_na=False, float_precision="round_trip",
+                ),
             )
         except (holder_targets.HolderTargetError, KeyError, ValueError, OSError) as exc:
             raise VerificationError(f"holder position target verification failed: {exc}") from exc

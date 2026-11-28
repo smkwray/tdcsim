@@ -99,15 +99,17 @@ def _params(
     fed_targets: dict[int, float] | None = None,
     debt_step: tuple[str, float] | None = None,
     fed_income: dict[str, float] | None = None,
+    start: str = START,
+    end: str = END,
 ) -> dict:
     """Engine params for a daily run; ``debt_step`` lowers the debt path by an amount from a date on."""
 
-    periods = build_simulation_calendar(START, END, "daily")
+    periods = build_simulation_calendar(start, end, "daily")
     debt = sum(row["FaceValue"] for row in book)
     paths = _build_temp_forecast_inputs(
         tmp_path,
         periods=periods,
-        period_start=START,
+        period_start=start,
         pre_issuance_controlled_debt_bil=debt,
         cbo_public_debt_target_bil=debt + 125.0,
         later_fiscal_years={2027: (debt + 125.0, 0.0)},
@@ -124,9 +126,9 @@ def _params(
         paths["fed_holdings_path_file"] = _write_csv(
             tmp_path / "tdcsim_fed_holdings_path.csv",
             build_fed_holdings_path_rows(
-                scenario_id="baseline", periods=periods, opening_state_date=START, opening_cb_holdings_bil=0.0,
-                cbo_fy_end_fed_holdings_bil=fed_targets or {2026: 20.0, 2027: 300.0}, observation_date=START,
-                available_date=START,
+                scenario_id="baseline", periods=periods, opening_state_date=start, opening_cb_holdings_bil=0.0,
+                cbo_fy_end_fed_holdings_bil=fed_targets or {2026: 20.0, 2027: 300.0}, observation_date=start,
+                available_date=start,
             ),
         )
     params = _minimal_engine_params(paths, opening_controlled_debt_bil=debt)
@@ -136,7 +138,7 @@ def _params(
     return params
 
 
-def _run(params: dict, out: Path):
+def _run(params: dict, out: Path, *, start: str = START, end: str = END):
     sink = BoundedScenarioEvidenceSink(
         out,
         limits=BoundedResourceLimits(
@@ -148,7 +150,7 @@ def _run(params: dict, out: Path):
         available_reader=lambda: 1,
     )
     results, portfolio = run_simulation(
-        params, START, END, freq="D", scenario_name="baseline", handoff_sink=sink, require_bounded_handoff=True
+        params, start, end, freq="D", scenario_name="baseline", handoff_sink=sink, require_bounded_handoff=True
     )
     closure = pd.read_csv(out / "tdcsim_period_stock_closure.csv.gz", keep_default_na=False)
     return results, portfolio, closure
@@ -163,14 +165,14 @@ def baseline(tmp_path_factory):
 
 
 def _targets(closure: pd.DataFrame, *, buyer, donors, size: float, origin_day: str = ORIGIN,
-             build_end: str = BUILD_END) -> tuple[list[dict], dict]:
+             build_end: str = BUILD_END, end: str = END) -> tuple[list[dict], dict]:
     origin = ht.closing_holder_stocks(closure, bills_only=True)
     origin = origin[origin["period_end"] == origin_day]
     origin_bills = {(r.holder_sector, r.holder_subsector): r.closing_stock_bil for r in origin.itertuples()}
     weights = ht.displacement_weights(origin_bills, buyer=buyer, donors=donors)
     path = ht.BuildAndHoldPath.from_points(
         [{"date": origin_day, "increment_bil": 0.0}, {"date": build_end, "increment_bil": size},
-         {"date": END, "increment_bil": size}]
+         {"date": end, "increment_bil": size}]
     )
     rows = ht.target_rows(ht.closing_holder_stocks(closure), path=path, weights=weights)
     ht.check_target_rows(rows, path=path, weights=weights)
@@ -529,7 +531,9 @@ def test_added_mmf_funding_preserves_ordinary_holdings_when_the_fed_buys(tmp_pat
 REMIT_ORIGIN, REMIT_BUILD_END = "2026-09-21", "2026-09-22"
 
 
-def _remitting_pair(tmp_path: Path, *, routing: dict | None = None, mmf_bill_share: float = 0.0):
+def _remitting_pair(tmp_path: Path, *, routing: dict | None = None, mmf_bill_share: float = 0.0,
+                    book: list[dict] = OPENING, start: str = START, end: str = END, origin: str = REMIT_ORIGIN,
+                    build_end: str = REMIT_BUILD_END):
     """A baseline and an ON RRP-funded money-fund scenario whose Fed remits, so a change in
     its income changes Treasury's borrowing. The build ends early enough that the changed
     income is remitted on 2026-09-30, a day Treasury sizes its auction to land cash on target."""
@@ -538,7 +542,8 @@ def _remitting_pair(tmp_path: Path, *, routing: dict | None = None, mmf_bill_sha
     # ON RRP and foreign balances are drawn from the H.4.1 level.
     small_fed = {"h41_reserve_balances_bil": 18_860.0, "h41_tga_bil": 0.0, "other_income_bil": 3.0,
                  "h41_earnings_remittances_due_bil": 0.0}
-    params = _params(tmp_path / "inputs", fed=True, fed_income=small_fed, routing=routing)
+    params = _params(tmp_path / "inputs", fed=True, fed_income=small_fed, routing=routing, book=book, start=start,
+                     end=end)
     # Issuance follows Treasury's cash, as in the release runs, so a remittance moves borrowing.
     params["treasury_issuance_profile"] = _profile(nominal_only=True)
     params["funding_rule"].update({"mode": "cbo_operating_cash_target_financing_v1", "cash_closure_target_bil": 0.0,
@@ -549,20 +554,21 @@ def _remitting_pair(tmp_path: Path, *, routing: dict | None = None, mmf_bill_sha
         }
     position = {"settlement_route": "covered_deposit_settled", "opening_on_rrp_bil": 60.0}
     params[PRIVATE_SUBBUCKET_MMF_ADDED] = position
-    base, _, closure = _run(params, tmp_path / "baseline")
+    base, _, closure = _run(params, tmp_path / "baseline", start=start, end=end)
     assert ht.DEBT_DIFFERENCE_COLUMN not in base.columns  # the baseline has no target
     rows, weights = _targets(closure, buyer=PRIVATE_MMF_ADDED, donors=MMF_DONORS, size=60.0,
-                             origin_day=REMIT_ORIGIN, build_end=REMIT_BUILD_END)
+                             origin_day=origin, build_end=build_end, end=end)
     config = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows,
               "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED}
     params["holder_position_target"] = config
     params[PRIVATE_SUBBUCKET_MMF_ADDED] = {**position, "settlement_route": "on_rrp_mmf"}
-    onrrp, _, onrrp_closure = _run(params, tmp_path / "onrrp")
+    onrrp, _, onrrp_closure = _run(params, tmp_path / "onrrp", start=start, end=end)
     target_path = ht.BuildAndHoldPath.from_points([
-        {"date": REMIT_ORIGIN, "increment_bil": 0.0}, {"date": REMIT_BUILD_END, "increment_bil": 60.0},
-        {"date": END, "increment_bil": 60.0},
+        {"date": origin, "increment_bil": 0.0}, {"date": build_end, "increment_bil": 60.0},
+        {"date": end, "increment_bil": 60.0},
     ])
-    return base, closure, onrrp, onrrp_closure, rows, weights, config, target_path
+    principal = pd.read_csv(tmp_path / "onrrp" / "tdcsim_period_principal_aggregates.csv.gz", keep_default_na=False)
+    return base, closure, onrrp, onrrp_closure, rows, weights, config, target_path, principal
 
 
 def _assert_debt_difference_held_by_donors(onrrp, onrrp_closure, rows, weights) -> None:
@@ -588,7 +594,7 @@ def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_
     who give up the position, in their donor weights; the added position and the ordinary
     money funds stay exactly on their targets."""
 
-    base, _, onrrp, onrrp_closure, rows, weights, config, target_path = _remitting_pair(tmp_path)
+    base, _, onrrp, onrrp_closure, rows, weights, config, target_path, principal = _remitting_pair(tmp_path)
     difference = onrrp[ht.DEBT_DIFFERENCE_COLUMN]
     remitted = onrrp.loc[:"2026-09-30", "CB_Remittance"].sum() - base.loc[:"2026-09-30", "CB_Remittance"].sum()
     assert abs(remitted) > TOLERANCE  # the trades moved what the Fed remitted
@@ -600,7 +606,7 @@ def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_
 
     def check(results, closure=onrrp_closure, rows=rows):
         return ht.check_stock_target_run(results, closure, {**config, "rows": rows}, target_path=target_path,
-                                         weights=weights, batched_settlement=True)
+                                         weights=weights, batched_settlement=True, principal=principal)
 
     assert check(onrrp) == pytest.approx(difference.abs().max())
     last = onrrp.index[-1]
@@ -668,7 +674,7 @@ def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at
     routing = _routing()
     routing["foreign_settlement_mix"] = {"foreign_bank_settled": 1.0, "foreign_official_deposit": 0.0,
                                          "foreign_official_rrp": 0.0}
-    base, base_closure, onrrp, onrrp_closure, rows, weights, config, target_path = _remitting_pair(
+    base, base_closure, onrrp, onrrp_closure, rows, weights, config, target_path, principal = _remitting_pair(
         tmp_path, routing=routing, mmf_bill_share=0.35)
     difference = onrrp[ht.DEBT_DIFFERENCE_COLUMN]
     remitted = onrrp.loc[:"2026-09-30", "CB_Remittance"].sum() - base.loc[:"2026-09-30", "CB_Remittance"].sum()
@@ -693,7 +699,7 @@ def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at
 
     def check(results, closure=onrrp_closure):
         return ht.check_stock_target_run(results, closure, config, target_path=target_path, weights=weights,
-                                         batched_settlement=True)
+                                         batched_settlement=True, principal=principal)
 
     assert check(onrrp) == pytest.approx(difference.abs().max())
     day = days[0]
@@ -786,6 +792,52 @@ def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at
         check(quiet)
 
 
+def test_fedwire_redeems_a_scheduled_maturity_while_the_securities_market_is_shut(tmp_path) -> None:
+    """Friday 2026-07-03 is a Fedwire business day with the securities market closed. A bank
+    bill due that day is paid, in the baseline as in the scenario, before the intervention:
+    the guard and the run check accept the booked redemption and still reject the bank stock
+    moving by anything else."""
+
+    bill = _security(13, "Banks", "", "bills", "2026-07-03", 10.0)
+    friday = pd.Timestamp("2026-07-03")
+    _, _, onrrp, closure, rows, weights, config, target_path, principal = _remitting_pair(
+        tmp_path, book=[*OPENING, bill], start="2026-06-29", end="2026-07-14", origin="2026-07-08",
+        build_end="2026-07-09")
+    assert onrrp.loc[friday, ht.MARKET_OPEN_COLUMN] == 0.0
+    paid = principal[(principal["period_end"] == "2026-07-03") & (principal["holder_sector"] == "Banks")]
+    assert paid["face_redeemed_bil"].sum() == pytest.approx(10.0)
+    assert set(paid["redemption_type"]) == {"scheduled_maturity"}
+    realized = _realized(closure)
+    assert realized[("2026-07-02", BANKS)] - realized[("2026-07-03", BANKS)] == pytest.approx(10.0)
+    assert abs(onrrp.loc[friday, ht.DEBT_DIFFERENCE_COLUMN]) <= TOLERANCE
+    assert onrrp.loc[friday, ht.CLOSED_DAY_GAP_COLUMN] <= TOLERANCE
+
+    def check(results=onrrp, closure=closure, principal=principal):
+        return ht.check_stock_target_run(results, closure, config, target_path=target_path, weights=weights,
+                                         batched_settlement=True, principal=principal)
+
+    check()
+    unbooked = principal.drop(paid.index)
+    with pytest.raises(ht.HolderTargetError, match="Banks holdings other than TIPS move on 2026-07-03, .* other than by booked redemptions"):
+        check(principal=unbooked)
+    bought_back = principal.copy()
+    bought_back.loc[paid.index, "redemption_type"] = "buyback"
+    with pytest.raises(ht.HolderTargetError, match="principal is redeemed on 2026-07-03, a closed-market day, other than at maturity"):
+        check(principal=bought_back)
+    # A transfer of 5.0 from foreign holders to banks that day is still refused.
+    moved, moved_closure = onrrp.copy(), closure.copy()
+    for holder, route, change in (("Banks", BANKS, 5.0), ("Foreign", FOREIGN, -5.0)):
+        row = moved_closure.index[(moved_closure["period_end"] == "2026-07-03") & (moved_closure["axis"] == "holder")
+                                  & (moved_closure["debt_scope"] == "controlled_public_marketable")
+                                  & (moved_closure["holder_sector"] == holder)
+                                  & (moved_closure["instrument_type"] == "Fixed")][0]
+        moved_closure.loc[row, "closing_debt_stock_bil"] += change
+        moved.loc[friday, ht.STOCK_COLUMNS["HolderStock"][route]] += change
+    moved.loc[friday, ht.CLOSED_DAY_GAP_COLUMN] = 5.0
+    with pytest.raises(ht.HolderTargetError, match="Banks holdings other than TIPS move on 2026-07-03"):
+        check(results=moved, closure=moved_closure)
+
+
 def test_a_closed_market_gap_may_move_only_by_tips_indexation_relative_to_the_baseline() -> None:
     """With the securities market shut nothing trades. Every lot stays with its holder at its
     principal, and only TIPS adjusted principal moves, by the change in the reference CPI.
@@ -813,14 +865,14 @@ def test_a_closed_market_gap_may_move_only_by_tips_indexation_relative_to_the_ba
             for route in ht.PARTICIPANTS}
 
     def gap(**changes):
-        return path.closed_day_gap(day, **{"gaps": gaps, "lots": today, "reference_cpi": 300.0 * (1.0 + 1e-6),
-                                           "market_close": close, **changes})
+        return path.closed_day_gap(day, **{"gaps": gaps, "lots": today, "matured": {},
+                                           "reference_cpi": 300.0 * (1.0 + 1e-6), "market_close": close, **changes})
 
     assert gap() == pytest.approx(2e-6)
     # Tampering probes: TIPS changing hands, and bills up by what TIPS lose, both with every gap
     # inside the tolerance.
     quiet = {route: 0.0 for route in ht.PARTICIPANTS}
-    with pytest.raises(ht.HolderTargetError, match="holdings change hands"):
+    with pytest.raises(ht.HolderTargetError, match="Banks acquires holdings on 2030-10-14"):
         gap(gaps=quiet, lots={**{k: v for k, v in today.items() if k != (FOREIGN, 2)}, (BANKS, 2): today[(FOREIGN, 2)]})
     with pytest.raises(ht.HolderTargetError, match="Foreign holdings move on 2030-10-14, .* other than by TIPS indexation"):
         gap(gaps=quiet, lots={**today, (FOREIGN, 3): (False, 51.0, 51.0), (FOREIGN, 2): (True, 50.0, 49.00005)})
@@ -828,11 +880,53 @@ def test_a_closed_market_gap_may_move_only_by_tips_indexation_relative_to_the_ba
         gap(reference_cpi=300.0)  # the TIPS moved but the CPI did not
     with pytest.raises(ht.HolderTargetError, match="Banks's gap is not explained by TIPS indexation"):
         gap(gaps={**gaps, BANKS: gaps[BANKS] + 3e-6})
+    # Every participant's gap must be finite, whichever comes first.
+    for route in (BANKS, FOREIGN):
+        with pytest.raises(ht.HolderTargetError, match=f"{ht.PARTICIPANT_LABELS[route]} gap on 2030-10-14 is not finite"):
+            gap(gaps={**gaps, route: float("nan")})
+
+    # Fedwire may redeem a lot at its scheduled maturity with the securities market shut: the
+    # bank bill booked as matured that day leaves, and its holder's gap moves by what the
+    # baseline does not also lose.
+    redeemed = {k: v for k, v in today.items() if k != (BANKS, 1)}
+    matured = {(BANKS, 1): (100.0, day)}
+    paid = {**stocks, BANKS: stocks[BANKS] - 100.0}  # the baseline kept that bill, so D falls by 100
+    paid_difference = math.fsum(paid.values()) - math.fsum(reference.values())
+    paid_gaps = {route: reference[route] + paid_difference * max(0.0, -weights.get(route, 0.0)) - paid[route]
+                 for route in ht.PARTICIPANTS}
+    assert gap(lots=redeemed, matured=matured, gaps=paid_gaps) == pytest.approx(50.0, abs=1e-5)
+    with pytest.raises(ht.HolderTargetError, match="Banks holdings leave on 2030-10-14, .* other than by a scheduled redemption"):
+        gap(lots=redeemed, gaps=paid_gaps)  # nothing booked it as matured
+    with pytest.raises(ht.HolderTargetError, match="other than by a scheduled redemption"):
+        gap(lots=redeemed, matured={(BANKS, 1): (100.0, day + pd.Timedelta(days=1))}, gaps=paid_gaps)  # not yet due
+    with pytest.raises(ht.HolderTargetError, match="other than by a scheduled redemption"):
+        gap(lots=redeemed, matured={(BANKS, 1): (60.0, day)}, gaps=paid_gaps)  # less than the lot's principal
+    with pytest.raises(ht.HolderTargetError, match="acquires holdings"):  # new issuance is still refused
+        gap(lots={**today, (BANKS, 9): (False, 5.0, 5.0)}, gaps=quiet)
+
+    # Before the first market-day close the opening holdings are the snapshot: the same checks
+    # apply, and the intervention must not have started, with every gap within tolerance.
+    opening = ht.MarketClose(lots=lots, reference_cpi=300.0, reference=None, gaps=None)
+    small = {route: 0.5 * TOLERANCE for route in ht.PARTICIPANTS}
     with pytest.raises(ht.HolderTargetError, match="before any market-day close"):
-        gap(market_close=None)
-    # Before any market-day close, a gap within tolerance needs no explanation.
-    assert gap(gaps={route: 0.5 * TOLERANCE for route in ht.PARTICIPANTS}, market_close=None) == pytest.approx(
-        0.5 * TOLERANCE)
+        gap(gaps=small, market_close=opening)  # the hold has started
+    pre_path = ht.holder_target_path({
+        "mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED,
+        "rows": [{"date": day.date().isoformat(), "phase": "pre", "holder_type": holder, "holder_subbucket": route,
+                  "target_stock_bil": 100.0, "displacement_weight": weights.get((holder, route), 0.0)}
+                 for holder, route in ht.PARTICIPANTS],
+    })
+
+    def pre_gap(**changes):
+        return pre_path.closed_day_gap(day, **{"gaps": small, "lots": today, "matured": {},
+                                               "reference_cpi": 300.0 * (1.0 + 1e-6), "market_close": opening,
+                                               **changes})
+
+    assert pre_gap() == pytest.approx(0.5 * TOLERANCE)
+    with pytest.raises(ht.HolderTargetError, match="before any market-day close"):
+        pre_gap(gaps=gaps)
+    with pytest.raises(ht.HolderTargetError, match="acquires holdings"):
+        pre_gap(lots={**today, (BANKS, 9): (False, 5.0, 5.0)})
 
 
 def test_an_untraded_route_trades_only_what_a_debt_difference_brings_it() -> None:

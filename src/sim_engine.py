@@ -4721,6 +4721,14 @@ def run_simulation(
         return total
     last_payment_date = dates[0]
     last_market_date = dates[0]
+    if holder_target_path is not None and holder_target_path.bill_change_weights is None:
+        # The opening holdings stand in for a market-day snapshot until the first market-day close.
+        holder_target_market_close = holder_targets.MarketClose(
+            lots=holder_targets.public_lots(bond_portfolio),
+            reference_cpi=float(results.loc[dates[0], 'Reference_CPI']),
+            reference=None,
+            gaps=None,
+        )
     for i in range(1, num_periods):
         prev_date = dates[i - 1]
         current_date = dates[i]
@@ -6844,6 +6852,7 @@ def run_simulation(
                     current_date,
                     gaps=holder_target_gaps,
                     lots=holder_targets.public_lots(bond_portfolio),
+                    matured=holder_targets.matured_lots(bond_portfolio),
                     reference_cpi=float(results.loc[current_date, 'Reference_CPI']),
                     market_close=holder_target_market_close,
                 )

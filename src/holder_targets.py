@@ -200,45 +200,66 @@ class HolderTargetPath:
         *,
         gaps: Mapping[tuple[str, str], float],
         lots: Mapping[tuple[tuple[str, str], Any], tuple[bool, float, float]],
+        matured: Mapping[tuple[tuple[str, str], Any], tuple[float, pd.Timestamp]],
         reference_cpi: float,
-        market_close: "MarketClose | None",
+        market_close: "MarketClose",
     ) -> float:
         """The largest gap at a closed-market close, where nothing trades.
 
-        Every lot must be held as at the last market-day close, with the same principal, and
-        each TIPS lot's adjusted principal must be that close's times the change in the reference
-        CPI; every other lot's must not move. Each gap must then be that close's gap moved only
-        by that indexation relative to the baseline's. Raises otherwise."""
+        Against the last market-day close (or, before the first, the opening holdings), no lot
+        may appear and every lot must still be held at the same principal, except a lot booked
+        as matured by its maturity date, which Fedwire may redeem with the securities market
+        shut. Each TIPS lot's adjusted principal must have moved exactly by the change in the
+        reference CPI and every other lot's not at all. Each gap must then be that close's gap
+        moved only by those changes relative to the baseline's; before the first market-day
+        close the intervention must not have started and every gap must be within tolerance.
+        Raises otherwise."""
 
         key = pd.Timestamp(day).normalize()
-        largest = max(abs(float(value)) for value in gaps.values())
-        if market_close is None:
-            if largest > self.tolerance_bil:
+        for p in PARTICIPANTS:
+            if not math.isfinite(float(gaps[p])):
+                raise HolderTargetError(f"{PARTICIPANT_LABELS[p]} gap on {key.date()} is not finite")
+        largest = max(abs(float(gaps[p])) for p in PARTICIPANTS)
+        appeared = set(lots) - set(market_close.lots)
+        if appeared:
+            holder = PARTICIPANT_LABELS[sorted(appeared, key=str)[0][0]]
+            raise HolderTargetError(f"{holder} acquires holdings on {key.date()}, a day the securities market is closed")
+        nontrade = {p: 0.0 for p in PARTICIPANTS}
+        for lot, (tips, last_principal, last_adjusted) in market_close.lots.items():
+            label = PARTICIPANT_LABELS[lot[0]]
+            if lot not in lots:
+                redemption = matured.get(lot)
+                if redemption is None or not abs(redemption[0] - last_principal) <= DUST_BIL or not redemption[1] <= key:
+                    raise HolderTargetError(
+                        f"{label} holdings leave on {key.date()}, a day the securities market is closed, other than "
+                        "by a scheduled redemption"
+                    )
+                nontrade[lot[0]] -= last_adjusted
+                continue
+            _, principal, adjusted = lots[lot]
+            expected = last_adjusted * (float(reference_cpi) / market_close.reference_cpi) if tips else last_adjusted
+            if not (abs(principal - last_principal) <= DUST_BIL and abs(adjusted - expected) <= DUST_BIL):
+                raise HolderTargetError(
+                    f"{label} holdings move on {key.date()}, a day the securities market is closed, other than by "
+                    "TIPS indexation"
+                )
+            nontrade[lot[0]] += expected - last_adjusted
+        phase, reference = self.rows[key]
+        if market_close.reference is None:
+            if phase != "pre" or largest > self.tolerance_bil:
                 raise HolderTargetError(
                     f"holder position targets move by {largest:.9f} billion on {key.date()}, a day the securities "
                     "market is closed, before any market-day close"
                 )
             return largest
-        if set(lots) != set(market_close.lots):
-            raise HolderTargetError(f"holdings change hands, mature or are issued on {key.date()}, a day the securities market is closed")
-        indexation = {p: 0.0 for p in PARTICIPANTS}
-        for lot, (tips, principal, adjusted) in lots.items():
-            _, last_principal, last_adjusted = market_close.lots[lot]
-            expected = last_adjusted * (float(reference_cpi) / market_close.reference_cpi) if tips else last_adjusted
-            if abs(principal - last_principal) > DUST_BIL or abs(adjusted - expected) > DUST_BIL:
-                raise HolderTargetError(
-                    f"{PARTICIPANT_LABELS[lot[0]]} holdings move on {key.date()}, a day the securities market is "
-                    "closed, other than by TIPS indexation"
-                )
-            indexation[lot[0]] += expected - last_adjusted
-        phase, reference = self.rows[key]
-        expected_gaps = closed_day_gaps(market_close.reference, market_close.gaps, indexation=indexation,
+        expected_gaps = closed_day_gaps(market_close.reference, market_close.gaps, indexation=nontrade,
                                         reference=reference, shares={} if phase == "pre" else self.donor_shares)
         for p in PARTICIPANTS:
-            if abs(float(gaps[p]) - expected_gaps[p]) > self.tolerance_bil:
+            if not abs(float(gaps[p]) - expected_gaps[p]) <= self.tolerance_bil:
                 raise HolderTargetError(
                     f"holder position targets move by {largest:.9f} billion on {key.date()}, a day the securities "
-                    f"market is closed, and {PARTICIPANT_LABELS[p]}'s gap is not explained by TIPS indexation"
+                    f"market is closed, and {PARTICIPANT_LABELS[p]}'s gap is not explained by TIPS indexation "
+                    "or scheduled redemptions"
                 )
         return largest
 
@@ -273,12 +294,13 @@ class HolderTargetPath:
 @dataclass(frozen=True)
 class MarketClose:
     """The last market-day close: every public lot's (TIPS flag, principal, adjusted
-    principal), the reference CPI, and each participant's baseline-relative reference and gap."""
+    principal), the reference CPI, and each participant's baseline-relative reference and gap.
+    The opening holdings stand in until the first market-day close, with no reference or gap."""
 
     lots: Mapping[tuple[tuple[str, str], Any], tuple[bool, float, float]]
     reference_cpi: float
-    reference: Mapping[tuple[str, str], float]
-    gaps: Mapping[tuple[str, str], float]
+    reference: Mapping[tuple[str, str], float] | None
+    gaps: Mapping[tuple[str, str], float] | None
 
 
 def closed_day_gaps(
@@ -295,6 +317,27 @@ def closed_day_gaps(
     relative = {p: indexation[p] - (reference[p] - close_reference[p]) for p in PARTICIPANTS}
     total = math.fsum(relative.values())
     return {p: close_gaps[p] - relative[p] + shares.get(p, 0.0) * total for p in PARTICIPANTS}
+
+
+def matured_lots(portfolio: pd.DataFrame) -> dict[tuple[tuple[str, str], Any], tuple[float, pd.Timestamp]]:
+    """Each participant's matured controlled public marketable lots by BondID: face and maturity date."""
+
+    if portfolio is None or portfolio.empty:
+        return {}
+    holder = portfolio["HolderType"].fillna("").astype(str)
+    mask = (
+        portfolio["Status"].astype(str).eq("Matured")
+        & portfolio["SecurityType"].fillna("").astype(str).isin(PUBLIC_MARKETABLE_SECURITY_TYPES)
+        & ~holder.isin(INTRAGOV_HOLDERS | {"CB"})
+    )
+    rows = portfolio.loc[mask]
+    subbucket = rows["HolderSubBucket"].fillna("").astype(str).replace({"<NA>": "", "nan": "", "None": ""})
+    frame = pd.DataFrame({"holder": holder[mask], "route": subbucket, "bond": rows["BondID"],
+                          "face": pd.to_numeric(rows["FaceValue"], errors="coerce"),
+                          "maturity": pd.to_datetime(rows["MaturityDate"], errors="coerce")})
+    grouped = frame.groupby(["holder", "route", "bond"], sort=False).agg(face=("face", "sum"), maturity=("maturity", "max"))
+    return {((str(h), str(r)), bond): (float(v.face), pd.Timestamp(v.maturity).normalize())
+            for (h, r, bond), v in grouped.iterrows()}
 
 
 def public_lots(portfolio: pd.DataFrame) -> dict[tuple[tuple[str, str], Any], tuple[bool, float, float]]:
@@ -397,11 +440,14 @@ def check_stock_target_run(
     target_path: "BuildAndHoldPath",
     weights: Mapping[tuple[str, str], float],
     batched_settlement: bool,
+    principal: pd.DataFrame,
 ) -> float:
     """Rebuild a stock-target run's every close and fail unless the run follows it.
 
     ``batched_settlement`` is the run's settlement mode: with it, a close is closed-market
     exactly when the securities market is shut; without it, every close is a market close.
+    ``principal`` is the run's booked principal redemptions (its period principal aggregates):
+    with the securities market shut, holdings may leave only by scheduled maturity there.
 
     Targets come from the dated baseline stocks, the declared path and weights, and D from the
     post-trade stock closure: the public stock less the baseline's. The closes after the
@@ -463,7 +509,40 @@ def check_stock_target_run(
                                     & (stock_closure["instrument_type"].fillna("").astype(str) == "TIPS")]
     tips_total_by_day = {pd.Timestamp(period).normalize(): float(value) for period, value in
                          instrument_tips.groupby("period_end")["closing_adjusted_principal_stock_bil"].sum().items()}
+    # Booked redemptions by close: each participant's face redeemed other than TIPS, TIPS face
+    # redeemed and TIPS adjusted principal removed, all holders' TIPS removed, and the kinds.
+    paid = principal.copy()
+    paid["holder_subsector"] = paid["holder_subsector"].fillna("").astype(str)
+    paid_tips = paid["instrument_type"].fillna("").astype(str) == "TIPS"
+    paid_nontips_face = by_participant(paid.loc[~paid_tips], "face_redeemed_bil")
+    paid_tips_face = by_participant(paid.loc[paid_tips], "face_redeemed_bil")
+    paid_tips_adjusted = by_participant(paid.loc[paid_tips], "adjusted_principal_stock_removed_bil")
+    paid_tips_total = {pd.Timestamp(period).normalize(): float(value) for period, value in
+                       paid.loc[paid_tips].groupby("period_end")["adjusted_principal_stock_removed_bil"].sum().items()}
+    paid_kinds: dict[pd.Timestamp, set[str]] = {}
+    for period, kind in zip(paid["period_end"], paid["redemption_type"].astype(str)):
+        paid_kinds.setdefault(pd.Timestamp(period).normalize(), set()).add(kind)
+    # The holdings each close is compared with: the previous close's, starting from the first
+    # close's opening stocks.
+    first = stock_closure[stock_closure["period_end"] == closes[0].date().isoformat()]
+    first_held = held[held["period_end"] == closes[0].date().isoformat()]
+    first_tips = first_held["instrument_type"].fillna("").astype(str) == "TIPS"
+
+    def opening(frame: pd.DataFrame, column: str) -> dict[tuple[str, str], float]:
+        values = by_participant(frame.assign(period_end=closes[0].date().isoformat()), column).get(closes[0], {})
+        return {p: values.get(p, 0.0) for p in PARTICIPANTS}
+
+    previous = {
+        "nontips": opening(first_held.loc[~first_tips], "opening_debt_stock_bil"),
+        "tips": opening(first_held.loc[first_tips], "opening_debt_stock_bil"),
+        "tips_face": opening(first_held.loc[first_tips], "opening_face_stock_bil"),
+        "tips_total": float(first[(first["axis"] == "instrument")
+                                  & (first["debt_scope"] == "controlled_public_marketable")
+                                  & (first["instrument_type"].fillna("").astype(str) == "TIPS")
+                                  ]["opening_adjusted_principal_stock_bil"].sum()),
+    }
     market_state: dict[str, Any] | None = None
+    moved = {p: 0.0 for p in PARTICIPANTS}  # nontrade stock change since the last market-day close
     largest = 0.0
     for day, (_, row) in zip(closes, results.iloc[1:].iterrows(), strict=True):
         if day not in baseline or set(baseline[day]) != set(PARTICIPANTS):
@@ -512,49 +591,59 @@ def check_stock_target_run(
         def participant_values(table: Mapping[pd.Timestamp, Mapping[tuple[str, str], float]]) -> dict[tuple[str, str], float]:
             return {p: table.get(day, {}).get(p, 0.0) for p in PARTICIPANTS}
 
+        today = {"nontips": participant_values(nontips_by_day), "tips": participant_values(tips_by_day),
+                 "tips_face": participant_values(tips_face_by_day), "tips_total": tips_total_by_day.get(day, 0.0)}
         if market_open:
             if closed_gap != 0.0:
                 raise HolderTargetError(f"a market-day close on {day.date()} records a closed-day gap")
             for p in PARTICIPANTS:
-                if abs(gaps[p]) > tolerance:
+                if not abs(gaps[p]) <= tolerance:
                     raise HolderTargetError(f"{PARTICIPANT_LABELS[p]} misses its target on {day.date()}")
-            market_state = {"reference": reference, "gaps": gaps, "nontips": participant_values(nontips_by_day),
-                            "tips": participant_values(tips_by_day), "tips_face": participant_values(tips_face_by_day),
-                            "tips_total": tips_total_by_day.get(day, 0.0)}
+            market_state = {"reference": reference, "gaps": gaps}
+            moved = {p: 0.0 for p in PARTICIPANTS}
         else:
             if any(float(row[f"HolderTarget{stem}_{PARTICIPANT_LABELS[p]}"]) != 0.0 for p in PARTICIPANTS for stem in legs):
                 raise HolderTargetError(f"holders trade on {day.date()}, a day the securities market is closed")
             observed = max(abs(value) for value in gaps.values())
-            if abs(closed_gap - observed) > tolerance:
+            if not abs(closed_gap - observed) <= tolerance:
                 raise HolderTargetError(f"the recorded closed-day gap on {day.date()} is not the largest gap")
+            # Whatever the gap, holdings move with the market shut only by TIPS indexation and
+            # booked scheduled redemptions, against the previous close.
+            if not paid_kinds.get(day, set()) <= {"scheduled_maturity"}:
+                raise HolderTargetError(f"principal is redeemed on {day.date()}, a closed-market day, other than at maturity")
+            removed_total = paid_tips_total.get(day, 0.0)
+            if previous["tips_total"] > 0.0:
+                ratio = (today["tips_total"] + removed_total) / previous["tips_total"]
+            elif today["tips_total"] == 0.0 and removed_total == 0.0:
+                ratio = 1.0
+            else:
+                raise HolderTargetError(f"TIPS appear on {day.date()}, a day the securities market is closed")
+            for p in PARTICIPANTS:
+                label = PARTICIPANT_LABELS[p]
+                redeemed = paid_nontips_face.get(day, {}).get(p, 0.0)
+                if not abs(today["nontips"][p] - (previous["nontips"][p] - redeemed)) <= tolerance:
+                    raise HolderTargetError(
+                        f"{label} holdings other than TIPS move on {day.date()}, a closed-market day, other than by "
+                        "booked redemptions")
+                if not abs(today["tips_face"][p] - (previous["tips_face"][p] - paid_tips_face.get(day, {}).get(p, 0.0))) <= tolerance:
+                    raise HolderTargetError(f"{label} TIPS principal moves on {day.date()}, a closed-market day")
+                indexed = previous["tips"][p] * ratio - paid_tips_adjusted.get(day, {}).get(p, 0.0)
+                if not abs(today["tips"][p] - indexed) <= tolerance:
+                    raise HolderTargetError(
+                        f"{label} TIPS on {day.date()} are not its previous TIPS indexed by the CPI change")
+                moved[p] += (indexed - previous["tips"][p]) - redeemed
             if market_state is None:
-                if observed > tolerance:
+                if not pre or observed > tolerance:
                     raise HolderTargetError(f"holder positions miss their targets on {day.date()} before any market-day close")
             else:
-                # Whatever the gap, only TIPS indexation may move holdings with the market shut.
-                total, last_total = tips_total_by_day.get(day, 0.0), market_state["tips_total"]
-                if last_total <= 0.0 and total != 0.0:
-                    raise HolderTargetError(f"TIPS appear on {day.date()}, a day the securities market is closed")
-                ratio = total / last_total if last_total > 0.0 else 1.0
-                nontips, tips, tips_face = (participant_values(table) for table in (nontips_by_day, tips_by_day, tips_face_by_day))
-                indexation = {}
-                for p in PARTICIPANTS:
-                    label = PARTICIPANT_LABELS[p]
-                    if abs(nontips[p] - market_state["nontips"][p]) > tolerance:
-                        raise HolderTargetError(f"{label} holdings other than TIPS move on {day.date()}, a closed-market day")
-                    if abs(tips_face[p] - market_state["tips_face"][p]) > tolerance:
-                        raise HolderTargetError(f"{label} TIPS principal moves on {day.date()}, a closed-market day")
-                    indexed = market_state["tips"][p] * ratio
-                    if abs(tips[p] - indexed) > tolerance:
-                        raise HolderTargetError(
-                            f"{label} TIPS on {day.date()} are not its last market-day TIPS indexed by the CPI change")
-                    indexation[p] = indexed - market_state["tips"][p]
-                expected = closed_day_gaps(market_state["reference"], market_state["gaps"], indexation=indexation,
+                expected = closed_day_gaps(market_state["reference"], market_state["gaps"], indexation=moved,
                                            reference=reference, shares={} if pre else shares)
                 for p in PARTICIPANTS:
-                    if abs(gaps[p] - expected[p]) > tolerance:
+                    if not abs(gaps[p] - expected[p]) <= tolerance:
                         raise HolderTargetError(
-                            f"{PARTICIPANT_LABELS[p]}'s gap on {day.date()} is not explained by TIPS indexation")
+                            f"{PARTICIPANT_LABELS[p]}'s gap on {day.date()} is not explained by TIPS indexation "
+                            "or booked redemptions")
+        previous = today
         face, cash = float(row[CORRECTION_FACE_COLUMN]), float(row[CORRECTION_CASH_COLUMN])
         if path.frozen_routes:
             traded = [
@@ -630,6 +719,10 @@ def target_gaps(
     """Target less current stock for each participant; the gaps must sum to zero."""
 
     gaps = {participant: float(targets[participant]) - float(stocks[participant]) for participant in PARTICIPANTS}
+    for participant, gap in gaps.items():
+        if not math.isfinite(gap):
+            raise HolderTargetError(
+                f"{PARTICIPANT_LABELS[participant]} gap on {pd.Timestamp(current_date).date()} is not finite")
     imbalance = sum(gaps.values())
     if abs(imbalance) > tolerance:
         raise HolderTargetError(
