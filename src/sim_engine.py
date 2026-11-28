@@ -6843,8 +6843,8 @@ def run_simulation(
                 results.loc[current_date, holder_targets.CLOSED_DAY_GAP_COLUMN] = holder_target_path.closed_day_gap(
                     current_date,
                     gaps=holder_target_gaps,
-                    stocks=holder_target_stocks,
-                    nontips=holder_targets.nontips_stocks(bond_portfolio),
+                    lots=holder_targets.public_lots(bond_portfolio),
+                    reference_cpi=float(results.loc[current_date, 'Reference_CPI']),
                     market_close=holder_target_market_close,
                 )
             elif holder_target_stock_mode:
@@ -6976,8 +6976,8 @@ def run_simulation(
             if holder_target_stock_mode and not holder_target_closed:
                 closing_target_stocks = closing_holder_stocks[stock_stem]
                 holder_target_market_close = holder_targets.MarketClose(
-                    stocks=dict(closing_target_stocks),
-                    nontips=holder_targets.nontips_stocks(bond_portfolio),
+                    lots=holder_targets.public_lots(bond_portfolio),
+                    reference_cpi=float(results.loc[current_date, 'Reference_CPI']),
                     reference=holder_target_path.rows[pd.Timestamp(current_date).normalize()][1],
                     gaps={p: holder_target_vector[p] - closing_target_stocks[p] for p in holder_targets.PARTICIPANTS},
                 )

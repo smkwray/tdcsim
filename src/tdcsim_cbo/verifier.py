@@ -1806,6 +1806,12 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
                 results.set_index(pd.to_datetime(results["Date"])), closure, holder_config,
                 target_path=holder_targets.BuildAndHoldPath.from_points(list(declaration["target_path"])),
                 weights=holder_targets.declared_weights(declaration),
+                # Closed-market closes exist only where the engine batches settlement: under
+                # operating-cash financing with the bill-share issuance rule.
+                batched_settlement=(
+                    _manifest_funding_closure_mode(manifest) == "cbo_operating_cash_target_financing_v1"
+                    and runner_module._issuance_assumptions(inputs_dir).get("mode") == runner_module.ISSUANCE_RULE_MODE
+                ),
             )
         except (holder_targets.HolderTargetError, KeyError, ValueError, OSError) as exc:
             raise VerificationError(f"holder position target verification failed: {exc}") from exc
