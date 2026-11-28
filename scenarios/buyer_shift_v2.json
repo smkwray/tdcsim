@@ -13,7 +13,7 @@
     "Illustrative scenario accounting, not a forecast or causal estimate",
     "The $500 billion size is a stated assumption, equal across buyers so their effects can be compared, not an estimated demand response",
     "Yields and the primary fiscal path are the baseline's. Federal Reserve remittances respond to the Fed's income, so a position that changes the Fed's balance sheet, such as the one funded from money-fund ON RRP, changes remittances and therefore Treasury's issuance. The holders who give up the position hold that debt difference in their donor weights; every other holder keeps its stated target, and ordinary money funds sell back to the donors, in the same weights, any part of the difference they receive at auction",
-    "Positions are exact at each daily period close, after the Federal Reserve's operation; this is a model clock, not literal market execution on every calendar day",
+    "Positions are exact at each market-day close, after the Federal Reserve's operation; this is a model clock, not literal market execution on every market day. On a day the securities market is closed nothing trades, and TIPS indexation on holdings that differ from the baseline's is settled at the next market-day close",
     "The added position is total controlled public marketable Treasury holdings at par (adjusted principal for TIPS), acquired and maintained through nominal bills; it is not exactly $500 billion more bills",
     "Every scenario puts the TGA on the operating-cash path at each fiscal-year end, so financing-cost differences change the debt rather than the TGA",
     "Banks settle with reserves and foreign holders settle through US banks outside covered deposits.",

@@ -20,7 +20,8 @@ measured from the origin close, and writes (USD billions):
 - controller_turnover.csv: the target trades by phase and holder route, gross and net of
   the build, with the difference in the Federal Reserve's purchase cash and the corrections
   that return the untraded ordinary money funds to their target when D reaches them at
-  auction (net and gross face, net cash, and days);
+  auction (net and gross face, net cash, and days), and the largest gap left at a close when the
+  securities market is shut;
 - receipt.json: producer, inputs, baseline references, clock, stock basis, funding states
   and the checks below.
 
@@ -185,6 +186,10 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
     checked["debt_difference_share"] = (-weight).where(weight < 0.0, 0.0)
     checked["debt_difference_held"] = checked["debt_difference_bil"] * checked["debt_difference_share"]
     checked["error"] = checked["closing_stock_bil"] - (checked["target_stock_bil"] + checked["debt_difference_held"])
+    # Exact at market-day closes; with the securities market shut, TIPS indexation may leave a
+    # gap that the next market-day close trades back.
+    market_day = checked["date"].map(results[ht.MARKET_OPEN_COLUMN]) == 1.0
+    checked["error"] = checked["error"].where(market_day, 0.0)
     if checked["error"].abs().max() > float(target["target_tolerance_bil"]):
         raise SystemExit(f"{role}: holdings miss their target by {checked['error'].abs().max()}")
     checked["realized_increment"] = checked["closing_stock_bil"] - checked["baseline_stock_bil"]
@@ -345,6 +350,7 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
             "correction_gross_face_bil": float(rows_phase[ht.CORRECTION_FACE_COLUMN].abs().sum()),
             "correction_net_cash_bil": float(rows_phase[ht.CORRECTION_CASH_COLUMN].sum()),
             "correction_days": int((rows_phase[ht.CORRECTION_FACE_COLUMN] != 0.0).sum()),
+            "closed_day_max_gap_bil": float(rows_phase[ht.CLOSED_DAY_GAP_COLUMN].max()),
             "fed_purchase_face_difference_bil": float(
                 (rows_phase["CBOFedSecondaryPurchaseFace"] - base_phase["CBOFedSecondaryPurchaseFace"]).sum()),
             "fed_purchase_cash_difference_bil": float(
@@ -357,6 +363,7 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
             "issuer_max_abs_difference_bil": issuer,
             "max_abs_debt_difference_bil": max_difference,
             "max_abs_daily_correction_face_bil": float(results[ht.CORRECTION_FACE_COLUMN].abs().max()),
+            "max_closed_day_gap_bil": float(results[ht.CLOSED_DAY_GAP_COLUMN].max()),
             "debt_difference_identity_max_abs_bil": identity_gap,
             "max_abs_target_error_bil": float(checked["error"].abs().max()),
             "closes_checked": int(checked["date"].nunique()),

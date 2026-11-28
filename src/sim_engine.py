@@ -4208,6 +4208,8 @@ def run_simulation(
         if holder_target_path.bill_change_weights is None:
             for numeric_col in holder_targets.STOCK_TARGET_COLUMNS:
                 results[numeric_col] = 0.0
+    # The last market-day close, from which a closed-market close's gaps may move only by TIPS indexation.
+    holder_target_market_close = None
     raw_events = params.get('events', [])
     scheduled_events = defaultdict(list)
     processed_event_ids = set()
@@ -6833,14 +6835,28 @@ def run_simulation(
             )
             holder_target_pre_gap = max(abs(value) for value in holder_target_gaps.values())
             holder_target_report = holder_targets.RebalanceReport()
+            # A stock-target close with the securities market shut trades nothing; its gaps may
+            # move from the last market-day close only by TIPS indexation, and the next
+            # market-day close trades them back.
+            holder_target_closed = holder_target_stock_mode and not market_open
+            if holder_target_closed:
+                results.loc[current_date, holder_targets.CLOSED_DAY_GAP_COLUMN] = holder_target_path.closed_day_gap(
+                    current_date,
+                    gaps=holder_target_gaps,
+                    stocks=holder_target_stocks,
+                    nontips=holder_targets.nontips_stocks(bond_portfolio),
+                    market_close=holder_target_market_close,
+                )
+            elif holder_target_stock_mode:
+                results.loc[current_date, holder_targets.MARKET_OPEN_COLUMN] = 1.0
             # Untraded routes match the baseline by themselves, except what D brings them at
             # auction, which they trade back with the donors before the other routes trade.
-            holder_target_corrections = holder_target_path.correction_flows(
+            holder_target_corrections = [] if holder_target_closed else holder_target_path.correction_flows(
                 holder_target_gaps, holder_target_difference, current_date=current_date,
             )
             for route in holder_target_path.frozen_routes:
                 holder_target_gaps[route] = 0.0
-            if holder_target_pre_gap > holder_target_tolerance:
+            if holder_target_pre_gap > holder_target_tolerance and not holder_target_closed:
                 if not market_open:
                     raise holder_targets.HolderTargetError(
                         f"holder position targets move by {holder_target_pre_gap:.9f} billion on "
@@ -6957,7 +6973,15 @@ def run_simulation(
                 report=holder_target_report,
                 deposit_effect=holder_target_deposit_effect,
             )
-            if holder_target_values['HolderTargetMaxError'] > holder_target_tolerance:
+            if holder_target_stock_mode and not holder_target_closed:
+                closing_target_stocks = closing_holder_stocks[stock_stem]
+                holder_target_market_close = holder_targets.MarketClose(
+                    stocks=dict(closing_target_stocks),
+                    nontips=holder_targets.nontips_stocks(bond_portfolio),
+                    reference=holder_target_path.rows[pd.Timestamp(current_date).normalize()][1],
+                    gaps={p: holder_target_vector[p] - closing_target_stocks[p] for p in holder_targets.PARTICIPANTS},
+                )
+            if holder_target_values['HolderTargetMaxError'] > holder_target_tolerance and not holder_target_closed:
                 raise holder_targets.HolderTargetError(
                     f"holder positions miss their target by {holder_target_values['HolderTargetMaxError']:.9f} "
                     f"billion after trading on {current_date.date()}"

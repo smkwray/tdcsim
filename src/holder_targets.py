@@ -13,6 +13,12 @@ leaves untraded (ordinary money funds when the added position is the buyer) must
 baseline by itself; when D is above tolerance, the extra or reduced issuance reaching it at
 auction is traded back with the donors, in their donor weights, as a correction.
 
+Positions are exact at every market-day close. On a day the securities market is closed
+nothing trades; each gap may then differ from its last market-day close only through TIPS
+indexation of holdings that differ from the baseline's (the participant's own change against
+the baseline's, and a donor's share of the change in D), and the next market-day close
+trades it back.
+
 After the day's Federal Reserve operation, holders above target sell nominal bills to
 holders below target, each seller's excess split across the buyers in proportion to their
 shortfalls. A seller's sale is spread across remaining-maturity buckets in proportion to
@@ -38,7 +44,7 @@ import pandas as pd
 
 from issuance_calibration import bill_mask
 from mmf_eligibility import mmf_may_acquire
-from simulation_calendar import previous_securities_business_day
+from simulation_calendar import is_securities_business_day, previous_securities_business_day
 from tdc_shared import (
     INTRAGOV_HOLDERS,
     MMF_SUBBUCKETS,
@@ -87,7 +93,13 @@ DEBT_DIFFERENCE_COLUMN = "HolderTargetDebtDifference"
 # Net face and cash the untraded routes bought from the donors at the close (negative: sold).
 CORRECTION_FACE_COLUMN = "HolderTargetCorrectionFace"
 CORRECTION_CASH_COLUMN = "HolderTargetCorrectionCash"
-STOCK_TARGET_COLUMNS = (DEBT_DIFFERENCE_COLUMN, CORRECTION_FACE_COLUMN, CORRECTION_CASH_COLUMN)
+# 1 when the securities market is open at the close, else 0; and the largest gap left at a
+# closed-market close.
+MARKET_OPEN_COLUMN = "HolderTargetMarketOpen"
+CLOSED_DAY_GAP_COLUMN = "HolderTargetClosedDayGap"
+STOCK_TARGET_COLUMNS = (
+    DEBT_DIFFERENCE_COLUMN, CORRECTION_FACE_COLUMN, CORRECTION_CASH_COLUMN, MARKET_OPEN_COLUMN, CLOSED_DAY_GAP_COLUMN,
+)
 SUMMARY_COLUMNS = (
     "HolderTargetPreTradeMaxGap",
     "HolderTargetMaxError",
@@ -182,6 +194,44 @@ class HolderTargetPath:
         _, reference = self.rows[pd.Timestamp(day).normalize()]
         return math.fsum(stocks.values()) - math.fsum(reference.values())
 
+    def closed_day_gap(
+        self,
+        day: Any,
+        *,
+        gaps: Mapping[tuple[str, str], float],
+        stocks: Mapping[tuple[str, str], float],
+        nontips: Mapping[tuple[str, str], float],
+        market_close: "MarketClose | None",
+    ) -> float:
+        """The largest gap at a closed-market close, where nothing trades. Raises unless every
+        holding other than TIPS is where the last market-day close left it and each gap is that
+        close's gap moved only by TIPS indexation relative to the baseline's."""
+
+        key = pd.Timestamp(day).normalize()
+        largest = max(abs(float(value)) for value in gaps.values())
+        if largest <= self.tolerance_bil:
+            return largest
+        if market_close is None:
+            raise HolderTargetError(
+                f"holder position targets move by {largest:.9f} billion on {key.date()}, a day the securities "
+                "market is closed, before any market-day close"
+            )
+        phase, reference = self.rows[key]
+        expected = closed_day_gaps(market_close, stocks=stocks, reference=reference,
+                                   shares={} if phase == "pre" else self.donor_shares)
+        for p in PARTICIPANTS:
+            label = PARTICIPANT_LABELS[p]
+            if abs(float(nontips[p]) - market_close.nontips[p]) > self.tolerance_bil:
+                raise HolderTargetError(
+                    f"{label} holdings other than TIPS move on {key.date()}, a day the securities market is closed"
+                )
+            if abs(float(gaps[p]) - expected[p]) > self.tolerance_bil:
+                raise HolderTargetError(
+                    f"holder position targets move by {largest:.9f} billion on {key.date()}, a day the securities "
+                    f"market is closed, and {label}'s gap is not explained by TIPS indexation"
+                )
+        return largest
+
     def correction_flows(
         self, gaps: Mapping[tuple[str, str], float], difference: float, *, current_date: Any,
     ) -> list[tuple[tuple[str, str], tuple[str, str], float]]:
@@ -208,6 +258,40 @@ class HolderTargetPath:
                     amount = abs(gap) * self.donor_shares[donor]
                     flows.append((route, donor, amount) if gap < 0.0 else (donor, route, amount))
         return flows
+
+
+@dataclass(frozen=True)
+class MarketClose:
+    """Each participant's stock, stock other than TIPS, baseline-relative reference and gap
+    at the last market-day close."""
+
+    stocks: Mapping[tuple[str, str], float]
+    nontips: Mapping[tuple[str, str], float]
+    reference: Mapping[tuple[str, str], float]
+    gaps: Mapping[tuple[str, str], float]
+
+
+def closed_day_gaps(
+    close: MarketClose,
+    *,
+    stocks: Mapping[tuple[str, str], float],
+    reference: Mapping[tuple[str, str], float],
+    shares: Mapping[tuple[str, str], float],
+) -> dict[tuple[str, str], float]:
+    """Gaps after closed days with no trades: the market close's gap less the participant's
+    stock change relative to the baseline's, plus its donor share of the change in D."""
+
+    relative = {p: (stocks[p] - close.stocks[p]) - (reference[p] - close.reference[p]) for p in PARTICIPANTS}
+    total = math.fsum(relative.values())
+    return {p: close.gaps[p] - relative[p] + shares.get(p, 0.0) * total for p in PARTICIPANTS}
+
+
+def nontips_stocks(portfolio: pd.DataFrame) -> dict[tuple[str, str], float]:
+    """Controlled public marketable stock other than TIPS by participant."""
+
+    if portfolio is None or portfolio.empty:
+        return closing_stocks(portfolio)["HolderStock"]
+    return closing_stocks(portfolio.loc[portfolio["SecurityType"].fillna("").astype(str).ne("TIPS")])["HolderStock"]
 
 
 def bill_change_weights(rows: list[Mapping[str, Any]]) -> dict[tuple[str, str], float]:
@@ -324,6 +408,13 @@ def check_stock_target_run(
             + (f": {extra[0].date()} has no target" if extra else "")
         )
     legs = ("BoughtFace", "SoldFace", "BoughtCash", "SoldCash")
+    nontips_frame = closing_holder_stocks(stock_closure[stock_closure["instrument_type"].fillna("").astype(str) != "TIPS"])
+    nontips_by_day: dict[pd.Timestamp, dict[tuple[str, str], float]] = {}
+    for record in nontips_frame.itertuples(index=False):
+        nontips_by_day.setdefault(pd.Timestamp(record.period_end).normalize(), {})[
+            (record.holder_sector, record.holder_subsector)
+        ] = float(record.closing_stock_bil)
+    market_close: MarketClose | None = None
     largest = 0.0
     for day, (_, row) in zip(closes, results.iloc[1:].iterrows(), strict=True):
         if day not in baseline or set(baseline[day]) != set(PARTICIPANTS):
@@ -351,14 +442,47 @@ def check_stock_target_run(
         pre = target_path.phase(day) == "pre"
         if pre and abs(difference) > tolerance:
             raise HolderTargetError(f"the public stock differs from the baseline on {day.date()}, before the intervention starts")
+        targets = {p: reference[p] + (0.0 if pre else difference * shares.get(p, 0.0)) for p in PARTICIPANTS}
+        gaps = {p: targets[p] - stocks[p] for p in PARTICIPANTS}
         for p in PARTICIPANTS:
             label = PARTICIPANT_LABELS[p]
-            target = reference[p] + (0.0 if pre else difference * shares.get(p, 0.0))
             reported = float(row[f"HolderTarget_{label}"])
-            if not math.isfinite(reported) or abs(reported - target) > tolerance:
+            if not math.isfinite(reported) or abs(reported - targets[p]) > tolerance:
                 raise HolderTargetError(f"{label} target on {day.date()} does not follow the debt-difference rule")
-            if abs(stocks[p] - target) > tolerance:
-                raise HolderTargetError(f"{label} misses its target on {day.date()}")
+        # A close is closed-market only on a day the securities market is shut; at every other
+        # close positions are exact. At a closed-market close nothing trades, holdings other
+        # than TIPS stay where the last market-day close left them, and each gap is that close's
+        # gap moved by TIPS indexation relative to the baseline's.
+        open_flag, closed_gap = float(row[MARKET_OPEN_COLUMN]), float(row[CLOSED_DAY_GAP_COLUMN])
+        if open_flag not in (0.0, 1.0) or (open_flag == 0.0 and is_securities_business_day(day)):
+            raise HolderTargetError(f"the {day.date()} close is marked closed-market on a securities business day")
+        if open_flag == 1.0:
+            if closed_gap != 0.0:
+                raise HolderTargetError(f"a market-day close on {day.date()} records a closed-day gap")
+            for p in PARTICIPANTS:
+                if abs(gaps[p]) > tolerance:
+                    raise HolderTargetError(f"{PARTICIPANT_LABELS[p]} misses its target on {day.date()}")
+            market_close = MarketClose(stocks=dict(stocks), nontips=dict(nontips_by_day.get(day, {})),
+                                       reference=reference, gaps=gaps)
+        else:
+            if any(float(row[f"HolderTarget{stem}_{PARTICIPANT_LABELS[p]}"]) != 0.0 for p in PARTICIPANTS for stem in legs):
+                raise HolderTargetError(f"holders trade on {day.date()}, a day the securities market is closed")
+            observed = max(abs(value) for value in gaps.values())
+            if abs(closed_gap - observed) > tolerance:
+                raise HolderTargetError(f"the recorded closed-day gap on {day.date()} is not the largest gap")
+            if observed > tolerance:
+                if market_close is None:
+                    raise HolderTargetError(f"holder positions miss their targets on {day.date()} before any market-day close")
+                expected = closed_day_gaps(market_close, stocks=stocks, reference=reference,
+                                           shares={} if pre else shares)
+                today_nontips = nontips_by_day.get(day, {})
+                for p in PARTICIPANTS:
+                    if abs(today_nontips.get(p, 0.0) - market_close.nontips.get(p, 0.0)) > tolerance:
+                        raise HolderTargetError(
+                            f"{PARTICIPANT_LABELS[p]} holdings other than TIPS move on {day.date()}, a closed-market day")
+                    if abs(gaps[p] - expected[p]) > tolerance:
+                        raise HolderTargetError(
+                            f"{PARTICIPANT_LABELS[p]}'s gap on {day.date()} is not explained by TIPS indexation")
         face, cash = float(row[CORRECTION_FACE_COLUMN]), float(row[CORRECTION_CASH_COLUMN])
         if path.frozen_routes:
             traded = [
@@ -890,7 +1014,10 @@ def result_values(
 
 
 __all__ = [
+    "CLOSED_DAY_GAP_COLUMN",
     "CORRECTION_CASH_COLUMN",
+    "MARKET_OPEN_COLUMN",
+    "MarketClose",
     "CORRECTION_FACE_COLUMN",
     "DEBT_DIFFERENCE_COLUMN",
     "HOLDER_TARGET_MODE",
