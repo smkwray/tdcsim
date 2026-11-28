@@ -4206,7 +4206,8 @@ def run_simulation(
         for numeric_col in holder_targets.RESULT_COLUMNS:
             results[numeric_col] = 0.0
         if holder_target_path.bill_change_weights is None:
-            results[holder_targets.DEBT_DIFFERENCE_COLUMN] = 0.0
+            for numeric_col in holder_targets.STOCK_TARGET_COLUMNS:
+                results[numeric_col] = 0.0
     raw_events = params.get('events', [])
     scheduled_events = defaultdict(list)
     processed_event_ids = set()
@@ -6817,10 +6818,13 @@ def run_simulation(
             holder_target_stocks = closing_holder_stocks[stock_stem]
             holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date, holder_target_stocks)
             holder_target_tolerance = holder_target_path.tolerance_bil
-            if holder_target_path.bill_change_weights is None:
-                results.loc[current_date, holder_targets.DEBT_DIFFERENCE_COLUMN] = holder_target_path.debt_difference(
-                    current_date, holder_target_stocks,
-                )
+            holder_target_stock_mode = holder_target_path.bill_change_weights is None
+            holder_target_difference = (
+                holder_target_path.debt_difference(current_date, holder_target_stocks)
+                if holder_target_stock_mode else 0.0
+            )
+            if holder_target_stock_mode:
+                results.loc[current_date, holder_targets.DEBT_DIFFERENCE_COLUMN] = holder_target_difference
             holder_target_gaps = holder_targets.target_gaps(
                 holder_target_stocks,
                 holder_target_vector,
@@ -6829,11 +6833,12 @@ def run_simulation(
             )
             holder_target_pre_gap = max(abs(value) for value in holder_target_gaps.values())
             holder_target_report = holder_targets.RebalanceReport()
+            # Untraded routes match the baseline by themselves, except what D brings them at
+            # auction, which they trade back with the donors before the other routes trade.
+            holder_target_corrections = holder_target_path.correction_flows(
+                holder_target_gaps, holder_target_difference, current_date=current_date,
+            )
             for route in holder_target_path.frozen_routes:
-                if abs(holder_target_gaps[route]) > holder_target_tolerance:
-                    raise holder_targets.HolderTargetError(
-                        f"Untraded route {route} differs from the baseline at the {current_date.date()} close."
-                    )
                 holder_target_gaps[route] = 0.0
             if holder_target_pre_gap > holder_target_tolerance:
                 if not market_open:
@@ -6851,11 +6856,8 @@ def run_simulation(
                     'holder': _handoff_portfolio_stock_map(bond_portfolio),
                     'route': _handoff_portfolio_stock_map(bond_portfolio, route=True),
                 }
-                bond_portfolio, holder_target_report = holder_targets.rebalance_holder_positions(
-                    bond_portfolio,
-                    holder_target_gaps,
-                    current_date=current_date,
-                    price=lambda row, amount: _fed_secondary_dirty_value(
+                def holder_target_price(row, amount):
+                    return _fed_secondary_dirty_value(
                         row,
                         amount,
                         current_date,
@@ -6866,10 +6868,40 @@ def run_simulation(
                         nominal_shock=evaluated_nominal_shock,
                         tips_real_curve_years=tips_real_curve_years,
                         tips_real_curve_rates=tips_real_curve_rates,
-                    ),
+                    )
+
+                holder_target_trade = functools.partial(
+                    holder_targets.rebalance_holder_positions,
+                    current_date=current_date,
+                    price=holder_target_price,
                     row_budget=handoff_tables.portfolio_row_budget if bounded_handoff else None,
                     record_mmf_acquisition=record_mmf_acquisition,
                 )
+                if holder_target_corrections:
+                    bond_portfolio, holder_target_correction = holder_target_trade(
+                        bond_portfolio, {}, flows=holder_target_corrections,
+                    )
+                    holder_target_report.add(holder_target_correction)
+                    for route in holder_target_path.frozen_routes:
+                        results.loc[current_date, holder_targets.CORRECTION_FACE_COLUMN] += (
+                            holder_target_correction.bought_face[route] - holder_target_correction.sold_face[route]
+                        )
+                        results.loc[current_date, holder_targets.CORRECTION_CASH_COLUMN] += (
+                            holder_target_correction.bought_cash[route] - holder_target_correction.sold_cash[route]
+                        )
+                    holder_target_gaps = holder_targets.target_gaps(
+                        holder_targets.closing_stocks(bond_portfolio)[stock_stem],
+                        holder_target_vector,
+                        tolerance=holder_target_tolerance,
+                        current_date=current_date,
+                    )
+                    for route in holder_target_path.frozen_routes:
+                        holder_target_gaps[route] = 0.0
+                if max(abs(value) for value in holder_target_gaps.values()) > holder_target_tolerance or not (
+                    holder_target_corrections
+                ):
+                    bond_portfolio, holder_target_main = holder_target_trade(bond_portfolio, holder_target_gaps)
+                    holder_target_report.add(holder_target_main)
                 _handoff_append_transfer_changes(
                     handoff_tables,
                     prev_date,

@@ -146,7 +146,7 @@ BOUNDED_SUMMARY_COLUMNS = [
     # Controller results are present only in runs with a target.
     holder_targets.PHASE_COLUMN,
     *holder_targets.RESULT_COLUMNS,
-    holder_targets.DEBT_DIFFERENCE_COLUMN,
+    *holder_targets.STOCK_TARGET_COLUMNS,
 ]
 
 COMMON_METADATA_COLUMNS = [

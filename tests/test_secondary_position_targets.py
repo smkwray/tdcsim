@@ -25,7 +25,7 @@ from sim_engine import run_simulation
 from simulation_calendar import build_simulation_calendar
 from tdc_shared import (
     BOND_PORTFOLIO_COLS, MMF_ADDED_TDC_COLUMNS, PORTFOLIO_DTYPES, PRIVATE_SUBBUCKET_DOMESTIC_NONBANK,
-    PRIVATE_SUBBUCKET_MMF, PRIVATE_SUBBUCKET_MMF_ADDED,
+    PRIVATE_SUBBUCKET_MMF, PRIVATE_SUBBUCKET_MMF_ADDED, PRIVATE_SUBBUCKET_SHARES_KEY,
 )
 from tdcsim_cbo.bounded_output import BoundedResourceLimits, BoundedScenarioEvidenceSink
 from test_cbo_engine_integration import _build_temp_forecast_inputs, _minimal_engine_params, _write_csv
@@ -525,6 +525,60 @@ def test_added_mmf_funding_preserves_ordinary_holdings_when_the_fed_buys(tmp_pat
     pd.testing.assert_frame_equal(deposit_book, onrrp_book, check_exact=True)
 
 
+REMIT_ORIGIN, REMIT_BUILD_END = "2026-09-21", "2026-09-22"
+
+
+def _remitting_pair(tmp_path: Path, *, routing: dict | None = None, mmf_bill_share: float = 0.0):
+    """A baseline and an ON RRP-funded money-fund scenario whose Fed remits, so a change in
+    its income changes Treasury's borrowing. The build ends early enough that the changed
+    income is remitted on 2026-09-30, a day Treasury sizes its auction to land cash on target."""
+
+    # A Fed that earns more than it pays: 3,000 of reserves once the fixture's 15,860 of
+    # ON RRP and foreign balances are drawn from the H.4.1 level.
+    small_fed = {"h41_reserve_balances_bil": 18_860.0, "h41_tga_bil": 0.0, "other_income_bil": 3.0,
+                 "h41_earnings_remittances_due_bil": 0.0}
+    params = _params(tmp_path / "inputs", fed=True, fed_income=small_fed, routing=routing)
+    # Issuance follows Treasury's cash, as in the release runs, so a remittance moves borrowing.
+    params["treasury_issuance_profile"] = _profile(nominal_only=True)
+    params["funding_rule"].update({"mode": "cbo_operating_cash_target_financing_v1", "cash_closure_target_bil": 0.0,
+                                   "validation_floor_bil": -0.000001})
+    if mmf_bill_share:
+        params["sector_preferences"][PRIVATE_SUBBUCKET_SHARES_KEY] = {
+            "bills": {DNB: 1.0 - mmf_bill_share, MMF: mmf_bill_share}
+        }
+    position = {"settlement_route": "covered_deposit_settled", "opening_on_rrp_bil": 60.0}
+    params[PRIVATE_SUBBUCKET_MMF_ADDED] = position
+    base, _, closure = _run(params, tmp_path / "baseline")
+    assert ht.DEBT_DIFFERENCE_COLUMN not in base.columns  # the baseline has no target
+    rows, weights = _targets(closure, buyer=PRIVATE_MMF_ADDED, donors=MMF_DONORS, size=60.0,
+                             origin_day=REMIT_ORIGIN, build_end=REMIT_BUILD_END)
+    config = {"mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows,
+              "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED}
+    params["holder_position_target"] = config
+    params[PRIVATE_SUBBUCKET_MMF_ADDED] = {**position, "settlement_route": "on_rrp_mmf"}
+    onrrp, _, onrrp_closure = _run(params, tmp_path / "onrrp")
+    target_path = ht.BuildAndHoldPath.from_points([
+        {"date": REMIT_ORIGIN, "increment_bil": 0.0}, {"date": REMIT_BUILD_END, "increment_bil": 60.0},
+        {"date": END, "increment_bil": 60.0},
+    ])
+    return base, closure, onrrp, onrrp_closure, rows, weights, config, target_path
+
+
+def _assert_debt_difference_held_by_donors(onrrp, onrrp_closure, rows, weights) -> None:
+    """Every close: the buyer and the untraded routes on their targets, the donors on theirs
+    plus their share of the day's D."""
+
+    difference = onrrp[ht.DEBT_DIFFERENCE_COLUMN]
+    realized = _realized(onrrp_closure)
+    for row in rows:
+        day, route = row["date"], (row["holder_type"], row["holder_subbucket"])
+        held = difference.loc[pd.Timestamp(day)] * (-weights[route] if weights[route] < 0.0 else 0.0)
+        if row["phase"] == "pre":
+            assert difference.loc[pd.Timestamp(day)] == pytest.approx(0.0, abs=TOLERANCE)
+            held = 0.0
+        assert realized[(day, route)] == pytest.approx(row["target_stock_bil"] + held, abs=1e-9), (day, route)
+
+
 def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_donors(tmp_path) -> None:
     """The trades change what the Fed pays on its liabilities: the added fund's ON RRP cash
     becomes reserves earning IORB, and foreign sellers leave part of their proceeds in
@@ -533,56 +587,114 @@ def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_
     who give up the position, in their donor weights; the added position and the ordinary
     money funds stay exactly on their targets."""
 
-    # A Fed that earns more than it pays, so it remits: 3,000 of reserves once the fixture's
-    # 15,860 of ON RRP and foreign balances are drawn from the H.4.1 level.
-    small_fed = {"h41_reserve_balances_bil": 18_860.0, "h41_tga_bil": 0.0, "other_income_bil": 3.0,
-                 "h41_earnings_remittances_due_bil": 0.0}
-    params = _params(tmp_path / "inputs", fed=True, fed_income=small_fed)
-    # Issuance follows Treasury's cash, as in the release runs, so a remittance moves borrowing.
-    params["treasury_issuance_profile"] = _profile(nominal_only=True)
-    params["funding_rule"].update({"mode": "cbo_operating_cash_target_financing_v1", "cash_closure_target_bil": 0.0,
-                                   "validation_floor_bil": -0.000001})
-    position = {"settlement_route": "covered_deposit_settled", "opening_on_rrp_bil": 60.0}
-    params[PRIVATE_SUBBUCKET_MMF_ADDED] = position
-    base, _, closure = _run(params, tmp_path / "baseline")
-    assert ht.DEBT_DIFFERENCE_COLUMN not in base.columns  # the baseline has no target
-    # The build ends early enough that the changed income is remitted on 2026-09-30, a day
-    # Treasury sizes its auction to land cash on target, so borrowing absorbs it.
-    rows, weights = _targets(closure, buyer=PRIVATE_MMF_ADDED, donors=MMF_DONORS, size=60.0,
-                             origin_day="2026-09-21", build_end="2026-09-22")
-    params["holder_position_target"] = {
-        "mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "rows": rows,
-        "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED,
-    }
-    params[PRIVATE_SUBBUCKET_MMF_ADDED] = {**position, "settlement_route": "on_rrp_mmf"}
-    onrrp, _, onrrp_closure = _run(params, tmp_path / "onrrp")
-
+    base, _, onrrp, onrrp_closure, rows, weights, config, target_path = _remitting_pair(tmp_path)
     difference = onrrp[ht.DEBT_DIFFERENCE_COLUMN]
     remitted = onrrp.loc[:"2026-09-30", "CB_Remittance"].sum() - base.loc[:"2026-09-30", "CB_Remittance"].sum()
     assert abs(remitted) > TOLERANCE  # the trades moved what the Fed remitted
     assert onrrp.loc[:"2026-09-29", ht.DEBT_DIFFERENCE_COLUMN].abs().max() < TOLERANCE
     # and Treasury borrows that much less (or more) at the auction that lands its cash on target
     assert difference.iloc[-1] * remitted < 0.0 and abs(difference.iloc[-1]) > TOLERANCE
+    _assert_debt_difference_held_by_donors(onrrp, onrrp_closure, rows, weights)
+    assert onrrp[ht.CORRECTION_FACE_COLUMN].abs().max() == 0.0  # ordinary funds take no auction bills here
+
+    def check(results, closure=onrrp_closure, rows=rows):
+        return ht.check_stock_target_run(results, closure, {**config, "rows": rows}, target_path=target_path,
+                                         weights=weights)
+
+    assert check(onrrp) == pytest.approx(difference.abs().max())
+    last = onrrp.index[-1]
+    tampered = {
+        "does not follow the debt-difference rule": [  # D booked with the ordinary money funds
+            ("HolderTarget_PrivateMMF", difference.iloc[-1]), ("HolderTarget_Banks", difference.iloc[-1] * weights[BANKS])],
+        "public stock less the baseline's": [(ht.DEBT_DIFFERENCE_COLUMN, -difference.iloc[-1])],
+        "nonfinite": [(ht.DEBT_DIFFERENCE_COLUMN, float("nan"))],
+        # A reported target 9e-6 off is far below a relative 1e-9 of 10,000, but above the tolerance.
+        "HolderTarget_|Banks target": [("HolderTarget_Banks", 9.0 * TOLERANCE)],
+    }
+    for message, changes in tampered.items():
+        results = onrrp.copy()
+        for column, change in changes:
+            results.loc[last, column] = results.loc[last, column] + change
+        with pytest.raises(ht.HolderTargetError, match=message):
+            check(results)
+    with pytest.raises(ht.HolderTargetError, match="has no close on 2026-10-01"):
+        check(onrrp.drop(pd.Timestamp("2026-10-01")))
+    with pytest.raises(ht.HolderTargetError, match="no complete holder target for the 2026-10-01 close"):
+        check(onrrp, rows=[row for row in rows if row["date"] != "2026-10-01"])
+    with pytest.raises(ht.HolderTargetError, match="stock closure has no 2026-10-01 close"):
+        check(onrrp, closure=onrrp_closure[onrrp_closure["period_end"] != "2026-10-01"])
+
+
+def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at_auction(tmp_path) -> None:
+    """The release's auction split: ordinary money funds take 35 percent of private bill
+    allocations, and foreign holders settle through banks. The ON RRP-funded position then
+    only raises the Fed's interest expense, since reserves earn IORB above the ON RRP rate, so
+    the Fed remits less and Treasury issues more. Part of the added bills reaches the untraded
+    ordinary money funds at auction; they sell it to the donors in donor weights, ending on
+    their baseline target, and that correction is recorded on its own."""
+
+    routing = _routing()
+    routing["foreign_settlement_mix"] = {"foreign_bank_settled": 1.0, "foreign_official_deposit": 0.0,
+                                         "foreign_official_rrp": 0.0}
+    base, base_closure, onrrp, onrrp_closure, rows, weights, config, target_path = _remitting_pair(
+        tmp_path, routing=routing, mmf_bill_share=0.35)
+    difference = onrrp[ht.DEBT_DIFFERENCE_COLUMN]
+    remitted = onrrp.loc[:"2026-09-30", "CB_Remittance"].sum() - base.loc[:"2026-09-30", "CB_Remittance"].sum()
+    assert remitted < -TOLERANCE and difference.iloc[-1] > TOLERANCE  # the Fed remits less; Treasury owes more
+    correction = onrrp[ht.CORRECTION_FACE_COLUMN]
+    assert correction.min() < -TOLERANCE  # the ordinary funds sold their auction share of D back
+    days = correction.index[correction != 0.0]
+    assert (difference.loc[days].abs() > TOLERANCE).all()
+    assert onrrp.loc[days, ht.CORRECTION_CASH_COLUMN].lt(0.0).all()  # they were paid for it
+    label = ht.PARTICIPANT_LABELS[PRIVATE_MMF]
+    assert onrrp[f"HolderTargetSoldFace_{label}"].to_numpy() == pytest.approx(-correction.to_numpy(), abs=1e-12)
+    assert onrrp[f"HolderTargetBoughtFace_{label}"].abs().max() == 0.0
+    # The ordinary funds end every close exactly on their baseline stock, as do the buyer and
+    # the donors on theirs plus their share of D.
+    baseline_mmf = {(r.period_end, (r.holder_sector, r.holder_subsector)): r.closing_stock_bil
+                    for r in ht.closing_holder_stocks(base_closure).itertuples()}
     realized = _realized(onrrp_closure)
-    for row in rows:
-        day, route = row["date"], (row["holder_type"], row["holder_subbucket"])
-        held = difference.loc[pd.Timestamp(day)] * (-weights[route] if weights[route] < 0.0 else 0.0)
-        if row["phase"] == "pre":
-            assert difference.loc[pd.Timestamp(day)] == pytest.approx(0.0, abs=TOLERANCE)
-            held = 0.0
-        assert realized[(day, route)] == pytest.approx(row["target_stock_bil"] + held, abs=TOLERANCE), (day, route)
-    path = ht.holder_target_path(params["holder_position_target"])
-    assert ht.check_debt_difference(onrrp, path) == pytest.approx(difference.abs().max())
-    shifted = onrrp.copy()  # D booked with the ordinary money funds instead of the donors
-    last = shifted.index[-1]
-    shifted.loc[last, "HolderTarget_PrivateMMF"] += difference.iloc[-1]
-    shifted.loc[last, "HolderTarget_Banks"] -= difference.iloc[-1] * -weights[BANKS]
-    with pytest.raises(ht.HolderTargetError, match="does not follow the debt-difference rule"):
-        ht.check_debt_difference(shifted, path)
-    misreported = onrrp.copy()
-    misreported.loc[last, ht.DEBT_DIFFERENCE_COLUMN] = 0.0
-    with pytest.raises(ht.HolderTargetError, match="public stock less the baseline's"):
-        ht.check_debt_difference(misreported, path)
+    for key, value in realized.items():
+        if key[1] == PRIVATE_MMF:
+            assert value == pytest.approx(baseline_mmf[key], abs=1e-9), key
+    _assert_debt_difference_held_by_donors(onrrp, onrrp_closure, rows, weights)
+
+    def check(results):
+        return ht.check_stock_target_run(results, onrrp_closure, config, target_path=target_path, weights=weights)
+
+    assert check(onrrp) == pytest.approx(difference.abs().max())
+    day = days[0]
+    for column, change in ((ht.CORRECTION_FACE_COLUMN, 0.001), (ht.CORRECTION_CASH_COLUMN, -0.001),
+                           (f"HolderTargetBoughtFace_{label}", 0.001)):
+        tampered = onrrp.copy()
+        tampered.loc[day, column] += change
+        with pytest.raises(ht.HolderTargetError, match="correction is not the untraded routes' trades"):
+            check(tampered)
+    quiet = onrrp.copy()  # a correction on a close with no debt difference to correct
+    quiet.loc[onrrp.index[2], [ht.CORRECTION_FACE_COLUMN, f"HolderTargetBoughtFace_{label}"]] = 0.001
+    with pytest.raises(ht.HolderTargetError, match="without a debt difference"):
+        check(quiet)
+
+
+def test_an_untraded_route_trades_only_what_a_debt_difference_brings_it() -> None:
+    day = pd.Timestamp("2026-09-22")
+    weights = {BANKS: -0.5, FOREIGN: -0.5, PRIVATE_MMF_ADDED: 1.0}
+    path = ht.holder_target_path({
+        "mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED,
+        "rows": [{"date": day.date().isoformat(), "phase": "build", "holder_type": holder, "holder_subbucket": route,
+                  "target_stock_bil": 100.0, "displacement_weight": weights.get((holder, route), 0.0)}
+                 for holder, route in ht.PARTICIPANTS],
+    })
+    gaps = {route: 0.0 for route in ht.PARTICIPANTS}
+    gaps[PRIVATE_MMF] = -0.2  # the ordinary funds hold 0.2 above their baseline
+    with pytest.raises(ht.HolderTargetError, match="Untraded route"):
+        path.correction_flows(gaps, TOLERANCE / 2.0, current_date=day)
+    assert path.correction_flows({**gaps, PRIVATE_MMF: -TOLERANCE / 2.0}, 0.0, current_date=day) == []
+    assert path.correction_flows(gaps, 0.6, current_date=day) == [
+        (PRIVATE_MMF, BANKS, pytest.approx(0.1)), (PRIVATE_MMF, FOREIGN, pytest.approx(0.1))]
+    gaps[PRIVATE_MMF] = 0.2  # short of it: it buys from the donors
+    assert path.correction_flows(gaps, -0.6, current_date=day) == [
+        (BANKS, PRIVATE_MMF, pytest.approx(0.1)), (FOREIGN, PRIVATE_MMF, pytest.approx(0.1))]
 
 
 def test_a_debt_difference_before_the_build_or_with_no_donors_raises() -> None:
@@ -712,8 +824,7 @@ def test_bill_stock_control_assigns_the_realized_change_and_settles_at_dirty_pri
     result, _, _ = _run(treatment, tmp_path / "treatment")
     # Bill-stock targets assign the realized change by their own weights; the stock-target
     # debt-difference rule and its column do not apply.
-    assert ht.DEBT_DIFFERENCE_COLUMN not in result.columns
-    assert ht.check_debt_difference(result, ht.holder_target_path(treatment["holder_position_target"])) == 0.0
+    assert not set(ht.STOCK_TARGET_COLUMNS) & set(result.columns)
     difference = result[list(bills.values())] - base[list(bills.values())]
     total = difference.sum(axis=1)
     assert total.abs().max() >= 10.0

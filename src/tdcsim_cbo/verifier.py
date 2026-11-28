@@ -1791,14 +1791,23 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         remittance_cash = fed_checks["max_remittance_bil"]
     except (OSError, ValueError, KeyError) as exc:
         raise VerificationError(f"Fed remittance verification failed: {exc}") from exc
-    # A stock-target scenario holds its debt difference with the donors, exactly.
+    # A stock-target scenario: every close rebuilt from the declaration and the stock closure.
     holder_config = runner_module._holder_position_target(inputs_dir)
-    if holder_config is not None:
+    if holder_config is not None and holder_config["mode"] == holder_targets.HOLDER_TARGET_MODE:
         try:
-            holder_targets.check_debt_difference(
-                results.set_index(pd.to_datetime(results["Date"])), holder_targets.holder_target_path(holder_config),
+            declaration = json.loads(
+                (inputs_dir / runner_module.HOLDER_TARGET_SPEC_FILE).read_text(encoding="utf-8")
+            )["declaration"]
+            closure = pd.read_csv(
+                _output_artifact_path(root, manifest, "tdcsim_period_stock_closure"),
+                keep_default_na=False, float_precision="round_trip",
             )
-        except (holder_targets.HolderTargetError, KeyError) as exc:
+            holder_targets.check_stock_target_run(
+                results.set_index(pd.to_datetime(results["Date"])), closure, holder_config,
+                target_path=holder_targets.BuildAndHoldPath.from_points(list(declaration["target_path"])),
+                weights=holder_targets.declared_weights(declaration),
+            )
+        except (holder_targets.HolderTargetError, KeyError, ValueError, OSError) as exc:
             raise VerificationError(f"holder position target verification failed: {exc}") from exc
     target_tolerance = (
         _BOUNDED_TARGET_TOLERANCE_BIL if bounded_limits else 1e-5

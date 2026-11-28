@@ -8,7 +8,10 @@ scenario's own debt differs from the baseline's (a position that changes the Fed
 Reserve's income changes its remittances, and so Treasury's borrowing), the day's
 difference D, the scenario public stock less the baseline's, is held by the holders who give
 up the position, in their declared donor weights; the buyer and every other route keep
-their targets exactly. Before the intervention starts D must be zero.
+their targets exactly. Before the intervention starts D must be zero. A route the controller
+leaves untraded (ordinary money funds when the added position is the buyer) must match the
+baseline by itself; when D is above tolerance, the extra or reduced issuance reaching it at
+auction is traded back with the donors, in their donor weights, as a correction.
 
 After the day's Federal Reserve operation, holders above target sell nominal bills to
 holders below target, each seller's excess split across the buyers in proportion to their
@@ -81,6 +84,10 @@ DUST_BIL = 1.0e-9
 PHASE_COLUMN = "HolderTargetPhase"
 # The scenario public stock less the baseline's at the close; recorded in stock-target runs.
 DEBT_DIFFERENCE_COLUMN = "HolderTargetDebtDifference"
+# Net face and cash the untraded routes bought from the donors at the close (negative: sold).
+CORRECTION_FACE_COLUMN = "HolderTargetCorrectionFace"
+CORRECTION_CASH_COLUMN = "HolderTargetCorrectionCash"
+STOCK_TARGET_COLUMNS = (DEBT_DIFFERENCE_COLUMN, CORRECTION_FACE_COLUMN, CORRECTION_CASH_COLUMN)
 SUMMARY_COLUMNS = (
     "HolderTargetPreTradeMaxGap",
     "HolderTargetMaxError",
@@ -175,6 +182,33 @@ class HolderTargetPath:
         _, reference = self.rows[pd.Timestamp(day).normalize()]
         return math.fsum(stocks.values()) - math.fsum(reference.values())
 
+    def correction_flows(
+        self, gaps: Mapping[tuple[str, str], float], difference: float, *, current_date: Any,
+    ) -> list[tuple[tuple[str, str], tuple[str, str], float]]:
+        """Seller-to-buyer face that returns each untraded route to its target with the donors.
+
+        An untraded route may differ from its target only through D: with D above tolerance it
+        trades its whole gap with the donors in their donor weights; otherwise a gap above
+        tolerance raises and a smaller one is left alone."""
+
+        flows = []
+        for route in self.frozen_routes:
+            gap = float(gaps[route])
+            if abs(difference) <= self.tolerance_bil or not self.donor_shares:
+                if abs(gap) > self.tolerance_bil:
+                    raise HolderTargetError(
+                        f"Untraded route {route} differs from the baseline at the "
+                        f"{pd.Timestamp(current_date).date()} close."
+                    )
+                continue
+            if abs(gap) <= DUST_BIL:
+                continue
+            for donor in PARTICIPANTS:
+                if donor in self.donor_shares:
+                    amount = abs(gap) * self.donor_shares[donor]
+                    flows.append((route, donor, amount) if gap < 0.0 else (donor, route, amount))
+        return flows
+
 
 def bill_change_weights(rows: list[Mapping[str, Any]]) -> dict[tuple[str, str], float]:
     """Positive shares of the change in non-Fed bills. Unnamed routes keep their baseline bill stock."""
@@ -242,29 +276,85 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
                             frozen_routes=frozen_routes, donor_shares=donor_shares)
 
 
-def check_debt_difference(results: pd.DataFrame, path: "HolderTargetPath") -> float:
-    """Every stock-target close: the recorded D is the public stock less the baseline's, the
-    donors' targets carry it in their donor shares, every other target is the baseline-relative
-    one, and the stocks meet the targets. Returns the largest absolute D."""
+def check_stock_target_run(
+    results: pd.DataFrame,
+    stock_closure: pd.DataFrame,
+    config: Mapping[str, Any],
+    *,
+    target_path: "BuildAndHoldPath",
+    weights: Mapping[tuple[str, str], float],
+) -> float:
+    """Rebuild a stock-target run's every close and fail unless the run follows it.
 
-    if path.bill_change_weights is not None:
+    Targets come from the dated baseline stocks, the declared path and weights, and D from the
+    post-trade stock closure: the public stock less the baseline's. Every close after the
+    opening must have finite inputs, a recorded D and reported targets within the declared
+    tolerance of the rebuilt ones, stocks within tolerance of their targets, and corrections
+    only of untraded routes, only with D above tolerance, matching those routes' trades.
+    Returns the largest absolute D."""
+
+    path = holder_target_path(config)
+    if path is None or path.bill_change_weights is not None:
         return 0.0
+    rows = list(config.get("rows") or ())
+    check_target_rows(rows, path=target_path, weights=weights)
+    tolerance = path.tolerance_bil
+    shares = {route: -weight for route, weight in weights.items() if weight < 0.0}
+    baseline: dict[pd.Timestamp, dict[tuple[str, str], float]] = {}
+    for row in rows:
+        baseline.setdefault(pd.Timestamp(row["date"]).normalize(), {})[
+            (str(row["holder_type"]), str(row.get("holder_subbucket") or ""))
+        ] = float(row["baseline_stock_bil"])
+    closing = closing_holder_stocks(stock_closure)
+    stocks_by_day: dict[pd.Timestamp, dict[tuple[str, str], float]] = {}
+    for record in closing.itertuples(index=False):
+        stocks_by_day.setdefault(pd.Timestamp(record.period_end).normalize(), {})[
+            (record.holder_sector, record.holder_subsector)
+        ] = float(record.closing_stock_bil)
+    closes = [pd.Timestamp(day).normalize() for day in results.index[1:]]  # the controller acts after the opening
+    if not closes:
+        raise HolderTargetError("the run has no close after the opening")
+    closed = set(closes)
+    missing = [day for day in baseline if closes[0] <= day <= closes[-1] and day not in closed]
+    if missing:
+        raise HolderTargetError(f"the run has no close on {missing[0].date()}, a dated target")
     largest = 0.0
-    for day, row in results.iloc[1:].iterrows():  # the controller acts at every close after the opening
-        key = pd.Timestamp(day).normalize()
-        if key not in path.rows:
-            continue
-        phase, reference = path.rows[key]
-        stocks = {p: float(row[STOCK_COLUMNS["HolderStock"][p]]) for p in PARTICIPANTS}
-        targets, difference = path.stock_targets(key, phase, reference, stocks)
-        if abs(float(row[DEBT_DIFFERENCE_COLUMN]) - difference) > 1.0e-9 * max(1.0, abs(difference)):
-            raise HolderTargetError(f"the recorded debt difference on {key.date()} is not the public stock less the baseline's")
+    for day, (_, row) in zip(closes, results.iloc[1:].iterrows(), strict=True):
+        if day not in baseline or set(baseline[day]) != set(PARTICIPANTS):
+            raise HolderTargetError(f"no complete holder target for the {day.date()} close")
+        if day not in stocks_by_day:
+            raise HolderTargetError(f"the stock closure has no {day.date()} close")
+        reference = {p: baseline[day][p] + target_path.increment(day) * weights[p] for p in PARTICIPANTS}
+        stocks = stocks_by_day[day]
+        values = [*reference.values(), *stocks.values(), float(row[DEBT_DIFFERENCE_COLUMN]),
+                  float(row[CORRECTION_FACE_COLUMN]), float(row[CORRECTION_CASH_COLUMN])]
+        if not all(math.isfinite(value) for value in values):
+            raise HolderTargetError(f"the {day.date()} close has a nonfinite target input")
+        difference = math.fsum(stocks.values()) - math.fsum(reference.values())
+        if abs(float(row[DEBT_DIFFERENCE_COLUMN]) - difference) > tolerance:
+            raise HolderTargetError(f"the recorded debt difference on {day.date()} is not the public stock less the baseline's")
+        if target_path.phase(day) == "pre" and abs(difference) > tolerance:
+            raise HolderTargetError(f"the public stock differs from the baseline on {day.date()}, before the intervention starts")
         for p in PARTICIPANTS:
             label = PARTICIPANT_LABELS[p]
-            if abs(float(row[f"HolderTarget_{label}"]) - targets[p]) > 1.0e-9 * max(1.0, abs(targets[p])):
-                raise HolderTargetError(f"{label} target on {key.date()} does not follow the debt-difference rule")
-            if abs(stocks[p] - targets[p]) > path.tolerance_bil:
-                raise HolderTargetError(f"{label} misses its target on {key.date()}")
+            target = reference[p] + difference * shares.get(p, 0.0)
+            reported = float(row[f"HolderTarget_{label}"])
+            if not math.isfinite(reported) or abs(reported - target) > tolerance:
+                raise HolderTargetError(f"{label} target on {day.date()} does not follow the debt-difference rule")
+            if abs(stocks[p] - target) > tolerance:
+                raise HolderTargetError(f"{label} misses its target on {day.date()}")
+        face, cash = float(row[CORRECTION_FACE_COLUMN]), float(row[CORRECTION_CASH_COLUMN])
+        if path.frozen_routes:
+            traded = [
+                tuple(float(row[f"HolderTarget{stem}_{PARTICIPANT_LABELS[route]}"]) for route in path.frozen_routes)
+                for stem in ("BoughtFace", "SoldFace", "BoughtCash", "SoldCash")
+            ]
+            bought, sold, bought_cash, sold_cash = (math.fsum(values) for values in traded)
+            if min(bought, sold) > DUST_BIL or abs(face - (bought - sold)) > tolerance \
+                    or abs(cash - (bought_cash - sold_cash)) > tolerance:
+                raise HolderTargetError(f"the {day.date()} correction is not the untraded routes' trades")
+        if (abs(face) > DUST_BIL or abs(cash) > DUST_BIL) and (not path.frozen_routes or abs(difference) <= tolerance):
+            raise HolderTargetError(f"a correction trades on {day.date()} without a debt difference to correct")
         largest = max(largest, abs(difference))
     return largest
 
@@ -455,6 +545,20 @@ class RebalanceReport:
     bought_cash: dict[tuple[str, str], float] = field(default_factory=lambda: {p: 0.0 for p in PARTICIPANTS})
     sold_cash: dict[tuple[str, str], float] = field(default_factory=lambda: {p: 0.0 for p in PARTICIPANTS})
 
+    def add(self, other: "RebalanceReport") -> None:
+        """Fold another trade step of the same close into this report."""
+
+        self.trade_face += other.trade_face
+        self.trade_cash += other.trade_cash
+        self.lot_splits += other.lot_splits
+        for pair, (face, cash) in other.pairs.items():
+            totals = self.pairs.setdefault(pair, [0.0, 0.0])
+            totals[0] += face
+            totals[1] += cash
+        for name in ("bought_face", "sold_face", "bought_cash", "sold_cash"):
+            for participant, value in getattr(other, name).items():
+                getattr(self, name)[participant] += value
+
 
 def rebalance_holder_positions(
     portfolio: pd.DataFrame,
@@ -464,14 +568,16 @@ def rebalance_holder_positions(
     price: Callable[[pd.Series, float], Mapping[str, float]],
     row_budget: int | None = None,
     record_mmf_acquisition: Callable[[Any, str, Any], None] | None = None,
+    flows: list[tuple[tuple[str, str], tuple[str, str], float]] | None = None,
 ) -> tuple[pd.DataFrame, RebalanceReport]:
-    """Close ``gaps`` by moving nominal bills from holders above target to holders below it.
+    """Close ``gaps`` by moving nominal bills from holders above target to holders below it,
+    or move the given seller-to-buyer ``flows`` instead.
 
     ``price(row, face)`` returns the dirty settlement value of ``face`` of the lot in ``row``.
     """
 
     day = pd.Timestamp(current_date).normalize()
-    flows = plan_transfers(gaps)
+    flows = plan_transfers(gaps) if flows is None else flows
     report = RebalanceReport()
     pieces: list[tuple[Any, float, tuple[str, str], tuple[str, str]]] = []
     for seller in PARTICIPANTS:
@@ -768,10 +874,13 @@ def result_values(
 
 
 __all__ = [
+    "CORRECTION_CASH_COLUMN",
+    "CORRECTION_FACE_COLUMN",
     "DEBT_DIFFERENCE_COLUMN",
     "HOLDER_TARGET_MODE",
     "PARTICIPANTS",
-    "check_debt_difference",
+    "STOCK_TARGET_COLUMNS",
+    "check_stock_target_run",
     "PARTICIPANT_LABELS",
     "PHASES",
     "PHASE_COLUMN",

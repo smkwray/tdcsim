@@ -18,7 +18,9 @@ measured from the origin close, and writes (USD billions):
   credited to deposit users, fiscal and other flows and a reconciliation residual, and the
   TRC difference split into the holder-routed reserve path and the route-held balances;
 - controller_turnover.csv: the target trades by phase and holder route, gross and net of
-  the build, with the difference in the Federal Reserve's purchase cash;
+  the build, with the difference in the Federal Reserve's purchase cash and the corrections
+  that return the untraded ordinary money funds to their target when D reaches them at
+  auction (net and gross face, net cash, and days);
 - receipt.json: producer, inputs, baseline references, clock, stock basis, funding states
   and the checks below.
 
@@ -339,6 +341,10 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
             "net_target_change_bil": net, "turnover_above_net_target_change_bil": gross - net,
             "trade_days": int((rows_phase["HolderTargetTradeFace"] > 0.0).sum()),
             "lot_splits": int(rows_phase["HolderTargetLotSplits"].sum()),
+            "correction_net_face_bil": float(rows_phase[ht.CORRECTION_FACE_COLUMN].sum()),
+            "correction_gross_face_bil": float(rows_phase[ht.CORRECTION_FACE_COLUMN].abs().sum()),
+            "correction_net_cash_bil": float(rows_phase[ht.CORRECTION_CASH_COLUMN].sum()),
+            "correction_days": int((rows_phase[ht.CORRECTION_FACE_COLUMN] != 0.0).sum()),
             "fed_purchase_face_difference_bil": float(
                 (rows_phase["CBOFedSecondaryPurchaseFace"] - base_phase["CBOFedSecondaryPurchaseFace"]).sum()),
             "fed_purchase_cash_difference_bil": float(
@@ -350,6 +356,7 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
             "pre_origin_max_abs_difference": max(pre_gap, pre_trc_gap),
             "issuer_max_abs_difference_bil": issuer,
             "max_abs_debt_difference_bil": max_difference,
+            "max_abs_daily_correction_face_bil": float(results[ht.CORRECTION_FACE_COLUMN].abs().max()),
             "debt_difference_identity_max_abs_bil": identity_gap,
             "max_abs_target_error_bil": float(checked["error"].abs().max()),
             "closes_checked": int(checked["date"].nunique()),
