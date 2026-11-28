@@ -3,7 +3,12 @@
 A scenario may require each public holder's controlled public marketable Treasury stock
 (par, adjusted principal for TIPS) to equal a dated target at every period close: the
 holder's realized closing stock in a matched baseline run plus a stated increment. The
-increments sum to zero, so the targets sum to the stock the public holds in both runs.
+increments sum to zero, so the targets sum to the baseline public's stock. Where the
+scenario's own debt differs from the baseline's (a position that changes the Federal
+Reserve's income changes its remittances, and so Treasury's borrowing), the day's
+difference D, the scenario public stock less the baseline's, is held by the holders who give
+up the position, in their declared donor weights; the buyer and every other route keep
+their targets exactly. Before the intervention starts D must be zero.
 
 After the day's Federal Reserve operation, holders above target sell nominal bills to
 holders below target, each seller's excess split across the buyers in proportion to their
@@ -74,6 +79,8 @@ BUCKET_EDGES_DAYS = (30, 91, 182)
 DUST_BIL = 1.0e-9
 
 PHASE_COLUMN = "HolderTargetPhase"
+# The scenario public stock less the baseline's at the close; recorded in stock-target runs.
+DEBT_DIFFERENCE_COLUMN = "HolderTargetDebtDifference"
 SUMMARY_COLUMNS = (
     "HolderTargetPreTradeMaxGap",
     "HolderTargetMaxError",
@@ -112,6 +119,8 @@ class HolderTargetPath:
     rows: Mapping[pd.Timestamp, tuple[str, dict[tuple[str, str], float]]]
     bill_change_weights: Mapping[tuple[str, str], float] | None = None
     frozen_routes: tuple[tuple[str, str], ...] = ()
+    # Stock targets: each donor's share of the position it gives up, which it also holds of D.
+    donor_shares: Mapping[tuple[str, str], float] = field(default_factory=dict)
 
     @property
     def stock_column_stem(self) -> str:
@@ -126,13 +135,45 @@ class HolderTargetPath:
         except KeyError:
             raise HolderTargetError(f"no holder position target for the {key.date()} close") from None
         if self.bill_change_weights is None:
-            return phase, reference
+            return phase, self.stock_targets(key, phase, reference, stocks)[0]
         delta = math.fsum(stocks.values()) - math.fsum(reference.values())
         targets = {p: reference[p] + delta * self.bill_change_weights.get(p, 0.0) for p in PARTICIPANTS}
         for p, target in targets.items():
             if target < 0.0:
                 raise HolderTargetError(f"{PARTICIPANT_LABELS[p]} bill target on {key.date()} is negative: {target}")
         return phase, targets
+
+
+    def stock_targets(
+        self, day: pd.Timestamp, phase: str, reference: Mapping[tuple[str, str], float],
+        stocks: Mapping[tuple[str, str], float],
+    ) -> tuple[dict[tuple[str, str], float], float]:
+        """Stock targets with the day's debt difference D held by the donors, and D."""
+
+        difference = math.fsum(stocks.values()) - math.fsum(reference.values())
+        if phase == "pre":
+            if abs(difference) > self.tolerance_bil:
+                raise HolderTargetError(
+                    f"the public holds {difference:.9f} billion more than the matched baseline on {day.date()}, "
+                    "before the intervention starts"
+                )
+            return dict(reference), difference
+        if not self.donor_shares:
+            if abs(difference) > self.tolerance_bil:
+                raise HolderTargetError(
+                    f"the public holds {difference:.9f} billion more than the matched baseline on {day.date()} "
+                    "and the target names no donors to hold it"
+                )
+            return dict(reference), difference
+        targets = {p: reference[p] + difference * self.donor_shares.get(p, 0.0) for p in PARTICIPANTS}
+        for p, target in targets.items():
+            if target < 0.0:
+                raise HolderTargetError(f"{PARTICIPANT_LABELS[p]} target on {day.date()} is negative: {target}")
+        return targets, difference
+
+    def debt_difference(self, day: Any, stocks: Mapping[tuple[str, str], float]) -> float:
+        _, reference = self.rows[pd.Timestamp(day).normalize()]
+        return math.fsum(stocks.values()) - math.fsum(reference.values())
 
 
 def bill_change_weights(rows: list[Mapping[str, Any]]) -> dict[tuple[str, str], float]:
@@ -163,6 +204,7 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
     if not math.isfinite(tolerance) or tolerance <= 0.0:
         raise HolderTargetError("holder position target tolerance must be positive")
     dated: dict[pd.Timestamp, tuple[str, dict[tuple[str, str], float]]] = {}
+    displacement: dict[tuple[str, str], float] = {}
     for row in config.get("rows") or ():
         day = pd.Timestamp(row["date"]).normalize()
         phase = "hold" if bills else str(row["phase"])
@@ -180,6 +222,10 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
         if holder in targets:
             raise HolderTargetError(f"holder target for {holder} on {day.date()} is repeated")
         targets[holder] = target
+        if not bills and row.get("displacement_weight") not in (None, ""):
+            weight = float(row["displacement_weight"])
+            if displacement.setdefault(holder, weight) != weight:
+                raise HolderTargetError(f"displacement weight for {holder} changes across dates")
     if not dated:
         raise HolderTargetError("holder position target has no dated rows")
     for day, (_, targets) in dated.items():
@@ -188,7 +234,39 @@ def holder_target_path(config: Mapping[str, Any] | None) -> HolderTargetPath | N
     frozen_routes = ()
     if config.get("buyer_private_route") == PRIVATE_SUBBUCKET_MMF_ADDED:
         frozen_routes = (("Private", PRIVATE_SUBBUCKET_MMF),)
-    return HolderTargetPath(tolerance_bil=tolerance, rows=dated, bill_change_weights=weights, frozen_routes=frozen_routes)
+    # The donors give up the position in proportion to their weights; they hold D the same way.
+    donor_shares = {route: -weight for route, weight in displacement.items() if weight < 0.0}
+    if donor_shares and not math.isclose(math.fsum(donor_shares.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise HolderTargetError("donor displacement weights must sum to minus one")
+    return HolderTargetPath(tolerance_bil=tolerance, rows=dated, bill_change_weights=weights,
+                            frozen_routes=frozen_routes, donor_shares=donor_shares)
+
+
+def check_debt_difference(results: pd.DataFrame, path: "HolderTargetPath") -> float:
+    """Every stock-target close: the recorded D is the public stock less the baseline's, the
+    donors' targets carry it in their donor shares, every other target is the baseline-relative
+    one, and the stocks meet the targets. Returns the largest absolute D."""
+
+    if path.bill_change_weights is not None:
+        return 0.0
+    largest = 0.0
+    for day, row in results.iloc[1:].iterrows():  # the controller acts at every close after the opening
+        key = pd.Timestamp(day).normalize()
+        if key not in path.rows:
+            continue
+        phase, reference = path.rows[key]
+        stocks = {p: float(row[STOCK_COLUMNS["HolderStock"][p]]) for p in PARTICIPANTS}
+        targets, difference = path.stock_targets(key, phase, reference, stocks)
+        if abs(float(row[DEBT_DIFFERENCE_COLUMN]) - difference) > 1.0e-9 * max(1.0, abs(difference)):
+            raise HolderTargetError(f"the recorded debt difference on {key.date()} is not the public stock less the baseline's")
+        for p in PARTICIPANTS:
+            label = PARTICIPANT_LABELS[p]
+            if abs(float(row[f"HolderTarget_{label}"]) - targets[p]) > 1.0e-9 * max(1.0, abs(targets[p])):
+                raise HolderTargetError(f"{label} target on {key.date()} does not follow the debt-difference rule")
+            if abs(stocks[p] - targets[p]) > path.tolerance_bil:
+                raise HolderTargetError(f"{label} misses its target on {key.date()}")
+        largest = max(largest, abs(difference))
+    return largest
 
 
 def closing_stocks(portfolio: pd.DataFrame) -> dict[str, dict[tuple[str, str], float]]:
@@ -690,8 +768,10 @@ def result_values(
 
 
 __all__ = [
+    "DEBT_DIFFERENCE_COLUMN",
     "HOLDER_TARGET_MODE",
     "PARTICIPANTS",
+    "check_debt_difference",
     "PARTICIPANT_LABELS",
     "PHASES",
     "PHASE_COLUMN",

@@ -4205,6 +4205,8 @@ def run_simulation(
         results[holder_targets.PHASE_COLUMN] = ''
         for numeric_col in holder_targets.RESULT_COLUMNS:
             results[numeric_col] = 0.0
+        if holder_target_path.bill_change_weights is None:
+            results[holder_targets.DEBT_DIFFERENCE_COLUMN] = 0.0
     raw_events = params.get('events', [])
     scheduled_events = defaultdict(list)
     processed_event_ids = set()
@@ -6815,6 +6817,10 @@ def run_simulation(
             holder_target_stocks = closing_holder_stocks[stock_stem]
             holder_target_phase, holder_target_vector = holder_target_path.for_date(current_date, holder_target_stocks)
             holder_target_tolerance = holder_target_path.tolerance_bil
+            if holder_target_path.bill_change_weights is None:
+                results.loc[current_date, holder_targets.DEBT_DIFFERENCE_COLUMN] = holder_target_path.debt_difference(
+                    current_date, holder_target_stocks,
+                )
             holder_target_gaps = holder_targets.target_gaps(
                 holder_target_stocks,
                 holder_target_vector,

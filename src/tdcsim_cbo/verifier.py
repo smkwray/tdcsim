@@ -104,6 +104,7 @@ from .output import (
 from .process_watchdog import THREAD_LIMIT_ENVIRONMENT_VARIABLES
 from fed_income import FED_INCOME_RESULT_COLUMNS
 from tips_indexation import value_opening_tips
+import holder_targets
 from tdc_shared import INTRAGOV_HOLDERS, PRIVATE_SUBBUCKET_MMF
 from .runtime_identity import (
     assert_loaded_distribution_modules,
@@ -1790,6 +1791,15 @@ def _verify_output_invariants(root: Path, manifest: dict[str, Any]) -> dict[str,
         remittance_cash = fed_checks["max_remittance_bil"]
     except (OSError, ValueError, KeyError) as exc:
         raise VerificationError(f"Fed remittance verification failed: {exc}") from exc
+    # A stock-target scenario holds its debt difference with the donors, exactly.
+    holder_config = runner_module._holder_position_target(inputs_dir)
+    if holder_config is not None:
+        try:
+            holder_targets.check_debt_difference(
+                results.set_index(pd.to_datetime(results["Date"])), holder_targets.holder_target_path(holder_config),
+            )
+        except (holder_targets.HolderTargetError, KeyError) as exc:
+            raise VerificationError(f"holder position target verification failed: {exc}") from exc
     target_tolerance = (
         _BOUNDED_TARGET_TOLERANCE_BIL if bounded_limits else 1e-5
     )
