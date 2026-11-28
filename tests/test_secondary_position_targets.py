@@ -619,6 +619,13 @@ def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_
             check(results)
     with pytest.raises(ht.HolderTargetError, match="has no close on 2026-10-01"):
         check(onrrp.drop(pd.Timestamp("2026-10-01")))
+    # Reported stocks are what the fiscal-year holder table publishes: offsetting errors that
+    # leave the public total unchanged must still fail against the stock closure.
+    offset = onrrp.copy()
+    offset.loc[last, ht.STOCK_COLUMNS["HolderStock"][BANKS]] += 50.0
+    offset.loc[last, ht.STOCK_COLUMNS["HolderStock"][FOREIGN]] -= 50.0
+    with pytest.raises(ht.HolderTargetError, match="Banks reported stock on 2026-10-12 is not its stock closure"):
+        check(offset)
     with pytest.raises(ht.HolderTargetError, match="no complete holder target for the 2026-10-01 close"):
         check(onrrp, rows=[row for row in rows if row["date"] != "2026-10-01"])
     with pytest.raises(ht.HolderTargetError, match="stock closure has no 2026-10-01 close"):
@@ -669,6 +676,11 @@ def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at
         tampered = onrrp.copy()
         tampered.loc[day, column] += change
         with pytest.raises(ht.HolderTargetError, match="correction is not the untraded routes' trades"):
+            check(tampered)
+    for value in (float("nan"), -0.001):  # every trade leg must be a finite nonnegative amount
+        tampered = onrrp.copy()
+        tampered.loc[day, f"HolderTargetSoldFace_{label}"] = value
+        with pytest.raises(ht.HolderTargetError, match=f"{label} SoldFace on .* is not a finite nonnegative amount"):
             check(tampered)
     quiet = onrrp.copy()  # a correction on a close with no debt difference to correct
     quiet.loc[onrrp.index[2], [ht.CORRECTION_FACE_COLUMN, f"HolderTargetBoughtFace_{label}"]] = 0.001

@@ -288,7 +288,8 @@ def check_stock_target_run(
 
     Targets come from the dated baseline stocks, the declared path and weights, and D from the
     post-trade stock closure: the public stock less the baseline's. Every close after the
-    opening must have finite inputs, a recorded D and reported targets within the declared
+    opening must have finite inputs, finite nonnegative trade legs, reported stocks equal to the
+    closure, a recorded D and reported targets within the declared
     tolerance of the rebuilt ones, stocks within tolerance of their targets, and corrections
     only of untraded routes, only with D above tolerance, matching those routes' trades.
     Returns the largest absolute D."""
@@ -318,6 +319,7 @@ def check_stock_target_run(
     missing = [day for day in baseline if closes[0] <= day <= closes[-1] and day not in closed]
     if missing:
         raise HolderTargetError(f"the run has no close on {missing[0].date()}, a dated target")
+    legs = ("BoughtFace", "SoldFace", "BoughtCash", "SoldCash")
     largest = 0.0
     for day, (_, row) in zip(closes, results.iloc[1:].iterrows(), strict=True):
         if day not in baseline or set(baseline[day]) != set(PARTICIPANTS):
@@ -330,6 +332,15 @@ def check_stock_target_run(
                   float(row[CORRECTION_FACE_COLUMN]), float(row[CORRECTION_CASH_COLUMN])]
         if not all(math.isfinite(value) for value in values):
             raise HolderTargetError(f"the {day.date()} close has a nonfinite target input")
+        for p in PARTICIPANTS:
+            label = PARTICIPANT_LABELS[p]
+            reported_stock = float(row[STOCK_COLUMNS["HolderStock"][p]])
+            if not math.isfinite(reported_stock) or abs(reported_stock - stocks[p]) > tolerance:
+                raise HolderTargetError(f"{label} reported stock on {day.date()} is not its stock closure")
+            for stem in legs:
+                amount = float(row[f"HolderTarget{stem}_{label}"])
+                if not math.isfinite(amount) or amount < 0.0:
+                    raise HolderTargetError(f"{label} {stem} on {day.date()} is not a finite nonnegative amount")
         difference = math.fsum(stocks.values()) - math.fsum(reference.values())
         if abs(float(row[DEBT_DIFFERENCE_COLUMN]) - difference) > tolerance:
             raise HolderTargetError(f"the recorded debt difference on {day.date()} is not the public stock less the baseline's")
@@ -347,7 +358,7 @@ def check_stock_target_run(
         if path.frozen_routes:
             traded = [
                 tuple(float(row[f"HolderTarget{stem}_{PARTICIPANT_LABELS[route]}"]) for route in path.frozen_routes)
-                for stem in ("BoughtFace", "SoldFace", "BoughtCash", "SoldCash")
+                for stem in legs
             ]
             bought, sold, bought_cash, sold_cash = (math.fsum(values) for values in traded)
             if min(bought, sold) > DUST_BIL or abs(face - (bought - sold)) > tolerance \
