@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -690,8 +691,8 @@ def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at
             assert value == pytest.approx(baseline_mmf[key], abs=1e-9), key
     _assert_debt_difference_held_by_donors(onrrp, onrrp_closure, rows, weights)
 
-    def check(results):
-        return ht.check_stock_target_run(results, onrrp_closure, config, target_path=target_path, weights=weights)
+    def check(results, closure=onrrp_closure):
+        return ht.check_stock_target_run(results, closure, config, target_path=target_path, weights=weights)
 
     assert check(onrrp) == pytest.approx(difference.abs().max())
     day = days[0]
@@ -706,10 +707,88 @@ def test_ordinary_money_funds_trade_back_what_the_debt_difference_brings_them_at
         tampered.loc[day, f"HolderTargetSoldFace_{label}"] = value
         with pytest.raises(ht.HolderTargetError, match=f"{label} SoldFace on .* is not a finite nonnegative amount"):
             check(tampered)
+    # Weekends are closed-market closes: nothing trades and, with no TIPS here, nothing moves.
+    assert onrrp.loc["2026-10-03", ht.MARKET_OPEN_COLUMN] == 0.0 and onrrp.loc["2026-10-05", ht.MARKET_OPEN_COLUMN] == 1.0
+    assert onrrp[ht.CLOSED_DAY_GAP_COLUMN].max() <= TOLERANCE
+    # Banks index 0.000004 of TIPS the baseline lacks over the 2026-10-03 weekend close: the
+    # close keeps a gap the next market day trades back, and the check accepts it.
+    tips_day, tips_change = pd.Timestamp("2026-10-03"), 4.0e-6
+    share = -weights[BANKS]
+    indexed, indexed_closure = onrrp.copy(), onrrp_closure.copy()
+    template = indexed_closure.index[(indexed_closure["period_end"] == "2026-10-03")
+                                     & (indexed_closure["axis"] == "holder")
+                                     & (indexed_closure["debt_scope"] == "controlled_public_marketable")
+                                     & (indexed_closure["holder_sector"] == "Banks")][0]
+    tips_row = indexed_closure.loc[[template]].assign(instrument_type="TIPS", closing_debt_stock_bil=tips_change)
+    indexed_closure = pd.concat([indexed_closure, tips_row], ignore_index=True)
+    indexed.loc[tips_day, ht.STOCK_COLUMNS["HolderStock"][BANKS]] += tips_change
+    indexed.loc[tips_day, ht.DEBT_DIFFERENCE_COLUMN] += tips_change
+    for route in MMF_DONORS:
+        indexed.loc[tips_day, f"HolderTarget_{ht.PARTICIPANT_LABELS[route]}"] += tips_change * -weights[route]
+    indexed.loc[tips_day, ht.CLOSED_DAY_GAP_COLUMN] = tips_change * (1.0 - share)
+    assert ht.check_stock_target_run(indexed, indexed_closure, config, target_path=target_path,
+                                     weights=weights) == pytest.approx(indexed[ht.DEBT_DIFFERENCE_COLUMN].abs().max())
+    probes = {
+        "trade on .* a day the securities market is closed": ("HolderTargetBoughtFace_Banks", 0.001),
+        "recorded closed-day gap": (ht.CLOSED_DAY_GAP_COLUMN, 0.001),
+        "marked closed-market on a securities business day": (ht.MARKET_OPEN_COLUMN, -1.0),
+    }
+    for message, (column, change) in probes.items():
+        tampered = indexed.copy()
+        probe_day = pd.Timestamp("2026-10-05") if column == ht.MARKET_OPEN_COLUMN else tips_day
+        tampered.loc[probe_day, column] += change
+        with pytest.raises(ht.HolderTargetError, match=message):
+            check(tampered, closure=indexed_closure)
+    moved = indexed_closure.copy()  # a bill moving on a closed day is not indexation
+    moved.loc[template, "closing_debt_stock_bil"] += tips_change
+    moved = moved[~((moved.index == moved.index[-1]))]
+    with pytest.raises(ht.HolderTargetError, match="Banks holdings other than TIPS move on 2026-10-03"):
+        check(indexed, closure=moved)
+    on_market_day = indexed.copy()  # the same gap at a market-day close is a miss
+    on_market_day.loc[tips_day, [ht.MARKET_OPEN_COLUMN, ht.CLOSED_DAY_GAP_COLUMN]] = [1.0, 0.0]
+    with pytest.raises(ht.HolderTargetError, match="misses its target on 2026-10-03"):
+        check(on_market_day, closure=indexed_closure)
     quiet = onrrp.copy()  # a correction on a close with no debt difference to correct
     quiet.loc[onrrp.index[2], [ht.CORRECTION_FACE_COLUMN, f"HolderTargetBoughtFace_{label}"]] = 0.001
     with pytest.raises(ht.HolderTargetError, match="without a debt difference"):
         check(quiet)
+
+
+def test_a_closed_market_gap_may_move_only_by_tips_indexation_relative_to_the_baseline() -> None:
+    """With the securities market shut nothing trades. Indexation of TIPS a participant holds
+    beyond the baseline's moves its gap by that difference, and D, the public total less the
+    baseline's, moves with it, which the donors hold in their shares. Any other move raises."""
+
+    day = pd.Timestamp("2030-10-14")  # Columbus Day, after a weekend
+    weights = {BANKS: -0.5, FOREIGN: -0.5, PRIVATE_MMF_ADDED: 1.0}
+    path = ht.holder_target_path({
+        "mode": ht.HOLDER_TARGET_MODE, "tolerance_bil": TOLERANCE, "buyer_private_route": PRIVATE_SUBBUCKET_MMF_ADDED,
+        "rows": [{"date": day.date().isoformat(), "phase": "hold", "holder_type": holder, "holder_subbucket": route,
+                  "target_stock_bil": 101.0, "displacement_weight": weights.get((holder, route), 0.0)}
+                 for holder, route in ht.PARTICIPANTS],
+    })
+    last = {route: 100.0 for route in ht.PARTICIPANTS}
+    close = ht.MarketClose(stocks=last, nontips=last, reference=last, gaps={route: 0.0 for route in ht.PARTICIPANTS})
+    # The baseline's holdings index by 1.0 each; foreign holds more TIPS than the baseline does,
+    # so its stock rises 1.000004.
+    stocks = {**{route: 101.0 for route in ht.PARTICIPANTS}, FOREIGN: 101.000004}
+    reference = {route: 101.0 for route in ht.PARTICIPANTS}
+    difference = math.fsum(stocks.values()) - math.fsum(reference.values())
+    targets = {route: reference[route] + difference * (-weights.get(route, 0.0) if weights.get(route, 0.0) < 0 else 0.0)
+               for route in ht.PARTICIPANTS}
+    gaps = {route: targets[route] - stocks[route] for route in ht.PARTICIPANTS}
+    assert path.closed_day_gap(day, gaps=gaps, stocks=stocks, nontips=last, market_close=close) == pytest.approx(2e-6)
+    assert gaps[BANKS] == pytest.approx(2e-6) and gaps[FOREIGN] == pytest.approx(-2e-6)
+    with pytest.raises(ht.HolderTargetError, match="Foreign holdings other than TIPS move on 2030-10-14"):
+        path.closed_day_gap(day, gaps=gaps, stocks=stocks, nontips={**last, FOREIGN: 100.000004}, market_close=close)
+    with pytest.raises(ht.HolderTargetError, match="Banks's gap is not explained by TIPS indexation"):
+        path.closed_day_gap(day, gaps={**gaps, BANKS: gaps[BANKS] + 3e-6}, stocks=stocks, nontips=last,
+                            market_close=close)
+    with pytest.raises(ht.HolderTargetError, match="before any market-day close"):
+        path.closed_day_gap(day, gaps=gaps, stocks=stocks, nontips=last, market_close=None)
+    # A gap within tolerance needs no explanation.
+    assert path.closed_day_gap(day, gaps={route: 0.5 * TOLERANCE for route in ht.PARTICIPANTS}, stocks=stocks,
+                               nontips=last, market_close=None) == pytest.approx(0.5 * TOLERANCE)
 
 
 def test_an_untraded_route_trades_only_what_a_debt_difference_brings_it() -> None:
