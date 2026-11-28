@@ -24,7 +24,7 @@
     "size": "$500 billion, about 1.6 percent of marketable debt at the opening, for every buyer.",
     "timing": "Zero at the 2026-09-30 close, rising linearly to $500 billion at the 2027-09-30 close, held at $500 billion through 2031-09-30.",
     "displacement": "Banks and foreign buyers displace the other ordinary holder routes. For either money-fund case, banks, foreign holders and other domestic nonbanks give up the position. Donor weights use their realized bill holdings in the baseline at the 2026-09-30 close. Ordinary money funds follow their baseline path in both money-fund cases, and the added route acquires securities only in controller trades.",
-    "trading": "After the Federal Reserve's operation each day, holders above their target sell nominal bills to holders below it at model dirty prices; each sale is spread across remaining-maturity buckets in proportion to the seller's bills."
+    "trading": "After the Federal Reserve's operation at each market-day close, holders above their target sell nominal bills to holders below it at model dirty prices; each sale is spread across remaining-maturity buckets in proportion to the seller's bills."
   },
   "scenarios": [
     {

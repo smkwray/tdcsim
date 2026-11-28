@@ -8,7 +8,7 @@ measured from the origin close, and writes (USD billions):
 
 - position_targets.csv: each holder route's displacement weight and amount, target
   increment, share and amount of the debt difference D it holds, and realized holdings
-  increment at both dates, and its largest target miss over every close;
+  increment at both dates, and its largest target miss over every market-day close;
 - dated_effects.csv: cumulative TDC and TRC since the origin close in the scenario and the
   baseline, and their difference, and the change in the public's controlled marketable stock,
   whose difference is D;
@@ -32,8 +32,8 @@ that difference in their donor weights, and every other route keeps its stated t
 The export fails unless every run passed bounded replay verification, each scenario names
 its family baseline's run, the paired runs are identical through the origin close, the
 recorded D is the public stock less the baseline's at every close, Treasury's side matches
-the baseline in a run whose D stays zero, every close meets its holder target with D held by
-the donors, and the cash components and TRC reconcile. Run it with the installed release the runs were produced with.
+the baseline in a run whose D stays zero, every market-day close meets its holder target with
+D held by the donors, and the cash components and TRC reconcile. Run it with the installed release the runs were produced with.
 """
 
 from __future__ import annotations
@@ -172,7 +172,7 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
     if max_difference <= TOLERANCE_BIL and max(issuer.values()) > TOLERANCE_BIL:
         raise SystemExit(f"{role}: Treasury's side differs from the baseline with no debt difference: {issuer}")
 
-    # Holder targets at every close, from the run's own stock closure.
+    # Holder targets at every market-day close, from the run's own stock closure.
     rows = pd.read_csv(run_dir / TARGET_FILE, keep_default_na=False, float_precision="round_trip")
     realized = ht.closing_holder_stocks(data["closure"]).rename(
         columns={"period_end": "date", "holder_sector": "holder_type", "holder_subsector": "holder_subbucket"})
@@ -432,7 +432,9 @@ def main(argv: list[str] | None = None) -> int:
         "producer": {"repository_commit": commit, "installed_archive_sha256": installed_archive_sha256(),
                      "distribution_file_digest": dist["file_digest"], "package_version": dist["version"],
                      "python_version": platform.python_version()},
-        "clock": "daily model period close; holder targets are met after the Federal Reserve's operation and before the close",
+        "clock": ("daily model period close; holder targets are met at each market-day close, after the Federal "
+                  "Reserve's operation; with the securities market shut nothing trades, and TIPS indexation on "
+                  "holdings that differ from the baseline's is settled at the next market-day close"),
         "stock_basis": "controlled public marketable Treasury holdings at par, adjusted principal for TIPS",
         "readings": "scenario less its own family baseline, cumulative since the origin close, at the end of the build and of the hold",
         "interest_note": "Treasury interest to deposit users is Treasury's payment to covered deposits, including bill discount at redemption; secondary-price effects stay in security settlements",
