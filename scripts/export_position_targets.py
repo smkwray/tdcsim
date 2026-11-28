@@ -6,10 +6,12 @@ Treasury holdings a stated amount above the baseline's. For every such scenario 
 compares the run with its own family baseline, at the end of the build and of the hold,
 measured from the origin close, and writes (USD billions):
 
-- position_targets.csv: each holder route's displacement weight and amount, target and
-  realized holdings increment at both dates, and its largest target miss over every close;
+- position_targets.csv: each holder route's displacement weight and amount, target
+  increment, share and amount of the debt difference D it holds, and realized holdings
+  increment at both dates, and its largest target miss over every close;
 - dated_effects.csv: cumulative TDC and TRC since the origin close in the scenario and the
-  baseline, and their difference;
+  baseline, and their difference, and the change in the public's controlled marketable stock,
+  whose difference is D;
 - cash_components.csv: the TDC difference split into net other security settlements
   (principal to deposit users, auction absorption and secondary settlements, the last split
   into the target trades and the Federal Reserve's background trades), Treasury interest
@@ -20,10 +22,15 @@ measured from the origin close, and writes (USD billions):
 - receipt.json: producer, inputs, baseline references, clock, stock basis, funding states
   and the checks below.
 
+D is the scenario public stock less the baseline's at a close. A position that changes the
+Federal Reserve's income changes its remittances and so Treasury's borrowing; the donors hold
+that difference in their donor weights, and every other route keeps its stated target.
+
 The export fails unless every run passed bounded replay verification, each scenario names
-its family baseline's run, the paired runs are identical through the origin close,
-Treasury's side matches the baseline, every close meets its holder target, and the cash
-components and TRC reconcile. Run it with the installed release the runs were produced with.
+its family baseline's run, the paired runs are identical through the origin close, the
+recorded D is the public stock less the baseline's at every close, Treasury's side matches
+the baseline in a run whose D stays zero, every close meets its holder target with D held by
+the donors, and the cash components and TRC reconcile. Run it with the installed release the runs were produced with.
 """
 
 from __future__ import annotations
@@ -149,9 +156,18 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
     )
     if pre_gap != 0.0 or pre_trc_gap != 0.0 or not same_closure:
         raise SystemExit(f"{role}: the paired runs differ before the origin close ({pre_gap}, {pre_trc_gap})")
+    # Treasury's side differs from the baseline only through the debt difference D.
+    def public(frame: pd.DataFrame) -> pd.Series:
+        return sum(frame[ht.STOCK_COLUMNS["HolderStock"][p]].astype(float) for p in ht.PARTICIPANTS)
+
+    difference = results[ht.DEBT_DIFFERENCE_COLUMN].astype(float)
+    identity_gap = float(((public(results) - public(base_results)) - difference).abs().max())
+    if identity_gap > TOLERANCE_BIL:
+        raise SystemExit(f"{role}: the recorded debt difference is not the public stock less the baseline's ({identity_gap})")
+    max_difference = float(difference.abs().max())
     issuer = {c: float((results[c] - base_results[c]).abs().max()) for c in ISSUER_COLUMNS}
-    if max(issuer.values()) > TOLERANCE_BIL:
-        raise SystemExit(f"{role}: Treasury's side differs from the baseline: {issuer}")
+    if max_difference <= TOLERANCE_BIL and max(issuer.values()) > TOLERANCE_BIL:
+        raise SystemExit(f"{role}: Treasury's side differs from the baseline with no debt difference: {issuer}")
 
     # Holder targets at every close, from the run's own stock closure.
     rows = pd.read_csv(run_dir / TARGET_FILE, keep_default_na=False, float_precision="round_trip")
@@ -160,7 +176,13 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
     checked = rows.merge(realized, on=["date", "holder_type", "holder_subbucket"], how="left", validate="one_to_one")
     if checked["closing_stock_bil"].isna().any() or len(checked) != len(rows):
         raise SystemExit(f"{role}: a target close has no realized holdings")
-    checked["error"] = checked["closing_stock_bil"] - checked["target_stock_bil"]
+    checked["debt_difference_bil"] = checked["date"].map(difference)
+    if checked["debt_difference_bil"].isna().any():
+        raise SystemExit(f"{role}: a target close has no recorded debt difference")
+    weight = checked["displacement_weight"].astype(float)
+    checked["debt_difference_share"] = (-weight).where(weight < 0.0, 0.0)
+    checked["debt_difference_held"] = checked["debt_difference_bil"] * checked["debt_difference_share"]
+    checked["error"] = checked["closing_stock_bil"] - (checked["target_stock_bil"] + checked["debt_difference_held"])
     if checked["error"].abs().max() > float(target["target_tolerance_bil"]):
         raise SystemExit(f"{role}: holdings miss their target by {checked['error'].abs().max()}")
     checked["realized_increment"] = checked["closing_stock_bil"] - checked["baseline_stock_bil"]
@@ -182,9 +204,12 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
             "origin_bill_stock_bil": float(donor["origin_bill_stock_bil"]) if donor else float("nan"),
             "displacement_weight": float(at["displacement_weight"].iloc[0]),
             "displacement_amount_bil": float(at["displacement_weight"].iloc[0]) * path.size_bil,
+            "debt_difference_share": float(at["debt_difference_share"].iloc[0]),
             "target_increment_build_end_bil": float(at.loc[build_end, "target_increment_bil"]),
+            "debt_difference_held_build_end_bil": float(at.loc[build_end, "debt_difference_held"]),
             "realized_increment_build_end_bil": float(at.loc[build_end, "realized_increment"]),
             "target_increment_end_bil": float(at.loc[end, "target_increment_bil"]),
+            "debt_difference_held_end_bil": float(at.loc[end, "debt_difference_held"]),
             "realized_increment_end_bil": float(at.loc[end, "realized_increment"]),
             "max_abs_target_error_bil": float(at["error"].abs().max()),
         })
@@ -200,9 +225,20 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
     }
     if (sum(interest_parts.values()) - results["TDC_InterestToDU"]).abs().max() > TOLERANCE_BIL:
         raise SystemExit(f"{role}: the interest components do not sum to Treasury interest to deposit users")
+    public_stock, base_public_stock = public(results), public(base_results)
     for day in (build_end, end):
         def diff(frame, other, column):
             return _since(frame, column, origin, day) - _since(other, column, origin, day)
+
+        stock_change = float(public_stock[day] - public_stock[origin])
+        base_stock_change = float(base_public_stock[day] - base_public_stock[origin])
+        effects.append({
+            "family_id": family["family_id"], "role": role, "date": day, "measure": "public_marketable_stock",
+            "scenario_since_origin_bil": stock_change, "baseline_since_origin_bil": base_stock_change,
+            "scenario_minus_baseline_bil": stock_change - base_stock_change,
+            "scenario_from_opening_bil": float(public_stock[day] - public_stock.iloc[0]),
+            "baseline_from_opening_bil": float(base_public_stock[day] - base_public_stock.iloc[0]),
+        })
 
         for measure, frame, other, column in (("cumulative_tdc", results, base_results, "TDC_Change"),
                                               ("cumulative_trc", trc, base_trc, "TRC_Change")):
@@ -313,6 +349,8 @@ def _case(family: dict[str, Any], root: Path, role: str, base: dict[str, Any], h
         "checks": {
             "pre_origin_max_abs_difference": max(pre_gap, pre_trc_gap),
             "issuer_max_abs_difference_bil": issuer,
+            "max_abs_debt_difference_bil": max_difference,
+            "debt_difference_identity_max_abs_bil": identity_gap,
             "max_abs_target_error_bil": float(checked["error"].abs().max()),
             "closes_checked": int(checked["date"].nunique()),
         },

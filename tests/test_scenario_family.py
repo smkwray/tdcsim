@@ -197,6 +197,7 @@ def test_family_runs_verify_and_export(tmp_path: Path, monkeypatch) -> None:
     with (tmp_path / "export" / "scenario_family_fy.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert {row["scenario_role"] for row in rows} == {"baseline", "retreat", "shift", "shift_rates"}
+    assert "holder_target_debt_difference_end_bil" not in rows[0]  # no role runs holder stock targets
     for column in ("cumulative_tdc_change_bil", "cumulative_modeled_financing_cost_bil", "cumulative_trc_bil",
                    "holdings_foreign_end_bil", "foreign_gross_settlement_cash_bil", "nominal_10y_end_pct"):
         assert all(row[column] != "" for row in rows), column

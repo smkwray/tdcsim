@@ -3,7 +3,10 @@
 Each role must be a completed run whose bounded replay verified. Rows combine the
 run's verified annual TDC and financing-cost summary, the fiscal-year TRC
 projection, holder stocks at each fiscal-year end, and the 10-year nominal par
-yield of the run's compiled curve in effect at each fiscal-year end. The export reports levels
+yield of the run's compiled curve in effect at each fiscal-year end. A role run with holder
+stock targets also reports its debt difference D, its public stock less the baseline's, at the
+fiscal-year end close and its largest absolute value over the year's closes; other roles leave
+those columns empty, and a family with no such role has none. The export reports levels
 per role; differences from the family baseline are left to consumers so that no
 derived quantity hides its inputs.
 """
@@ -22,7 +25,7 @@ from typing import Any
 import pandas as pd
 
 from fed_income import FED_INCOME_EXPORT_FLOWS, FED_INCOME_EXPORT_LEVELS
-from holder_targets import PARTICIPANT_LABELS, STOCK_COLUMNS
+from holder_targets import DEBT_DIFFERENCE_COLUMN, PARTICIPANT_LABELS, STOCK_COLUMNS
 
 from .open04_campaign import OPEN04_AGGREGATION_CLOCK_ID
 from .marginal_tdc import INTEREST_PAYMENT_TYPES
@@ -50,6 +53,7 @@ HOLDING_COLUMNS = {
     "DebtHeld_Foreign": "holdings_foreign_end_bil",
     "DebtHeld_DomesticNonBanks": "holdings_domestic_nonbank_end_bil",
 }
+DEBT_DIFFERENCE_FIELDS = ("holder_target_debt_difference_end_bil", "holder_target_debt_difference_max_abs_bil")
 
 
 class ScenarioFamilyExportError(RuntimeError):
@@ -166,6 +170,11 @@ def _role_rows(
         if in_effect.empty:
             raise ScenarioFamilyExportError(f"{role}: no curve date precedes {end}")
         row["nominal_10y_end_pct"] = float(in_effect.iloc[-1])
+        if DEBT_DIFFERENCE_COLUMN in results.columns:
+            start = fy_row["coverage_start_exclusive"]
+            closes = results.loc[(results.index > start) & (results.index <= end), DEBT_DIFFERENCE_COLUMN]
+            row.update(zip(DEBT_DIFFERENCE_FIELDS, (float(results.loc[end, DEBT_DIFFERENCE_COLUMN]),
+                                                    float(closes.abs().max()))))
         rows.append(row)
     evidence.update(
         {
@@ -257,6 +266,10 @@ def export_scenario_family(
             "verification_grade": verification.get("verification_grade"),
             **evidence,
         }
+    if any(DEBT_DIFFERENCE_FIELDS[0] in row for row in rows):
+        for row in rows:
+            for field in DEBT_DIFFERENCE_FIELDS:
+                row.setdefault(field, None)
     table_bytes = _csv_bytes(rows)
     fed_table_bytes = _csv_bytes(fed_rows)
     stock_bytes = _csv_bytes(stock_rows) if stock_rows else None

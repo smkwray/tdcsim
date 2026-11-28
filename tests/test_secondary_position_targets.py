@@ -849,6 +849,7 @@ def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monk
 
     banks = _load(root / "banks" / "run")["results"]
     assert banks["HolderTargetMaxError"].max() <= TOLERANCE
+    assert ht.DEBT_DIFFERENCE_COLUMN in banks.columns
     assert banks.loc["2026-09-26":, "HolderTarget_Banks"].iloc[0] > 0.0
     assert "HolderTargetPhase" not in _load(root / "baseline" / "run")["results"].columns
     case = _case(family, root, "banks", _load(root / "baseline" / "run"), ht)
@@ -860,12 +861,41 @@ def test_a_written_holder_target_family_runs_verifies_and_exports(tmp_path, monk
     assert abs(components[("2026-09-30", "reconciliation_residual")]) <= TOLERANCE
     # Banks pay with reserves, so deposit-funded donors' deposits rise by what they receive.
     assert components[("2026-09-30", "secondary_settlements_target_trades")] > 0.0
+    effects = {(e["date"], e["measure"]): e for e in case["effects"]}
+    assert effects[("2026-09-30", "public_marketable_stock")]["scenario_minus_baseline_bil"] == pytest.approx(
+        banks.loc["2026-09-30", ht.DEBT_DIFFERENCE_COLUMN], abs=TOLERANCE)
+    for position in case["positions"]:
+        assert position["realized_increment_end_bil"] == pytest.approx(
+            position["target_increment_end_bil"] + position["debt_difference_held_end_bil"], abs=TOLERANCE)
+    assert sum(p["debt_difference_share"] for p in case["positions"]) == pytest.approx(1.0)
+    assert case["checks"]["max_abs_debt_difference_bil"] == pytest.approx(banks[ht.DEBT_DIFFERENCE_COLUMN].abs().max())
     mmf_case = _case(family, root, "mmf_onrrp", _load(root / "baseline" / "run"), ht)
     assert any(c["component"] == "secondary_settlements_target_trades_added_mmf_position"
                and c["scenario_minus_baseline_bil"] == 0.0 for c in mmf_case["components"])
     issuance = pd.read_csv(root / "mmf_onrrp/run/outputs/tdcsim_period_issuance_aggregates.csv.gz")
     assert PRIVATE_SUBBUCKET_MMF_ADDED not in set(issuance["holder_subsector"])
 
+    # The family export carries each stock-target role's D; the baseline's columns stay empty.
+    from tdcsim_cbo.scenario_family_export import export_scenario_family
+
+    runs = {item["role"]: {"run_dir": root / item["role"] / "run", "scenario_id": item["scenario_id"],
+                           "scenario_sha256": "0" * 64,
+                           "verification": json.loads((root / item["role"] / "verification.json").read_text())}
+            for item in family["scenarios"]}
+    export_scenario_family(family_spec=family, family_spec_sha256="1" * 64, runs=runs, output_dir=tmp_path / "export",
+                           producer={"repository_commit": "a" * 40})
+    exported = pd.read_csv(tmp_path / "export" / "scenario_family_fy.csv", keep_default_na=False)
+    for row in exported.itertuples():
+        if row.scenario_role == "baseline":
+            assert row.holder_target_debt_difference_end_bil == row.holder_target_debt_difference_max_abs_bil == ""
+            continue
+        recorded = _load(root / row.scenario_role / "run")["results"][ht.DEBT_DIFFERENCE_COLUMN]
+        window = recorded[(recorded.index > row.coverage_start_exclusive) & (recorded.index <= row.coverage_end_inclusive)]
+        # The export parses results with pandas' default float reader, so the last digit may differ.
+        assert float(row.holder_target_debt_difference_end_bil) == pytest.approx(
+            recorded[row.coverage_end_inclusive[:10]], rel=1e-12, abs=1e-15)
+        assert float(row.holder_target_debt_difference_max_abs_bil) == pytest.approx(
+            window.abs().max(), rel=1e-12, abs=1e-15)
     with pytest.raises(SystemExit, match="baseline reference"):
         (root / "baseline" / "run" / "tdcsim_cbo_run_manifest.json").write_text("{}")
         _case(family, root, "banks", _load(root / "baseline" / "run"), ht)
