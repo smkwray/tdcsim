@@ -617,8 +617,12 @@ def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_
             results.loc[last, column] = results.loc[last, column] + change
         with pytest.raises(ht.HolderTargetError, match=message):
             check(results)
-    with pytest.raises(ht.HolderTargetError, match="has no close on 2026-10-01"):
-        check(onrrp.drop(pd.Timestamp("2026-10-01")))
+    # Every close after the opening must be there, the first and last included, against the
+    # dated target sequence rather than the surviving rows' own endpoints.
+    for dropped, message in (("2026-10-01", "2026-10-01"), ("2026-09-21", "2026-09-21"),
+                             ("2026-10-12", "2026-10-12"), ("2026-09-20", "2026-09-21")):
+        with pytest.raises(ht.HolderTargetError, match=f"has no close on {message}"):
+            check(onrrp.drop(pd.Timestamp(dropped)))
     # Reported stocks are what the fiscal-year holder table publishes: offsetting errors that
     # leave the public total unchanged must still fail against the stock closure.
     offset = onrrp.copy()
@@ -626,7 +630,27 @@ def test_a_position_that_changes_fed_income_leaves_the_debt_difference_with_its_
     offset.loc[last, ht.STOCK_COLUMNS["HolderStock"][FOREIGN]] -= 50.0
     with pytest.raises(ht.HolderTargetError, match="Banks reported stock on 2026-10-12 is not its stock closure"):
         check(offset)
-    with pytest.raises(ht.HolderTargetError, match="no complete holder target for the 2026-10-01 close"):
+
+    # Before the build every target is the baseline's, as the controller sets it: a public
+    # stock 0.9e-6 above the baseline, inside the 1e-6 tolerance, is not given to the donors.
+    def deviate(day):
+        results, closure = onrrp.copy(), onrrp_closure.copy()
+        for route, change in ((BANKS, -0.9e-6), (FOREIGN, 0.9e-6), (PRIVATE_DNB, 0.9e-6)):
+            match = ((closure["period_end"] == day) & (closure["axis"] == "holder")
+                     & (closure["debt_scope"] == "controlled_public_marketable")
+                     & (closure["holder_sector"] == route[0])
+                     & (closure["holder_subsector"].fillna("").astype(str) == route[1]))
+            closure.loc[closure.index[match][0], "closing_debt_stock_bil"] += change
+            results.loc[pd.Timestamp(day), ht.STOCK_COLUMNS["HolderStock"][route]] += change
+        results.loc[pd.Timestamp(day), ht.DEBT_DIFFERENCE_COLUMN] += 0.9e-6
+        return results, closure
+
+    results, closure = deviate(REMIT_ORIGIN)
+    assert check(results, closure=closure) == pytest.approx(difference.abs().max())
+    results, closure = deviate("2026-09-23")  # in the hold the donors hold D, so banks now miss
+    with pytest.raises(ht.HolderTargetError, match="Banks misses its target on 2026-09-23"):
+        check(results, closure=closure)
+    with pytest.raises(ht.HolderTargetError, match="not the dated target sequence: 2026-10-01 has no target"):
         check(onrrp, rows=[row for row in rows if row["date"] != "2026-10-01"])
     with pytest.raises(ht.HolderTargetError, match="stock closure has no 2026-10-01 close"):
         check(onrrp, closure=onrrp_closure[onrrp_closure["period_end"] != "2026-10-01"])

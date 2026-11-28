@@ -287,12 +287,13 @@ def check_stock_target_run(
     """Rebuild a stock-target run's every close and fail unless the run follows it.
 
     Targets come from the dated baseline stocks, the declared path and weights, and D from the
-    post-trade stock closure: the public stock less the baseline's. Every close after the
-    opening must have finite inputs, finite nonnegative trade legs, reported stocks equal to the
-    closure, a recorded D and reported targets within the declared
-    tolerance of the rebuilt ones, stocks within tolerance of their targets, and corrections
-    only of untraded routes, only with D above tolerance, matching those routes' trades.
-    Returns the largest absolute D."""
+    post-trade stock closure: the public stock less the baseline's. The closes after the
+    opening must be exactly the dated target sequence. Each must have finite inputs, finite
+    nonnegative trade legs, reported stocks equal to the closure, a recorded D and reported
+    targets within the declared tolerance of the rebuilt ones (donors hold D from the build
+    on, as the controller sets them; before it every target is the baseline's), stocks within
+    tolerance of their targets, and corrections only of untraded routes, only with D above
+    tolerance, matching those routes' trades. Returns the largest absolute D."""
 
     path = holder_target_path(config)
     if path is None or path.bill_change_weights is not None:
@@ -313,12 +314,15 @@ def check_stock_target_run(
             (record.holder_sector, record.holder_subsector)
         ] = float(record.closing_stock_bil)
     closes = [pd.Timestamp(day).normalize() for day in results.index[1:]]  # the controller acts after the opening
-    if not closes:
-        raise HolderTargetError("the run has no close after the opening")
-    closed = set(closes)
-    missing = [day for day in baseline if closes[0] <= day <= closes[-1] and day not in closed]
-    if missing:
-        raise HolderTargetError(f"the run has no close on {missing[0].date()}, a dated target")
+    dated = sorted(baseline)
+    if closes != dated:
+        missing, extra = sorted(set(dated) - set(closes)), sorted(set(closes) - set(dated))
+        if missing:
+            raise HolderTargetError(f"the run has no close on {missing[0].date()}, a dated target")
+        raise HolderTargetError(
+            "the run's closes after the opening are not the dated target sequence"
+            + (f": {extra[0].date()} has no target" if extra else "")
+        )
     legs = ("BoughtFace", "SoldFace", "BoughtCash", "SoldCash")
     largest = 0.0
     for day, (_, row) in zip(closes, results.iloc[1:].iterrows(), strict=True):
@@ -344,11 +348,12 @@ def check_stock_target_run(
         difference = math.fsum(stocks.values()) - math.fsum(reference.values())
         if abs(float(row[DEBT_DIFFERENCE_COLUMN]) - difference) > tolerance:
             raise HolderTargetError(f"the recorded debt difference on {day.date()} is not the public stock less the baseline's")
-        if target_path.phase(day) == "pre" and abs(difference) > tolerance:
+        pre = target_path.phase(day) == "pre"
+        if pre and abs(difference) > tolerance:
             raise HolderTargetError(f"the public stock differs from the baseline on {day.date()}, before the intervention starts")
         for p in PARTICIPANTS:
             label = PARTICIPANT_LABELS[p]
-            target = reference[p] + difference * shares.get(p, 0.0)
+            target = reference[p] + (0.0 if pre else difference * shares.get(p, 0.0))
             reported = float(row[f"HolderTarget_{label}"])
             if not math.isfinite(reported) or abs(reported - target) > tolerance:
                 raise HolderTargetError(f"{label} target on {day.date()} does not follow the debt-difference rule")
